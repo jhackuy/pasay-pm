@@ -76,11 +76,10 @@ def callback_data_of(env, call_type, index=-1):
 
 
 def _run_rent_to_confirm(env, user_id=OWNER_ID, chat_id=OWNER_ID):
+    """V1.1 compressed flow: pick unpaid unit -> confirmation card with
+    smart defaults (amount = monthly rent, date = today, method = default)."""
     updates = [
         make_callback_update(user_id, chat_id, encode("rn", "go", "1"), bot=env.bot),
-        make_text_update(user_id, chat_id, "55000", message_id=2, update_id=2, bot=env.bot),
-        make_text_update(user_id, chat_id, date.today().isoformat(), message_id=3, update_id=3, bot=env.bot),
-        make_callback_update(user_id, chat_id, encode("mt", "bank"), message_id=4, update_id=4, bot=env.bot),
     ]
     run_updates(env, updates)
     return _confirm_card_data(env)
@@ -89,28 +88,38 @@ def _run_rent_to_confirm(env, user_id=OWNER_ID, chat_id=OWNER_ID):
 # --- navigation / rent flow ---
 
 def test_rent_callback(make_app):
+    """★ B4/B5: [💵 收租] shows the unpaid-unit collect list — paid and vacant
+    units hidden, overdue units first; selecting a unit opens the confirmation
+    card with smart defaults."""
     env = make_app()
     updates = [
         make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot),
-        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "prop", "1"),
+        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"),
                              message_id=20, update_id=2, bot=env.bot),
-        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "unit", "1"),
-                             message_id=20, update_id=3, bot=env.bot),
     ]
     run_updates(env, updates)
-    texts = [c["text"] or "" for c in env.bot.calls]
-    assert any("选择物业" in t for t in texts)
-    assert any("选择 Unit（Pasay Premier Residences）" in t for t in texts)
-    unit_page = env.bot.edits()[-1]["text"]
-    assert "🏢 <b>Pasay Premier Residences · Unit 16B</b>" in unit_page
-    assert "租客：Juan Dela Cruz" in unit_page
-    assert "月租：₱55,000" in unit_page
+    collect_text = env.bot.edits()[0]["text"]
+    assert "选择未付款 Unit" in collect_text
+    # 2C (40d overdue) sorts before 16B (5d); vacant 17A and paid units hidden
+    assert "2C" in collect_text
+    assert "16B" in collect_text
+    assert "17A" not in collect_text
+    confirm_text = env.bot.edits()[-1]["text"]
+    assert "确认收租" in confirm_text
+    assert "🏢" not in confirm_text or "Unit" in confirm_text
+    # smart defaults on the confirmation card
+    assert "金额：<b>₱55,000</b>" in confirm_text
+    assert "日期：" + date.today().isoformat() in confirm_text
+    conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
+    assert conv is not None and conv["state"] == "rent_confirm"
     kb = env.bot.edits()[-1]["reply_markup"]
     labels = [b.text for row in kb.inline_keyboard for b in row]
-    assert "💵 记一笔" in labels
+    assert "✅ 确认入账" in labels
+    assert "✏️ 修改收租信息" in labels
 
 
 def test_commands_and_menu(make_app):
+    """★ B1: /start renders the live dashboard, not a static 4-button menu."""
     env = make_app()
     updates = [
         make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot),
@@ -119,10 +128,16 @@ def test_commands_and_menu(make_app):
         make_text_update(OWNER_ID, OWNER_ID, "/properties", message_id=4, update_id=4, bot=env.bot),
     ]
     run_updates(env, updates)
+    start_text = env.bot.sends()[0]["text"]
+    assert "Pasay 房产管理" in start_text
+    assert "本月租金" in start_text
+    assert "应收：₱363,000" in start_text
+    assert "已收到：₱190,000" in start_text
+    assert "未收到：<b>₱173,000</b>" in start_text
+    assert "逾期 2 笔" in start_text  # aggregate, no zero-noise
+    assert "今日待处理" in start_text
     texts = "".join(env.bot.all_texts())
-    assert "主菜单" in texts
     assert "2026年8月财务" in texts
-    assert "应收：₱363,000" in texts
     assert "逾期租金 · 2笔" in texts
     assert "房源概况" in texts
 
@@ -136,7 +151,9 @@ def test_overdue_escape_and_action_buttons(make_app):
     assert "Maria <Admin>" not in text
     kb = env.bot.last_send()["reply_markup"]
     buttons = [b for row in kb.inline_keyboard for b in row]
-    assert len(buttons) == 4  # 2 items x (记一笔 + 详情)
+    # 2 items x (记一笔 + 详情) + home button (B7)
+    assert len(buttons) == 5
+    assert "🏠 首页" in [b.text for b in buttons]
 
 
 # --- confirm flows ---
@@ -186,7 +203,7 @@ def test_edit_noop_message_not_modified(make_app, caplog):
     assert edits[0]["text"] == edits[1]["text"]  # identical re-render is a no-op
     assert "Message is not modified" not in caplog.text  # no error log spam
     conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
-    assert conv is not None and conv["state"] == "rent_amount"
+    assert conv is not None and conv["state"] == "rent_confirm"
 
 
 def test_edit_other_bad_request_still_raises():
@@ -267,7 +284,7 @@ def test_expired_callback(make_app):
 def test_invalid_callback(make_app):
     env = make_app()
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, "garbage", bot=env.bot)])
-    assert env.bot.last_answer()["text"] == "已过期"
+    assert env.bot.last_answer()["text"] == "⚠️ 无效操作"
     assert env.backend.calls == []
 
 
@@ -390,23 +407,25 @@ def test_create_timeout_after_write_no_duplicate(make_app):
 
 def test_new_card_re_records_same_period_reuses_pending(make_app):
     """★ F1: after a create timeout, a NEW card (new nonce) for the same
-    unit/period reuses the landed pending income instead of duplicating it."""
+    unit/period reuses the landed pending income instead of duplicating it.
+    (V1.1: confirmed incomes block re-entry, so the first write stays pending.)"""
     env = make_app()
-    data = _run_rent_to_confirm(env)
+    data = _run_rent_to_confirm(env, user_id=SECRETARY_ID, chat_id=SECRETARY_ID)
     env.backend.timeout_after_write_paths.add("/incomes")
 
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, update_id=10, bot=env.bot)])
     assert len(env.backend.incomes) == 1
-    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.backend.incomes[0]["status"] == "pending"
     assert env.backend.count_calls("POST", "/incomes") == 1
 
-    # user opens a fresh flow (new nonce) and re-records the same unit/period
+    # OWNER opens a fresh flow (new nonce) and re-records the same unit/period
     env.backend.timeout_after_write_paths.clear()
     data2 = _run_rent_to_confirm(env)
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data2, update_id=20, bot=env.bot)])
     assert len(env.backend.incomes) == 1  # reused, not duplicated
     assert env.backend.count_calls("POST", "/incomes") == 1
-    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.bot.last_answer()["text"] == "✅ 已入账"
 
 
 def test_backend_timeout_pending_reconcile(make_app):
@@ -549,9 +568,15 @@ def test_owner_confirms_secretary_pending_via_pending_command(make_app):
     assert "待确认收入" in send["text"]
     kb = send["reply_markup"]
     assert kb is not None
-    btn = kb.inline_keyboard[0][0]
-    parsed = decode(btn.callback_data)
-    assert parsed["action"] == "cnf" and parsed["entity"] == "inc" and parsed["ref"] == "1"
+    btn = next(
+        b
+        for row in kb.inline_keyboard
+        for b in row
+        if decode(b.callback_data) is not None
+        and decode(b.callback_data)["action"] == "cnf"
+        and decode(b.callback_data)["entity"] == "inc"
+        and decode(b.callback_data)["ref"] == "1"
+    )
 
     run_updates(
         env,
@@ -563,13 +588,22 @@ def test_owner_confirms_secretary_pending_via_pending_command(make_app):
 
 
 def test_secretary_pending_list_has_no_confirm_buttons(make_app):
-    """★ F5: SECRETARY can view the pending list but gets no confirm buttons."""
+    """★ F5: SECRETARY can view the pending to-do page but gets no confirm
+    buttons (only the overdue collect + home buttons)."""
     env = make_app()
     env.backend.add_income(status="pending", income_id=1)
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending", bot=env.bot)])
     send = env.bot.last_send()
-    assert "Pending Income" in send["text"]  # SECRETARY locale is en
-    assert send["reply_markup"] is None
+    assert "To-do" in send["text"]  # SECRETARY locale is en
+    assert "Pending income · 1" in send["text"]
+    kb = send["reply_markup"]
+    assert kb is not None
+    cnf = [
+        b for row in kb.inline_keyboard for b in row
+        if decode(b.callback_data) is not None
+        and decode(b.callback_data)["action"] == "cnf"
+    ]
+    assert cnf == []
 
 
 # --- F6: group-chat ownership check happens before acquire ---

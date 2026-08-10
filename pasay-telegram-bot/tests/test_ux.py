@@ -1,0 +1,422 @@
+"""V1.1 UX regression tests (no-network harness: FakeBot + httpx MockTransport).
+
+Covers the named scenarios from the V1.1 brief: dashboard, pending
+aggregation, rent-flow compression with smart defaults, state-driven buttons,
+edit-first navigation, back/cancel, error recovery, empty states, i18n."""
+from datetime import date, timedelta
+
+from conftest import OWNER_ID, SECRETARY_ID, make_callback_update, make_text_update, run_updates
+from pasay_bot.keyboards import decode, encode, new_nonce, now_ts
+
+CUR_MONTH = date.today().strftime("%Y-%m")
+TODAY = date.today().isoformat()
+
+
+def _buttons_of(kb):
+    if kb is None:
+        return []
+    return [b for row in kb.inline_keyboard for b in row]
+
+
+def _has_nav(kb, entity):
+    return any(
+        decode(b.callback_data) is not None and decode(b.callback_data)["action"] == "nav"
+        and decode(b.callback_data)["entity"] == entity
+        for b in _buttons_of(kb)
+    )
+
+
+def _confirm_data(env):
+    call = env.bot.edits()[-1]
+    kb = call["reply_markup"]
+    return next(
+        b.callback_data
+        for b in _buttons_of(kb)
+        if decode(b.callback_data) is not None and decode(b.callback_data)["action"] == "cnf"
+    )
+
+
+def _paid_unit1(env):
+    env.backend.add_income(
+        status="confirmed", lease_id=1, amount="55000.00",
+        received_date=TODAY, payment_method="Bank",
+        description=f"rent {CUR_MONTH}", income_id=1,
+    )
+
+
+# --- dashboard (B1) ---
+
+def test_start_shows_dashboard(make_app):
+    """★ /start renders the live dashboard with data + 4 task-first buttons."""
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
+    send = env.bot.last_send()
+    text = send["text"]
+    assert "<b>🏠 Pasay 房产管理</b>" in text
+    assert "本月租金" in text
+    assert "应收：₱363,000" in text
+    assert "已收到：₱190,000" in text
+    assert "未收到：<b>₱173,000</b>" in text
+    assert "今日待处理" in text
+    assert "逾期 2 笔" in text
+    assert "空置 1 套" in text
+    labels = [b.text for b in _buttons_of(send["reply_markup"])]
+    assert labels == ["💵 收租", "⚠️ 待处理", "🏘 房源", "📊 财务"]
+
+
+def test_dashboard_no_tasks(make_app):
+    """★ no overdue/tasks -> positive empty line, no zero-noise."""
+    env = make_app()
+    env.backend.overdue = []
+    env.backend.tasks = []
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "✅ 今天没有紧急事项" in text
+    assert "逾期 0 笔" not in text
+    assert "待办 0 项" not in text
+
+
+def test_dashboard_with_overdue(make_app):
+    """★ overdue entries surface on the dashboard attention line."""
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "今日待处理" in text
+    assert "逾期 2 笔" in text
+    assert "✅ 今天没有紧急事项" not in text
+
+
+def test_dashboard_zero_values_hidden(make_app):
+    """★ zero/empty values are hidden; only the positive empty-state remains."""
+    env = make_app()
+    env.backend.overdue = []
+    env.backend.tasks = []
+    env.backend.financial_summary = {
+        "month": CUR_MONTH, "expected_rent_total": "0.00", "collected_rent": "0.00",
+        "outstanding_rent": "0.00", "total_income": "0.00", "total_expense": "0.00",
+        "net_income": "0.00", "units_count": 0, "occupied_units": 0, "vacant_units": 0,
+    }
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "✅ 今天没有紧急事项" in text
+    assert "逾期 0 笔" not in text
+    assert "待办 0 项" not in text
+    assert "空置 0 套" not in text
+    assert "租约即将到期 0 份" not in text
+
+
+# --- state-driven buttons (B5) ---
+
+def test_paid_unit_has_no_collect_button(make_app):
+    """★ paid unit: hidden from the collect list, no collect button on its page,
+    and a stale collect callback is refused."""
+    env = make_app()
+    _paid_unit1(env)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot)])
+    collect_text = env.bot.edits()[-1]["text"]
+    assert "16B" not in collect_text
+    assert "2C" in collect_text  # other unpaid unit still shown
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "unit", "1"),
+                                           update_id=2, bot=env.bot)])
+    unit_text = env.bot.edits()[-1]["text"]
+    assert "本月租金已收" in unit_text
+    labels = [b.text for b in _buttons_of(env.bot.edits()[-1]["reply_markup"])]
+    assert "✅ 登记收租" not in labels
+    assert "💰 查看付款" in labels
+
+    # stale collect callback on a paid unit -> refused, no NEW write
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"),
+                                           update_id=3, bot=env.bot)])
+    assert len(env.backend.incomes) == 1  # only the pre-existing confirmed one
+    assert env.backend.count_calls("POST", "/incomes") == 0
+    assert "本月租金已收" in env.bot.edits()[-1]["text"]
+
+
+def test_vacant_unit_has_no_collect_button(make_app):
+    """★ vacant unit: hidden from the collect list and has no collect button."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot)])
+    collect_text = env.bot.edits()[-1]["text"]
+    assert "17A" not in collect_text  # vacant unit hidden
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "unit", "2"),
+                                           update_id=2, bot=env.bot)])
+    labels = [b.text for b in _buttons_of(env.bot.edits()[-1]["reply_markup"])]
+    assert "✅ 登记收租" not in labels
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "2"),
+                                           update_id=3, bot=env.bot)])
+    assert "没有活跃租约" in env.bot.edits()[-1]["text"]
+
+
+def test_overdue_unit_priority(make_app):
+    """★ overdue units sort first in the collect list (most-days first)."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot)])
+    kb = env.bot.edits()[-1]["reply_markup"]
+    refs = [
+        decode(b.callback_data)["ref"]
+        for b in _buttons_of(kb)
+        if decode(b.callback_data) is not None and decode(b.callback_data)["action"] == "rn"
+    ]
+    # 2C (40d) before 16B (5d); unit 3 = 2C, unit 1 = 16B
+    assert refs[0] == "3"
+    assert refs[1] == "1"
+
+
+def test_unit_page_payment_view(make_app):
+    """★ [💰 查看付款] opens the income record for a paid unit."""
+    env = make_app()
+    _paid_unit1(env)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "unit", "1"), bot=env.bot)])
+    kb = env.bot.edits()[-1]["reply_markup"]
+    view = next(
+        b.callback_data
+        for b in _buttons_of(kb)
+        if decode(b.callback_data) is not None and decode(b.callback_data)["action"] == "det"
+    )
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, view, update_id=2, bot=env.bot)])
+    text = env.bot.edits()[-1]["text"]
+    assert "💰 付款记录" in text
+    assert "#1" in text
+    assert "₱55,000" in text
+
+
+# --- back / cancel / expiry (B7) ---
+
+def test_back_button_every_page(make_app):
+    """★ every secondary page has a home/back route."""
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/properties", bot=env.bot)])
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/finance", message_id=2, update_id=2, bot=env.bot)])
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/overdue", message_id=3, update_id=3, bot=env.bot)])
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/rent", message_id=4, update_id=4, bot=env.bot)])
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", message_id=5, update_id=5, bot=env.bot)])
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+
+
+def test_cancel_write_flow(make_app):
+    """★ [❌取消] during a write flow clears state and offers home."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("ccl"), update_id=2, bot=env.bot)])
+    assert env.store.get_conversation(OWNER_ID, OWNER_ID) is None
+    text = env.bot.edits()[-1]["text"]
+    assert "已取消" in text
+    assert _has_nav(env.bot.edits()[-1]["reply_markup"], "home")
+
+
+def test_expired_state_home_button(make_app):
+    """★ expired action -> explicit expired card with [🏠 首页] (no dead end)."""
+    env = make_app()
+    env.backend.add_income(status="pending", income_id=1)
+    old_ts = now_ts() - 10000
+    data = encode("cnf", "inc", "1", nonce=new_nonce(), ts=old_ts)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    text = env.bot.edits()[-1]["text"]
+    assert "这个操作已经过期" in text
+    assert _has_nav(env.bot.edits()[-1]["reply_markup"], "home")
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
+
+
+# --- empty states (B9) ---
+
+def test_empty_overdue_state(make_app):
+    env = make_app()
+    env.backend.overdue = []
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/overdue", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "🎉 暂无逾期租金" in text
+    assert "No data" not in text and "[]" not in text and "0 records" not in text
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+
+
+def test_empty_property_state(make_app):
+    env = make_app()
+    env.backend.properties = []
+    env.backend.units = []
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/properties", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "还没有房源数据" in text
+    assert "No data" not in text and "[]" not in text
+    assert _has_nav(env.bot.last_send()["reply_markup"], "home")
+
+
+# --- edit-first navigation (B6/B11) ---
+
+def test_edit_navigation_no_message_spam(make_app):
+    """★ nav callbacks edit the current message; no new messages are sent."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot)])
+    sends = len(env.bot.sends())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "finance"),
+                                           update_id=2, bot=env.bot)])
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "home"),
+                                           update_id=3, bot=env.bot)])
+    assert len(env.bot.sends()) == sends  # zero new messages
+    edits = env.bot.edits()
+    assert all(c["message_id"] == 10 for c in edits)
+    assert "本月租金" in edits[-1]["text"]  # back on the dashboard
+
+
+def test_callback_ack_fast(make_app):
+    """★ B11: the callback is acknowledged BEFORE the page renders."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot)])
+    assert env.bot.calls and env.bot.calls[0]["type"] == "answer_callback_query"
+    assert env.bot.edits()  # page still rendered afterwards
+
+
+# --- rent-flow compression + smart defaults (B4) ---
+
+def test_collect_default_current_period(make_app):
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
+    assert conv["payload"]["period"] == CUR_MONTH
+
+
+def test_collect_default_amount(make_app):
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
+    assert conv["payload"]["amount"] == "55000.00"  # current receivable
+
+
+def test_collect_default_today(make_app):
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
+    assert conv["payload"]["received_date"] == TODAY
+
+
+def test_double_click_still_idempotent(make_app):
+    """★ double-click on the confirm button writes exactly one income."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    data = _confirm_data(env)
+    run_updates(
+        env,
+        [
+            make_callback_update(OWNER_ID, OWNER_ID, data, update_id=2, bot=env.bot),
+            make_callback_update(OWNER_ID, OWNER_ID, data, update_id=3, bot=env.bot),
+        ],
+    )
+    assert len(env.backend.incomes) == 1
+    assert env.backend.count_calls("POST", "/incomes") == 1
+
+
+def test_uncertain_payment_state(make_app):
+    """★ an in-flight confirm shows the 'checking result, don't repeat'
+    message and never writes twice."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    data = _confirm_data(env)
+    nonce = decode(data)["nonce"]
+    env.guard.acquire(f"ik:cnf:ren:{nonce}", kind="income", resource="")
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=2, bot=env.bot)])
+    assert "请勿重复提交" in (env.bot.last_answer()["text"] or "")
+    assert len(env.backend.incomes) == 0
+
+
+# --- error recovery (B8) ---
+
+def test_api_error_retry_button(make_app):
+    """★ API failure -> error card with [🔄重试] + [🏠 首页]."""
+    env = make_app()
+    env.backend.fail_status["/reports/financial-summary"] = 500
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/finance", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "获取数据失败" in text
+    kb = env.bot.last_send()["reply_markup"]
+    assert _has_nav(kb, "finance")  # retry -> same page
+    assert _has_nav(kb, "home")
+
+
+def test_confirm_error_retry_same_nonce(make_app):
+    """★ confirm failure keeps the SAME nonce on the retry button so the
+    idempotency guard still dedupes."""
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot)])
+    data = _confirm_data(env)
+    nonce = decode(data)["nonce"]
+    env.backend.fail_status["/incomes"] = 500
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=2, bot=env.bot)])
+    kb = env.bot.edits()[-1]["reply_markup"]
+    retry = next(
+        b.callback_data
+        for b in _buttons_of(kb)
+        if decode(b.callback_data) is not None and decode(b.callback_data)["action"] == "cnf"
+    )
+    assert decode(retry)["nonce"] == nonce
+
+
+# --- i18n (B10) ---
+
+def test_i18n_zh(make_app):
+    """★ OWNER (zh) pages use short natural Chinese wording."""
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
+    zh_start = env.bot.last_send()["text"]
+    assert "Pasay 房产管理" in zh_start
+    assert "今天没有紧急事项" not in zh_start  # there IS overdue in fixture
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/finance", message_id=2, update_id=2, bot=env.bot)])
+    assert "2026年8月财务" in env.bot.last_send()["text"]
+    # no English 'No data' / 'Main Menu' leak
+    assert "Main Menu" not in "".join(env.bot.all_texts())
+
+
+def test_i18n_en(make_app):
+    """★ SECRETARY (en) pages use short natural English wording."""
+    env = make_app()
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/start", bot=env.bot)])
+    start = env.bot.last_send()["text"]
+    assert "Pasay Property Management" in start
+    assert "This month" in start
+    assert "overdue" in start.lower()
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending",
+                                       message_id=2, update_id=2, bot=env.bot)])
+    assert "To-do" in env.bot.last_send()["text"]
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID,
+                                           encode("cnf", "inc", "1", nonce=new_nonce(),
+                                                  ts=now_ts() - 10000),
+                                           update_id=3, bot=env.bot)])
+    assert "This action has expired" in env.bot.edits()[-1]["text"]
+
+
+# --- pending aggregation (B2/B3) ---
+
+def test_pending_aggregates_overdue_and_tasks(make_app):
+    """★ the to-do page aggregates overdue, pending income and tasks."""
+    env = make_app()
+    env.backend.tasks = [
+        {"id": 1, "title": "Fix AC in 16B", "unit_id": 1, "unit": "16B",
+         "status": "open", "priority": "high", "due_date": TODAY,
+         "assigned_to": None, "recurring": False, "interval_months": None,
+         "next_due_date": None},
+    ]
+    env.backend.add_income(status="pending", income_id=9, lease_id=2,
+                           amount="12000.00", received_date=TODAY,
+                           payment_method="GCash", description=f"rent {CUR_MONTH}")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "逾期租金 · 2笔" in text
+    assert "待确认收入 · 1笔" in text
+    assert "待办任务 · 1项" in text
+    assert "Fix AC in 16B" in text
+
+
+def test_pending_empty_positive(make_app):
+    """★ empty to-do page shows the positive line, not zeros."""
+    env = make_app()
+    env.backend.overdue = []
+    env.backend.tasks = []
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "✅ 今天没有紧急事项" in text
+    assert "0" not in text.replace("✅ 今天没有紧急事项", "")

@@ -7,10 +7,10 @@ Write paths (confirm/reverse) implement design §8/§13/§14:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import date
-from decimal import Decimal, InvalidOperation
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -24,16 +24,14 @@ from pasay_bot.api_client import (
 )
 from pasay_bot.handlers import commands as pages
 from pasay_bot.handlers.commands import (
-    build_finance_page,
-    build_overdue_page,
-    build_properties_page,
-    build_rent_property_list,
-    show_menu,
+    _current_month,
+    show_dashboard,
 )
 from pasay_bot.keyboards import (
     ACTION_CANCEL,
     ACTION_CONFIRM,
     ACTION_DETAIL,
+    ACTION_EDIT,
     ACTION_METHOD,
     ACTION_NAV,
     ACTION_PAGE,
@@ -43,11 +41,16 @@ from pasay_bot.keyboards import (
     confirm_income_keyboard,
     confirm_rent_keyboard,
     decode,
-    encode,
+    edit_date_keyboard,
+    edit_input_keyboard,
+    edit_menu_keyboard,
+    error_keyboard,
+    expired_keyboard,
+    home_keyboard,
     new_nonce,
     now_ts,
     payment_method_keyboard,
-    unit_page_keyboard,
+    retry_confirm_keyboard,
 )
 from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.render import cards, html as H
@@ -97,6 +100,21 @@ def _payload(conv: dict) -> dict:
     return conv.get("payload") or {}
 
 
+def _load_error(detail: str, locale: str) -> str:
+    return f"⚠️ {H.escape(t('common.load_error', locale, detail=str(detail)))}"
+
+
+def _remember_default_method(update, context, payload: dict) -> None:
+    """Persist the user's last-used payment method (B4 smart default)."""
+    try:
+        user_id = update.effective_user.id if update.effective_user else None
+        method = payload.get("method")
+        if user_id is not None and method:
+            context.bot_data["store"].set_user_default_method(user_id, method)
+    except Exception:  # noqa: BLE001 - defaults are best-effort
+        pass
+
+
 def _can_reverse(context, role) -> bool:
     """Reverse needs OWNER permission AND an admin API key (F2). Without the
     admin key the button is hidden and hand-crafted callbacks are refused."""
@@ -138,7 +156,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == ACTION_CANCEL:
         await _handle_cancel(update, context, locale)
     elif action == ACTION_DETAIL:
-        await _handle_detail(update, context, ref, role, locale)
+        await _handle_detail(update, context, entity, ref, role, locale)
+    elif action == ACTION_EDIT:
+        await _handle_edit(update, context, entity, role, locale)
     else:
         await _answer(update, t("common.invalid", locale))
 
@@ -147,18 +167,23 @@ async def _handle_nav(update, context, entity, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    chat_id = update.effective_chat.id
-    if entity == "properties":
-        await pages.show_properties(context, chat_id, role, locale, page=1)
-    elif entity == "finance":
-        await pages.show_finance(context, chat_id, locale)
-    elif entity == "overdue":
-        await pages.show_overdue(context, chat_id, locale, page=1)
-    elif entity == "rent":
-        await pages.show_rent(context, chat_id, locale)
-    else:
-        await show_menu(context, chat_id, locale)
+    # B11: acknowledge immediately so Telegram never keeps the spinner up
+    # while dashboard data loads.
     await _answer(update, "")
+    chat_id = update.effective_chat.id
+    message_id = update.callback_query.message.message_id
+    if entity == "properties":
+        await pages.show_properties(context, chat_id, role, locale, page=1, message_id=message_id)
+    elif entity == "finance":
+        await pages.show_finance(context, chat_id, locale, message_id=message_id)
+    elif entity == "overdue":
+        await pages.show_overdue(context, chat_id, locale, page=1, message_id=message_id)
+    elif entity == "rent":
+        await pages.show_rent(context, chat_id, locale, message_id=message_id)
+    elif entity == "pending":
+        await pages.show_pending(context, chat_id, role, locale, message_id=message_id)
+    else:  # home / menu
+        await show_dashboard(context, chat_id, locale, message_id=message_id)
 
 
 async def _handle_page(update, context, entity, ref, role, locale):
@@ -170,13 +195,14 @@ async def _handle_page(update, context, entity, ref, role, locale):
     except ValueError:
         page = 1
     chat_id = update.effective_chat.id
-    if entity == "prop":
-        await pages.show_properties(context, chat_id, None, locale, page=page)
-    elif entity == "ovd":
-        await pages.show_overdue(context, chat_id, locale, page=page)
-    else:
-        await show_menu(context, chat_id, locale)
+    message_id = update.callback_query.message.message_id
     await _answer(update, "")
+    if entity == "prop":
+        await pages.show_properties(context, chat_id, None, locale, page=page, message_id=message_id)
+    elif entity == "ovd":
+        await pages.show_overdue(context, chat_id, locale, page=page, message_id=message_id)
+    else:
+        await show_dashboard(context, chat_id, locale, message_id=message_id)
 
 
 async def _handle_rent(update, context, entity, ref, role, locale):
@@ -187,16 +213,16 @@ async def _handle_rent(update, context, entity, ref, role, locale):
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
     if entity == "prop" and ref.isdigit():
-        await pages.show_rent_units(context, chat_id, message_id, int(ref), locale)
         await _answer(update, "")
+        await pages.show_rent_units(context, chat_id, message_id, int(ref), locale)
         return
     if entity == "unit" and ref.isdigit():
+        await _answer(update, "")
         unit_id = int(ref)
         can_rent = has_permission(role, PERMISSION_RENT_ENTRY)
         await pages.show_unit_page(
             context, chat_id, message_id, unit_id, can_rent, locale
         )
-        await _answer(update, "")
         return
     if entity == "go" and ref.isdigit():
         if not has_permission(role, PERMISSION_RENT_ENTRY):
@@ -208,25 +234,44 @@ async def _handle_rent(update, context, entity, ref, role, locale):
 
 
 async def _begin_rent_entry(update, context, unit_id: int, role, locale):
-    """Fetch unit + active lease, save conversation, ask for amount."""
+    """Compressed rent entry (B4): apply smart defaults (period = this month,
+    date = today, amount = current receivable, method = last used) and jump
+    straight to the final confirmation card. The final confirm is never
+    skipped; stale clicks on already-paid units are refused."""
     api = context.bot_data["api_client"]
     store = context.bot_data["store"]
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    await _answer(update, "")
     try:
-        unit = await api.get_unit(unit_id)
-        properties = await api.get_properties()
-        leases = await api.get_leases()
+        unit, properties, leases, incomes = await asyncio.gather(
+            api.get_unit(unit_id),
+            api.get_properties(),
+            api.get_leases(),
+            api.list_incomes(),
+        )
     except PasayApiError as exc:
-        await _answer(update, t("common.load_error", locale, detail=exc.detail))
+        await _edit(update, _load_error(exc.detail, locale), error_keyboard("rent", locale))
         return
     prop = next((p for p in properties if p.id == unit.property_id), None)
     lease = next(
         (l for l in leases if l.unit_id == unit.id and l.status == "active"), None
     )
     if lease is None:
-        await _edit(update, t("rent.no_active_lease", locale))
-        await _answer(update, "无活跃租约")
+        await _edit(update, t("rent.no_active_lease", locale), home_keyboard(locale))
+        return
+    month = _current_month()
+    covered = False
+    for inc in incomes:
+        if inc.lease_id != lease.id or inc.status != "confirmed":
+            continue
+        if month in (inc.description or "") or (
+            inc.received_date and inc.received_date.strftime("%Y-%m") == month
+        ):
+            covered = True
+            break
+    if covered:
+        await _edit(update, t("unit.payment_paid", locale), home_keyboard(locale))
         return
     payload = {
         "unit_id": unit.id,
@@ -235,28 +280,20 @@ async def _begin_rent_entry(update, context, unit_id: int, role, locale):
         "property_name": prop.name if prop else "?",
         "unit_number": unit.unit_number,
         "monthly_rent": str(lease.monthly_rent),
+        "amount": str(lease.monthly_rent),
+        "received_date": date.today().isoformat(),
+        "period": month,
+        "method": store.get_user_default_method(user_id),
+        "confirm_message_id": str(update.callback_query.message.message_id),
     }
-    store.save_conversation(chat_id, user_id, "rent_amount", payload)
-    default = H.money(lease.monthly_rent)
-    text = t("rent.ask_amount", locale, unit=H.escape(unit.unit_number), default=default)
-    await _edit(update, text)
+    await _render_confirm_from_payload(update, context, payload, role, locale)
 
 
-async def _handle_method(update, context, method_key: str, role, locale):
-    """Payment method -> save payload -> show confirmation card."""
+async def _render_confirm_from_payload(update, context, payload, role, locale):
+    """Render the final confirmation card onto the current message (B4)."""
     store = context.bot_data["store"]
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    conv = store.get_conversation(chat_id, user_id)
-    if conv is None or conv["state"] != "rent_method":
-        await _answer(update, t("common.expired", locale))
-        return
-    method = METHOD_LABELS.get(method_key)
-    if method is None:
-        await _answer(update, t("common.invalid", locale))
-        return
-    payload = _payload(conv)
-    payload["method"] = method
     nonce = new_nonce()
     ts = now_ts()
     store.save_conversation(chat_id, user_id, "rent_confirm", payload, nonce=nonce)
@@ -266,14 +303,85 @@ async def _handle_method(update, context, method_key: str, role, locale):
         payload["unit_number"],
         payload["amount"],
         payload["received_date"],
-        method,
+        payload["method"],
         locale,
     )
-    await _edit(
-        update,
-        text,
-        confirm_rent_keyboard(nonce, ts, can_confirm, locale),
+    await _edit(update, text, confirm_rent_keyboard(nonce, ts, can_confirm, locale))
+
+
+async def _handle_method(update, context, method_key: str, role, locale):
+    """Payment method -> save payload -> show confirmation card.
+
+    Accepts both the legacy 'rent_method' state and the V1.1 edit state
+    'rent_edit_method', then returns to the final confirmation card."""
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] not in ("rent_method", "rent_edit_method"):
+        await _answer(update, t("common.expired", locale))
+        return
+    method = METHOD_LABELS.get(method_key)
+    if method is None:
+        await _answer(update, t("common.invalid", locale))
+        return
+    payload = _payload(conv)
+    payload["method"] = method
+    await _render_confirm_from_payload(update, context, payload, role, locale)
+
+
+async def _handle_edit(update, context, sub, role, locale):
+    """B4: [✏️修改] sub-flow on the final confirmation card.
+
+    sub: menu / amount / date / method / back. Any expired or missing
+    conversation is rendered as an expired card with a home button."""
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    payload = _payload(conv) if conv else {}
+    allowed = (
+        "rent_confirm", "rent_edit", "rent_edit_amount",
+        "rent_edit_date", "rent_edit_method",
     )
+    if conv is None or conv["state"] not in allowed or not payload.get("amount"):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    await _answer(update, "")
+    if sub == "menu":
+        store.save_conversation(chat_id, user_id, "rent_edit", payload)
+        await _edit(update, H.escape(t("rent.edit_title", locale)), edit_menu_keyboard(locale))
+        return
+    if sub == "amount":
+        store.save_conversation(chat_id, user_id, "rent_edit_amount", payload)
+        await _edit(
+            update,
+            t("rent.ask_edit_amount", locale, current=H.money(payload.get("amount"))),
+            edit_input_keyboard(locale),
+        )
+        return
+    if sub == "date":
+        store.save_conversation(chat_id, user_id, "rent_edit_date", payload)
+        await _edit(
+            update,
+            t("rent.ask_edit_date", locale, current=payload.get("received_date", "")),
+            edit_date_keyboard(locale),
+        )
+        return
+    if sub == "method":
+        store.save_conversation(chat_id, user_id, "rent_edit_method", payload)
+        await _edit(
+            update, H.escape(t("rent.ask_method", locale)),
+            payment_method_keyboard(locale),
+        )
+        return
+    if sub == "today" and conv["state"] == "rent_edit_date":
+        payload["received_date"] = date.today().isoformat()
+        await _render_confirm_from_payload(update, context, payload, role, locale)
+        return
+    # back -> re-render the confirmation card with the edited payload
+    await _render_confirm_from_payload(update, context, payload, role, locale)
 
 
 async def _handle_confirm(update, context, entity, ref, nonce, ts, role, locale):
@@ -294,6 +402,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
     user_id = update.effective_user.id
     if _expired(ts, settings):
         await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
     if not has_permission(role, PERMISSION_RENT_ENTRY):
         await _answer(update, t("common.no_permission", locale))
@@ -416,6 +525,8 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
     except PasayApiError as exc:
         guard.fail(key, resource=str(income.id) if income else None)
         await _answer(update, t("common.error", locale, detail=exc.detail))
+        await _edit(update, _load_error(exc.detail, locale),
+                    retry_confirm_keyboard(nonce, ts, locale))
 
 
 async def _confirm_income(update, context, ref, nonce, ts, role, locale):
@@ -428,6 +539,7 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
     user_id = update.effective_user.id
     if _expired(ts, settings):
         await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
     if not has_permission(role, PERMISSION_RENT_CONFIRM):
         await _answer(update, t("common.no_permission", locale))
@@ -469,6 +581,8 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
     except PasayApiError as exc:
         guard.fail(key, resource=str(income_id))
         await _answer(update, t("common.error", locale, detail=exc.detail))
+        await _edit(update, _load_error(exc.detail, locale),
+                    retry_confirm_keyboard(nonce, ts, locale, entity="inc", ref=str(income_id)))
 
 
 async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
@@ -478,6 +592,7 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
     settings = context.bot_data["settings"]
     if _expired(ts, settings):
         await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
     if not has_permission(role, PERMISSION_REVERSE):
         await _answer(update, t("common.no_permission", locale))
@@ -532,19 +647,27 @@ async def _handle_cancel(update, context, locale):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     conv = store.get_conversation(chat_id, user_id)
-    if conv and conv["state"] in ("rent_amount", "rent_date", "rent_method", "rent_confirm"):
+    write_states = (
+        "rent_amount", "rent_date", "rent_method", "rent_confirm",
+        "rent_edit", "rent_edit_amount", "rent_edit_date", "rent_edit_method",
+    )
+    if conv and conv["state"] in write_states:
         store.delete_conversation(chat_id, user_id)
-        await _edit(update, H.escape(t("rent.cancelled", locale)))
+        await _edit(update, H.escape(t("rent.cancelled", locale)), home_keyboard(locale))
     else:
-        await show_menu(context, chat_id, locale)
+        await show_dashboard(
+            context, chat_id, locale,
+            message_id=update.callback_query.message.message_id,
+        )
     await _answer(update, t("rent.cancelled", locale))
 
 
-async def _handle_detail(update, context, ref, role, locale):
+async def _handle_detail(update, context, entity, ref, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    if ref.isdigit():
+    await _answer(update, "")
+    if entity == "unit" and ref.isdigit():
         await pages.show_unit_page(
             context,
             update.effective_chat.id,
@@ -552,8 +675,19 @@ async def _handle_detail(update, context, ref, role, locale):
             int(ref),
             can_rent=has_permission(role, PERMISSION_RENT_ENTRY),
             locale=locale,
+            back_entity="overdue",
         )
-        await _answer(update, "")
+        return
+    if entity == "inc" and ref.isdigit():
+        api = context.bot_data["api_client"]
+        try:
+            income = await api.get_income(int(ref))
+        except PasayApiError as exc:
+            await _edit(update, _load_error(exc.detail, locale),
+                        error_keyboard("home", locale))
+            return
+        await _edit(update, cards.payment_detail_card(income, locale),
+                    home_keyboard(locale))
         return
     await _answer(update, t("common.invalid", locale))
 
@@ -656,8 +790,9 @@ async def _reconcile_income_after_timeout(
 # --- result rendering ---
 
 async def _render_done_card(update, context, income, payload, role, locale):
+    _remember_default_method(update, context, payload)
     if income is None:
-        await _edit(update, H.escape(t("common.timeout", locale)))
+        await _edit(update, H.escape(t("common.timeout", locale)), home_keyboard(locale))
         return
     if income.status == "reversed":
         text = cards.reversed_card(income, locale)
@@ -678,6 +813,7 @@ async def _render_done_card(update, context, income, payload, role, locale):
 
 
 async def _render_pending_card(update, context, income, payload, role, locale):
+    _remember_default_method(update, context, payload)
     text = cards.pending_recorded_card(
         income, payload.get("property_name", ""), payload.get("unit_number", ""), locale
     )

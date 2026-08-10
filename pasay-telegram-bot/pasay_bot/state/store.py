@@ -32,6 +32,11 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
   created_at  TEXT NOT NULL,
   expires_at  TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS user_defaults (
+  user_id        TEXT PRIMARY KEY,
+  payment_method TEXT NOT NULL DEFAULT 'Bank',
+  updated_at     TEXT NOT NULL
+);
 """
 
 DEFAULT_CONVERSATION_TTL = 900        # 15 minutes
@@ -78,6 +83,31 @@ class StateStore:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # --- user defaults (e.g. last-used payment method) ---
+    def get_user_default_method(self, user_id: Any) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT payment_method FROM user_defaults WHERE user_id=?",
+                (str(user_id),),
+            ).fetchone()
+        if row is None:
+            return "Bank"
+        return row["payment_method"] or "Bank"
+
+    def set_user_default_method(self, user_id: Any, method: str) -> None:
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO user_defaults (user_id, payment_method, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                  payment_method=excluded.payment_method, updated_at=excluded.updated_at
+                """,
+                (str(user_id), method, str(now)),
+            )
+            self._conn.commit()
 
     # --- conversations ---
     def save_conversation(

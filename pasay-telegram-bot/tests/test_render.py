@@ -168,7 +168,7 @@ def test_overdue_block_shows_fields():
 
 def test_empty_properties():
     text = cards.properties_overview([], {})
-    assert "暂无房源数据" in text
+    assert "🏘 还没有房源数据" in text
 
 
 def test_message_length():

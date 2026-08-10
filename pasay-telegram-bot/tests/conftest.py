@@ -147,6 +147,7 @@ class FakeBackend:
              "outstanding": "24000.00", "days_overdue": 40},
         ]
         self.overdue: Optional[list] = None
+        self.tasks: list[dict] = []
         self.timeout_after_write_paths: set[str] = set()
         self.timeout_before_write_paths: set[str] = set()
         self.timeout_without_effect_paths: set[str] = set()
@@ -222,6 +223,8 @@ class FakeBackend:
             rows = self.overdue if self.overdue is not None else self.overdue_rows
             return httpx.Response(200, json=rows)
 
+        if path == "/reports/tasks":
+            return httpx.Response(200, json=self.tasks)
         if path == "/incomes" and method == "POST":
             payload = body or {}
             inc = self.add_income(

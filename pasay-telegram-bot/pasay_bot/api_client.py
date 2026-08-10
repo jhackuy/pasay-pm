@@ -231,6 +231,37 @@ class OverdueRent:
         )
 
 
+@dataclass
+class ReportTask:
+    id: int
+    title: str
+    unit_id: Optional[int] = None
+    unit: Optional[str] = None
+    status: str = "open"
+    priority: str = "medium"
+    due_date: Optional[date] = None
+    assigned_to: Optional[int] = None
+    recurring: bool = False
+    interval_months: Optional[int] = None
+    next_due_date: Optional[date] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ReportTask":
+        return cls(
+            id=int(d.get("id") or 0),
+            title=d.get("title") or "",
+            unit_id=int(d["unit_id"]) if d.get("unit_id") is not None else None,
+            unit=d.get("unit"),
+            status=d.get("status") or "open",
+            priority=d.get("priority") or "medium",
+            due_date=_to_date(d.get("due_date")),
+            assigned_to=int(d["assigned_to"]) if d.get("assigned_to") is not None else None,
+            recurring=bool(d.get("recurring", False)),
+            interval_months=d.get("interval_months"),
+            next_due_date=_to_date(d.get("next_due_date")),
+        )
+
+
 class PasayApiError(Exception):
     def __init__(self, status_code: Optional[int], detail: str):
         self.status_code = status_code
@@ -366,6 +397,21 @@ class PasayApiClient:
     async def get_overdue_rents(self) -> list[OverdueRent]:
         data = await self._request("GET", "/reports/overdue-rents")
         return [OverdueRent.from_dict(d) for d in data]
+
+    async def get_tasks(
+        self, *, status: Optional[str] = None, overdue: bool = False,
+        within_days: Optional[int] = None,
+    ) -> list[ReportTask]:
+        """Task report: optional status filter, overdue flag, due-within window."""
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        if overdue:
+            params["overdue"] = "true"
+        if within_days is not None:
+            params["within_days"] = str(within_days)
+        data = await self._request("GET", "/reports/tasks", params=params)
+        return [ReportTask.from_dict(d) for d in data]
 
     # --- write endpoints (pending -> confirm -> reverse, never direct DB) ---
     async def create_income(

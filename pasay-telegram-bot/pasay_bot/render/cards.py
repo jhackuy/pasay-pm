@@ -182,7 +182,10 @@ def unit_card(
     lease: Optional[Lease],
     tenant_name: Optional[str],
     locale: str = "zh",
+    payment_state: Optional[str] = None,
 ) -> str:
+    """Unit page card. ``payment_state`` is one of 'paid' / 'unpaid' / None
+    (vacant or no active lease) and drives the state line (B5)."""
     lease_or_unit_rent = lease.monthly_rent if lease else unit.monthly_rent
     lines = [
         f"🏢 <b>{H.escape(property_name)} · Unit {H.escape(unit.unit_number)}</b>",
@@ -192,6 +195,10 @@ def unit_card(
         f"{H.escape(t('unit.monthly_rent', locale))}：{H.money(lease_or_unit_rent)}",
         f"{H.escape(t('unit.status', locale))}：{unit_status_label(unit.status, locale)}",
     ]
+    if payment_state == "paid":
+        lines.append(H.escape(t("unit.payment_paid", locale)))
+    elif payment_state == "unpaid":
+        lines.append(H.escape(t("unit.payment_unpaid", locale)))
     return "\n".join(lines)
 
 
@@ -279,3 +286,130 @@ def pending_list_card(rows: list[dict], locale: str = "zh") -> str:
         )
     blocks.append(H.escape(t("pending.hint", locale)))
     return "\n\n".join(blocks)
+
+
+# --- V1.1 UX cards (dashboard / collect / pending / payment detail) ---
+
+def dashboard_card(
+    date_label: str,
+    *,
+    expected,
+    collected,
+    outstanding,
+    overdue_count: int = 0,
+    expiring_count: int = 0,
+    task_count: int = 0,
+    vacant_count: int = 0,
+    locale: str = "zh",
+) -> str:
+    """Today's management center (B1). Zero/empty values are hidden; a fully
+    clear day shows the positive empty-state line."""
+    blocks = [
+        f"<b>{H.escape(t('dashboard.title', locale))}</b>",
+        f"📅 {H.escape(date_label)}",
+        f"{H.escape(t('dashboard.rent_title', locale))}",
+        f"{H.escape(t('finance.expected', locale))}：{H.money(expected)}",
+        f"{H.escape(t('finance.collected', locale))}：{H.money(collected)}",
+        f"{H.escape(t('finance.outstanding', locale))}：<b>{H.money(outstanding)}</b>",
+    ]
+    attention: list[str] = []
+    if overdue_count > 0:
+        attention.append(H.escape(t("dashboard.overdue_count", locale, count=overdue_count)))
+    if expiring_count > 0:
+        attention.append(H.escape(t("dashboard.lease_expiring", locale, count=expiring_count)))
+    if task_count > 0:
+        attention.append(H.escape(t("dashboard.tasks_count", locale, count=task_count)))
+    if attention:
+        blocks.append(H.escape(t("dashboard.tasks_title", locale)))
+        blocks.append(" · ".join(attention))
+    if vacant_count > 0:
+        blocks.append(H.escape(t("dashboard.vacant", locale, count=vacant_count)))
+    if not attention:
+        blocks.append(H.escape(t("dashboard.tasks_none", locale)))
+    return "\n".join(blocks)
+
+
+def rent_collect_list(rows: list[dict], locale: str = "zh") -> str:
+    """Unpaid-unit collect list (B4). ``rows``: unit_id, unit_number,
+    property_name, amount, overdue_days (0 when not overdue). Paid/vacant
+    units are filtered out before this renderer is called."""
+    if not rows:
+        return (
+            f"{H.escape(t('rent.collect_title', locale))}\n\n"
+            f"{H.escape(t('rent.collect_all_paid', locale))}"
+        )
+    blocks = [f"<b>{H.escape(t('rent.collect_title', locale))}</b>"]
+    for r in rows:
+        where = " · ".join(
+            x for x in (r.get("property_name"), r.get("unit_number")) if x
+        )
+        marker = ""
+        if int(r.get("overdue_days") or 0) > 0:
+            marker = " " + H.escape(
+                t("rent.collect_overdue", locale, days=int(r["overdue_days"]))
+            )
+        blocks.append(
+            f"{H.escape(where)}\n"
+            f"{H.escape(t('rent.amount', locale))}：<b>{H.money(r.get('amount'))}</b>{marker}"
+        )
+    return "\n\n".join(blocks)
+
+
+def pending_overview_card(sections: dict, locale: str = "zh") -> str:
+    """One aggregated to-do page (B2/B3): overdue / pending-confirm /
+    expiring leases / open tasks. Empty sections are omitted."""
+    blocks = [f"<b>{H.escape(t('pending.title', locale))}</b>"]
+    if not any(sections.values()):
+        return "\n".join(
+            [
+                f"<b>{H.escape(t('pending.title', locale))}</b>",
+                H.escape(t("pending.empty", locale)),
+            ]
+        )
+    overdue = sections.get("overdue") or []
+    if overdue:
+        items = [
+            f"🔴 {H.escape(r.get('unit', ''))} · {H.money(r.get('total_outstanding'))}"
+            f" · {H.escape(t('overdue.days', locale))} {r.get('overdue_days')}"
+            f"{H.escape(t('overdue.days_unit', locale))}"
+            for r in overdue
+        ]
+        blocks.append(H.escape(t("pending.section_overdue", locale, count=len(overdue))))
+        blocks.append("\n".join(items))
+    confirm = sections.get("confirm") or []
+    if confirm:
+        items = [
+            f"#{r['id']} · {H.escape(r.get('where', ''))} · {H.money(r.get('amount'))}"
+            for r in confirm
+        ]
+        blocks.append(H.escape(t("pending.section_confirm", locale, count=len(confirm))))
+        blocks.append("\n".join(items))
+        blocks.append(H.escape(t("pending.hint", locale)))
+    expiring = sections.get("expiring") or []
+    if expiring:
+        items = [
+            f"📋 {H.escape(r.get('unit', ''))} · {H.escape(r.get('tenant', ''))}"
+            f" · {H.format_date(r.get('end_date'))}"
+            for r in expiring
+        ]
+        blocks.append(H.escape(t("pending.section_expiring", locale, count=len(expiring))))
+        blocks.append("\n".join(items))
+    tasks = sections.get("tasks") or []
+    if tasks:
+        items = [
+            f"🛠 {H.escape(r.get('title', ''))}"
+            + (f" · {H.format_date(r.get('due_date'))}" if r.get("due_date") else "")
+            for r in tasks
+        ]
+        blocks.append(H.escape(t("pending.section_tasks", locale, count=len(tasks))))
+        blocks.append("\n".join(items))
+    return "\n\n".join(blocks)
+
+
+def payment_detail_card(income: Income, locale: str = "zh") -> str:
+    """Paid unit's payment record (B5: [💰 查看付款])."""
+    return t(
+        "rent.payment_detail_title",
+        locale,
+    ) + f"\n#{income.id} · {H.money(income.amount)}\n{H.format_date(income.received_date)} · {H.escape(income.payment_method or '-')}"
+

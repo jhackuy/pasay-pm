@@ -14,6 +14,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from pasay_bot.render import html as H
 from pasay_bot.render.i18n import t
 
 VERSION = "v1"
@@ -27,6 +28,7 @@ ACTION_CONFIRM = "cnf"
 ACTION_REVERSE = "rv"
 ACTION_CANCEL = "ccl"
 ACTION_DETAIL = "det"
+ACTION_EDIT = "ed"
 
 METHODS = ["bank", "gcash", "cash", "other"]
 METHOD_LABELS = {"bank": "Bank", "gcash": "GCash", "cash": "Cash", "other": "Other"}
@@ -123,8 +125,17 @@ def overdue_pagination_keyboard(page: int, total_pages: int, locale: str = "zh")
     return _pagination_keyboard(ACTION_PAGE, "ovd", page, total_pages, locale)
 
 
-def menu_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Home dashboard buttons (B1): rent, to-do, properties, finance."""
     kb = [
+        [
+            InlineKeyboardButton(
+                t("nav.rent", locale), callback_data=encode(ACTION_NAV, "rent")
+            ),
+            InlineKeyboardButton(
+                t("nav.pending", locale), callback_data=encode(ACTION_NAV, "pending")
+            ),
+        ],
         [
             InlineKeyboardButton(
                 t("nav.properties", locale),
@@ -135,18 +146,13 @@ def menu_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
                 callback_data=encode(ACTION_NAV, "finance"),
             ),
         ],
-        [
-            InlineKeyboardButton(
-                t("nav.overdue", locale),
-                callback_data=encode(ACTION_NAV, "overdue"),
-            ),
-            InlineKeyboardButton(
-                t("nav.rent", locale),
-                callback_data=encode(ACTION_NAV, "rent"),
-            ),
-        ],
     ]
     return InlineKeyboardMarkup(kb)
+
+
+def menu_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Backward-compatible alias: the menu IS the home dashboard now."""
+    return dashboard_keyboard(locale)
 
 
 def property_list_keyboard(properties, locale: str = "zh") -> InlineKeyboardMarkup:
@@ -184,20 +190,49 @@ def unit_list_keyboard(units, locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def unit_page_keyboard(
-    unit_id: int, can_rent: bool, locale: str = "zh"
+    unit_id: int,
+    action: Optional[str] = None,
+    locale: str = "zh",
+    back_entity: str = "home",
+    ref: str = "",
 ) -> InlineKeyboardMarkup:
+    """State-driven unit-page buttons (B5):
+    - action='collect' -> unpaid: [✅ 登记收租]
+    - action='reopen'  -> reversed: [🔄 重新登记]
+    - action='view'    -> paid:     [💰 查看付款] (ref = income id)
+    - action=None      -> vacant / no active lease: no collect button
+    """
     buttons = []
-    if can_rent:
+    if action == "collect":
         buttons.append(
             [
                 InlineKeyboardButton(
-                    t("rent.register", locale),
+                    t("rent.register_unpaid", locale),
                     callback_data=encode(ACTION_RENT, "go", str(unit_id)),
                 )
             ]
         )
+    elif action == "reopen":
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    t("rent.re_register", locale),
+                    callback_data=encode(ACTION_RENT, "go", str(unit_id)),
+                )
+            ]
+        )
+    elif action == "view" and ref.isdigit():
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    t("rent.view_payment", locale),
+                    callback_data=encode(ACTION_DETAIL, "inc", ref),
+                )
+            ]
+        )
+    label = t("common.home", locale) if back_entity == "home" else t("rent.back", locale)
     buttons.append(
-        [InlineKeyboardButton(t("rent.back", locale), callback_data=encode(ACTION_NAV, "rent"))]
+        [InlineKeyboardButton(label, callback_data=encode(ACTION_NAV, back_entity))]
     )
     return InlineKeyboardMarkup(buttons)
 
@@ -218,7 +253,8 @@ def payment_method_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def confirm_rent_keyboard(
-    nonce: str, ts: int, can_confirm: bool, locale: str = "zh"
+    nonce: str, ts: int, can_confirm: bool, locale: str = "zh",
+    edit_available: bool = True,
 ) -> InlineKeyboardMarkup:
     label = t("rent.confirm", locale) if can_confirm else t("rent.confirm_pending", locale)
     kb = [
@@ -227,9 +263,15 @@ def confirm_rent_keyboard(
                 label, callback_data=encode(ACTION_CONFIRM, "ren", nonce=nonce, ts=ts)
             ),
             InlineKeyboardButton(
+                t("rent.edit_title", locale),
+                callback_data=encode(ACTION_EDIT, "menu"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
                 t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL)
             ),
-        ]
+        ],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -288,6 +330,9 @@ def overdue_page_keyboard(rows, page: int, total_pages: int, locale: str = "zh")
         )
     if pag:
         buttons.append(pag)
+    buttons.append(
+        [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))]
+    )
     return InlineKeyboardMarkup(buttons)
 
 
@@ -309,3 +354,169 @@ def pending_list_keyboard(entries, locale: str = "zh") -> InlineKeyboardMarkup:
         [InlineKeyboardButton(t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL))]
     )
     return InlineKeyboardMarkup(buttons)
+
+
+# --- V1.1 UX keyboards ---
+
+def collect_list_keyboard(rows: list[dict], locale: str = "zh") -> InlineKeyboardMarkup:
+    """Unpaid-unit collect list (B4). One button per unit -> direct entry."""
+    buttons = []
+    has_overdue = any(int(r.get("overdue_days") or 0) > 0 for r in rows)
+    for r in rows:
+        label = f"{r.get('unit_number', '')} · {H.money(r.get('amount'))}"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label, callback_data=encode(ACTION_RENT, "go", str(r["unit_id"]))
+                )
+            ]
+        )
+    if has_overdue:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    t("pending.view_all_overdue", locale),
+                    callback_data=encode(ACTION_NAV, "overdue"),
+                )
+            ]
+        )
+    buttons.append(
+        [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def edit_menu_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Rent edit menu (B4: [✏️修改] -> amount / date / method / back)."""
+    kb = [
+        [
+            InlineKeyboardButton(
+                t("rent.edit_amount", locale), callback_data=encode(ACTION_EDIT, "amount")
+            ),
+            InlineKeyboardButton(
+                t("rent.edit_date", locale), callback_data=encode(ACTION_EDIT, "date")
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("rent.edit_method", locale), callback_data=encode(ACTION_EDIT, "method")
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("rent.edit_back", locale), callback_data=encode(ACTION_EDIT, "back")
+            ),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def home_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Single [🏠 首页] — used by empty states, cancel and expired cards."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))]]
+    )
+
+
+def expired_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    return home_keyboard(locale)
+
+
+def error_keyboard(entity: str, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Recovery buttons for load errors (B8): retry same page + home."""
+    kb = [
+        [
+            InlineKeyboardButton(
+                t("common.retry", locale), callback_data=encode(ACTION_NAV, entity)
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            ),
+        ]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def retry_confirm_keyboard(
+    nonce: str, ts: int, locale: str = "zh", entity: str = "ren", ref: str = ""
+) -> InlineKeyboardMarkup:
+    """Retry a failed financial write with the SAME nonce (idempotency-safe)."""
+    kb = [
+        [
+            InlineKeyboardButton(
+                t("common.retry", locale),
+                callback_data=encode(ACTION_CONFIRM, entity, ref, nonce=nonce, ts=ts),
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            ),
+        ]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def pending_page_keyboard(
+    overdue_rows: list[dict],
+    confirm_entries: list[tuple[int, str]],
+    locale: str = "zh",
+    can_confirm: bool = False,
+) -> InlineKeyboardMarkup:
+    """Aggregated to-do page buttons (B2): per-overdue-unit collect, per-
+    pending-income confirm (OWNER only), view-all, home."""
+    buttons = []
+    for r in overdue_rows:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"✅ {r.get('unit', '')} · {H.money(r.get('total_outstanding'))}",
+                    callback_data=encode(ACTION_RENT, "go", str(r["unit_id"])),
+                )
+            ]
+        )
+    if can_confirm:
+        for income_id, label in confirm_entries:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=encode(
+                            ACTION_CONFIRM, "inc", str(income_id),
+                            nonce=new_nonce(), ts=now_ts(),
+                        ),
+                    )
+                ]
+            )
+    if overdue_rows:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    t("pending.view_all_overdue", locale),
+                    callback_data=encode(ACTION_NAV, "overdue"),
+                )
+            ]
+        )
+    buttons.append(
+        [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))]
+    )
+    return InlineKeyboardMarkup(buttons)
+
+
+def edit_input_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Prompt keyboard during the [✏️修改] amount/date steps (B7)."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL))],
+            [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))],
+        ]
+    )
+
+
+def edit_date_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Date-edit prompt: [📅 今天] shortcut + cancel + home (B4/B7)."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(t("rent.today", locale), callback_data=encode(ACTION_EDIT, "today"))],
+            [InlineKeyboardButton(t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL))],
+            [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))],
+        ]
+    )
