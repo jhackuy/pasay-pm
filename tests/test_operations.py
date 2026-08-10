@@ -43,6 +43,11 @@ from app.services.operations.generation import generate_business_tasks
 from app.services.operations.notifier import claim_pending_notifications, process_notifications_once
 from app.services.operations.outbox import enqueue_notification
 from app.services.operations.scheduler import run_scheduler_once
+from app.services.operations.backfill import (
+    backfill_unassigned_business_tasks,
+    enqueue_missing_notifications,
+)
+from app.services.operations.assignee import validate_default_assignee
 
 API = "/api/v1"
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
@@ -594,12 +599,36 @@ def test_summary_scoped_to_agent(client, db_session, agent_headers, admin_header
     assert resp.json() == {"overdue": 1, "due_today": 1, "due_7_days": 2, "pending_total": 3}
 
 
-def test_scheduler_run_endpoint(client, db_session, manager_headers):
+def test_scheduler_run_endpoint(client, db_session, manager_headers, monkeypatch):
+    from app.services.operations import config as ops_config
+
+    admin = _seed_valid_default_admin(db_session, "tg-sched")  # valid notifiable default
+    # endpoint validates against config DEFAULT_ASSIGNED_USER_ID; pin it to the
+    # seeded valid admin so the manager-triggered pass is allowed.
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", admin.id)
     _seed_lease(db_session)
     db_session.commit()
     resp = client.post(f"{API}/operations/scheduler/run", headers=manager_headers)
     assert resp.status_code == 200
     assert resp.json()["tasks_created"] >= 1
+
+
+def test_scheduler_run_endpoint_fails_fast_on_invalid_default(client, db_session, manager_headers, monkeypatch):
+    """A manager-triggered scheduler pass with a broken default assignee must NOT
+    silently create un-notifiable tasks (backend review finding #1). It fails fast
+    instead of creating PENDING tasks with an unresolvable recipient."""
+    import pytest
+
+    from app.services.operations import config as ops_config
+
+    _seed_lease(db_session)
+    db_session.commit()
+    # Pin the default to a user id that does not exist -> validate fails.
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", 999999)
+    with pytest.raises(RuntimeError) as excinfo:
+        client.post(f"{API}/operations/scheduler/run", headers=manager_headers)
+    assert "no user with this id" in str(excinfo.value)
+    assert _task_count(db_session) == 0, "no business task may be created behind a broken default"
 
 
 def test_audit_action_enum_append_only(db_session):
@@ -890,3 +919,270 @@ def test_alembic_migration_upgrade_downgrade(monkeypatch, test_engine):
     finally:
         monkeypatch.setattr(settings, "database_url", original_url)
         _drop_scratch()
+
+
+# ---------------------------------------------------------------------------
+# V1.2 data-hardening: default-assignee backfill + notification re-enqueue
+# ---------------------------------------------------------------------------
+
+def _seed_valid_default_admin(db, telegram_chat_id="tg-default"):
+    """Create a valid default assignee (active admin with a telegram chat id)."""
+    return _user(db, "admin-backfill", UserRole.admin, telegram_chat_id)
+
+
+def _business_task(db, *, assigned_user_id=None, status=OperationalTaskStatus.PENDING,
+                   source_type="lease", dedupe_key=None):
+    """A PENDING business-source task (source_type in BUSINESS_SOURCE_TYPES)."""
+    return _make_task(
+        db,
+        task_type=OperationalTaskType.RENT_DUE,
+        status=status,
+        assigned_user_id=assigned_user_id,
+        source_type=source_type,
+        source_id=1,
+        dedupe_key=dedupe_key,
+    )
+
+
+def test_backfill_assigns_unassigned_business_task_and_enqueues(db_session):
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, dedupe_key="b1")
+    db_session.commit()
+
+    report = backfill_unassigned_business_tasks(
+        db_session, default_assignee_id=admin.id, now=NOW
+    )
+    assert report.tasks_backfilled == [task.id]
+    assert report.tasks_skipped_already_assigned == 0
+    assert report.tasks_missing_notification == [task.id]
+    assert report.notifications_enqueued == 1
+
+    db_session.refresh(task)
+    assert task.assigned_user_id == admin.id
+    outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    assert outbox.recipient == "tg-default"
+    assert outbox.status == NotificationStatus.PENDING
+    assert _audit_count(db_session, "task_backfilled") == 1
+    audit = (
+        db_session.query(__import__("app.models.audit_log", fromlist=["AuditLog"]).AuditLog)
+        .filter_by(action="task_backfilled", record_id=task.id)
+        .one()
+    )
+    assert audit.changed_fields["assigned_user_id"] == [None, admin.id]
+    assert audit.actor_id is None or audit.actor_id == admin.id
+
+
+def test_backfill_does_not_overwrite_already_assigned_task(db_session):
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    other = _user(db_session, "manager-owner", UserRole.manager, "tg-mgr")
+    _ = other
+    task = _business_task(db_session, assigned_user_id=other.id, dedupe_key="b2")
+    db_session.commit()
+
+    report = backfill_unassigned_business_tasks(
+        db_session, default_assignee_id=admin.id, now=NOW
+    )
+    assert report.tasks_backfilled == []
+    assert report.tasks_skipped_already_assigned == 1
+    db_session.refresh(task)
+    assert task.assigned_user_id == other.id, "backfill must not overwrite ownership"
+    assert _audit_count(db_session, "task_backfilled") == 0
+
+
+def test_backfill_rerun_is_idempotent(db_session):
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, dedupe_key="b3")
+    db_session.commit()
+
+    r1 = backfill_unassigned_business_tasks(db_session, default_assignee_id=admin.id, now=NOW)
+    assert r1.tasks_backfilled == [task.id]
+    assert r1.notifications_enqueued == 1
+    outbox_after_first = _outbox_count(db_session)
+
+    # Re-run: finds nothing to do, produces no new audit / no duplicate outbox.
+    r2 = backfill_unassigned_business_tasks(db_session, default_assignee_id=admin.id, now=NOW)
+    assert r2.tasks_backfilled == []
+    assert r2.tasks_skipped_already_assigned == 1
+    assert r2.notifications_enqueued == 0
+    db_session.refresh(task)
+    assert task.assigned_user_id == admin.id
+    assert _audit_count(db_session, "task_backfilled") == 1
+    assert _outbox_count(db_session) == outbox_after_first == 1
+
+
+def test_enqueue_missing_notifications_no_dupe_when_sent_exists(db_session):
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, assigned_user_id=admin.id, dedupe_key="b4")
+    # a SENT outbox row already exists for this task
+    enqueue_notification(
+        db_session, task_id=task.id, channel="telegram", recipient="tg-default",
+        payload={"message": "x"}, dedupe_key=f"task:{task.id}:telegram:tg-default",
+    )
+    sent = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    sent.status = NotificationStatus.SENT
+    sent.sent_at = NOW
+    db_session.commit()
+
+    missing, enqueued = enqueue_missing_notifications(db_session)
+    assert missing == []
+    assert enqueued == 0
+    assert (
+        db_session.query(NotificationOutbox).filter_by(task_id=task.id).count() == 1
+    ), "SENT outbox must not be duplicated"
+
+
+def test_enqueue_missing_notifications_creates_one_row_when_none(db_session):
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, assigned_user_id=admin.id, dedupe_key="b5")
+    db_session.commit()
+    assert _outbox_count(db_session) == 0
+
+    missing, enqueued = enqueue_missing_notifications(db_session)
+    assert missing == [task.id]
+    assert enqueued == 1
+    assert _outbox_count(db_session) == 1
+    outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    assert outbox.recipient == "tg-default"
+    assert outbox.status == NotificationStatus.PENDING
+
+
+def test_enqueue_missing_notifications_does_not_repair_existing_pending_outbox(db_session):
+    """A PENDING (not-yet-sent) outbox row blocks a duplicate via the dedupe index."""
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, assigned_user_id=admin.id, dedupe_key="b6")
+    enqueue_notification(
+        db_session, task_id=task.id, channel="telegram", recipient="tg-default",
+        payload={"message": "x"}, dedupe_key=f"task:{task.id}:telegram:tg-default",
+    )
+    db_session.commit()
+
+    missing, enqueued = enqueue_missing_notifications(db_session)
+    # Task is considered "missing a SENT notification" (its row is still PENDING) but the
+    # unique dedupe index makes the re-enqueue a no-op -> no duplicate row.
+    assert missing == [task.id]
+    assert enqueued == 0
+    assert _outbox_count(db_session) == 1
+
+
+def test_validate_default_assignee_missing_user_raises(db_session):
+    import pytest
+
+    with pytest.raises(RuntimeError) as excinfo:
+        validate_default_assignee(db_session, 999999)
+    assert "no user with this id" in str(excinfo.value)
+
+
+def test_validate_default_assignee_no_telegram_chat_id_raises(db_session):
+    import pytest
+
+    admin = _user(db_session, "admin-no-tg", UserRole.admin, telegram_chat_id=None)
+    db_session.commit()
+    with pytest.raises(RuntimeError) as excinfo:
+        validate_default_assignee(db_session, admin.id)
+    assert "telegram_chat_id" in str(excinfo.value) or "Telegram chat id" in str(excinfo.value)
+
+
+def test_validate_default_assignee_inactive_user_raises(db_session):
+    import pytest
+
+    admin = User(
+        username="admin-inactive", role=UserRole.admin,
+        api_key_hash=__import__("secrets").token_urlsafe(24),
+        is_active=False, telegram_chat_id="tg-x",
+    )
+    db_session.add(admin)
+    db_session.commit()
+    with pytest.raises(RuntimeError) as excinfo:
+        validate_default_assignee(db_session, admin.id)
+    assert "inactive" in str(excinfo.value)
+
+
+def test_validate_default_assignee_agent_role_raises(db_session):
+    import pytest
+
+    agent = _user(db_session, "agent-default", UserRole.agent, "tg-agent")
+    db_session.commit()
+    with pytest.raises(RuntimeError) as excinfo:
+        validate_default_assignee(db_session, agent.id)
+    assert "admin" in str(excinfo.value) or "manager" in str(excinfo.value)
+
+
+def test_backfill_validates_default_assignee_before_touching_data(db_session):
+    import pytest
+
+    task = _business_task(db_session, dedupe_key="b7")
+    db_session.commit()
+    with pytest.raises(RuntimeError):
+        backfill_unassigned_business_tasks(db_session, default_assignee_id=999999, now=NOW)
+    db_session.refresh(task)
+    assert task.assigned_user_id is None
+    assert _audit_count(db_session, "task_backfilled") == 0
+    assert _outbox_count(db_session) == 0
+
+
+def test_concurrent_missing_notifications_single_outbox(db_session, test_engine):
+    """Two concurrent enqueue processes on one unassigned business task -> ONE outbox row."""
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, assigned_user_id=admin.id, dedupe_key="b8")
+    db_session.commit()
+
+    Session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _run():
+        db = Session()
+        try:
+            barrier.wait(timeout=20)
+            enqueue_missing_notifications(db)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            db.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_run) for _ in range(2)]
+        for f in futures:
+            f.result(timeout=60)
+    assert not errors, errors
+    assert (
+        db_session.query(NotificationOutbox).filter_by(task_id=task.id).count() == 1
+    ), "concurrent enqueue must produce exactly one outbox row"
+
+
+def test_concurrent_backfill_assignment_converges(db_session, test_engine):
+    """Two concurrent backfills of the same unassigned task converge: one owner, one audit,
+    no duplicate outbox."""
+    admin = _seed_valid_default_admin(db_session, "tg-default")
+    task = _business_task(db_session, dedupe_key="b9")
+    db_session.commit()
+
+    Session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _run():
+        db = Session()
+        try:
+            barrier.wait(timeout=20)
+            backfill_unassigned_business_tasks(db, default_assignee_id=admin.id, now=NOW)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+        finally:
+            db.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_run) for _ in range(2)]
+        for f in futures:
+            f.result(timeout=60)
+    assert not errors, errors
+
+    db_session.refresh(task)
+    assert task.assigned_user_id == admin.id
+    # exactly one owner; audit rows may be 1..2 depending on the race, but ownership +
+    # outbox must be unique. The atomic conditional UPDATE guarantees one winner claims
+    # assignment, so exactly one task_backfilled audit row is written.
+    assert _audit_count(db_session, "task_backfilled") == 1
+    assert _outbox_count(db_session) == 1
+    outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    assert outbox.recipient == "tg-default"

@@ -432,5 +432,15 @@ def trigger_scheduler(
     db: Session = Depends(get_db),
     _: User = Depends(manager_or_admin),
 ):
-    """Run one scheduler pass on demand (same code path as the worker loop)."""
+    """Run one scheduler pass on demand (same code path as the worker loop).
+
+    Fail fast if the default assignee is misconfigured, so an operator-triggered
+    pass can never silently create un-notifiable business tasks (mirrors the
+    worker's startup guard — worker.main() validates at boot; this endpoint
+    validates on hit).
+    """
+    from app.services.operations.config import DEFAULT_ASSIGNED_USER_ID
+    from app.services.operations.assignee import validate_default_assignee
+
+    validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
     return run_scheduler_once(db)

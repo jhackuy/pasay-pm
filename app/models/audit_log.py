@@ -28,6 +28,7 @@ class AuditAction(str, Enum):
     rule_disabled = "rule_disabled"
     task_auto_completed = "task_auto_completed"
     task_auto_cancelled = "task_auto_cancelled"
+    task_backfilled = "task_backfilled"
 
 
 class AuditLog(AuditMixin, Base):

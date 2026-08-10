@@ -17,11 +17,13 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models.user import User
 from app.services.operations.config import (
+    DEFAULT_ASSIGNED_USER_ID,
     NOTIFY_BACKOFF_BASE_SECONDS,
     NOTIFY_MAX_ATTEMPTS,
 )
 from app.services.operations.notifier import TelegramSender, process_notifications_once
 from app.services.operations.scheduler import run_scheduler_once
+from app.services.operations.assignee import validate_default_assignee
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pasay.operations.worker")
@@ -59,6 +61,15 @@ def run_worker_once(
         db.close()
 
 
+def _validate_startup(db) -> None:
+    """Fail fast at startup if the default assignee is misconfigured.
+
+    A broken default (missing/inactive/wrong-role/no-telegram chat id) would otherwise
+    silently produce un-notifiable business tasks — fail loudly instead.
+    """
+    validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="pasay-operations-worker")
     parser.add_argument("--once", action="store_true", help="run a single pass and exit")
@@ -70,6 +81,12 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    # Startup safety-check: fail loudly on a misconfigured default assignee (requirement #5).
+    db = SessionLocal()
+    try:
+        _validate_startup(db)
+    finally:
+        db.close()
     if args.once:
         result = run_worker_once(max_attempts=args.max_attempts, backoff_base=args.backoff_base)
         logger.info("worker pass: %s", result)
