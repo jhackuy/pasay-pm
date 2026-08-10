@@ -22,10 +22,10 @@ from app.models.operations import (
     OperationalTaskType,
 )
 from app.services.audit import record_audit, serialize_row
-from app.services.operations.generation import covered_periods, lease_periods
+from app.services.operations.rent_math import covered_periods, lease_periods
 
 
-def _auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskStatus,
+def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskStatus,
                      now: datetime, reason: str) -> bool:
     """Atomic PENDING->target transition; returns False if someone else
     already transitioned the task (no duplicate audit)."""
@@ -169,6 +169,6 @@ def _lease_renewed(db: Session, lease: Lease) -> bool:
 
 
 def _transition(db, task, to, now, reason) -> str:
-    if _auto_transition(db, task, to=to, now=now, reason=reason):
+    if auto_transition(db, task, to=to, now=now, reason=reason):
         return "completed" if to == OperationalTaskStatus.COMPLETED else "cancelled"
     return None

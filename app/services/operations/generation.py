@@ -11,9 +11,7 @@ only read; their real state transitions stay in the V1.1 routers.
 """
 from __future__ import annotations
 
-import calendar
-import re
-from datetime import date, datetime, time, timedelta
+from datetime import datetime, time, timedelta
 from decimal import Decimal
 
 from sqlalchemy import text
@@ -32,6 +30,7 @@ from app.models.operations import (
 from app.models.property import Unit
 from app.models.tenant import Tenant
 from app.services.audit import record_audit, serialize_row
+from app.services.operations.rent_math import covered_periods, lease_periods
 from app.services.operations.config import (
     APPROVAL_PENDING_AFTER_DAYS,
     LEASE_EXPIRY_WINDOW_DAYS,
@@ -41,73 +40,7 @@ from app.services.operations.config import (
     SETTLEMENT_PENDING_AFTER_DAYS,
 )
 from app.services.operations.outbox import enqueue_notification, resolve_recipient
-
-_PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
-
-
-def _default_due_day(lease: Lease) -> int:
-    return lease.due_day if lease.due_day is not None else lease.start_date.day
-
-
-def _accounting_start(lease: Lease) -> date:
-    if lease.accounting_start_date is None:
-        return lease.start_date
-    return max(lease.start_date, lease.accounting_start_date)
-
-
-def lease_periods(lease: Lease) -> list[tuple[str, date]]:
-    """(YYYY-MM, due_date) for every full rent month from accounting start.
-
-    Mirrors /reports/overdue-rents semantics: a trailing partial final month
-    does not generate a new full rent period; the start month always does.
-    """
-    due_day = _default_due_day(lease)
-    periods: list[tuple[str, date]] = []
-    accounting_start = _accounting_start(lease)
-    year, month = accounting_start.year, accounting_start.month
-    end_year, end_month = lease.end_date.year, lease.end_date.month
-    end_is_fully_covered = lease.end_date.day >= calendar.monthrange(end_year, end_month)[1]
-    while (year, month) <= (end_year, end_month):
-        if (year, month) == (end_year, end_month) and not end_is_fully_covered:
-            break
-        day = min(due_day, calendar.monthrange(year, month)[1])
-        periods.append((f"{year:04d}-{month:02d}", date(year, month, day)))
-        month += 1
-        if month > 12:
-            month = 1
-            year += 1
-    return periods
-
-
-def _month_from_description(description: str | None) -> str | None:
-    if not description:
-        return None
-    match = _PERIOD_IN_DESC.search(description)
-    if match is None:
-        return None
-    year, month = int(match.group(1)), int(match.group(2))
-    if not 1 <= month <= 12:
-        return None
-    return f"{year:04d}-{month:02d}"
-
-
-def covered_periods(
-    lease: Lease,
-    lease_periods_list: list[tuple[str, date]],
-    incomes: list[Income],
-) -> set[str]:
-    """Months covered by confirmed income (description period, else received
-    month), mirroring the overdue-rents report coverage rule."""
-    receivable = {month for month, _ in lease_periods_list}
-    covered: set[str] = set()
-    for income in incomes:
-        month = _month_from_description(income.description)
-        if month is None:
-            month = income.received_date.strftime("%Y-%m")
-        if month in receivable:
-            covered.add(month)
-    return covered
-
+from app.services.operations.reconcile import auto_transition
 
 def _notification_message(task: OperationalTask) -> str:
     details = task.details or {}
@@ -204,18 +137,9 @@ def _supersede_rent_due(db: Session, lease_id: int, now: datetime) -> None:
         .all()
     )
     for task in tasks:
-        old = serialize_row(task)
-        task.status = OperationalTaskStatus.COMPLETED
-        task.completed_at = now
-        record_audit(
-            db,
-            table_name="operational_tasks",
-            record_id=task.id,
-            action="task_auto_completed",
-            actor_id=None,
-            changed_fields={"status": ["PENDING", "COMPLETED"], "reason": "superseded_by_rent_overdue"},
-            old_value=old,
-            new_value=serialize_row(task),
+        auto_transition(
+            db, task, to=OperationalTaskStatus.COMPLETED, now=now,
+            reason="superseded_by_rent_overdue",
         )
 
 
