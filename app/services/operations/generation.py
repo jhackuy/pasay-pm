@@ -33,6 +33,7 @@ from app.services.audit import record_audit, serialize_row
 from app.services.operations.rent_math import covered_periods, lease_periods
 from app.services.operations.config import (
     APPROVAL_PENDING_AFTER_DAYS,
+    DEFAULT_ASSIGNED_USER_ID,
     LEASE_EXPIRY_WINDOW_DAYS,
     NOTIFY_CHANNEL_TELEGRAM,
     PAYMENT_PENDING_AFTER_DAYS,
@@ -41,6 +42,9 @@ from app.services.operations.config import (
 )
 from app.services.operations.outbox import enqueue_notification, resolve_recipient
 from app.services.operations.reconcile import auto_transition
+
+BUSINESS_SOURCE_TYPES = frozenset({"lease", "expense", "commission_settlement"})
+
 
 def _notification_message(task: OperationalTask) -> str:
     details = task.details or {}
@@ -107,8 +111,18 @@ def _enqueue_for_task(db: Session, task: OperationalTask) -> bool:
 def _register_task(db: Session, *, fields: dict, now: datetime) -> tuple[OperationalTask | None, bool]:
     """Create task + audit(task_created) + outbox in one transaction.
 
+    Business-source tasks with no explicit assignee fall back to
+    ``DEFAULT_ASSIGNED_USER_ID`` so proactive notifications get a recipient;
+    recurring-rule tasks keep the rule's assignee as-is.
+
     Returns (task_or_None, notification_enqueued).
     """
+    fields = dict(fields)
+    if (
+        fields.get("source_type") in BUSINESS_SOURCE_TYPES
+        and fields.get("assigned_user_id") is None
+    ):
+        fields["assigned_user_id"] = DEFAULT_ASSIGNED_USER_ID
     task = _insert_task_on_conflict_do_nothing(db, fields=fields)
     if task is None:
         return None, False

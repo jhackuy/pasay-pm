@@ -98,6 +98,16 @@ def _seed_rule(db, *, rule_type=OperationalTaskType.AC_MAINTENANCE,
     return rule
 
 
+def _seed_default_assignee(db, monkeypatch):
+    """Pin the fallback assignee to a real user so business-source tasks
+    (and notification recipients) resolve in tests."""
+    from app.services.operations import generation
+
+    user = _user(db, "default-admin", UserRole.admin)
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", user.id)
+    return user
+
+
 def _task_count(db) -> int:
     return db.query(OperationalTask).count()
 
@@ -655,7 +665,8 @@ def test_financial_write_path_not_bypassed(client, db_session, admin_headers):
     assert expense.amount == Decimal("5000.00")
 
 
-def test_reconciliation_approval_pending_cancelled_when_rejected(db_session):
+def test_reconciliation_approval_pending_cancelled_when_rejected(db_session, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
                       payee="Fix-It Co", status=ExpenseStatus.pending,
                       created_at=NOW - timedelta(days=10))
@@ -676,7 +687,8 @@ def test_reconciliation_approval_pending_cancelled_when_rejected(db_session):
     assert _audit_count(db_session, "task_auto_cancelled") >= 1
 
 
-def test_reconciliation_rent_due_completes_when_covered(db_session):
+def test_reconciliation_rent_due_completes_when_covered(db_session, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     _seed_lease(db_session, due_day=13)  # Aug 13 inside the 3-day advance window
     db_session.commit()
     run_scheduler_once(db_session, now=NOW)
@@ -696,7 +708,8 @@ def test_reconciliation_rent_due_completes_when_covered(db_session):
     assert task.status == OperationalTaskStatus.COMPLETED
 
 
-def test_reconciliation_lease_expiring_cancelled_when_terminated(db_session):
+def test_reconciliation_lease_expiring_cancelled_when_terminated(db_session, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     _seed_lease(db_session, start="2025-01-01", end="2026-08-20")
     db_session.commit()
     run_scheduler_once(db_session, now=NOW)
@@ -713,7 +726,8 @@ def test_reconciliation_lease_expiring_cancelled_when_terminated(db_session):
     assert task.status == OperationalTaskStatus.CANCELLED
 
 
-def test_reconciliation_lease_expiring_completes_when_renewed(db_session):
+def test_reconciliation_lease_expiring_completes_when_renewed(db_session, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     lease = _seed_lease(db_session, start="2025-01-01", end="2026-08-20")
     db_session.commit()
     run_scheduler_once(db_session, now=NOW)
@@ -734,7 +748,8 @@ def test_reconciliation_lease_expiring_completes_when_renewed(db_session):
     assert task.status == OperationalTaskStatus.COMPLETED
 
 
-def test_settlement_pending_task_and_reconciliation(db_session):
+def test_settlement_pending_task_and_reconciliation(db_session, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     agent = _user(db_session, "ag1", UserRole.agent)
     lease = _seed_lease(db_session)
     rule = CommissionRule(name="出租", rule_type=CommissionRuleType.percentage,
@@ -753,13 +768,46 @@ def test_settlement_pending_task_and_reconciliation(db_session):
         task_type=OperationalTaskType.SETTLEMENT_PENDING
     ).one()
     assert task.assigned_user_id == agent.id
-    assert _outbox_count(db_session) == 1  # agent has no telegram id -> user:{id} recipient
+    outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    assert outbox.recipient == f"user:{agent.id}"  # agent has no telegram id
 
     settlement.status = CommissionSettlementStatus.confirmed
     db_session.commit()
     run_scheduler_once(db_session, now=NOW)
     db_session.refresh(task)
     assert task.status == OperationalTaskStatus.COMPLETED
+
+
+def test_business_task_no_assignee_defaults_and_enqueues_notification(db_session, monkeypatch):
+    from app.services.operations import generation
+
+    admin = _user(db_session, "admin-tg", UserRole.admin, "tg-admin")
+    db_session.commit()
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", admin.id)
+
+    _seed_lease(db_session)  # due day 5 -> RENT_OVERDUE (no explicit assignee)
+    db_session.commit()
+
+    run_scheduler_once(db_session, now=NOW)
+    task = db_session.query(OperationalTask).filter_by(
+        task_type=OperationalTaskType.RENT_OVERDUE
+    ).one()
+    assert task.assigned_user_id == admin.id
+    outbox = db_session.query(NotificationOutbox).one()
+    assert outbox.task_id == task.id
+    assert outbox.recipient == "tg-admin"
+    assert outbox.status == NotificationStatus.PENDING
+
+
+def test_recurring_rule_task_keeps_rule_assignee_as_is(db_session):
+    _seed_rule(db_session, next_run_at=NOW)  # rule has no assigned_user_id
+    db_session.commit()
+
+    run_scheduler_once(db_session, now=NOW)
+    task = db_session.query(OperationalTask).one()
+    assert task.source_type == "recurring_rule"
+    assert task.assigned_user_id is None
+    assert _outbox_count(db_session) == 0
 
 
 # ---------------------------------------------------------------------------
