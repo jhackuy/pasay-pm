@@ -1,6 +1,7 @@
 """High-level reports: server-computed aggregates for Hermes (no client-side math)."""
 import calendar
-from datetime import date, datetime, time, timedelta, timezone
+import re
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, Query
@@ -24,6 +25,7 @@ from app.schemas.reports import (
     FinancialSummary,
     MonthlyLeaseSummary,
     OverdueRent,
+    OverdueRentPeriod,
     ReportTask,
 )
 from app.services.dates import add_months, month_range
@@ -51,34 +53,69 @@ def _default_due_day(lease: Lease) -> int:
     return lease.due_day if lease.due_day is not None else lease.start_date.day
 
 
-def _months_expected(lease: Lease, today: date) -> int:
-    """Monthly rent periods whose due day has passed since the lease started."""
-    elapsed = (
-        (today.year - lease.start_date.year) * 12
-        + (today.month - lease.start_date.month)
-    )
-    if elapsed < 0:
-        return 0
+_PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
+
+
+def _lease_periods(lease: Lease) -> list[tuple[str, date]]:
+    """(YYYY-MM, due_date) for every rent month from lease start through end.
+
+    A trailing end month is only included when the lease covers it fully
+    (i.e. the lease end date is the last day of that month). If the lease ends
+    mid-month, the partial final month does not generate a new full rent
+    period (principle: periods after the lease effectively stop are not owed).
+    The start month is always included.
+    """
     due_day = _default_due_day(lease)
-    count = elapsed
-    cur_due = date(
-        today.year,
-        today.month,
-        min(due_day, calendar.monthrange(today.year, today.month)[1]),
-    )
-    if today >= cur_due:
-        count += 1
-    return count
+    periods: list[tuple[str, date]] = []
+    year, month = lease.start_date.year, lease.start_date.month
+    end_year, end_month = lease.end_date.year, lease.end_date.month
+    end_is_fully_covered = lease.end_date.day >= calendar.monthrange(end_year, end_month)[1]
+    while (year, month) <= (end_year, end_month):
+        if (year, month) == (end_year, end_month) and not end_is_fully_covered:
+            # final month is partial (lease ends mid-month) -> skip
+            break
+        day = min(due_day, calendar.monthrange(year, month)[1])
+        periods.append((f"{year:04d}-{month:02d}", date(year, month, day)))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return periods
 
 
-def _last_due_date(today: date, due_day: int) -> date:
-    day = min(due_day, calendar.monthrange(today.year, today.month)[1])
-    candidate = date(today.year, today.month, day)
-    if candidate <= today:
-        return candidate
-    prev = candidate.replace(day=1) - timedelta(days=1)
-    prev_day = min(due_day, calendar.monthrange(prev.year, prev.month)[1])
-    return date(prev.year, prev.month, prev_day)
+def _month_from_description(description: str | None) -> str | None:
+    """Extract a YYYY-MM rent period from an income description, if present."""
+    if not description:
+        return None
+    match = _PERIOD_IN_DESC.search(description)
+    if match is None:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    if not 1 <= month <= 12:
+        return None
+    return f"{year:04d}-{month:02d}"
+
+
+def _covered_periods(
+    lease: Lease,
+    lease_periods: list[tuple[str, date]],
+    incomes: list[Income],
+) -> set[str]:
+    """Months of this lease covered by confirmed income.
+
+    Match by an explicit YYYY-MM in the description when present; otherwise
+    fall back to the month of the received date. Payments landing outside the
+    lease's receivable months (before start / after end) cover nothing.
+    """
+    receivable = {month for month, _ in lease_periods}
+    covered: set[str] = set()
+    for income in incomes:
+        month = _month_from_description(income.description)
+        if month is None:
+            month = income.received_date.strftime("%Y-%m")
+        if month in receivable:
+            covered.add(month)
+    return covered
 
 
 @router.get("/financial-summary", response_model=FinancialSummary)
@@ -157,33 +194,41 @@ def overdue_rents(
     _: User = Depends(manager_or_admin),
 ):
     today = date.today()
-    rows: list[OverdueRent] = []
     leases = (
         db.query(Lease)
         .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
         .all()
     )
+    lease_ids = [lease.id for lease in leases]
+    confirmed_by_lease: dict[int, list[Income]] = {}
+    if lease_ids:
+        for income in (
+            db.query(Income)
+            .filter(
+                Income.lease_id.in_(lease_ids),
+                Income.status == IncomeStatus.confirmed,
+            )
+            .all()
+        ):
+            confirmed_by_lease.setdefault(income.lease_id, []).append(income)
+
+    rows: list[OverdueRent] = []
     for lease in leases:
         unit = db.query(Unit).filter(Unit.id == lease.unit_id).first()
         tenant = db.query(Tenant).filter(Tenant.id == lease.tenant_id).first()
         if unit is None or tenant is None:
             continue
-        months = _months_expected(lease, today)
-        if months <= 0:
+        periods = _lease_periods(lease)
+        due_periods = [(month, due) for month, due in periods if due <= today]
+        if not due_periods:
             continue
-        expected = _d2(lease.monthly_rent * months)
-        collected = (
-            db.query(func.coalesce(func.sum(Income.amount), 0))
-            .filter(
-                Income.lease_id == lease.id,
-                Income.status == IncomeStatus.confirmed,
-            )
-            .scalar()
-        )
-        outstanding = _d2(expected - collected)
-        if outstanding <= 0:
+        covered = _covered_periods(lease, periods, confirmed_by_lease.get(lease.id, []))
+        overdue = [(month, due) for month, due in due_periods if month not in covered]
+        if not overdue:
             continue
-        last_due = _last_due_date(today, _default_due_day(lease))
+        oldest_due_date = overdue[0][1]
+        overdue_days = max((today - oldest_due_date).days, 0)
+        total_outstanding = _d2(lease.monthly_rent * len(overdue))
         rows.append(
             OverdueRent(
                 lease_id=lease.id,
@@ -191,11 +236,20 @@ def overdue_rents(
                 tenant_id=lease.tenant_id,
                 unit=unit.unit_number,
                 tenant=tenant.full_name,
-                outstanding=outstanding,
-                days_overdue=max((today - last_due).days, 0),
+                overdue_months=len(overdue),
+                overdue_periods=[
+                    OverdueRentPeriod(month=month, amount=_d2(lease.monthly_rent))
+                    for month, _ in overdue
+                ],
+                amount_per_month=_d2(lease.monthly_rent),
+                total_outstanding=total_outstanding,
+                oldest_due_date=oldest_due_date,
+                overdue_days=overdue_days,
+                outstanding=total_outstanding,
+                days_overdue=overdue_days,
             )
         )
-    rows.sort(key=lambda r: r.days_overdue, reverse=True)
+    rows.sort(key=lambda r: r.overdue_days, reverse=True)
     return rows
 
 

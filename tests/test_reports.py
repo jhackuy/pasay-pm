@@ -128,6 +128,217 @@ def test_overdue_rents_report(client, admin_headers, unit_id, tenant_id):
     assert row["days_overdue"] >= 0
 
 
+def _month_key(value: date) -> str:
+    return value.strftime("%Y-%m")
+
+
+def _shift_month(value: date, delta: int) -> date:
+    month_index = value.month - 1 + delta
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    return value.replace(year=year, month=month, day=1)
+
+
+def _create_rent_lease(
+    client, admin_headers, unit_id, tenant_id, start_date, end_date,
+    monthly_rent="65000.00", due_day=None,
+):
+    payload = {
+        "unit_id": unit_id,
+        "tenant_id": tenant_id,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "monthly_rent": monthly_rent,
+        "deposit": "0.00",
+        "status": "active",
+    }
+    if due_day is not None:
+        payload["due_day"] = due_day
+    resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def _overdue_row(client, admin_headers, lease_id):
+    resp = client.get(f"{API}/reports/overdue-rents", headers=admin_headers)
+    assert resp.status_code == 200
+    rows = [r for r in resp.json() if r["lease_id"] == lease_id]
+    assert len(rows) == 1
+    return rows[0]
+
+
+def _post_income(client, admin_headers, lease_id, amount, received_date,
+                 status="confirmed", description=None):
+    payload = {
+        "lease_id": lease_id,
+        "amount": amount,
+        "received_date": received_date.isoformat(),
+        "payment_method": "cash",
+        "status": status,
+    }
+    if description is not None:
+        payload["description"] = description
+    resp = client.post(f"{API}/incomes", json=payload, headers=admin_headers)
+    assert resp.status_code == 201, resp.text
+
+
+def test_overdue_rents_current_month(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = today.replace(day=1)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["unit"] == "101"
+    assert row["tenant"] == "Juan Dela Cruz"
+    assert row["overdue_months"] == 1
+    assert row["amount_per_month"] == "65000.00"
+    assert row["total_outstanding"] == "65000.00"
+    assert row["outstanding"] == "65000.00"
+    assert row["overdue_periods"] == [{"month": _month_key(start), "amount": "65000.00"}]
+    assert row["oldest_due_date"] == start.isoformat()
+    assert row["overdue_days"] == (today - start).days
+    assert row["days_overdue"] == row["overdue_days"]
+
+
+def test_overdue_rents_consecutive_months(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 3
+    assert row["total_outstanding"] == "195000.00"
+    assert row["overdue_periods"] == [
+        {"month": _month_key(_shift_month(today, -2)), "amount": "65000.00"},
+        {"month": _month_key(_shift_month(today, -1)), "amount": "65000.00"},
+        {"month": _month_key(today), "amount": "65000.00"},
+    ]
+    assert row["oldest_due_date"] == start.isoformat()
+
+
+def test_overdue_rents_one_month_paid(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    paid_month = _shift_month(today, -1)
+    _post_income(
+        client, admin_headers, lease_id, "65000.00", today,
+        description=f"rent {_month_key(paid_month)}",
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 2
+    assert row["total_outstanding"] == "130000.00"
+    assert [p["month"] for p in row["overdue_periods"]] == [
+        _month_key(start),
+        _month_key(today),
+    ]
+
+
+def test_overdue_rents_received_month_fallback(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    paid_month = _shift_month(today, -1)
+    _post_income(client, admin_headers, lease_id, "65000.00", paid_month)
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 2
+    assert [p["month"] for p in row["overdue_periods"]] == [
+        _month_key(start),
+        _month_key(today),
+    ]
+
+
+def test_overdue_rents_pending_not_counted(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = today.replace(day=1)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    _post_income(
+        client, admin_headers, lease_id, "65000.00", today,
+        status="pending", description=f"rent {_month_key(start)}",
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 1
+    assert row["total_outstanding"] == "65000.00"
+
+
+def test_overdue_rents_advance_future_payment(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    future_month = _shift_month(today, 1)
+    _post_income(
+        client, admin_headers, lease_id, "65000.00", today,
+        description=f"rent {_month_key(future_month)}",
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 3
+    assert row["total_outstanding"] == "195000.00"
+    assert _month_key(future_month) not in [p["month"] for p in row["overdue_periods"]]
+
+
+def test_overdue_rents_lease_started_midterm(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = today - timedelta(days=15)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 1
+    assert row["total_outstanding"] == "65000.00"
+    assert row["overdue_periods"] == [{"month": _month_key(start), "amount": "65000.00"}]
+    assert row["oldest_due_date"] == start.isoformat()
+
+
+def test_overdue_rents_lease_ended(client, admin_headers, unit_id, tenant_id):
+    today = date.today()
+    start = _shift_month(today, -5)
+    end = _shift_month(today, -2) - timedelta(days=1)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=end,
+        due_day=1,
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 3
+    assert row["total_outstanding"] == "195000.00"
+    assert [p["month"] for p in row["overdue_periods"]] == [
+        _month_key(_shift_month(today, -5)),
+        _month_key(_shift_month(today, -4)),
+        _month_key(_shift_month(today, -3)),
+    ]
+
+
 def test_monthly_report(client, admin_headers, lease_id):
     resp = client.get(f"{API}/reports/monthly?month={_month()}", headers=admin_headers)
     assert resp.status_code == 200

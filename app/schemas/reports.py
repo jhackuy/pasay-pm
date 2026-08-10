@@ -19,13 +19,25 @@ class FinancialSummary(BaseModel):
     vacant_units: int
 
 
+class OverdueRentPeriod(BaseModel):
+    month: str
+    amount: Decimal = money_field(ge=0)
+
+
 class OverdueRent(BaseModel):
     lease_id: int
     unit_id: int
     tenant_id: int
     unit: str
     tenant: str
-    outstanding: Decimal = money_field()
+    overdue_months: int
+    overdue_periods: list[OverdueRentPeriod]
+    amount_per_month: Decimal = money_field(ge=0)
+    total_outstanding: Decimal = money_field(ge=0)
+    oldest_due_date: date
+    overdue_days: int
+    # Backward-compatible aliases for existing consumers.
+    outstanding: Decimal = money_field(ge=0)
     days_overdue: int
 
 
