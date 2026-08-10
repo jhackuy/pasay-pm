@@ -1,0 +1,539 @@
+"""End-to-end handler tests through PTB's no-network Application:
+rent flow, confirm, duplicate/double clicks, expiry, invalid callbacks,
+permissions + bypass, timeout reconciliation, crash recovery, pending list,
+and dual-key (manager/admin) enforcement."""
+import re
+import time
+from datetime import date
+
+from conftest import (
+    OWNER_ID,
+    SECRETARY_ID,
+    UNKNOWN_ID,
+    make_callback_update,
+    make_text_update,
+    run_updates,
+)
+from pasay_bot.keyboards import decode, encode, new_nonce, now_ts
+
+
+def _html_balanced(text: str) -> bool:
+    stack = []
+    for m in re.finditer(r"</?([a-zA-Z][a-zA-Z0-9-]*)[^>]*>", text):
+        raw, name = m.group(0), m.group(1).lower()
+        if raw.startswith("</"):
+            if not stack or stack[-1] != name:
+                return False
+            stack.pop()
+        elif not raw.endswith("/>"):
+            stack.append(name)
+    return not stack
+
+
+def _confirm_card_data(env):
+    """callback_data of the confirm button on the rendered confirmation card."""
+    return callback_data_of(env, "edit_message_text", -1)
+
+
+def callback_data_of(env, call_type, index=-1):
+    call = env.bot.of_type(call_type)[index]
+    return call["reply_markup"].inline_keyboard[0][0].callback_data
+
+
+def _run_rent_to_confirm(env, user_id=OWNER_ID, chat_id=OWNER_ID):
+    updates = [
+        make_callback_update(user_id, chat_id, encode("rn", "go", "1"), bot=env.bot),
+        make_text_update(user_id, chat_id, "55000", message_id=2, update_id=2, bot=env.bot),
+        make_text_update(user_id, chat_id, date.today().isoformat(), message_id=3, update_id=3, bot=env.bot),
+        make_callback_update(user_id, chat_id, encode("mt", "bank"), message_id=4, update_id=4, bot=env.bot),
+    ]
+    run_updates(env, updates)
+    return _confirm_card_data(env)
+
+
+# --- navigation / rent flow ---
+
+def test_rent_callback(make_app):
+    env = make_app()
+    updates = [
+        make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "rent"), bot=env.bot),
+        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "prop", "1"),
+                             message_id=20, update_id=2, bot=env.bot),
+        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "unit", "1"),
+                             message_id=20, update_id=3, bot=env.bot),
+    ]
+    run_updates(env, updates)
+    texts = [c["text"] or "" for c in env.bot.calls]
+    assert any("选择物业" in t for t in texts)
+    assert any("选择 Unit（Pasay Premier Residences）" in t for t in texts)
+    unit_page = env.bot.edits()[-1]["text"]
+    assert "🏢 <b>Pasay Premier Residences · Unit 16B</b>" in unit_page
+    assert "租客：Juan Dela Cruz" in unit_page
+    assert "月租：₱55,000" in unit_page
+    kb = env.bot.edits()[-1]["reply_markup"]
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "💵 登记收租" in labels
+
+
+def test_commands_and_menu(make_app):
+    env = make_app()
+    updates = [
+        make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot),
+        make_text_update(OWNER_ID, OWNER_ID, "/finance", message_id=2, update_id=2, bot=env.bot),
+        make_text_update(OWNER_ID, OWNER_ID, "/overdue", message_id=3, update_id=3, bot=env.bot),
+        make_text_update(OWNER_ID, OWNER_ID, "/properties", message_id=4, update_id=4, bot=env.bot),
+    ]
+    run_updates(env, updates)
+    texts = "".join(env.bot.all_texts())
+    assert "主菜单" in texts
+    assert "2026年8月财务" in texts
+    assert "应收：₱363,000" in texts
+    assert "逾期租金 · 2笔" in texts
+    assert "房源概况" in texts
+
+
+def test_overdue_escape_and_action_buttons(make_app):
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/overdue", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    # tenant name with HTML-ish content must be escaped
+    assert "Maria &lt;Admin&gt;" in text
+    assert "Maria <Admin>" not in text
+    kb = env.bot.last_send()["reply_markup"]
+    buttons = [b for row in kb.inline_keyboard for b in row]
+    assert len(buttons) == 4  # 2 items x (登记收租 + 详情)
+
+
+# --- confirm flows ---
+
+def test_rent_confirm(make_app):
+    env = make_app()
+    data = _run_rent_to_confirm(env)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    inc = env.backend.incomes[0]
+    assert inc["status"] == "confirmed"
+    assert inc["amount"] == "55000.00"
+    assert inc["description"] == f"rent {date.today().strftime('%Y-%m')}"
+    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert "收租成功" in env.bot.edits()[-1]["text"]
+    # conversation is retained (15-min TTL) so a second click can replay
+    conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
+    assert conv is not None and conv["state"] == "rent_confirm"
+
+
+def test_secretary_records_pending_not_confirmed(make_app):
+    env = make_app()
+    data = _run_rent_to_confirm(env, user_id=SECRETARY_ID, chat_id=SECRETARY_ID)
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    inc = env.backend.incomes[0]
+    assert inc["status"] == "pending"
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
+    assert env.bot.last_answer()["text"] == "📝 Recorded, pending"
+    assert "Recorded, pending" in env.bot.edits()[-1]["text"]
+
+
+def test_duplicate_rent_callback(make_app):
+    """★ Same confirm card clicked twice -> only ONE income is written."""
+    env = make_app()
+    data = _run_rent_to_confirm(env)
+    run_updates(
+        env,
+        [
+            make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot),
+            make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot),
+        ],
+    )
+    assert len(env.backend.incomes) == 1
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
+    assert env.bot.last_answer()["text"] == "✅ 已处理"
+
+
+def test_double_confirm(make_app):
+    """★ Confirm the same pending income twice -> confirm endpoint called once."""
+    env = make_app()
+    env.backend.add_income(status="pending", income_id=1)
+    nonce = new_nonce()
+    data = encode("cnf", "inc", "1", nonce=nonce, ts=now_ts())
+    run_updates(
+        env,
+        [
+            make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot),
+            make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot),
+        ],
+    )
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
+    assert len(env.backend.incomes) == 1
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.bot.last_answer()["text"] == "✅ 已处理"
+
+
+def test_double_confirm_backend_409_path(make_app):
+    """★ Even if the local guard is bypassed, backend 409 -> 'already handled'."""
+    env = make_app()
+    env.backend.add_income(status="confirmed", income_id=1)
+    # Hand-craft a confirm callback for the already-confirmed income with a
+    # different nonce so the local guard can't short-circuit.
+    data = encode("cnf", "inc", "1", nonce=new_nonce(), ts=now_ts())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
+    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert "收租成功" in env.bot.edits()[-1]["text"]
+
+
+def test_expired_callback(make_app):
+    """★ Old card (ts beyond TTL) -> refused, no API call, no write."""
+    env = make_app()
+    env.backend.add_income(status="pending", income_id=1)
+    old_ts = now_ts() - 10000  # 10k seconds > 900s TTL
+    data = encode("cnf", "inc", "1", nonce=new_nonce(), ts=old_ts)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
+    assert env.backend.incomes[0]["status"] == "pending"
+    assert "过期" in (env.bot.last_answer()["text"] or "")
+
+
+def test_invalid_callback(make_app):
+    env = make_app()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, "garbage", bot=env.bot)])
+    assert env.bot.last_answer()["text"] == "已过期"
+    assert env.backend.calls == []
+
+
+def test_reverse_owner_only(make_app):
+    env = make_app()
+    env.backend.add_income(status="confirmed", income_id=1)
+    data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    assert env.backend.incomes[0]["status"] == "reversed"
+    assert env.bot.last_answer()["text"] == "↩️ 已冲销"
+    assert "已冲销" in env.bot.edits()[-1]["text"]
+
+
+# --- permissions ---
+
+def test_permission_bypass(make_app):
+    """★ Secretary hand-crafts a confirm callback -> bot refuses, no API call.
+    Backend enforcement is also simulated (403) for an agent-level key."""
+    env = make_app()
+    env.backend.add_income(status="pending", income_id=1)
+    data = encode("cnf", "inc", "1", nonce=new_nonce(), ts=now_ts())
+    run_updates(
+        env,
+        [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, bot=env.bot)],
+    )
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
+    assert env.backend.incomes[0]["status"] == "pending"
+    answer = (env.bot.last_answer()["text"] or "").lower()
+    assert "permission" in answer or "无权限" in answer
+
+    # unknown telegram user also refused
+    run_updates(
+        env,
+        [make_callback_update(UNKNOWN_ID, UNKNOWN_ID, data, update_id=20, bot=env.bot)],
+    )
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
+
+    # backend enforcement: even a valid user's confirm is refused if the API
+    # key lacks permission (backend 403).
+    env2 = make_app(api_key="agent-key")
+    env2.backend.add_income(status="pending", income_id=1)
+    env2.backend.fail_status["/incomes/1/confirm"] = 403
+    run_updates(
+        env2,
+        [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=30, bot=env2.bot)],
+    )
+    assert env2.backend.incomes[0]["status"] == "pending"
+    assert "无权限" in (env2.bot.last_answer()["text"] or "")
+
+
+# --- timeout reconciliation (design §13) ---
+
+def test_backend_timeout_before_write(make_app):
+    """★ Create times out before the write lands: user is told it's uncertain,
+    retry is allowed and completes exactly one income."""
+    env = make_app()
+    env.backend.timeout_before_write_paths.add("/incomes")
+    data = _run_rent_to_confirm(env)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
+    assert len(env.backend.incomes) == 0
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    answer = env.bot.last_answer()["text"] or ""
+    assert "网络超时" in answer
+    assert "请重试" in answer or "不确定" in answer
+
+    # retry same card -> allowed (failed state) and completes
+    env.backend.timeout_before_write_paths.clear()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.bot.last_answer()["text"] == "✅ 已入账"
+
+
+def test_backend_timeout_after_write(make_app):
+    """★ CREATE actually landed server-side but the response timed out: the
+    bot reconciles via GET /incomes matching, confirms the reused income,
+    never claims 'nothing changed', and never creates a second income."""
+    env = make_app()
+    data = _run_rent_to_confirm(env)
+    env.backend.timeout_after_write_paths.add("/incomes")
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    assert env.backend.count_calls("GET", "/incomes") >= 1  # reconciled via list
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
+    answer = env.bot.last_answer()["text"] or ""
+    assert answer == "✅ 已入账"
+    assert "没有修改" not in "".join(env.bot.all_texts())
+    assert "收租成功" in env.bot.edits()[-1]["text"]
+
+    # second click on the same card -> replay, no new API calls
+    before = len(env.backend.calls)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    assert len(env.backend.calls) == before
+    assert env.bot.last_answer()["text"] == "✅ 已处理"
+
+
+def test_create_timeout_after_write_no_duplicate(make_app):
+    """★ F1 regression: create lands as pending, response times out, retry on
+    the same card must NEVER produce a second income."""
+    env = make_app()
+    data = _run_rent_to_confirm(env)
+    env.backend.timeout_after_write_paths.add("/incomes")
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.backend.count_calls("POST", "/incomes") == 1
+
+    before = len(env.backend.calls)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
+    assert len(env.backend.incomes) == 1  # never a second income
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    assert len(env.backend.calls) == before
+    assert env.bot.last_answer()["text"] == "✅ 已处理"
+
+
+def test_new_card_re_records_same_period_reuses_pending(make_app):
+    """★ F1: after a create timeout, a NEW card (new nonce) for the same
+    unit/period reuses the landed pending income instead of duplicating it."""
+    env = make_app()
+    data = _run_rent_to_confirm(env)
+    env.backend.timeout_after_write_paths.add("/incomes")
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.backend.count_calls("POST", "/incomes") == 1
+
+    # user opens a fresh flow (new nonce) and re-records the same unit/period
+    env.backend.timeout_after_write_paths.clear()
+    data2 = _run_rent_to_confirm(env)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data2, update_id=20, bot=env.bot)])
+    assert len(env.backend.incomes) == 1  # reused, not duplicated
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    assert env.bot.last_answer()["text"] == "✅ 已处理"
+
+
+def test_backend_timeout_pending_reconcile(make_app):
+    """Confirm times out with NO server-side effect (income still pending):
+    keep it pending, allow retry, never mislead the user."""
+    env = make_app()
+    data = _run_rent_to_confirm(env)
+    env.backend.timeout_without_effect_paths.add("/incomes/1/confirm")
+
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
+    assert env.backend.incomes[0]["status"] == "pending"
+    answer = env.bot.last_answer()["text"] or ""
+    assert "已登记待确认" in answer or "网络超时" in answer
+    assert "收租成功" not in "".join(env.bot.all_texts())
+
+    # retry is allowed, resumes the existing pending income, and completes
+    env.backend.timeout_without_effect_paths.clear()
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
+    assert len(env.backend.incomes) == 1  # no second income created
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.bot.last_answer()["text"] == "✅ 已入账"
+
+
+# --- F2: dual API keys (manager for writes, admin for reverse) ---
+
+def test_reverse_uses_admin_key_writes_use_manager_key(make_app):
+    """★ F2: create/confirm go through the manager key; reverse through admin."""
+    env = make_app(api_key="manager-key", admin_api_key="admin-key")
+
+    data = _run_rent_to_confirm(env, user_id=SECRETARY_ID, chat_id=SECRETARY_ID)
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, bot=env.bot)])
+    assert env.backend.incomes[0]["status"] == "pending"
+    assert env.backend.auth_for("POST", "/incomes") == "Bearer manager-key"
+
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, encode("cnf", "inc", "1", nonce=new_nonce(), ts=now_ts()), bot=env.bot)],
+    )
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.backend.auth_for("POST", "/incomes/1/confirm") == "Bearer manager-key"
+
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts()), update_id=30, bot=env.bot)],
+    )
+    assert env.backend.incomes[0]["status"] == "reversed"
+    assert env.backend.auth_for("POST", "/incomes/1/reverse") == "Bearer admin-key"
+
+
+def test_reverse_disabled_without_admin_key(make_app):
+    """★ F2: without PASSAY_ADMIN_API_KEY the reverse button is hidden and a
+    hand-crafted reverse callback is refused without touching the API."""
+    env = make_app(admin_api_key="")
+    env.backend.add_income(status="confirmed", income_id=1)
+    data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    assert env.backend.count_calls("POST", "/incomes/1/reverse") == 0
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert "未配置" in (env.bot.last_answer()["text"] or "")
+
+    # full OWNER flow renders a success card WITHOUT a reverse button
+    env2 = make_app(admin_api_key="")
+    data2 = _run_rent_to_confirm(env2)
+    run_updates(env2, [make_callback_update(OWNER_ID, OWNER_ID, data2, bot=env2.bot)])
+    kb = env2.bot.edits()[-1]["reply_markup"]
+    labels = [b.text for row in kb.inline_keyboard for b in row] if kb else []
+    assert "↩️ 冲销" not in labels
+
+
+# --- F3: crash after write -> restart -> same card retry, no duplicate ---
+
+def test_crash_after_write_restart_no_duplicate(make_app, tmp_path):
+    """★ F3: create lands, the process dies before settling, the bot restarts;
+    the same card retry reuses the landed pending income instead of creating
+    a second one."""
+    db = str(tmp_path / "restart_state.db")
+    env1 = make_app(state_db=db)
+    data = _run_rent_to_confirm(env1)
+    parsed = decode(data)
+    key = f"ik:cnf:ren:{parsed['nonce']}"
+
+    # simulate: create landed as pending, then the process died mid-write
+    env1.backend.add_income(
+        status="pending", income_id=1, lease_id=1, amount="55000.00",
+        received_date=date.today().isoformat(), payment_method="Bank",
+    )
+    env1.guard.acquire(key, kind="income", resource="")
+    env1.store._conn.execute(
+        "UPDATE idempotency_keys SET created_at=? WHERE key=?",
+        (str(int(time.time()) - 200), key),
+    )
+    env1.store._conn.commit()
+
+    # restart on the same state db + backend
+    env2 = make_app(backend=env1.backend, state_db=db)
+    run_updates(env2, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=30, bot=env2.bot)])
+    assert len(env2.backend.incomes) == 1
+    assert env2.backend.incomes[0]["status"] == "confirmed"
+    assert env2.backend.count_calls("POST", "/incomes") == 0  # never re-created
+    assert env2.bot.last_answer()["text"] == "✅ 已入账"
+
+
+# --- F4: read paths are permission-gated ---
+
+def test_unknown_user_read_refused(make_app):
+    """★ F4: unknown users cannot read /finance (command or nav callback)."""
+    env = make_app()
+    run_updates(env, [make_text_update(UNKNOWN_ID, UNKNOWN_ID, "/finance", bot=env.bot)])
+    assert env.backend.count_calls("GET", "/reports/financial-summary") == 0
+    assert "无权限" in "".join(env.bot.all_texts())
+
+    run_updates(
+        env,
+        [make_callback_update(UNKNOWN_ID, UNKNOWN_ID, encode("nav", "finance"), update_id=20, bot=env.bot)],
+    )
+    assert env.backend.count_calls("GET", "/reports/financial-summary") == 0
+    assert "无权限" in (env.bot.last_answer()["text"] or "")
+
+
+def test_owner_and_secretary_can_read(make_app):
+    """★ F4: OWNER and SECRETARY keep read access (zh for OWNER, en for SECRETARY)."""
+    for user_id, marker in ((OWNER_ID, "财务"), (SECRETARY_ID, "Finance")):
+        env = make_app()
+        run_updates(env, [make_text_update(user_id, user_id, "/finance", bot=env.bot)])
+        assert env.backend.count_calls("GET", "/reports/financial-summary") == 1
+        assert marker in "".join(env.bot.all_texts())
+
+
+# --- F5: OWNER confirms SECRETARY-recorded pending via /pending ---
+
+def test_owner_confirms_secretary_pending_via_pending_command(make_app):
+    """★ F5: SECRETARY records pending; OWNER confirms it from /pending."""
+    env = make_app()
+    data = _run_rent_to_confirm(env, user_id=SECRETARY_ID, chat_id=SECRETARY_ID)
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, bot=env.bot)])
+    assert env.backend.incomes[0]["status"] == "pending"
+
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
+    send = env.bot.last_send()
+    assert "待确认收入" in send["text"]
+    kb = send["reply_markup"]
+    assert kb is not None
+    btn = kb.inline_keyboard[0][0]
+    parsed = decode(btn.callback_data)
+    assert parsed["action"] == "cnf" and parsed["entity"] == "inc" and parsed["ref"] == "1"
+
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, btn.callback_data, update_id=30, bot=env.bot)],
+    )
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
+    assert env.bot.last_answer()["text"] == "✅ 已入账"
+
+
+def test_secretary_pending_list_has_no_confirm_buttons(make_app):
+    """★ F5: SECRETARY can view the pending list but gets no confirm buttons."""
+    env = make_app()
+    env.backend.add_income(status="pending", income_id=1)
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending", bot=env.bot)])
+    send = env.bot.last_send()
+    assert "Pending Income" in send["text"]  # SECRETARY locale is en
+    assert send["reply_markup"] is None
+
+
+# --- F6: group-chat ownership check happens before acquire ---
+
+def test_group_other_user_click_does_not_lock_card(make_app):
+    """★ F6: in a group, another member clicking your card must not burn the
+    idempotency key / lock your card."""
+    env = make_app()
+    GROUP = 424242
+    data = _run_rent_to_confirm(env, user_id=OWNER_ID, chat_id=GROUP)
+    nonce = decode(data)["nonce"]
+
+    # secretary (has RENT_ENTRY) clicks the OWNER's card first
+    run_updates(env, [make_callback_update(SECRETARY_ID, GROUP, data, update_id=20, bot=env.bot)])
+    assert env.store.get_idempotency(f"ik:cnf:ren:{nonce}") is None  # never acquired
+
+    # owner's own click still completes exactly one income
+    run_updates(env, [make_callback_update(OWNER_ID, GROUP, data, update_id=21, bot=env.bot)])
+    assert len(env.backend.incomes) == 1
+    assert env.backend.incomes[0]["status"] == "confirmed"
+
+
+# --- F7: reverse timeout still-confirmed toast ---
+
+def test_reverse_timeout_reconcile_still_confirmed_toast(make_app):
+    """★ F7: reverse times out with no effect (still confirmed) -> the toast
+    must say 'not reversed, retry', never 'already processed'."""
+    env = make_app()
+    env.backend.add_income(status="confirmed", income_id=1)
+    env.backend.timeout_without_effect_paths.add("/incomes/1/reverse")
+    data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
+    assert env.backend.incomes[0]["status"] == "confirmed"
+    answer = env.bot.last_answer()["text"] or ""
+    assert "未冲销" in answer
+    assert "已处理" not in answer

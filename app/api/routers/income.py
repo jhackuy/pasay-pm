@@ -133,7 +133,7 @@ def confirm_income(
         record_id=obj.id,
         action="confirm",
         actor_id=user.id,
-        old_value=serialize_row(obj),
+        old_value=old,
     )
     db.commit()
     db.refresh(obj)
@@ -158,7 +158,7 @@ def reverse_income(
         record_id=obj.id,
         action="reverse",
         actor_id=user.id,
-        old_value=serialize_row(obj),
+        old_value=old,
     )
     db.commit()
     db.refresh(obj)
