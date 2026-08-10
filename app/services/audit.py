@@ -20,8 +20,22 @@ def jsonable(value):
 
 
 def serialize_row(obj) -> dict:
-    """Snapshot a SQLAlchemy row as a plain dict."""
-    return {c.name: jsonable(getattr(obj, c.name)) for c in obj.__table__.columns}
+    """Snapshot a SQLAlchemy row as a plain dict.
+
+    Column names are used as dict keys; the mapped attribute name resolves
+    the value (handles columns whose attribute differs, e.g. the reserved
+    ``metadata`` column mapped to a ``details`` attribute).
+    """
+    mapper = obj.__mapper__
+    out = {}
+    for column in obj.__table__.columns:
+        key = column.name
+        try:
+            key = mapper.get_property_by_column(column).key
+        except Exception:  # noqa: BLE001 - fall back to the column name
+            pass
+        out[column.name] = jsonable(getattr(obj, key))
+    return out
 
 
 def field_changes(obj, updates: dict) -> dict:

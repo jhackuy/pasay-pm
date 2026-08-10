@@ -267,7 +267,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
 
         if overdue:
             oldest_due = overdue[0][1]
-            amount = _d2(lease.monthly_rent * len(overdue))
+            amount = _d2(Decimal(str(lease.monthly_rent)) * len(overdue))
             task, enqueued = _register_task(
                 db,
                 now=now,
@@ -500,5 +500,6 @@ def advance_next_run(rule, from_at: datetime) -> datetime:
     return datetime.combine(add_months(from_at.date(), months), from_at.time(), tzinfo=from_at.tzinfo)
 
 
-def _d2(value: Decimal) -> Decimal:
-    return Decimal(value).quantize(Decimal("0.01"))
+def _d2(value) -> Decimal:
+    """Normalize a Numeric (or string/Decimal) value to 2dp."""
+    return Decimal(str(value)).quantize(Decimal("0.01"))
