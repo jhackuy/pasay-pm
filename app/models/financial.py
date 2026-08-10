@@ -2,7 +2,7 @@ from datetime import date, datetime
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Numeric, String, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Index, Numeric, String, Text, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin, Base, pg_enum
@@ -16,11 +16,20 @@ class IncomeStatus(str, Enum):
 
 class Income(AuditMixin, Base):
     __tablename__ = "incomes"
+    __table_args__ = (
+        Index(
+            "uq_incomes_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
 
     lease_id: Mapped[int | None] = mapped_column(ForeignKey("leases.id"), nullable=True, index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     received_date: Mapped[date] = mapped_column(Date, nullable=False)
     payment_method: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[IncomeStatus] = mapped_column(
         pg_enum(IncomeStatus, "income_status"), nullable=False, default=IncomeStatus.pending
     )

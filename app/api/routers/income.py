@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy import func, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import admin_only, get_current_user, manager_or_admin
@@ -37,6 +39,7 @@ def list_incomes(db: Session = Depends(get_db), _: User = Depends(get_current_us
 @router.post("", response_model=IncomeRead, status_code=status.HTTP_201_CREATED)
 def create_income(
     payload: IncomeCreate,
+    response: Response,
     db: Session = Depends(get_db),
     user: User = Depends(manager_or_admin),
 ):
@@ -46,6 +49,16 @@ def create_income(
             "Income can only be created as pending or confirmed",
         )
     _check_lease(db, payload.lease_id)
+    if payload.idempotency_key:
+        existing = (
+            db.query(Income)
+            .filter(Income.idempotency_key == payload.idempotency_key)
+            .first()
+        )
+        if existing is not None:
+            # Idempotent replay: the create already landed -> return it.
+            response.status_code = status.HTTP_200_OK
+            return existing
     obj = Income(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -53,16 +66,31 @@ def create_income(
         obj.confirmed_by = user.id
         obj.confirmed_at = datetime.now(timezone.utc)
     db.add(obj)
-    db.flush()
-    record_audit(
-        db,
-        table_name="incomes",
-        record_id=obj.id,
-        action="create",
-        actor_id=user.id,
-        new_value=serialize_row(obj),
-    )
-    db.commit()
+    try:
+        db.flush()
+        record_audit(
+            db,
+            table_name="incomes",
+            record_id=obj.id,
+            action="create",
+            actor_id=user.id,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+    except IntegrityError:
+        # UNIQUE(idempotency_key) is the atomic backstop: a concurrent
+        # create with the same key won the race. Re-read and return it.
+        db.rollback()
+        if payload.idempotency_key:
+            existing = (
+                db.query(Income)
+                .filter(Income.idempotency_key == payload.idempotency_key)
+                .first()
+            )
+            if existing is not None:
+                response.status_code = status.HTTP_200_OK
+                return existing
+        raise
     db.refresh(obj)
     return obj
 
@@ -120,24 +148,40 @@ def confirm_income(
     user: User = Depends(manager_or_admin),
 ):
     obj = _get_or_404(db, income_id)
-    if obj.status != IncomeStatus.pending:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only pending income can be confirmed")
     old = serialize_row(obj)
-    obj.status = IncomeStatus.confirmed
-    obj.confirmed_by = user.id
-    obj.confirmed_at = datetime.now(timezone.utc)
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="incomes",
-        record_id=obj.id,
-        action="confirm",
-        actor_id=user.id,
-        old_value=old,
+    result = db.execute(
+        update(Income)
+        .where(Income.id == income_id, Income.status == IncomeStatus.pending)
+        .values(
+            status=IncomeStatus.confirmed,
+            confirmed_by=user.id,
+            confirmed_at=datetime.now(timezone.utc),
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="incomes",
+            record_id=obj.id,
+            action="confirm",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    # rowcount == 0 -> no transition happened. Replay (already confirmed)
+    # returns the current state; any other state is a genuine conflict.
+    db.rollback()
+    current = _get_or_404(db, income_id)
+    if current.status == IncomeStatus.confirmed:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only pending income can be confirmed")
 
 
 @router.post("/{income_id}/reverse", response_model=IncomeRead)
@@ -147,19 +191,33 @@ def reverse_income(
     user: User = Depends(admin_only),
 ):
     obj = _get_or_404(db, income_id)
-    if obj.status != IncomeStatus.confirmed:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only confirmed income can be reversed")
     old = serialize_row(obj)
-    obj.status = IncomeStatus.reversed
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="incomes",
-        record_id=obj.id,
-        action="reverse",
-        actor_id=user.id,
-        old_value=old,
+    result = db.execute(
+        update(Income)
+        .where(Income.id == income_id, Income.status == IncomeStatus.confirmed)
+        .values(
+            status=IncomeStatus.reversed,
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="incomes",
+            record_id=obj.id,
+            action="reverse",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    db.rollback()
+    current = _get_or_404(db, income_id)
+    if current.status == IncomeStatus.reversed:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only confirmed income can be reversed")

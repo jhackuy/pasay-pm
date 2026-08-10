@@ -12,6 +12,7 @@ class IncomeBase(BaseModel):
     amount: Decimal = money_field(gt=0)
     received_date: date
     payment_method: str | None = Field(default=None, max_length=50)
+    idempotency_key: str | None = Field(default=None, max_length=128)
     status: IncomeStatus
     description: str | None = None
 

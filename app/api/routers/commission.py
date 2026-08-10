@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import admin_only, get_current_user, manager_or_admin
@@ -221,20 +222,42 @@ def confirm_settlement(
     )
     if obj is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Commission settlement not found")
-    if obj.status != CommissionSettlementStatus.pending:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only pending settlements can be confirmed")
     old = serialize_row(obj)
-    obj.status = CommissionSettlementStatus.confirmed
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="commission_settlements",
-        record_id=obj.id,
-        action="confirm",
-        actor_id=user.id,
-        old_value=old,
-        new_value=serialize_row(obj),
+    result = db.execute(
+        update(CommissionSettlement)
+        .where(
+            CommissionSettlement.id == settlement_id,
+            CommissionSettlement.status == CommissionSettlementStatus.pending,
+        )
+        .values(
+            status=CommissionSettlementStatus.confirmed,
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="commission_settlements",
+            record_id=obj.id,
+            action="confirm",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    db.rollback()
+    current = (
+        db.query(CommissionSettlement)
+        .filter(CommissionSettlement.id == settlement_id)
+        .first()
+    )
+    if current is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Commission settlement not found")
+    if current.status == CommissionSettlementStatus.confirmed:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only pending settlements can be confirmed")

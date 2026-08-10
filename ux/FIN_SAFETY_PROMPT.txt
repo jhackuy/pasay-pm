@@ -1,0 +1,19 @@
+You are Codex Max, Principal Engineer + Financial-Safety Reviewer for the PASay property-management system V1.1 final financial-safety hardening.
+
+Read and follow the full task brief at ux/FIN_SAFETY_BRIEF.md and execute it COMPLETELY and AUTONOMOUSLY in order:
+
+Phase 1 — Audit: confirm every financial/state-changing write path (income create/confirm/reverse, expense approve/reject/pay/reverse, commission settlement create/confirm). Confirm the TOCTOU SELECT-then-check-then-UPDATE pattern and document which need DB-level protection.
+Phase 2 — Implement DB-level idempotency: add idempotency_key column + partial UNIQUE index on incomes for create-idempotency; convert all state transitions (confirm/reverse/approve/reject/pay/settlement-confirm) to atomic conditional UPDATE with rowcount check, writing audit in the same transaction, returning current state on idempotent replay instead of double-side-effect. Add an alembic migration with pre-apply duplicate detection SQL and a downgrade. Do NOT break the commission compute engine semantics — only make confirm idempotent.
+Phase 3 — Concurrency tests: create tests/test_financial_idempotency.py using the REAL PostgreSQL test DB (tests/conftest.py already builds pasay_pm_test). Cover sequential x10 and concurrent x10 for income create/confirm/reverse, expense approve/reject/pay, commission settlement confirm; timeout-after-commit replay (DB committed but response lost -> same key retry returns existing, no second row); stale-callback replay. Real ThreadPoolExecutor concurrency, no mocks. One explicit test asserts the system invariant: N identical commands (sequential or concurrent) == same final DB state as one.
+Phase 4 — Verify: run full backend pytest (baseline 102 must not shrink) plus the new concurrency tests green, run full bot suite (132 must hold). Run the migration against the test DB. Run any pre-apply duplicate-detection SQL read-only.
+Phase 5 — Review + report: write ux/FIN_SAFETY_REVIEW.md covering audit findings, each protected operation's mechanism (UNIQUE/conditional/tx), concurrency test result tables, production detection SQL result, migration version, rollback, and a definitive list of any REMAINING double-booking/double-reverse/double-pay paths.
+
+Constraints:
+- Work ONLY in the git working tree /Users/jhackuy/Documents/Codex/pasay-pm. Do NOT touch /opt. Do NOT commit to main — stay on feature/telegram-ui-v2 branch.
+- Always run python/pytest with env -u PYTHONPATH and .venv/bin/python.
+- Do NOT add new user-facing features, do NOT start cron, do NOT add bots.
+- Do not fabricate data or test results — run the suites and show real counts.
+- Check production data (read-only) for duplicate/migration-safety before applying constraints; do not let a UNIQUE constraint break production startup.
+- Keep amounts in PHP original currency, no conversion.
+
+When finished, print a final plain-text summary of the 14 reporting points the brief lists (idempotency reality; races found; races fixed; per-operation protection; sequential x10 result; concurrent x10 result; timeout-after-commit result; stale-callback result; bot tests count; backend tests count; second-review conclusion; production-deploy status; tag readiness; remaining known risks). End with the exact marker line: CODEX_MAX_FIN_DONE

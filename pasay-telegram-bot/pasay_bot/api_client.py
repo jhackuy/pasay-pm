@@ -423,6 +423,7 @@ class PasayApiClient:
         payment_method: str,
         description: str,
         status: str = "pending",
+        idempotency_key: Optional[str] = None,
     ) -> Income:
         payload = {
             "status": status,
@@ -432,6 +433,8 @@ class PasayApiClient:
             "payment_method": payment_method,
             "description": description,
         }
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
         data = await self._request("POST", "/incomes", json=payload)
         return Income.from_dict(data)
 

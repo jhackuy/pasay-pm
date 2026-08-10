@@ -32,7 +32,7 @@ def test_income_requires_status(client, admin_headers, lease_id):
     assert resp.status_code == 422
 
 
-def test_income_confirm_and_double_confirm_conflict(client, admin_headers, lease_id):
+def test_income_confirm_and_double_confirm_idempotent(client, admin_headers, lease_id):
     resp = client.post(f"{API}/incomes", json=_income(lease_id), headers=admin_headers)
     income_id = resp.json()["id"]
     assert resp.json()["status"] == "pending"
@@ -43,7 +43,10 @@ def test_income_confirm_and_double_confirm_conflict(client, admin_headers, lease
     assert resp.json()["confirmed_by"] is not None
 
     resp = client.post(f"{API}/incomes/{income_id}/confirm", headers=admin_headers)
-    assert resp.status_code == 409
+    # Financial-safety V1.1: an idempotent replay of confirm returns the
+    # current confirmed state instead of a conflict.
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "confirmed"
 
 
 def test_income_reverse_flow(client, admin_headers, lease_id):
@@ -56,7 +59,10 @@ def test_income_reverse_flow(client, admin_headers, lease_id):
     assert resp.json()["status"] == "reversed"
 
     resp = client.post(f"{API}/incomes/{income_id}/reverse", headers=admin_headers)
-    assert resp.status_code == 409
+    # Financial-safety V1.1: replay of reverse returns the current reversed
+    # state instead of a conflict.
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "reversed"
 
 
 def test_income_no_delete_endpoint(client, admin_headers, lease_id):

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import admin_only, get_current_user, manager_or_admin
@@ -135,29 +136,42 @@ def approve_expense(
     user: User = Depends(manager_or_admin),
 ):
     obj = _get_or_404(db, expense_id)
-    if obj.status != ExpenseStatus.pending:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be approved")
     if user.role == "manager" and obj.created_by == user.id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot approve an expense you created"
         )
     old = serialize_row(obj)
-    obj.status = ExpenseStatus.approved
-    obj.approved_by = user.id
-    obj.approved_at = datetime.now(timezone.utc)
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="expenses",
-        record_id=obj.id,
-        action="approve",
-        actor_id=user.id,
-        old_value=old,
-        new_value=serialize_row(obj),
+    result = db.execute(
+        update(Expense)
+        .where(Expense.id == expense_id, Expense.status == ExpenseStatus.pending)
+        .values(
+            status=ExpenseStatus.approved,
+            approved_by=user.id,
+            approved_at=datetime.now(timezone.utc),
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="expenses",
+            record_id=obj.id,
+            action="approve",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    db.rollback()
+    current = _get_or_404(db, expense_id)
+    if current.status == ExpenseStatus.approved:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be approved")
 
 
 @router.post("/{expense_id}/reject", response_model=ExpenseRead)
@@ -167,27 +181,40 @@ def reject_expense(
     user: User = Depends(admin_only),
 ):
     obj = _get_or_404(db, expense_id)
-    if obj.status != ExpenseStatus.pending:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be rejected")
     if obj.created_by == user.id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot reject an expense you created"
         )
     old = serialize_row(obj)
-    obj.status = ExpenseStatus.rejected
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="expenses",
-        record_id=obj.id,
-        action="reject",
-        actor_id=user.id,
-        old_value=old,
-        new_value=serialize_row(obj),
+    result = db.execute(
+        update(Expense)
+        .where(Expense.id == expense_id, Expense.status == ExpenseStatus.pending)
+        .values(
+            status=ExpenseStatus.rejected,
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="expenses",
+            record_id=obj.id,
+            action="reject",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    db.rollback()
+    current = _get_or_404(db, expense_id)
+    if current.status == ExpenseStatus.rejected:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be rejected")
 
 
 @router.post("/{expense_id}/pay", response_model=ExpenseRead)
@@ -197,23 +224,36 @@ def pay_expense(
     user: User = Depends(admin_only),
 ):
     obj = _get_or_404(db, expense_id)
-    if obj.status != ExpenseStatus.approved:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only approved expenses can be paid")
     old = serialize_row(obj)
-    obj.status = ExpenseStatus.paid
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="expenses",
-        record_id=obj.id,
-        action="pay",
-        actor_id=user.id,
-        old_value=old,
-        new_value=serialize_row(obj),
+    result = db.execute(
+        update(Expense)
+        .where(Expense.id == expense_id, Expense.status == ExpenseStatus.approved)
+        .values(
+            status=ExpenseStatus.paid,
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="expenses",
+            record_id=obj.id,
+            action="pay",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    db.rollback()
+    current = _get_or_404(db, expense_id)
+    if current.status == ExpenseStatus.paid:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only approved expenses can be paid")
 
 
 @router.post("/{expense_id}/reverse", response_model=ExpenseRead)
@@ -223,20 +263,33 @@ def reverse_expense(
     user: User = Depends(admin_only),
 ):
     obj = _get_or_404(db, expense_id)
-    if obj.status != ExpenseStatus.paid:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only paid expenses can be reversed")
     old = serialize_row(obj)
-    obj.status = ExpenseStatus.reversed
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="expenses",
-        record_id=obj.id,
-        action="reverse",
-        actor_id=user.id,
-        old_value=old,
-        new_value=serialize_row(obj),
+    result = db.execute(
+        update(Expense)
+        .where(Expense.id == expense_id, Expense.status == ExpenseStatus.paid)
+        .values(
+            status=ExpenseStatus.reversed,
+            updated_by=user.id,
+            updated_at=func.now(),
+        ),
+        execution_options={"synchronize_session": False},
     )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    if result.rowcount == 1:
+        db.refresh(obj)
+        record_audit(
+            db,
+            table_name="expenses",
+            record_id=obj.id,
+            action="reverse",
+            actor_id=user.id,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+    db.rollback()
+    current = _get_or_404(db, expense_id)
+    if current.status == ExpenseStatus.reversed:
+        return current
+    raise HTTPException(status.HTTP_409_CONFLICT, "Only paid expenses can be reversed")

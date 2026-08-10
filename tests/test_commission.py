@@ -108,7 +108,10 @@ def test_settlement_confirm_flow(client, admin_headers, agent, lease_id):
     resp = client.post(
         f"{API}/commission/settlements/{settlement_id}/confirm", headers=admin_headers
     )
-    assert resp.status_code == 409
+    # Financial-safety V1.1: replay of settlement confirm returns the current
+    # confirmed state instead of a conflict.
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "confirmed"
 
 
 def test_agent_sees_only_own_settlements(

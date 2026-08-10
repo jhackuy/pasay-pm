@@ -490,6 +490,10 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
             received_date=payload.get("received_date"),
             payment_method=payload.get("method"),
             description=f"rent {str(payload.get('received_date', ''))[:7]}",
+            # Backend-level idempotency (P0): the same guard key is sent so a
+            # timeout-after-commit retry or stale card replay reuses the row
+            # the backend already committed, instead of creating a second one.
+            idempotency_key=key,
         )
         income_id = income.id
         if can_confirm:
