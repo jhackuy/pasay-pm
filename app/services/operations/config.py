@@ -27,14 +27,19 @@ DEFAULT_FIXED_INTERVAL_MONTHS = 1
 NOTIFY_CHANNEL_TELEGRAM = "telegram"
 NOTIFY_MAX_ATTEMPTS = 5
 NOTIFY_BACKOFF_BASE_SECONDS = 30
+# Claim lease: a notifier claim (claimed_at) is only re-claimable after this
+# many seconds — a worker that crashes mid-send is retried after the lease
+# expires (at-least-once), while a live claim is never double-claimed.
+NOTIFY_CLAIM_LEASE_SECONDS = 300
 
 # Worker / scheduler batch sizes.
 SCHEDULER_RULE_BATCH = 20
 OUTBOX_CLAIM_BATCH = 10
 SNOOZE_REDELIVERY_BATCH = 20
 
-# Snooze redelivery outbox dedupe keys: ``snooze-redelivery:{task_id}:{window}``.
-# The window (the exact ``snoozed_until`` value) makes the key valid for one
-# snooze window only, so a re-snooze produces a fresh key and an old window can
-# never reuse a stale key.
+# Snooze redelivery outbox dedupe keys: ``snooze-redelivery:{task_id}:{generation}:{window}``.
+# The generation (bumped on every snooze / complete / cancel) plus the window
+# (the exact ``snoozed_until`` value) make the key valid for one logical
+# reminder only, so a re-snooze produces a fresh key and a DROPPED old
+# generation can never block a new generation for the same window.
 SNOOZE_REDELIVERY_KEY_PREFIX = "snooze-redelivery:"

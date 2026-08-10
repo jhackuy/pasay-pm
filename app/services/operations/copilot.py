@@ -13,6 +13,11 @@ NO LLM integration and NO action execution in this phase:
   financial entity (expense / income / settlement), and payloads may not carry
   SQL / execution / bypass keys. Phase C will be forced to route financial
   intents into the existing V1.1 state machine (no second financial write path).
+- The security boundary is ARCHITECTURAL, not lexical: the Copilot surface has
+  no raw DB access and no SQL execution — it only ever calls parameterized
+  backend services against a structured schema with enum allowlists. The SQL /
+  execution keyword denylist is defense-in-depth only (a cosmetic guard), never
+  the security boundary, and is NOT a substitute for the allowlist + schema.
 
 Context contract (stable for Phase C):
 - ``context_schema_version = "1.0"`` identifies the schema.
@@ -26,6 +31,8 @@ Context contract (stable for Phase C):
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -87,6 +94,9 @@ TARGET_TYPES = frozenset({"property", "lease", "task", "expense", "income", "set
 # Payload denylist: keys that could smuggle raw SQL / execution / a financial
 # mutation bypass into a proposal payload are rejected outright. Top-level
 # proposal fields are also blocked so the payload can never shadow them.
+# NOTE: this denylist is DEFENSE-IN-DEPTH ONLY — the real boundary is the
+# structured schema + enum allowlists + parameterized backend services (the
+# Copilot never reaches raw SQL). Do not treat this list as a security boundary.
 PAYLOAD_DENYLIST_KEYS = frozenset({
     "sql", "raw_sql", "query", "statement", "script", "execute", "exec",
     "financial_write", "bypass", "bypass_safety",
@@ -94,6 +104,37 @@ PAYLOAD_DENYLIST_KEYS = frozenset({
 })
 PAYLOAD_MAX_BYTES = 16 * 1024  # 16 KiB serialized-JSON cap
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
+
+# Canonical form for allowlist / idempotency comparisons at the API boundary:
+# Unicode NFC normalization + removal of invisible / zero-width control
+# characters, so ``"\u200bsummarize"`` and confusable variants can never
+# defeat the action_type / target_type allowlists or split an idempotency key.
+_INVISIBLE_CHARS = re.compile(
+    "[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]"
+)
+
+
+def canonicalize(value: str) -> str:
+    """NFC-normalize and strip invisible/zero-width characters."""
+    if not isinstance(value, str):
+        return value
+    return _INVISIBLE_CHARS.sub("", unicodedata.normalize("NFC", value))
+
+
+# Stable machine-readable error codes for confirm-time revalidation (V1.2.2
+# A+B.1). The router surfaces these as a structured 409 body with
+# ``{"message": ..., "error_code": ...}``. Codes are append-only.
+ERR_ACTOR_NOT_FOUND = "actor_not_found"
+ERR_ACTOR_INACTIVE = "actor_inactive"
+ERR_ACTOR_PERMISSION = "actor_permission"
+ERR_PROPOSAL_STATE = "proposal_state"
+ERR_PROPOSAL_EXPIRED = "proposal_expired"
+ERR_TARGET_TYPE_UNKNOWN = "target_type_unknown"
+ERR_TARGET_MISSING = "target_missing"
+ERR_TARGET_OUT_OF_SCOPE = "target_out_of_scope"
+ERR_ACTION_TARGET_ILLEGAL = "action_target_illegal"
+ERR_PAYLOAD_INVALID = "payload_invalid"
+ERR_BUSINESS_STALE = "business_stale"
 
 # Phase A+B: execution is disabled. Phase C flips this flag only with an
 # approved design; every execution path must pass through it.
@@ -159,6 +200,16 @@ class ProposalStateError(ValueError):
 class ProposalExpiredError(ProposalStateError):
     """The proposal expired; the EXPIRED transition has been applied and must
     be committed by the caller before the error surfaces."""
+
+
+class ProposalConfirmRejectedError(ProposalStateError):
+    """Confirm-time revalidation failed (fail closed): the proposal stays
+    PENDING and nothing executes. Carries a stable machine-readable
+    ``error_code`` for the API contract."""
+
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
 
 
 # ---------------------------------------------------------------------------
@@ -575,11 +626,19 @@ def create_proposal(
 ) -> tuple[CopilotActionProposal, bool]:
     """Create a PENDING proposal; returns (proposal, created).
 
-    ``uq_copilot_action_proposals_idempotency`` makes concurrent / duplicate
-    submissions idempotent: a second call with the same ``idempotency_key``
-    returns the existing proposal with ``created=False``.
+    Idempotency is actor-scoped (``uq_copilot_action_proposals_actor_idempotency``
+    = UNIQUE(actor_user_id, idempotency_key)): the same actor re-submitting the
+    same logical request returns the existing proposal with ``created=False``,
+    while two different actors using the same key are independent requests.
+
+    ``action_type`` / ``target_type`` / ``idempotency_key`` are canonicalized
+    (NFC + invisible-character removal) at this boundary before validation, so
+    confusable variants cannot bypass the allowlists or split a key.
     """
     now = now or datetime.now(timezone.utc)
+    action_type = canonicalize(action_type)
+    target_type = canonicalize(target_type)
+    idempotency_key = canonicalize(idempotency_key)
     _validate_proposal(
         db,
         action_type=action_type,
@@ -604,7 +663,7 @@ def create_proposal(
             created_by=actor.id,
             updated_by=actor.id,
         )
-        .on_conflict_do_nothing(index_elements=["idempotency_key"])
+        .on_conflict_do_nothing(index_elements=["actor_user_id", "idempotency_key"])
         .returning(CopilotActionProposal.id)
     )
     row = db.execute(stmt).first()
@@ -621,7 +680,10 @@ def create_proposal(
         return proposal, True
     proposal = (
         db.query(CopilotActionProposal)
-        .filter(CopilotActionProposal.idempotency_key == idempotency_key)
+        .filter(
+            CopilotActionProposal.actor_user_id == actor.id,
+            CopilotActionProposal.idempotency_key == idempotency_key,
+        )
         .one()
     )
     return proposal, False
@@ -649,19 +711,7 @@ def _validate_proposal(
         raise ProposalValidationError(
             f"action '{action_type}' may not target financial entity '{target_type}'"
         )
-    if not isinstance(payload, dict):
-        raise ProposalValidationError("payload must be a JSON object")
-    bad_keys = sorted(
-        k for k in payload
-        if k.lower() in PAYLOAD_DENYLIST_KEYS or k.lower().startswith(("sql", "raw_"))
-    )
-    if bad_keys:
-        raise ProposalValidationError(f"payload contains rejected keys: {bad_keys}")
-    size = len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
-    if size > PAYLOAD_MAX_BYTES:
-        raise ProposalValidationError(
-            f"payload exceeds the {PAYLOAD_MAX_BYTES}-byte cap"
-        )
+    _validate_payload(payload)
     if not idempotency_key or len(idempotency_key) > IDEMPOTENCY_KEY_MAX_LENGTH:
         raise ProposalValidationError("idempotency_key is required (max 128 chars)")
     if expires_at is not None and expires_at <= now:
@@ -669,6 +719,32 @@ def _validate_proposal(
     if _resolve_target(db, target_type, target_id) is None:
         raise ProposalValidationError(
             f"target {target_type}:{target_id} does not exist"
+        )
+
+
+def _validate_payload(payload) -> None:
+    """Payload schema rules shared by create AND confirm revalidation.
+
+    Keys are canonicalized (NFC + invisible-character removal) before the
+    denylist check so zero-width confusables cannot smuggle a rejected key.
+    """
+    if not isinstance(payload, dict):
+        raise ProposalValidationError("payload must be a JSON object")
+    bad_keys = sorted(
+        k
+        for k in payload
+        if isinstance(k, str)
+        and (
+            canonicalize(k).lower() in PAYLOAD_DENYLIST_KEYS
+            or canonicalize(k).lower().startswith(("sql", "raw_"))
+        )
+    )
+    if bad_keys:
+        raise ProposalValidationError(f"payload contains rejected keys: {bad_keys}")
+    size = len(json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8"))
+    if size > PAYLOAD_MAX_BYTES:
+        raise ProposalValidationError(
+            f"payload exceeds the {PAYLOAD_MAX_BYTES}-byte cap"
         )
 
 
@@ -698,17 +774,168 @@ def _resolve_target(db: Session, target_type: str, target_id: int):
     return None
 
 
+def _revalidate_proposal_for_confirm(
+    db: Session, *, actor: User, proposal: CopilotActionProposal
+) -> None:
+    """FAIL-CLOSED revalidation of a PENDING proposal at confirm time.
+
+    Runs inside the caller's single DB transaction against CURRENT state
+    (fresh DB reads, not the creation-time snapshot). On any failure it
+    records a ``copilot_proposal_confirm_rejected`` audit with a stable
+    ``error_code`` and raises ``ProposalConfirmRejectedError``; the proposal
+    stays PENDING and nothing executes.
+    """
+    def _reject(error_code: str, reason: str) -> None:
+        record_audit(
+            db,
+            table_name="copilot_action_proposals",
+            record_id=proposal.id,
+            action="copilot_proposal_confirm_rejected",
+            actor_id=actor.id,
+            changed_fields={"error_code": error_code, "reason": reason},
+        )
+        raise ProposalConfirmRejectedError(error_code, reason)
+
+    # 1) actor still exists and is active
+    actor_row = db.get(User, actor.id)
+    if actor_row is None:
+        _reject(ERR_ACTOR_NOT_FOUND, "actor user no longer exists")
+    if not actor_row.is_active:
+        _reject(ERR_ACTOR_INACTIVE, "actor user is deactivated")
+
+    # 2) actor still holds a confirming role and owns this proposal
+    if actor_row.role not in (UserRole.manager, UserRole.admin):
+        _reject(ERR_ACTOR_PERMISSION, "actor no longer has permission to confirm proposals")
+    if proposal.actor_user_id != actor_row.id:
+        _reject(ERR_ACTOR_PERMISSION, "actor does not own this proposal")
+
+    # 3) action x target allowlists (revalidated against CURRENT constants)
+    action_type = canonicalize(proposal.action_type)
+    target_type = canonicalize(proposal.target_type)
+    if action_type not in ACTION_SAFETY:
+        _reject(ERR_ACTION_TARGET_ILLEGAL, f"unknown action_type '{action_type}'")
+    if target_type not in TARGET_TYPES:
+        _reject(ERR_TARGET_TYPE_UNKNOWN, f"unknown target_type '{target_type}'")
+    if ACTION_SAFETY[action_type] != "READ" and target_type in FINANCIAL_TARGET_TYPES:
+        _reject(
+            ERR_ACTION_TARGET_ILLEGAL,
+            f"action '{action_type}' may not target financial entity '{target_type}'",
+        )
+
+    # 4) payload still schema-valid (same rules as create)
+    try:
+        _validate_payload(proposal.payload_json)
+    except ProposalValidationError as exc:
+        _reject(ERR_PAYLOAD_INVALID, str(exc))
+
+    # 5) target still exists (current existence, not the creation snapshot)
+    target = _resolve_target(db, target_type, proposal.target_id)
+    if target is None:
+        _reject(
+            ERR_TARGET_MISSING,
+            f"target {target_type}:{proposal.target_id} no longer exists",
+        )
+
+    # 6) target still inside the actor's operable scope
+    if not _target_in_actor_scope(actor_row, target_type, target):
+        _reject(
+            ERR_TARGET_OUT_OF_SCOPE,
+            f"target {target_type}:{proposal.target_id} is outside the actor's scope",
+        )
+
+    # 7) business state unchanged since creation (no stale action)
+    stale = _business_stale_reason(target_type, target)
+    if stale is not None:
+        _reject(ERR_BUSINESS_STALE, stale)
+
+
+def _target_in_actor_scope(actor: User, target_type: str, target) -> bool:
+    """Current operable scope of the actor over a resolved target.
+
+    Managers/admins have full operational scope. Agents (defense in depth —
+    the role check above already rejects them) may only operate on tasks
+    assigned to them and settlements they own.
+    """
+    if actor.role in (UserRole.manager, UserRole.admin):
+        return True
+    if target_type == "task":
+        return target.assigned_user_id == actor.id
+    if target_type == "settlement":
+        return target.agent_id == actor.id
+    return False
+
+
+def _business_stale_reason(target_type: str, target) -> str | None:
+    """Business-state staleness check: refuse to execute a proposal whose
+    underlying entity no longer warrants the action (e.g. an expense already
+    paid/reversed, a task already completed, a lease terminated)."""
+    if target_type == "task":
+        if target.status != OperationalTaskStatus.PENDING:
+            return f"task is no longer pending (status={target.status.value})"
+        return None
+    if target_type == "expense":
+        if target.status != ExpenseStatus.pending:
+            return f"expense is no longer pending (status={target.status.value})"
+        return None
+    if target_type == "income":
+        if target.status != IncomeStatus.pending:
+            return f"income is no longer pending (status={target.status.value})"
+        return None
+    if target_type == "settlement":
+        if target.status != CommissionSettlementStatus.pending:
+            return f"settlement is no longer pending (status={target.status.value})"
+        return None
+    if target_type == "lease":
+        if target.status != LeaseStatus.active or target.deleted_at is not None:
+            return f"lease is no longer active (status={target.status.value})"
+        return None
+    if target_type == "property":
+        if not target.is_active:
+            return "property is inactive"
+        return None
+    return None
+
+
+def assert_executed_invariant(proposal: CopilotActionProposal) -> None:
+    """Consistency contract for the future EXECUTED state (Phase C/D).
+
+    ``status=EXECUTED`` must imply ``executed_at IS NOT NULL`` and
+    ``confirmed_at`` set. Not enforced as a cross-column DB rule (a CHECK
+    cannot compare columns cheaply here); asserted at the service/helper
+    level so any future executor is forced through the invariant.
+    """
+    if proposal.status == CopilotActionStatus.EXECUTED:
+        if proposal.executed_at is None:
+            raise ProposalStateError("EXECUTED proposal must set executed_at")
+        if proposal.confirmed_at is None:
+            raise ProposalStateError("EXECUTED proposal must have confirmed_at set")
+
+
 def confirm_proposal(
     db: Session, *, actor: User, proposal_id: int, now: datetime | None = None
 ) -> CopilotActionProposal:
     """PENDING -> CONFIRMED (idempotent replay when already CONFIRMED).
 
-    Never sets ``executed_at`` and never transitions to EXECUTED (Phase C).
-    Expired proposals are atomically marked EXPIRED and rejected.
+    Fail-closed confirm: in ONE DB transaction the proposal row is locked
+    (``SELECT ... FOR UPDATE``) and EVERYTHING is revalidated against current
+    state — actor existence/activity/permission, proposal state + expiry,
+    target allowlist/existence/scope, action x target legality, payload
+    schema, and business staleness. Any failure records
+    ``copilot_proposal_confirm_rejected`` and raises
+    ``ProposalConfirmRejectedError`` (nothing executes, proposal stays
+    PENDING). Never sets ``executed_at`` and never transitions to EXECUTED
+    (Phase C).
     """
     _guard_execution_disabled()
     now = now or datetime.now(timezone.utc)
-    proposal = db.get(CopilotActionProposal, proposal_id)
+    # Row lock serializes concurrent confirms/cancels/expiry so the
+    # revalidation + transition are atomic w.r.t. other proposal transitions.
+    proposal = (
+        db.query(CopilotActionProposal)
+        .filter(CopilotActionProposal.id == proposal_id)
+        .with_for_update()
+        .first()
+    )
     if proposal is None:
         raise ProposalStateError("proposal not found")
     if proposal.status == CopilotActionStatus.CONFIRMED:
@@ -723,7 +950,19 @@ def confirm_proposal(
         )
     if proposal.expires_at is not None and proposal.expires_at <= now:
         _expire_one(db, proposal, now=now)
+        record_audit(
+            db,
+            table_name="copilot_action_proposals",
+            record_id=proposal.id,
+            action="copilot_proposal_confirm_rejected",
+            actor_id=actor.id,
+            changed_fields={
+                "error_code": ERR_PROPOSAL_EXPIRED,
+                "reason": "proposal has expired",
+            },
+        )
         raise ProposalExpiredError("proposal has expired")
+    _revalidate_proposal_for_confirm(db, actor=actor, proposal=proposal)
 
     old = serialize_row(proposal)
     result = db.execute(

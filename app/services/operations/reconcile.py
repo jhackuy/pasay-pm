@@ -22,6 +22,7 @@ from app.models.operations import (
     OperationalTaskType,
 )
 from app.services.audit import record_audit, serialize_row
+from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.rent_math import covered_periods, lease_periods
 
 
@@ -32,6 +33,10 @@ def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskSt
     values = {"status": to, "updated_at": now}
     if to == OperationalTaskStatus.COMPLETED:
         values["completed_at"] = now
+    # Bump the reminder generation so any in-flight / enqueued snooze reminder
+    # for this task is invalidated at the notifier's claim-time validation.
+    values["reminder_generation"] = OperationalTask.reminder_generation + 1
+    old_row = serialize_row(task)
     result = db.execute(
         update(OperationalTask)
         .where(
@@ -44,6 +49,7 @@ def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskSt
     if result.rowcount != 1:
         return False
     task.status = to
+    task.reminder_generation += 1
     if to == OperationalTaskStatus.COMPLETED:
         task.completed_at = now
     record_audit(
@@ -55,10 +61,16 @@ def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskSt
             else "task_auto_cancelled"
         ),
         actor_id=None,
-        changed_fields={"status": ["PENDING", to.value], "reason": reason},
-        old_value=serialize_row(task),
+        changed_fields={
+            "status": ["PENDING", to.value],
+            "reason": reason,
+            "reminder_generation": [old_row.get("reminder_generation", 0), task.reminder_generation],
+        },
+        old_value=old_row,
         new_value=serialize_row(task),
     )
+    # Drop any already-enqueued-but-unsent snooze reminders for this task.
+    suppress_pending_redeliveries(db, task.id, actor_id=None, reason=reason, now=now)
     return True
 
 

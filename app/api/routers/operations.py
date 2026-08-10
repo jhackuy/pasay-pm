@@ -170,6 +170,7 @@ def complete_task(
             status=OperationalTaskStatus.COMPLETED,
             completed_at=now,
             completed_by=user.id,
+            reminder_generation=OperationalTask.reminder_generation + 1,
             updated_by=user.id,
             updated_at=now,
         ),
@@ -183,7 +184,10 @@ def complete_task(
             record_id=task.id,
             action="task_completed",
             actor_id=user.id,
-            changed_fields={"status": ["PENDING", "COMPLETED"]},
+            changed_fields={
+                "status": ["PENDING", "COMPLETED"],
+                "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
+            },
             old_value=old,
             new_value=serialize_row(task),
         )
@@ -217,6 +221,7 @@ def snooze_task(
         .where(OperationalTask.id == task_id, OperationalTask.status == OperationalTaskStatus.PENDING)
         .values(
             snoozed_until=until,
+            reminder_generation=OperationalTask.reminder_generation + 1,
             updated_by=user.id,
             updated_at=now,
         ),
@@ -230,7 +235,10 @@ def snooze_task(
             record_id=task.id,
             action="task_snoozed",
             actor_id=user.id,
-            changed_fields={"snoozed_until": [None, until.isoformat()]},
+            changed_fields={
+                "snoozed_until": [None, until.isoformat()],
+                "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
+            },
             old_value=old,
             new_value=serialize_row(task),
         )
@@ -264,6 +272,7 @@ def cancel_task(
         .where(OperationalTask.id == task_id, OperationalTask.status == OperationalTaskStatus.PENDING)
         .values(
             status=OperationalTaskStatus.CANCELLED,
+            reminder_generation=OperationalTask.reminder_generation + 1,
             updated_by=user.id,
             updated_at=now,
         ),
@@ -277,7 +286,10 @@ def cancel_task(
             record_id=task.id,
             action="task_cancelled",
             actor_id=user.id,
-            changed_fields={"status": ["PENDING", "CANCELLED"]},
+            changed_fields={
+                "status": ["PENDING", "CANCELLED"],
+                "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
+            },
             old_value=old,
             new_value=serialize_row(task),
         )
@@ -480,9 +492,13 @@ def create_copilot_proposal(
 ):
     """Create a PENDING action proposal.
 
-    Idempotent on ``idempotency_key`` (DB unique index): a duplicate submission
-    returns the existing proposal with HTTP 200 instead of creating a second
-    row. Nothing is executed — proposals only record intent for Phase C.
+    Idempotency is actor-scoped (``UNIQUE(actor_user_id, idempotency_key)``):
+    a duplicate submission by the SAME actor returns the existing proposal with
+    HTTP 200 instead of creating a second row; a different actor using the same
+    key is an independent request. ``action_type`` / ``target_type`` /
+    ``idempotency_key`` are canonicalized (NFC + invisible-character removal)
+    at this boundary. Nothing is executed — proposals only record intent for
+    Phase C.
     """
     try:
         proposal, created = copilot_svc.create_proposal(
@@ -522,9 +538,15 @@ def confirm_copilot_proposal(
 ):
     """Confirm a PENDING proposal (PENDING -> CONFIRMED).
 
-    Idempotent replay when already CONFIRMED; expired proposals are atomically
-    marked EXPIRED and rejected. Phase A+B never transitions to EXECUTED and
-    never sets ``executed_at``.
+    Fail-closed: in one DB transaction the proposal row is locked and
+    EVERYTHING is revalidated against current state (actor existence/activity/
+    permission, proposal state + expiry, target allowlist/existence/scope,
+    action x target legality, payload schema, business staleness). Failures
+    return a structured 409 ``{"message", "error_code"}``, write a
+    ``copilot_proposal_confirm_rejected`` audit, and execute nothing. Idempotent
+    replay when already CONFIRMED; expired proposals are atomically marked
+    EXPIRED and rejected. Phase A+B never transitions to EXECUTED and never
+    sets ``executed_at``.
     """
     before = db.get(CopilotActionProposal, proposal_id)
     before_status = (
@@ -535,6 +557,12 @@ def confirm_copilot_proposal(
     except copilot_svc.ProposalExpiredError as exc:
         db.commit()  # persist the EXPIRED transition before rejecting
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except copilot_svc.ProposalConfirmRejectedError as exc:
+        db.commit()  # persist the copilot_proposal_confirm_rejected audit
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "error_code": exc.error_code},
+        ) from exc
     except copilot_svc.ProposalStateError as exc:
         raise _proposal_state_error(exc) from exc
     db.commit()

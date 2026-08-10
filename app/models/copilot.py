@@ -71,9 +71,11 @@ class CopilotActionProposal(AuditMixin, Base):
 
     __tablename__ = "copilot_action_proposals"
     __table_args__ = (
-        # DB-level dedupe: duplicate/overlapping submissions can only land once.
+        # DB-level dedupe, scoped per actor: the same idempotency key used by
+        # two different actors is two independent requests (V1.2.2 A+B.1).
         Index(
-            "uq_copilot_action_proposals_idempotency",
+            "uq_copilot_action_proposals_actor_idempotency",
+            "actor_user_id",
             "idempotency_key",
             unique=True,
         ),

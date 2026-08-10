@@ -37,6 +37,7 @@ class AuditAction(str, Enum):
     copilot_proposal_confirmed = "copilot_proposal_confirmed"
     copilot_proposal_cancelled = "copilot_proposal_cancelled"
     copilot_proposal_expired = "copilot_proposal_expired"
+    copilot_proposal_confirm_rejected = "copilot_proposal_confirm_rejected"
 
 
 class AuditLog(AuditMixin, Base):

@@ -117,6 +117,12 @@ class OperationalTask(AuditMixin, Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     remind_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     snoozed_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # V1.2.2 A+B.1: bumped on every snooze / complete / cancel so the snooze
+    # redelivery logical identity is (task, generation, window) — a DROPPED
+    # old-generation reminder can never block a new-generation enqueue.
+    reminder_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -211,6 +217,9 @@ class NotificationOutbox(AuditMixin, Base):
     )
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # V1.2.2 A+B.1: durable claim marker for the notifier's two-phase
+    # claim -> send -> finalize flow (reclaimed after the lease expires).
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Optional Telegram message id returned by sendMessage; lets the bot edit
     # the same message later (editMessageText) instead of spamming new ones.

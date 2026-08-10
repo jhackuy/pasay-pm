@@ -52,11 +52,19 @@ def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
 
 
-def snooze_redelivery_dedupe_key(task_id: int, snoozed_until: datetime) -> str:
-    """One dedupe key per task per snooze window (ISO-8601, normalized to UTC
-    so the key is identical no matter which session timezone writes it)."""
+def snooze_redelivery_dedupe_key(
+    task_id: int, snoozed_until: datetime, generation: int = 0
+) -> str:
+    """One dedupe key per task per (reminder generation, snooze window).
+
+    The window is ISO-8601 normalized to UTC so the key is identical no matter
+    which session timezone writes it. The generation (bumped on every snooze /
+    complete / cancel) makes the logical identity ``(task, generation, window)``
+    — so a DROPPED old-generation row for a window can never block a NEW
+    generation enqueued for the same window.
+    """
     return (
-        f"{SNOOZE_REDELIVERY_KEY_PREFIX}{task_id}:"
+        f"{SNOOZE_REDELIVERY_KEY_PREFIX}{task_id}:{generation}:"
         f"{snoozed_until.astimezone(timezone.utc).isoformat()}"
     )
 
@@ -117,7 +125,8 @@ def redeliver_due_snoozes(
             # still consumed so the task re-enters the normal board.
             _audit_redelivery(db, task, window, now, enqueued=False, before=before)
             continue
-        dedupe_key = snooze_redelivery_dedupe_key(task.id, window)
+        generation = task.reminder_generation
+        dedupe_key = snooze_redelivery_dedupe_key(task.id, window, generation=generation)
         enqueued = enqueue_notification(
             db,
             task_id=task.id,
@@ -129,6 +138,7 @@ def redeliver_due_snoozes(
                 "title": task.title,
                 "due_at": task.due_at.isoformat(),
                 "snooze_window": _utc_iso(window),
+                "reminder_generation": generation,
                 "message": f"🔔 待办提醒（继续）\n#{task.id} · {task.task_type.value}\n{task.title}",
             },
             dedupe_key=dedupe_key,
