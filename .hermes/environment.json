@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "recipe": {
+    "name": "PASay-PM backend (project venv)",
+    "kind": "fastapi",
+    "bootstrap": [],
+    "build": [],
+    "test": [
+      ".venv/bin/python -m pytest tests/ -q"
+    ],
+    "start": ".venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000",
+    "port": 8000,
+    "readinessPath": "/health",
+    "evidence": [
+      "Project `.venv` interpreter (project deps incl. FastAPI/SQLAlchemy/psycopg2)",
+      "Backend full suite via .venv/bin/python -m pytest tests/",
+      "Recipe overridden to use the repo venv (hermes verify's global venv lacks `app`)"
+    ]
+  },
+  "updatedAt": "2026-08-10T15:05:00.000000+00:00"
+}
