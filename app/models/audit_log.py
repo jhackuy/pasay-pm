@@ -29,6 +29,14 @@ class AuditAction(str, Enum):
     task_auto_completed = "task_auto_completed"
     task_auto_cancelled = "task_auto_cancelled"
     task_backfilled = "task_backfilled"
+    # V1.2.2 OPS COPILOT values (appended only).
+    task_reminder_redelivered = "task_reminder_redelivered"
+    outbox_dropped = "outbox_dropped"
+    copilot_context_built = "copilot_context_built"
+    copilot_proposal_created = "copilot_proposal_created"
+    copilot_proposal_confirmed = "copilot_proposal_confirmed"
+    copilot_proposal_cancelled = "copilot_proposal_cancelled"
+    copilot_proposal_expired = "copilot_proposal_expired"
 
 
 class AuditLog(AuditMixin, Base):

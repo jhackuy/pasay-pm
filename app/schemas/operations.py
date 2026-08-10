@@ -101,3 +101,4 @@ class SchedulerRunResult(BaseModel):
     rules_advanced: int
     reconciled_completed: int
     reconciled_cancelled: int
+    snooze_redelivered: int = 0

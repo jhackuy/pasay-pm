@@ -31,3 +31,10 @@ NOTIFY_BACKOFF_BASE_SECONDS = 30
 # Worker / scheduler batch sizes.
 SCHEDULER_RULE_BATCH = 20
 OUTBOX_CLAIM_BATCH = 10
+SNOOZE_REDELIVERY_BATCH = 20
+
+# Snooze redelivery outbox dedupe keys: ``snooze-redelivery:{task_id}:{window}``.
+# The window (the exact ``snoozed_until`` value) makes the key valid for one
+# snooze window only, so a re-snooze produces a fresh key and an old window can
+# never reuse a stale key.
+SNOOZE_REDELIVERY_KEY_PREFIX = "snooze-redelivery:"

@@ -21,6 +21,7 @@ from app.schemas.operations import SchedulerRunResult
 from app.services.operations.config import SCHEDULER_RULE_BATCH
 from app.services.operations.generation import generate_business_tasks, generate_rule_task
 from app.services.operations.reconcile import reconcile_tasks
+from app.services.operations.redelivery import redeliver_due_snoozes
 
 
 def claim_due_rules(db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_BATCH) -> list[RecurringRule]:
@@ -42,7 +43,13 @@ def claim_due_rules(db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_B
 
 
 def run_scheduler_once(db: Session, *, now: datetime | None = None) -> SchedulerRunResult:
-    """Run one full scheduler pass and commit. Returns a result summary."""
+    """Run one full scheduler pass and commit. Returns a result summary.
+
+    Order matters for snooze safety: reconcile settles stale PENDING tasks
+    BEFORE the snooze redelivery scan, so a task that reconcile completed or
+    cancelled in the same pass is never redelivered (the scan only selects
+    tasks still PENDING after reconciliation).
+    """
     now = now or datetime.now(timezone.utc)
     rules = claim_due_rules(db, now=now)
     tasks_created = 0
@@ -58,6 +65,8 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
 
     auto_completed, auto_cancelled = reconcile_tasks(db, now=now)
 
+    snooze_redelivered = redeliver_due_snoozes(db, now=now)
+
     db.commit()
     return SchedulerRunResult(
         tasks_created=tasks_created,
@@ -66,4 +75,5 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
         rules_advanced=len(rules),
         reconciled_completed=auto_completed,
         reconciled_cancelled=auto_cancelled,
+        snooze_redelivered=snooze_redelivered,
     )

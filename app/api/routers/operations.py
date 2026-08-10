@@ -10,14 +10,15 @@ V1.1 financial state machine is the only writer for those tables.
 """
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, manager_or_admin
 from app.database import get_db
+from app.models.copilot import CopilotActionProposal, CopilotActionStatus
 from app.models.operations import (
     OperationalTask,
     OperationalTaskStatus,
@@ -35,7 +36,10 @@ from app.schemas.operations import (
     TaskActionOut,
     TaskSnoozeIn,
 )
+from app.schemas.copilot import CopilotProposalActionOut, CopilotProposalCreate, CopilotProposalRead
 from app.services.audit import record_audit, serialize_row
+from app.services.operations import copilot as copilot_svc
+from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
 
 router = APIRouter(prefix="/operations", tags=["operations"])
@@ -183,6 +187,9 @@ def complete_task(
             old_value=old,
             new_value=serialize_row(task),
         )
+        suppress_pending_redeliveries(
+            db, task_id, actor_id=user.id, reason="task_completed", now=now
+        )
         db.commit()
         db.refresh(task)
         return TaskActionOut(task=task, detail="Task completed")
@@ -226,6 +233,9 @@ def snooze_task(
             changed_fields={"snoozed_until": [None, until.isoformat()]},
             old_value=old,
             new_value=serialize_row(task),
+        )
+        suppress_pending_redeliveries(
+            db, task_id, actor_id=user.id, reason="task_snoozed", now=now
         )
         db.commit()
         db.refresh(task)
@@ -271,6 +281,9 @@ def cancel_task(
             old_value=old,
             new_value=serialize_row(task),
         )
+        suppress_pending_redeliveries(
+            db, task_id, actor_id=user.id, reason="task_cancelled", now=now
+        )
         db.commit()
         db.refresh(task)
         return TaskActionOut(task=task, detail="Task cancelled")
@@ -286,30 +299,10 @@ def operations_summary(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    query = _agent_scope(db.query(OperationalTask), user).filter(
-        OperationalTask.status == OperationalTaskStatus.PENDING
-    )
-    tasks = query.all()
-    now = datetime.now(timezone.utc)
-    start_of_today = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
-    end_of_today = start_of_today + timedelta(days=1)
-    end_of_7_days = start_of_today + timedelta(days=7)
-    overdue = due_today = due_7_days = 0
-    for task in tasks:
-        if task.snoozed_until is not None and task.snoozed_until > now:
-            continue  # deferred by snooze
-        if task.due_at < start_of_today:
-            overdue += 1
-        elif task.due_at < end_of_today:
-            due_today += 1
-        if start_of_today <= task.due_at < end_of_7_days:
-            due_7_days += 1
-    return OperationsSummary(
-        overdue=overdue,
-        due_today=due_today,
-        due_7_days=due_7_days,
-        pending_total=len(tasks),
-    )
+    """Operational counts for the current user (agents scoped to their own)."""
+    from app.services.operations.summary import build_operations_summary
+
+    return build_operations_summary(db, user)
 
 
 # ---------------------------------------------------------------------------
@@ -444,3 +437,148 @@ def trigger_scheduler(
 
     validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
     return run_scheduler_once(db)
+
+
+# ---------------------------------------------------------------------------
+# copilot context + action proposals (V1.2.2 Phase B — NO execution)
+# ---------------------------------------------------------------------------
+
+@router.get("/copilot/context")
+def copilot_context(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Deterministic, RBAC-scoped Copilot context.
+
+    Admin/manager see the full operational picture; agents see only their own
+    tasks and the entities reachable through them. Read-only: the only write is
+    the ``copilot_runs`` audit row for this build. No LLM is involved and
+    nothing executes any action in Phase A+B.
+    """
+    context = copilot_svc.build_copilot_context(db, user)
+    copilot_svc.log_context_run(db, actor=user, context=context)
+    db.commit()
+    return context
+
+
+def _proposal_state_error(exc: Exception) -> HTTPException:
+    if "not found" in str(exc):
+        return HTTPException(status.HTTP_404_NOT_FOUND, "Copilot proposal not found")
+    return HTTPException(status.HTTP_409_CONFLICT, str(exc))
+
+
+@router.post(
+    "/copilot/proposals",
+    response_model=CopilotProposalActionOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_copilot_proposal(
+    payload: CopilotProposalCreate,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Create a PENDING action proposal.
+
+    Idempotent on ``idempotency_key`` (DB unique index): a duplicate submission
+    returns the existing proposal with HTTP 200 instead of creating a second
+    row. Nothing is executed — proposals only record intent for Phase C.
+    """
+    try:
+        proposal, created = copilot_svc.create_proposal(
+            db,
+            actor=user,
+            action_type=payload.action_type,
+            target_type=payload.target_type,
+            target_id=payload.target_id,
+            payload=payload.payload,
+            idempotency_key=payload.idempotency_key,
+            expires_at=payload.expires_at,
+        )
+    except copilot_svc.ProposalValidationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    db.commit()
+    db.refresh(proposal)
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return CopilotProposalActionOut(
+        proposal=CopilotProposalRead.model_validate(proposal),
+        detail=(
+            "Proposal already exists (idempotent replay)"
+            if not created
+            else "Proposal created"
+        ),
+    )
+
+
+@router.post(
+    "/copilot/proposals/{proposal_id}/confirm",
+    response_model=CopilotProposalActionOut,
+)
+def confirm_copilot_proposal(
+    proposal_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Confirm a PENDING proposal (PENDING -> CONFIRMED).
+
+    Idempotent replay when already CONFIRMED; expired proposals are atomically
+    marked EXPIRED and rejected. Phase A+B never transitions to EXECUTED and
+    never sets ``executed_at``.
+    """
+    before = db.get(CopilotActionProposal, proposal_id)
+    before_status = (
+        before.status if before is not None else None
+    )  # snapshot value BEFORE the service mutates the same ORM instance
+    try:
+        proposal = copilot_svc.confirm_proposal(db, actor=user, proposal_id=proposal_id)
+    except copilot_svc.ProposalExpiredError as exc:
+        db.commit()  # persist the EXPIRED transition before rejecting
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except copilot_svc.ProposalStateError as exc:
+        raise _proposal_state_error(exc) from exc
+    db.commit()
+    db.refresh(proposal)
+    was_replay = before_status == CopilotActionStatus.CONFIRMED
+    return CopilotProposalActionOut(
+        proposal=CopilotProposalRead.model_validate(proposal),
+        detail=(
+            "Proposal already confirmed (idempotent replay)"
+            if was_replay
+            else "Proposal confirmed"
+        ),
+    )
+
+
+@router.post(
+    "/copilot/proposals/{proposal_id}/cancel",
+    response_model=CopilotProposalActionOut,
+)
+def cancel_copilot_proposal(
+    proposal_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Cancel a PENDING proposal (PENDING -> CANCELLED, idempotent replay)."""
+    before = db.get(CopilotActionProposal, proposal_id)
+    before_status = (
+        before.status if before is not None else None
+    )  # snapshot value BEFORE the service mutates the same ORM instance
+    try:
+        proposal = copilot_svc.cancel_proposal(db, actor=user, proposal_id=proposal_id)
+    except copilot_svc.ProposalExpiredError as exc:
+        db.commit()  # persist the EXPIRED transition before rejecting
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except copilot_svc.ProposalStateError as exc:
+        raise _proposal_state_error(exc) from exc
+    db.commit()
+    db.refresh(proposal)
+    was_replay = before_status == CopilotActionStatus.CANCELLED
+    return CopilotProposalActionOut(
+        proposal=CopilotProposalRead.model_validate(proposal),
+        detail=(
+            "Proposal already cancelled (idempotent replay)"
+            if was_replay
+            else "Proposal cancelled"
+        ),
+    )

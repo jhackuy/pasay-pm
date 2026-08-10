@@ -18,11 +18,13 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models.operations import NotificationOutbox, NotificationStatus
+from app.services.audit import record_audit, serialize_row
 from app.services.operations.config import (
     NOTIFY_BACKOFF_BASE_SECONDS,
     NOTIFY_MAX_ATTEMPTS,
     OUTBOX_CLAIM_BATCH,
 )
+from app.services.operations.redelivery import is_snooze_redelivery_key
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +107,38 @@ def process_notifications_once(
     backoff_base: int = NOTIFY_BACKOFF_BASE_SECONDS,
     batch: int = OUTBOX_CLAIM_BATCH,
 ) -> dict:
-    """One notifier pass over a claimed batch. Commits the outcome."""
+    """One notifier pass over a claimed batch. Commits the outcome.
+
+    Snooze-redelivery rows get a send-time safety guard: before sending, the
+    task must still be PENDING and not re-snoozed into the future. If the task
+    was completed / cancelled / reconciled, or re-snoozed past ``now``, the row
+    is DROPPED instead of delivered (defense-in-depth behind the scheduler's
+    claim and the API's eager suppression). All other rows use the existing
+    path unchanged.
+    """
     now = now or datetime.now(timezone.utc)
     items = claim_pending_notifications(db, now=now, batch=batch)
     result = {"claimed": len(items), "sent": 0, "retried": 0, "failed": 0}
     for item in items:
+        if is_snooze_redelivery_key(item.dedupe_key) and not _redelivery_still_valid(db, item, now):
+            old = serialize_row(item)
+            item.status = NotificationStatus.DROPPED
+            item.updated_at = now
+            record_audit(
+                db,
+                table_name="notification_outbox",
+                record_id=item.id,
+                action="outbox_dropped",
+                actor_id=None,  # system / notifier guard
+                changed_fields={
+                    "status": ["PENDING", "DROPPED"],
+                    "reason": "task no longer warrants the snoozed reminder",
+                },
+                old_value=old,
+                new_value=serialize_row(item),
+            )
+            db.add(item)
+            continue
         text = _message_text(item)
         try:
             message_id = sender.send(item.recipient, text)
@@ -138,3 +167,16 @@ def process_notifications_once(
         db.add(item)
     db.commit()
     return result
+
+
+def _redelivery_still_valid(db: Session, item: NotificationOutbox, now: datetime) -> bool:
+    """Send-time guard: only deliver a snooze reminder while the task still
+    warrants it (PENDING and not deferred into the future again)."""
+    from app.models.operations import OperationalTask, OperationalTaskStatus
+
+    task = db.get(OperationalTask, item.task_id) if item.task_id is not None else None
+    if task is None or task.status != OperationalTaskStatus.PENDING:
+        return False
+    if task.snoozed_until is not None and task.snoozed_until > now:
+        return False
+    return True

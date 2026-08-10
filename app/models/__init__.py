@@ -8,6 +8,12 @@ from app.models.commission import (
     CommissionSettlement,
     CommissionSettlementStatus,
 )
+from app.models.copilot import (
+    CopilotActionProposal,
+    CopilotActionStatus,
+    CopilotRun,
+    CopilotRunStatus,
+)
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
 from app.models.operations import (
@@ -36,6 +42,10 @@ __all__ = [
     "CommissionRuleType",
     "CommissionSettlement",
     "CommissionSettlementStatus",
+    "CopilotActionProposal",
+    "CopilotActionStatus",
+    "CopilotRun",
+    "CopilotRunStatus",
     "Expense",
     "ExpenseStatus",
     "Income",
