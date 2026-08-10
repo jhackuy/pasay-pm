@@ -132,12 +132,12 @@ def update_expense(
 def approve_expense(
     expense_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(manager_or_admin),
 ):
     obj = _get_or_404(db, expense_id)
     if obj.status != ExpenseStatus.pending:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be approved")
-    if obj.created_by == user.id:
+    if user.role == "manager" and obj.created_by == user.id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot approve an expense you created"
         )

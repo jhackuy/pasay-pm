@@ -103,16 +103,18 @@ def test_expense_approve_pay_reverse_flow(client, admin_headers, manager_headers
     assert resp.json()["status"] == "reversed"
 
 
-def test_expense_approve_by_creator_forbidden(client, admin_headers, manager_headers):
-    # admin creates an expense, then tries to approve their own -> forbidden
+def test_expense_admin_can_approve_own_created(client, admin_headers, manager_headers):
+    # admin creates an expense, then approves their own -> allowed
     resp = client.post(f"{API}/expenses", json=_expense(), headers=admin_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/approve", headers=admin_headers)
-    assert resp.status_code == 403
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "approved"
+    assert resp.json()["approved_by"] is not None
 
 
-def test_expense_manager_cannot_approve(client, admin_headers, manager_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=admin_headers)
+def test_expense_manager_cannot_approve_own_created(client, admin_headers, manager_headers):
+    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/approve", headers=manager_headers)
     assert resp.status_code == 403
