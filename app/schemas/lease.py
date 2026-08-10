@@ -12,6 +12,7 @@ class LeaseBase(BaseModel):
     tenant_id: int
     start_date: date
     end_date: date
+    accounting_start_date: date | None = None
     monthly_rent: Decimal = money_field(gt=0)
     deposit: Decimal = money_field(ge=0, default=Decimal("0.00"))
     status: LeaseStatus = LeaseStatus.active
@@ -22,6 +23,11 @@ class LeaseBase(BaseModel):
     def check_dates(self):
         if self.end_date < self.start_date:
             raise ValueError("end_date must be on or after start_date")
+        if self.accounting_start_date is not None:
+            if self.accounting_start_date < self.start_date:
+                raise ValueError("accounting_start_date must not be before start_date")
+            if self.accounting_start_date > self.end_date:
+                raise ValueError("accounting_start_date must not be after end_date")
         return self
 
 
@@ -34,11 +40,21 @@ class LeaseUpdate(BaseModel):
     tenant_id: int | None = None
     start_date: date | None = None
     end_date: date | None = None
+    accounting_start_date: date | None = None
     monthly_rent: Decimal | None = money_field(gt=0, default=None)
     deposit: Decimal | None = money_field(ge=0, default=None)
     status: LeaseStatus | None = None
     due_day: int | None = Field(default=None, ge=1, le=31)
     notes: str | None = None
+
+    @model_validator(mode="after")
+    def check_accounting_start_date(self):
+        if self.accounting_start_date is not None:
+            if self.start_date is not None and self.accounting_start_date < self.start_date:
+                raise ValueError("accounting_start_date must not be before start_date")
+            if self.end_date is not None and self.accounting_start_date > self.end_date:
+                raise ValueError("accounting_start_date must not be after end_date")
+        return self
 
 
 class LeaseRead(LeaseBase, AuditFields):

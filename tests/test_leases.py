@@ -1,3 +1,5 @@
+from datetime import date, timedelta
+
 API = "/api/v1"
 
 
@@ -83,3 +85,94 @@ def test_lease_due_day(client, admin_headers, unit_id, tenant_id):
     resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
     assert resp.status_code == 201
     assert resp.json()["due_day"] == 5
+
+
+def test_create_lease_without_accounting_start_date_returns_null(
+    client, admin_headers, unit_id, tenant_id
+):
+    resp = client.post(
+        f"{API}/leases", json=_lease_payload(unit_id, tenant_id), headers=admin_headers
+    )
+    assert resp.status_code == 201
+    assert resp.json()["accounting_start_date"] is None
+
+
+def test_lease_accounting_start_date_roundtrip(client, admin_headers, unit_id, tenant_id):
+    payload = _lease_payload(unit_id, tenant_id)
+    payload["accounting_start_date"] = "2026-03-01"
+    resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["accounting_start_date"] == "2026-03-01"
+    lease_id = resp.json()["id"]
+
+    resp = client.get(f"{API}/leases/{lease_id}", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json()["accounting_start_date"] == "2026-03-01"
+
+    resp = client.patch(
+        f"{API}/leases/{lease_id}",
+        json={"accounting_start_date": "2026-05-01"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["accounting_start_date"] == "2026-05-01"
+
+    resp = client.patch(
+        f"{API}/leases/{lease_id}",
+        json={"accounting_start_date": None},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["accounting_start_date"] is None
+
+
+def test_accounting_start_date_after_end_422(client, admin_headers, unit_id, tenant_id):
+    payload = _lease_payload(unit_id, tenant_id)
+    payload["accounting_start_date"] = "2027-01-01"  # end_date is 2026-12-31
+    resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
+    assert resp.status_code == 422
+
+
+def test_accounting_start_date_before_start_422(client, admin_headers, unit_id, tenant_id):
+    payload = _lease_payload(unit_id, tenant_id)
+    payload["accounting_start_date"] = "2025-12-31"  # start_date is 2026-01-01
+    resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
+    assert resp.status_code == 422
+
+
+def test_lease_update_accounting_start_date_out_of_range_422(
+    client, admin_headers, lease_id
+):
+    resp = client.patch(
+        f"{API}/leases/{lease_id}",
+        json={"accounting_start_date": "2027-01-01"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 422
+
+    resp = client.patch(
+        f"{API}/leases/{lease_id}",
+        json={"accounting_start_date": "2025-12-31"},
+        headers=admin_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_lease_future_accounting_start_date_allowed(
+    client, admin_headers, unit_id, tenant_id
+):
+    today = date.today()
+    future = today + timedelta(days=10)
+    payload = {
+        "unit_id": unit_id,
+        "tenant_id": tenant_id,
+        "start_date": (today - timedelta(days=30)).isoformat(),
+        "end_date": f"{today.year + 1}-12-31",
+        "monthly_rent": "12000.00",
+        "deposit": "0.00",
+        "status": "active",
+        "accounting_start_date": future.isoformat(),
+    }
+    resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["accounting_start_date"] == future.isoformat()

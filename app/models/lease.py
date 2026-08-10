@@ -21,6 +21,7 @@ class Lease(AuditMixin, SoftDeleteMixin, Base):
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), nullable=False, index=True)
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
     end_date: Mapped[date] = mapped_column(Date, nullable=False)
+    accounting_start_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     monthly_rent: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     deposit: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=Decimal("0.00"))
     status: Mapped[LeaseStatus] = mapped_column(

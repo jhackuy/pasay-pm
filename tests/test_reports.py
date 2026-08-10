@@ -141,7 +141,7 @@ def _shift_month(value: date, delta: int) -> date:
 
 def _create_rent_lease(
     client, admin_headers, unit_id, tenant_id, start_date, end_date,
-    monthly_rent="65000.00", due_day=None,
+    monthly_rent="65000.00", due_day=None, accounting_start_date=None,
 ):
     payload = {
         "unit_id": unit_id,
@@ -154,6 +154,8 @@ def _create_rent_lease(
     }
     if due_day is not None:
         payload["due_day"] = due_day
+    if accounting_start_date is not None:
+        payload["accounting_start_date"] = accounting_start_date.isoformat()
     resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
@@ -462,3 +464,195 @@ def test_expenses_report(client, admin_headers, unit_id):
     )
     assert resp.status_code == 200
     assert resp.json()["total_amount"] == "3000.00"
+
+
+def test_overdue_rents_no_accounting_start_regression(
+    client, admin_headers, unit_id, tenant_id
+):
+    # 旧租约不传 accounting_start_date → 行为完全不变（回归）
+    today = date.today()
+    start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 3
+    assert row["total_outstanding"] == "195000.00"
+    assert [p["month"] for p in row["overdue_periods"]] == [
+        _month_key(_shift_month(today, -2)),
+        _month_key(_shift_month(today, -1)),
+        _month_key(today),
+    ]
+
+
+def test_overdue_rents_accounting_start_excludes_history(
+    client, admin_headers, unit_id, tenant_id
+):
+    # 租约历史已半年、accounting_start_date=本月 → 历史月份不报欠租
+    today = date.today()
+    start = _shift_month(today, -6)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+        accounting_start_date=today.replace(day=1),
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 1
+    assert row["total_outstanding"] == "65000.00"
+    assert row["overdue_periods"] == [{"month": _month_key(today), "amount": "65000.00"}]
+
+
+def test_overdue_rents_accounting_start_unpaid_after(
+    client, admin_headers, unit_id, tenant_id
+):
+    # accounting_start_date 之后未付月份 → 正常 overdue
+    today = date.today()
+    start = _shift_month(today, -3)
+    accounting_start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+        accounting_start_date=accounting_start,
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 3
+    assert row["total_outstanding"] == "195000.00"
+    assert [p["month"] for p in row["overdue_periods"]] == [
+        _month_key(_shift_month(today, -2)),
+        _month_key(_shift_month(today, -1)),
+        _month_key(today),
+    ]
+
+
+def test_overdue_rents_income_before_accounting_start_ignored(
+    client, admin_headers, unit_id, tenant_id
+):
+    # accounting_start_date 之前的 confirmed income 不影响之后的月份
+    today = date.today()
+    start = _shift_month(today, -3)
+    accounting_start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+        accounting_start_date=accounting_start,
+    )
+    _post_income(
+        client, admin_headers, lease_id, "65000.00", start,
+        description=f"rent {_month_key(start)}",
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 3
+    assert row["total_outstanding"] == "195000.00"
+
+
+def test_overdue_rents_income_after_accounting_start_covers_period(
+    client, admin_headers, unit_id, tenant_id
+):
+    # accounting_start_date 之后的 confirmed income 正确覆盖对应 period
+    today = date.today()
+    start = _shift_month(today, -3)
+    accounting_start = _shift_month(today, -2)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(start.year + 1, 12, 31),
+        due_day=1,
+        accounting_start_date=accounting_start,
+    )
+    paid_month = _shift_month(today, -1)
+    _post_income(
+        client, admin_headers, lease_id, "65000.00", today,
+        description=f"rent {_month_key(paid_month)}",
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 2
+    assert [p["month"] for p in row["overdue_periods"]] == [
+        _month_key(_shift_month(today, -2)),
+        _month_key(today),
+    ]
+
+
+def test_overdue_rents_accounting_start_cross_year(
+    client, admin_headers, unit_id, tenant_id
+):
+    # 跨年租约：accounting 起点在上一年，应收周期跨两个年份
+    today = date.today()
+    start = _shift_month(today, -14)
+    accounting_start = _shift_month(today, -8)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(today.year + 1, 12, 31),
+        due_day=1,
+        accounting_start_date=accounting_start,
+    )
+    row = _overdue_row(client, admin_headers, lease_id)
+    assert row["overdue_months"] == 9
+    assert row["overdue_periods"][0]["month"] == _month_key(accounting_start)
+    assert row["overdue_periods"][-1]["month"] == _month_key(today)
+    years = {p["month"].split("-")[0] for p in row["overdue_periods"]}
+    assert years == {str(today.year - 1), str(today.year)}
+
+
+def test_overdue_rents_future_accounting_start_no_overdue(
+    client, admin_headers, unit_id, tenant_id
+):
+    # future accounting_start_date → 当前不产生 overdue
+    today = date.today()
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=_shift_month(today, -3),
+        end_date=date(today.year + 1, 12, 31),
+        due_day=1,
+        accounting_start_date=_shift_month(today, 1),
+    )
+    resp = client.get(f"{API}/reports/overdue-rents", headers=admin_headers)
+    assert resp.status_code == 200
+    assert all(r["lease_id"] != lease_id for r in resp.json())
+
+
+def test_financial_summary_accounting_start_filters_expected(
+    client, admin_headers, unit_id, tenant_id
+):
+    # accounting_start 晚于查询月 → 租约不计入 expected_rent_total（coalesce 口径）
+    today = date.today()
+    _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=_shift_month(today, -2),
+        end_date=date(today.year + 1, 12, 31),
+        monthly_rent="65000.00",
+        accounting_start_date=_shift_month(today, 1),
+    )
+    resp = client.get(
+        f"{API}/reports/financial-summary?month={_month()}", headers=admin_headers
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["expected_rent_total"] == "0.00"
+    assert data["occupied_units"] == 1
+
+
+def test_monthly_report_accounting_start_excludes_lease(
+    client, admin_headers, unit_id, tenant_id
+):
+    # monthly 与 financial-summary 同口径：accounting_start 之前不计入
+    today = date.today()
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=_shift_month(today, -2),
+        end_date=date(today.year + 1, 12, 31),
+        monthly_rent="65000.00",
+        accounting_start_date=_shift_month(today, 1),
+    )
+    resp = client.get(f"{API}/reports/monthly?month={_month()}", headers=admin_headers)
+    assert resp.status_code == 200
+    assert all(r["lease_id"] != lease_id for r in resp.json())

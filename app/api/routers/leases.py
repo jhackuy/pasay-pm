@@ -119,6 +119,21 @@ def update_lease(
     if not updates:
         return obj
 
+    if {"accounting_start_date", "start_date", "end_date"} & updates.keys():
+        effective_start = updates.get("start_date", obj.start_date)
+        effective_end = updates.get("end_date", obj.end_date)
+        effective_accounting_start = updates.get(
+            "accounting_start_date", obj.accounting_start_date
+        )
+        if effective_accounting_start is not None and (
+            effective_accounting_start < effective_start
+            or effective_accounting_start > effective_end
+        ):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "accounting_start_date must be within [start_date, end_date]",
+            )
+
     if updates.get("unit_id") is not None and updates["unit_id"] != obj.unit_id:
         unit = db.query(Unit).filter(Unit.id == updates["unit_id"], Unit.deleted_at.is_(None)).first()
         if unit is None:

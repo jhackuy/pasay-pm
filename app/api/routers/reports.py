@@ -53,11 +53,18 @@ def _default_due_day(lease: Lease) -> int:
     return lease.due_day if lease.due_day is not None else lease.start_date.day
 
 
+def _accounting_start(lease: Lease) -> date:
+    """Earliest month the lease accrues rent: max(start_date, accounting_start_date)."""
+    if lease.accounting_start_date is None:
+        return lease.start_date
+    return max(lease.start_date, lease.accounting_start_date)
+
+
 _PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
 
 
 def _lease_periods(lease: Lease) -> list[tuple[str, date]]:
-    """(YYYY-MM, due_date) for every rent month from lease start through end.
+    """(YYYY-MM, due_date) for every rent month from accounting start through end.
 
     A trailing end month is only included when the lease covers it fully
     (i.e. the lease end date is the last day of that month). If the lease ends
@@ -67,7 +74,8 @@ def _lease_periods(lease: Lease) -> list[tuple[str, date]]:
     """
     due_day = _default_due_day(lease)
     periods: list[tuple[str, date]] = []
-    year, month = lease.start_date.year, lease.start_date.month
+    accounting_start = _accounting_start(lease)
+    year, month = accounting_start.year, accounting_start.month
     end_year, end_month = lease.end_date.year, lease.end_date.month
     end_is_fully_covered = lease.end_date.day >= calendar.monthrange(end_year, end_month)[1]
     while (year, month) <= (end_year, end_month):
@@ -131,7 +139,7 @@ def financial_summary(
     lease_query = db.query(Lease).filter(
         Lease.deleted_at.is_(None),
         Lease.status == LeaseStatus.active,
-        Lease.start_date <= end,
+        func.coalesce(Lease.accounting_start_date, Lease.start_date) <= end,
         Lease.end_date >= start,
     )
     if unit_id is not None:
@@ -266,7 +274,7 @@ def monthly_report(
         .filter(
             Lease.deleted_at.is_(None),
             Lease.status == LeaseStatus.active,
-            Lease.start_date <= end,
+            func.coalesce(Lease.accounting_start_date, Lease.start_date) <= end,
             Lease.end_date >= start,
         )
         .order_by(Lease.id)
