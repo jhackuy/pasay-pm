@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import admin_only, get_current_user, manager_or_admin
 from app.database import get_db
 from app.models.financial import Expense, ExpenseStatus
+from app.models.property import Unit
 from app.models.user import User
 from app.schemas.financial import ExpenseCreate, ExpenseRead, ExpenseUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
@@ -20,6 +21,18 @@ def _get_or_404(db: Session, expense_id: int) -> Expense:
     if obj is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
     return obj
+
+
+def _check_unit(db: Session, unit_id: int | None) -> None:
+    if unit_id is None:
+        return
+    unit = (
+        db.query(Unit)
+        .filter(Unit.id == unit_id, Unit.deleted_at.is_(None))
+        .first()
+    )
+    if unit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
 
 
 def _guard_edit(obj: Expense, updates: dict) -> None:
@@ -53,6 +66,7 @@ def create_expense(
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Only admin can create an approved expense"
         )
+    _check_unit(db, payload.unit_id)
     obj = Expense(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -93,6 +107,7 @@ def update_expense(
     if not updates:
         return obj
     _guard_edit(obj, updates)
+    _check_unit(db, updates.get("unit_id"))
     old = serialize_row(obj)
     changed = field_changes(obj, updates)
     for field, value in updates.items():

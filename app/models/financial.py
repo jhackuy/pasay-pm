@@ -41,10 +41,14 @@ class Expense(AuditMixin, Base):
     __tablename__ = "expenses"
 
     expense_date: Mapped[date] = mapped_column(Date, nullable=False)
+    due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     category: Mapped[str] = mapped_column(String(100), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     payee: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    unit_id: Mapped[int | None] = mapped_column(
+        ForeignKey("units.id"), nullable=True, index=True
+    )
     status: Mapped[ExpenseStatus] = mapped_column(
         pg_enum(ExpenseStatus, "expense_status"), nullable=False, default=ExpenseStatus.pending
     )

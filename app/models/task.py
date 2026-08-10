@@ -1,7 +1,7 @@
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 
-from sqlalchemy import Date, ForeignKey, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin, Base, SoftDeleteMixin, pg_enum
@@ -11,6 +11,7 @@ class TaskStatus(str, Enum):
     open = "open"
     in_progress = "in_progress"
     completed = "completed"
+    scheduled = "scheduled"
 
 
 class TaskPriority(str, Enum):
@@ -32,3 +33,13 @@ class Task(AuditMixin, SoftDeleteMixin, Base):
         pg_enum(TaskPriority, "task_priority"), nullable=False, default=TaskPriority.medium
     )
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    recurring: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    interval_months: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    assigned_to: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_due_date: Mapped[date | None] = mapped_column(Date, nullable=True)

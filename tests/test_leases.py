@@ -75,3 +75,11 @@ def test_update_lease_rent(client, admin_headers, lease_id):
 def test_get_missing_lease_404(client, admin_headers):
     resp = client.get(f"{API}/leases/99999", headers=admin_headers)
     assert resp.status_code == 404
+
+
+def test_lease_due_day(client, admin_headers, unit_id, tenant_id):
+    payload = _lease_payload(unit_id, tenant_id)
+    payload["due_day"] = 5
+    resp = client.post(f"{API}/leases", json=payload, headers=admin_headers)
+    assert resp.status_code == 201
+    assert resp.json()["due_day"] == 5

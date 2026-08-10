@@ -185,3 +185,19 @@ def test_money_rejects_float_input(client, admin_headers, lease_id):
         headers=admin_headers,
     )
     assert resp.status_code == 422
+
+
+def test_expense_due_date_and_unit(client, admin_headers, unit_id):
+    payload = _expense()
+    payload.update({"due_date": "2026-08-18", "unit_id": unit_id})
+    resp = client.post(f"{API}/expenses", json=payload, headers=admin_headers)
+    assert resp.status_code == 201
+    assert resp.json()["due_date"] == "2026-08-18"
+    assert resp.json()["unit_id"] == unit_id
+
+
+def test_expense_unknown_unit_404(client, admin_headers):
+    payload = _expense()
+    payload["unit_id"] = 999999
+    resp = client.post(f"{API}/expenses", json=payload, headers=admin_headers)
+    assert resp.status_code == 404

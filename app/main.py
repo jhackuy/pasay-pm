@@ -11,6 +11,7 @@ from app.api.routers import (
     income,
     leases,
     properties,
+    reports,
     tasks,
     tenants,
     units,
@@ -34,6 +35,7 @@ app.include_router(income.router, prefix=API_PREFIX)
 app.include_router(expense.router, prefix=API_PREFIX)
 app.include_router(commission.router, prefix=API_PREFIX)
 app.include_router(tasks.router, prefix=API_PREFIX)
+app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(attachments.router, prefix=API_PREFIX)
 app.include_router(audit.router, prefix=API_PREFIX)
 

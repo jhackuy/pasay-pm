@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from pydantic import BaseModel, Field
 
@@ -13,6 +13,9 @@ class TaskBase(BaseModel):
     status: TaskStatus = TaskStatus.open
     priority: TaskPriority = TaskPriority.medium
     due_date: date | None = None
+    recurring: bool = False
+    interval_months: int | None = Field(default=None, ge=1)
+    assigned_to: int | None = None
 
 
 class TaskCreate(TaskBase):
@@ -26,7 +29,18 @@ class TaskUpdate(BaseModel):
     status: TaskStatus | None = None
     priority: TaskPriority | None = None
     due_date: date | None = None
+    recurring: bool | None = None
+    interval_months: int | None = Field(default=None, ge=1)
+    assigned_to: int | None = None
 
 
 class TaskRead(TaskBase, AuditFields):
     id: int
+    completed_at: datetime | None = None
+    last_completed_at: datetime | None = None
+    next_due_date: date | None = None
+
+
+class TaskCompleteResult(BaseModel):
+    completed: TaskRead
+    next: TaskRead | None = None

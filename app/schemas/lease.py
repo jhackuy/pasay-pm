@@ -15,6 +15,7 @@ class LeaseBase(BaseModel):
     monthly_rent: Decimal = money_field(gt=0)
     deposit: Decimal = money_field(ge=0, default=Decimal("0.00"))
     status: LeaseStatus = LeaseStatus.active
+    due_day: int | None = Field(default=None, ge=1, le=31)
     notes: str | None = None
 
     @model_validator(mode="after")
@@ -36,6 +37,7 @@ class LeaseUpdate(BaseModel):
     monthly_rent: Decimal | None = money_field(gt=0, default=None)
     deposit: Decimal | None = money_field(ge=0, default=None)
     status: LeaseStatus | None = None
+    due_day: int | None = Field(default=None, ge=1, le=31)
     notes: str | None = None
 
 

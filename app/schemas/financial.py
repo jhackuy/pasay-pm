@@ -36,10 +36,12 @@ class IncomeRead(IncomeBase, AuditFields):
 
 class ExpenseBase(BaseModel):
     expense_date: date
+    due_date: date | None = None
     category: str = Field(min_length=1, max_length=100)
     amount: Decimal = money_field(gt=0)
     payee: str = Field(min_length=1, max_length=200)
     description: str | None = None
+    unit_id: int | None = None
     status: ExpenseStatus
     receipt_attachment_id: int | None = None
 
@@ -50,10 +52,12 @@ class ExpenseCreate(ExpenseBase):
 
 class ExpenseUpdate(BaseModel):
     expense_date: date | None = None
+    due_date: date | None = None
     category: str | None = Field(default=None, min_length=1, max_length=100)
     amount: Decimal | None = money_field(gt=0, default=None)
     payee: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
+    unit_id: int | None = None
     receipt_attachment_id: int | None = None
 
 

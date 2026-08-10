@@ -76,8 +76,19 @@ docker compose exec api python scripts/create_api_key.py --username admin --role
 - `commission/rules` — `GET`（全员）、`POST/PATCH/DELETE`（admin）
 - `commission/settlements` — `GET`、`POST`（manager/admin）；`POST /{id}/confirm`（admin）
 - `tasks` — `GET/POST`（全员）；`PATCH/DELETE`（admin/manager）
+- `tasks/{id}/complete` — 完成任务；recurring 任务自动派生下一条（scheduled，admin/manager）
 - `attachments` — `POST`（multipart）、`GET /{id}`、`GET /{id}/download`
 - `audit-logs` — `GET`（admin；支持 `table_name` / `record_id` 过滤）
+- `reports` — `GET /financial-summary|overdue-rents|monthly|commission|tasks|expenses`（admin/manager；服务端聚合，Hermes 直接取用）
+
+### 第二阶段新增字段
+
+- `tasks`：`recurring`、`interval_months`、`assigned_to`、`completed_at`、`last_completed_at`、`next_due_date`；`status` 增加 `scheduled`
+- `leases`：`due_day`（每月几号交租）
+- `expenses`：`due_date`（账单到期日）、`unit_id`（可选关联房源）
+
+recurring 任务的 `next_due_date` 由服务端在创建/更新/完成时派生；完成时通过
+`POST /api/v1/tasks/{id}/complete` 自动生成下一条（due_date = 上一条 due_date + interval_months）。
 
 财务规则（强制）：收入/支出创建**必须带 status**；已确认收入、已审批/已支付支出禁止改金额；确认/审批后禁止 DELETE，只能 reverse；冲突一律 `409 {"detail": "..."}`。
 
