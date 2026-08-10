@@ -245,4 +245,4 @@ CREATE UNIQUE INDEX uq_operational_tasks_active_dedupe
 - `d537e67` Phase B+C — scheduler/generation/reconciliation + notification outbox/notifier + worker entry
 - `6bdabce` Phase D — Telegram 待办中心(bot:菜单/分区/inline keyboard/editMessageText/callback 重校验)
 - `19b634a` Phase E — 真实 PG 并发/crash/retry 测试 + rent-math 共享重构
-- (本简报提交)`REPORT_COMMIT_PLACEHOLDER` — V1.2 交付简报
+- `fd99098` V1.2 交付简报(本文件正文)
