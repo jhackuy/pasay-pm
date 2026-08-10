@@ -79,8 +79,8 @@ def test_finance_decimal():
     text = cards.finance_card(fin, Decimal("0"))
     assert "💰 <b>2026年8月财务</b>" in text
     assert "应收：₱363,000" in text
-    assert "已收：₱190,000" in text
-    assert "未收：<b>₱173,000</b>" in text
+    assert "已收到：₱190,000" in text
+    assert "未收到：<b>₱173,000</b>" in text
     assert "收租率：52.3%" in text
     assert "总收入：₱721,000" in text
     assert "总支出：₱19,650" in text
@@ -101,7 +101,7 @@ def test_zero_income():
     text = cards.finance_card(fin, Decimal("0"))
     assert "收租率：0.0%" in text
     assert "应收：₱0" in text
-    assert "未收：<b>₱0</b>" in text
+    assert "未收到：<b>₱0</b>" in text
 
 
 def test_large_amount():

@@ -278,7 +278,7 @@ def make_app(tmp_path):
     created: list[tuple[Any, Any]] = []
 
     def _make(backend=None, api_key="manager-key", admin_api_key="admin-key",
-              callback_ttl=900, state_db=None):
+              callback_ttl=900, state_db=None, bot=None):
         backend = backend or FakeBackend()
         settings = Settings(
             state_db=state_db or str(tmp_path / f"state_{len(created)}.db"),
@@ -303,7 +303,7 @@ def make_app(tmp_path):
                 timeout=1.0,
                 transport=httpx.MockTransport(backend.handler),
             )
-        bot = FakeBot()
+        bot = bot or FakeBot()
         app = build_application(settings, api, store, bot=bot, admin_api_client=admin_api)
         created.append((api, admin_api, store))
         return SimpleNamespace(

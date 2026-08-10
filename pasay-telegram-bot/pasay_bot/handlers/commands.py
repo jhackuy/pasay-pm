@@ -16,6 +16,7 @@ from pasay_bot.keyboards import (
     unit_list_keyboard,
     unit_page_keyboard,
 )
+from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.render import cards, html as H
 from pasay_bot.render.cards import PAGE_SIZE_OVERDUE, PAGE_SIZE_PROPERTIES
 from pasay_bot.render.i18n import t
@@ -293,7 +294,8 @@ async def build_unit_page(api, unit_id: int, can_rent: bool, locale: str):
 async def show_unit_page(context, chat_id, message_id, unit_id: int, can_rent: bool, locale: str):
     api = context.bot_data["api_client"]
     text, keyboard = await build_unit_page(api, unit_id, can_rent, locale)
-    await context.bot.edit_message_text(
+    await edit_message_text_idempotent(
+        context.bot,
         chat_id=chat_id,
         message_id=message_id,
         text=H.truncate(text),
@@ -308,7 +310,8 @@ async def show_rent_units(context, chat_id, message_id, property_id: int, locale
         properties = await api.get_properties()
         units = await api.get_units()
     except PasayApiError as exc:
-        await context.bot.edit_message_text(
+        await edit_message_text_idempotent(
+            context.bot,
             chat_id=chat_id, message_id=message_id, text=_load_error(exc.detail, locale),
             parse_mode=HTML,
         )
@@ -319,7 +322,8 @@ async def show_rent_units(context, chat_id, message_id, property_id: int, locale
         (u for u in units if u.property_id == property_id), key=lambda u: u.unit_number
     )
     text = f"{H.escape(t('rent.select_unit', locale, property=prop_name))}："
-    await context.bot.edit_message_text(
+    await edit_message_text_idempotent(
+        context.bot,
         chat_id=chat_id,
         message_id=message_id,
         text=text,

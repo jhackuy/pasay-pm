@@ -49,6 +49,7 @@ from pasay_bot.keyboards import (
     payment_method_keyboard,
     unit_page_keyboard,
 )
+from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.render import cards, html as H
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
@@ -82,7 +83,8 @@ async def _answer(update: Update, text: str):
 
 async def _edit(update: Update, text: str, keyboard=None):
     cq = update.callback_query
-    await update.get_bot().edit_message_text(
+    await edit_message_text_idempotent(
+        update.get_bot(),
         chat_id=update.effective_chat.id,
         message_id=cq.message.message_id,
         text=H.truncate(text),
@@ -223,7 +225,7 @@ async def _begin_rent_entry(update, context, unit_id: int, role, locale):
         (l for l in leases if l.unit_id == unit.id and l.status == "active"), None
     )
     if lease is None:
-        await _edit(update, "⚠️ 该 Unit 没有活跃租约，无法登记收租。")
+        await _edit(update, t("rent.no_active_lease", locale))
         await _answer(update, "无活跃租约")
         return
     payload = {
@@ -512,7 +514,7 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         if current.status == "reversed":
             await _answer(update, t("rent.reversed_toast", locale))
         else:
-            await _answer(update, "⚠️ 当前状态不可冲销")
+            await _answer(update, t("rent.reverse_conflict_toast", locale))
     except PasayApiTimeoutError:
         await _reconcile_income_after_timeout(
             update, context, key, income_id, role, locale, reverse=True

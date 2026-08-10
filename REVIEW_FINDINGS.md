@@ -118,3 +118,33 @@
 ### 简短总结
 
 F1-F9/F11 修复经源码逐行复核 + 全量回归（bot 99 / 后端 102）确认通过，无 CRITICAL/HIGH 残留；仅余 2 项 LOW 边角建议，不阻塞部署。
+
+---
+
+## F12 修复记录（按 /tmp/F12_BRIEF.md 执行，2026-08-10）
+
+> 状态：**F12 已修复并回归**；未 commit、未重启 bot（重启由 orchestrator 协调）。
+> 现象：`_edit()` 调 `edit_message_text` 时，若新内容与当前消息完全一致（如重复点某 unit 的「登记收租」），Telegram 返回 `BadRequest: Message is not modified`，每次点击抛一次栈级错误并刷 err.log。
+
+### 修复方式
+
+| 项 | 处理 |
+|----|------|
+| 新增 helper | `pasay_bot/handlers/edit_utils.py`：`edit_message_text_idempotent()` 包一层 `edit_message_text`，仅当错误信息含 `"Message is not modified"` 时视为「内容未变」幂等忽略（不抛、不刷日志），其余 `BadRequest` 原样抛出。 |
+| `_edit` | `callback.py` 的 `_edit()`（L83-92）改走该 helper，覆盖全部 `_edit` 调用点（登记收租/确认卡/冲销卡/超时兜底/取消等）。 |
+| 其他 edit 点 | `commands.py` 的 `show_unit_page` 与 `show_rent_units`（error 分支 + 成功分支）共 3 处 `edit_message_text` 一并改走 helper，仓库内不再有绕过 helper 的 `edit_message_text` 调用。 |
+
+### 测试
+
+| 测试 | 断言 |
+|------|------|
+| `test_edit_noop_message_not_modified`（新增，F12 核心） | 用 `_NoopEditBot`（fake bot 的 `edit_message_text` 在内容与上次一致时抛 `BadRequest("Message is not modified")`）模拟重复点「登记收租」（`rn:go:1` 连点两次）：不抛异常、两次渲染同一文本、`caplog` 无该错误的 ERROR 日志（不再刷 err.log）、会话状态保持 `rent_amount`。已实测：临时去掉容错后本测试失败，恢复后通过。 |
+| `test_edit_other_bad_request_still_raises`（新增） | 非 "Message is not modified" 的 `BadRequest`（如 `message can't be edited`）仍从 `_edit` 正常抛出。 |
+| `conftest.py` | `make_app` 增加可选 `bot=` 参数以便注入上述 fake bot（向后兼容，默认 `FakeBot()`）。 |
+
+### 回归
+
+- dev（`pasay-pm/pasay-telegram-bot`）：`env -u PYTHONPATH <bot venv>/bin/python -m pytest tests` → **101 passed**（原 99 全绿 + 新增 2）。
+- /opt 部署副本（`/opt/pasay-pm/pasay-telegram-bot`，自带 `.venv`）：**101 passed**，与 dev 逐文件 diff 一致。
+- 同步文件：`pasay_bot/handlers/edit_utils.py`（新增）、`callback.py`、`commands.py`、`tests/conftest.py`、`tests/test_handlers.py`。
+- 未 commit、未重启 bot、未改动后端与 i18n 既有内容。

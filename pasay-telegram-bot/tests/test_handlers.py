@@ -2,18 +2,25 @@
 rent flow, confirm, duplicate/double clicks, expiry, invalid callbacks,
 permissions + bypass, timeout reconciliation, crash recovery, pending list,
 and dual-key (manager/admin) enforcement."""
+import asyncio
+import logging
 import re
 import time
 from datetime import date
+
+import pytest
 
 from conftest import (
     OWNER_ID,
     SECRETARY_ID,
     UNKNOWN_ID,
+    FakeBot,
     make_callback_update,
     make_text_update,
     run_updates,
 )
+from telegram.error import BadRequest
+from pasay_bot.handlers import callback as callback_handlers
 from pasay_bot.keyboards import decode, encode, new_nonce, now_ts
 
 
@@ -33,6 +40,34 @@ def _html_balanced(text: str) -> bool:
 def _confirm_card_data(env):
     """callback_data of the confirm button on the rendered confirmation card."""
     return callback_data_of(env, "edit_message_text", -1)
+
+
+class _NoopEditBot(FakeBot):
+    """edit_message_text raises Telegram's 'Message is not modified'
+    BadRequest when re-rendering identical text for the same message."""
+
+    def __init__(self):
+        super().__init__()
+        self._text_by_message = {}
+
+    async def edit_message_text(self, text=None, chat_id=None, message_id=None,
+                                parse_mode=None, reply_markup=None, **kw):
+        prev = self._text_by_message.get(message_id)
+        self._text_by_message[message_id] = text
+        if prev is not None and prev == text:
+            self.calls.append({
+                "type": "edit_message_text",
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": parse_mode,
+                "reply_markup": reply_markup,
+            })
+            raise BadRequest("Message is not modified")
+        return await super().edit_message_text(
+            text=text, chat_id=chat_id, message_id=message_id,
+            parse_mode=parse_mode, reply_markup=reply_markup, **kw,
+        )
 
 
 def callback_data_of(env, call_type, index=-1):
@@ -72,7 +107,7 @@ def test_rent_callback(make_app):
     assert "月租：₱55,000" in unit_page
     kb = env.bot.edits()[-1]["reply_markup"]
     labels = [b.text for row in kb.inline_keyboard for b in row]
-    assert "💵 登记收租" in labels
+    assert "💵 记一笔" in labels
 
 
 def test_commands_and_menu(make_app):
@@ -101,7 +136,7 @@ def test_overdue_escape_and_action_buttons(make_app):
     assert "Maria <Admin>" not in text
     kb = env.bot.last_send()["reply_markup"]
     buttons = [b for row in kb.inline_keyboard for b in row]
-    assert len(buttons) == 4  # 2 items x (登记收租 + 详情)
+    assert len(buttons) == 4  # 2 items x (记一笔 + 详情)
 
 
 # --- confirm flows ---
@@ -132,6 +167,40 @@ def test_secretary_records_pending_not_confirmed(make_app):
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
     assert env.bot.last_answer()["text"] == "📝 Recorded, pending"
     assert "Recorded, pending" in env.bot.edits()[-1]["text"]
+
+
+def test_edit_noop_message_not_modified(make_app, caplog):
+    """★ F12: re-clicking 登记收租 re-renders identical text; the Telegram
+    'Message is not modified' BadRequest must be swallowed — no exception,
+    no error log (the same double-click used to spam err.log)."""
+    env = make_app(bot=_NoopEditBot())
+    updates = [
+        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"), bot=env.bot),
+        make_callback_update(OWNER_ID, OWNER_ID, encode("rn", "go", "1"),
+                             message_id=10, update_id=2, bot=env.bot),
+    ]
+    with caplog.at_level(logging.ERROR):
+        run_updates(env, updates)  # must complete without propagating
+    edits = env.bot.edits()
+    assert len(edits) == 2
+    assert edits[0]["text"] == edits[1]["text"]  # identical re-render is a no-op
+    assert "Message is not modified" not in caplog.text  # no error log spam
+    conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
+    assert conv is not None and conv["state"] == "rent_amount"
+
+
+def test_edit_other_bad_request_still_raises():
+    """★ F12: only the 'Message is not modified' BadRequest is swallowed;
+    any other BadRequest must still propagate from _edit."""
+    class _RejectEditBot(_NoopEditBot):
+        async def edit_message_text(self, text=None, chat_id=None, message_id=None,
+                                    parse_mode=None, reply_markup=None, **kw):
+            self._text_by_message.setdefault(message_id, text)
+            raise BadRequest("Bad Request: message can't be edited")
+
+    update = make_callback_update(OWNER_ID, OWNER_ID, "x", bot=_RejectEditBot())
+    with pytest.raises(BadRequest):
+        asyncio.run(callback_handlers._edit(update, "text"))
 
 
 def test_duplicate_rent_callback(make_app):
@@ -208,8 +277,8 @@ def test_reverse_owner_only(make_app):
     data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "reversed"
-    assert env.bot.last_answer()["text"] == "↩️ 已冲销"
-    assert "已冲销" in env.bot.edits()[-1]["text"]
+    assert env.bot.last_answer()["text"] == "↩️ 已撤销"
+    assert "已撤销" in env.bot.edits()[-1]["text"]
 
 
 # --- permissions ---
@@ -404,7 +473,7 @@ def test_reverse_disabled_without_admin_key(make_app):
     run_updates(env2, [make_callback_update(OWNER_ID, OWNER_ID, data2, bot=env2.bot)])
     kb = env2.bot.edits()[-1]["reply_markup"]
     labels = [b.text for row in kb.inline_keyboard for b in row] if kb else []
-    assert "↩️ 冲销" not in labels
+    assert "↩️ 撤销" not in labels
 
 
 # --- F3: crash after write -> restart -> same card retry, no duplicate ---
@@ -535,5 +604,5 @@ def test_reverse_timeout_reconcile_still_confirmed_toast(make_app):
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "confirmed"
     answer = env.bot.last_answer()["text"] or ""
-    assert "未冲销" in answer
+    assert "未撤销" in answer
     assert "已处理" not in answer

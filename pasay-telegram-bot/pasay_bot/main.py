@@ -10,7 +10,15 @@ import asyncio
 import logging
 import sys
 
-from telegram.ext import Application, ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+import telegram
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
 
 from pasay_bot.api_client import PasayApiClient
 from pasay_bot.config import Settings, get_settings
@@ -69,17 +77,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-async def _amain(args: argparse.Namespace) -> int:
+def _load(args: argparse.Namespace) -> tuple[Settings, StateStore, PasayApiClient, PasayApiClient | None]:
     settings = get_settings()
     if args.token:
         settings = settings.model_copy(update={"pasay_tg_bot_token": args.token})
     if args.state_db:
         settings = settings.model_copy(update={"state_db": args.state_db})
     if not settings.pasay_tg_bot_token:
-        print("[pasay-bot] PASSAY_TG_BOT_TOKEN is not set (set it in .env or pass --token).",
-              file=sys.stderr)
-        return 2
-
+        raise RuntimeError("PASSAY_TG_BOT_TOKEN is not set (set it in .env or pass --token).")
     store = StateStore(settings.state_db)
     store.migrate()
     api = PasayApiClient(settings.pasay_api_base, settings.pasay_api_key)
@@ -90,28 +95,61 @@ async def _amain(args: argparse.Namespace) -> int:
     )
     if admin_api is None:
         logger.warning("PASSAY_ADMIN_API_KEY is not configured; reverse is disabled")
-    app = build_application(settings, api, store, admin_api_client=admin_api)
-    try:
-        async with app.bot:
-            print(f"[pasay-bot] {await self_check(app)}")
-        if args.dry_run:
-            print("[pasay-bot] dry-run OK; not starting polling.")
-            return 0
-        print("[pasay-bot] starting polling ...")
-        await app.run_polling()
-        return 0
-    except Exception as exc:  # noqa: BLE001 - fail closed with a clear message
-        print(f"[pasay-bot] self-check failed: {exc}", file=sys.stderr)
-        return 1
-    finally:
-        await api.aclose()
-        if admin_api is not None:
-            await admin_api.aclose()
+    return settings, store, api, admin_api
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    return asyncio.run(_amain(args))
+    try:
+        settings, store, api, admin_api = _load(args)
+    except RuntimeError as exc:
+        print(f"[pasay-bot] {exc}", file=sys.stderr)
+        return 2
+
+    # Self-check (getMe) in its own short-lived event loop so it never
+    # conflicts with PTB's polling loop below.
+    try:
+        asyncio.run(_self_check(settings))
+        if args.dry_run:
+            print("[pasay-bot] dry-run OK; not starting polling.")
+            return 0
+    except Exception as exc:  # noqa: BLE001 - fail closed with a clear message
+        print(f"[pasay-bot] self-check failed: {exc}", file=sys.stderr)
+        return 1
+
+    app = build_application(settings, api, store, admin_api_client=admin_api)
+    print("[pasay-bot] starting polling ...")
+    try:
+        # run_polling() is BLOCKING and manages its OWN event loop; call it at
+        # top level (not inside asyncio.run) so its loop isn't shared/closed by
+        # an outer runner.
+        app.run_polling()
+        return 0
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        print(f"[pasay-bot] self-check failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            import asyncio as _asyncio
+            _asyncio.run(api.aclose())
+        except Exception:
+            pass
+        if admin_api is not None:
+            try:
+                import asyncio as _asyncio
+                _asyncio.run(admin_api.aclose())
+            except Exception:
+                pass
+        store.close()
+
+
+async def _self_check(settings: Settings) -> None:
+    # Standalone lightweight bot so we don't disturb the Application lifecycle
+    # that run_polling() manages (using `async with app.bot` would pre-close the
+    # bot's event-loop context -> "Cannot close a running event loop").
+    async with telegram.Bot(settings.pasay_tg_bot_token) as selfcheck_bot:
+        me = await selfcheck_bot.get_me()
+        print(f"[pasay-bot] getMe OK: @{me.username} (id={me.id})")
 
 
 if __name__ == "__main__":
