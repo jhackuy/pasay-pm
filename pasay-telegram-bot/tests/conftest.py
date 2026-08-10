@@ -9,7 +9,18 @@ from typing import Any, Optional
 
 import httpx
 import pytest
+from datetime import date, timedelta
 from telegram import Update
+
+TODAY = date.today().isoformat()
+
+
+def today_str():
+    return date.today().isoformat()
+
+
+def _add_days(iso: str, days: int) -> str:
+    return (date.fromisoformat(iso) + timedelta(days=days)).isoformat()
 
 from pasay_bot.api_client import PasayApiClient
 from pasay_bot.config import Settings
@@ -129,6 +140,8 @@ class FakeBackend:
         ]
         self.incomes: list[dict] = []
         self._next_income_id = 1
+        self.operational_tasks: list[dict] = []
+        self.ops_forbidden_task_ids: set[int] = set()
         self.financial_summary = {
             "month": "2026-08", "expected_rent_total": "363000.00",
             "collected_rent": "190000.00", "outstanding_rent": "173000.00",
@@ -273,7 +286,104 @@ class FakeBackend:
         if path == "/incomes" and method == "GET":
             return httpx.Response(200, json=self.incomes)
 
+        # --- V1.2 operations center ---
+        if path == "/operations/summary" and method == "GET":
+            return httpx.Response(200, json=self._ops_summary())
+        if path == "/operations/tasks" and method == "GET":
+            status = request.url.params.get("status")
+            rows = self.operational_tasks
+            if status:
+                rows = [r for r in rows if r.get("status") == status]
+            return httpx.Response(200, json=rows)
+        if path.startswith("/operations/tasks/") and method == "GET":
+            task = self._ops_task(path)
+            if task is None:
+                return httpx.Response(404, json={"detail": "Operational task not found"})
+            return httpx.Response(200, json=task)
+        if path.startswith("/operations/tasks/") and path.endswith("/complete") and method == "POST":
+            task = self._ops_task(path)
+            if task is None:
+                return httpx.Response(404, json={"detail": "Operational task not found"})
+            if task["id"] in self.ops_forbidden_task_ids:
+                return httpx.Response(403, json={"detail": "Cannot access a task assigned to another user"})
+            if task.get("status") != "PENDING":
+                return httpx.Response(409, json={"detail": "Cannot complete a cancelled task"})
+            task["status"] = "COMPLETED"
+            task["completed_at"] = "2026-08-10T12:00:00Z"
+            return httpx.Response(200, json={"task": task, "detail": "Task completed"})
+        if path.startswith("/operations/tasks/") and path.endswith("/snooze") and method == "POST":
+            task = self._ops_task(path)
+            if task is None:
+                return httpx.Response(404, json={"detail": "Operational task not found"})
+            if task["id"] in self.ops_forbidden_task_ids:
+                return httpx.Response(403, json={"detail": "Cannot access a task assigned to another user"})
+            until = (body or {}).get("until")
+            preset = (body or {}).get("preset")
+            if until:
+                task["snoozed_until"] = until
+            elif preset == "1h":
+                task["snoozed_until"] = "2026-08-10T13:00:00Z"
+            elif preset == "today_afternoon":
+                task["snoozed_until"] = "2026-08-10T17:00:00Z"
+            elif preset == "tomorrow_morning":
+                task["snoozed_until"] = "2026-08-11T09:00:00Z"
+            elif preset == "3d":
+                task["snoozed_until"] = "2026-08-13T12:00:00Z"
+            else:
+                return httpx.Response(422, json={"detail": "preset must be one of ..."})
+            return httpx.Response(200, json={"task": task, "detail": "Task snoozed"})
+
         return httpx.Response(404, json={"detail": f"no route {method} {path}"})
+
+    # --- V1.2 ops helpers ---
+    def add_ops_task(self, task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
+                     status="PENDING", due_at=None, snoozed_until=None, property_id=1,
+                     details=None, assigned_user_id=None):
+        row = {
+            "id": task_id,
+            "task_type": task_type,
+            "title": title,
+            "description": None,
+            "property_id": property_id,
+            "tenant_id": None,
+            "lease_id": None,
+            "source_type": "recurring_rule",
+            "source_id": 1,
+            "assigned_user_id": assigned_user_id,
+            "priority": "medium",
+            "status": status,
+            "due_at": due_at or "2026-08-10T00:00:00+08:00",
+            "remind_at": None,
+            "snoozed_until": snoozed_until,
+            "completed_at": None,
+            "completed_by": None,
+            "dedupe_key": f"recurring:1:2026-Q3",
+            "details": details or {"amount": "12000.00", "period": "2026-Q3"},
+        }
+        self.operational_tasks.append(row)
+        return row
+
+    def _ops_task(self, path):
+        parts = path.split("/")
+        try:
+            task_id = int(parts[3])
+        except (IndexError, ValueError):
+            return None
+        return next((t for t in self.operational_tasks if t["id"] == task_id), None)
+
+    def _ops_summary(self):
+        pending = [t for t in self.operational_tasks if t.get("status") == "PENDING"]
+        overdue = today = next7 = 0
+        for t in pending:
+            due = (t.get("due_at") or "")[:10]
+            if due and due < TODAY:
+                overdue += 1
+            elif due == TODAY:
+                today += 1
+            if due and today_str() <= due <= _add_days(TODAY, 7):
+                next7 += 1
+        return {"overdue": overdue, "due_today": today, "due_7_days": next7,
+                "pending_total": len(pending)}
 
 
 @pytest.fixture()

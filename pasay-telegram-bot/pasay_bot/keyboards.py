@@ -29,6 +29,27 @@ ACTION_REVERSE = "rv"
 ACTION_CANCEL = "ccl"
 ACTION_DETAIL = "det"
 ACTION_EDIT = "ed"
+# V1.2 operations center (待办中心).
+ACTION_OPS_NAV = "opn"
+ACTION_TASK_COMPLETE = "tkc"
+ACTION_TASK_SNOOZE = "tks"
+ACTION_TASK_SNOOZE_PICK = "tsp"
+ACTION_TASK_DETAIL = "tkd"
+
+# ops center section entities (callback entity field).
+OPS_OVERVIEW = "ops"
+OPS_SECTION_OVERDUE = "oov"
+OPS_SECTION_TODAY = "otd"
+OPS_SECTION_NEXT7 = "on7"
+OPS_SECTION_ALL = "oal"
+
+# bot-side snooze preset codes -> backend preset names.
+SNOOZE_PRESET_MAP = {
+    "1h": "1h",
+    "today": "today_afternoon",
+    "tomorrow": "tomorrow_morning",
+    "3d": "3d",
+}
 
 METHODS = ["bank", "gcash", "cash", "other"]
 METHOD_LABELS = {"bank": "Bank", "gcash": "GCash", "cash": "Cash", "other": "Other"}
@@ -126,7 +147,7 @@ def overdue_pagination_keyboard(page: int, total_pages: int, locale: str = "zh")
 
 
 def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
-    """Home dashboard buttons (B1): rent, to-do, properties, finance."""
+    """Home dashboard buttons (B1): rent, to-do, properties, finance + V1.2 待办中心."""
     kb = [
         [
             InlineKeyboardButton(
@@ -144,6 +165,12 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 t("nav.finance", locale),
                 callback_data=encode(ACTION_NAV, "finance"),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("nav.ops", locale),
+                callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW),
             ),
         ],
     ]
@@ -518,5 +545,148 @@ def edit_date_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
             [InlineKeyboardButton(t("rent.today", locale), callback_data=encode(ACTION_EDIT, "today"))],
             [InlineKeyboardButton(t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL))],
             [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))],
+        ]
+    )
+
+
+# --- V1.2 operations center (待办中心) ------------------------------------
+
+def ops_overview_keyboard(summary: dict, locale: str = "zh") -> InlineKeyboardMarkup:
+    """待办中心 overview: four section buttons with counts."""
+    kb = [
+        [
+            InlineKeyboardButton(
+                f"🔴 {t('ops.section_overdue', locale)} · {int(summary.get('overdue', 0))}",
+                callback_data=encode(ACTION_OPS_NAV, OPS_SECTION_OVERDUE),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"🟠 {t('ops.section_today', locale)} · {int(summary.get('due_today', 0))}",
+                callback_data=encode(ACTION_OPS_NAV, OPS_SECTION_TODAY),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"🟡 {t('ops.section_next7', locale)} · {int(summary.get('due_7_days', 0))}",
+                callback_data=encode(ACTION_OPS_NAV, OPS_SECTION_NEXT7),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"📅 {t('ops.section_all', locale)} · {int(summary.get('pending_total', 0))}",
+                callback_data=encode(ACTION_OPS_NAV, OPS_SECTION_ALL),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def ops_section_keyboard(tasks: list, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Per-task rows: ✅ 完成 / ⏰ 稍后提醒 / 👁 查看详情 + ◀️ 返回."""
+    kb = []
+    for task in tasks:
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("ops.complete", locale),
+                    callback_data=encode(ACTION_TASK_COMPLETE, "ops", str(task.id), nonce=nonce, ts=ts),
+                ),
+                InlineKeyboardButton(
+                    t("ops.snooze", locale),
+                    callback_data=encode(ACTION_TASK_SNOOZE, "ops", str(task.id)),
+                ),
+                InlineKeyboardButton(
+                    t("ops.detail", locale),
+                    callback_data=encode(ACTION_TASK_DETAIL, "ops", str(task.id)),
+                ),
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("ops.back", locale), callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW)
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def task_action_keyboard(task_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Detail card actions: ✅ 完成 / ⏰ 稍后提醒 / ◀️ 返回."""
+    nonce, ts = new_nonce(), now_ts()
+    kb = [
+        [
+            InlineKeyboardButton(
+                t("ops.complete", locale),
+                callback_data=encode(ACTION_TASK_COMPLETE, "ops", str(task_id), nonce=nonce, ts=ts),
+            ),
+            InlineKeyboardButton(
+                t("ops.snooze", locale),
+                callback_data=encode(ACTION_TASK_SNOOZE, "ops", str(task_id)),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("ops.back", locale), callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW)
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def snooze_preset_keyboard(task_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Snooze presets: 1 小时 / 今天下午 / 明天上午 / 3 天后 / 自定义."""
+    kb = [
+        [
+            InlineKeyboardButton(
+                t("ops.snooze_1h", locale),
+                callback_data=encode(ACTION_TASK_SNOOZE_PICK, "1h", str(task_id), nonce=new_nonce(), ts=now_ts()),
+            ),
+            InlineKeyboardButton(
+                t("ops.snooze_today", locale),
+                callback_data=encode(ACTION_TASK_SNOOZE_PICK, "today", str(task_id), nonce=new_nonce(), ts=now_ts()),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("ops.snooze_tomorrow", locale),
+                callback_data=encode(ACTION_TASK_SNOOZE_PICK, "tomorrow", str(task_id), nonce=new_nonce(), ts=now_ts()),
+            ),
+            InlineKeyboardButton(
+                t("ops.snooze_3d", locale),
+                callback_data=encode(ACTION_TASK_SNOOZE_PICK, "3d", str(task_id), nonce=new_nonce(), ts=now_ts()),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("ops.snooze_custom", locale),
+                callback_data=encode(ACTION_TASK_SNOOZE_PICK, "custom", str(task_id)),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("ops.back", locale), callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW)
+            )
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def ops_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Small ◀️ 返回 (to 待办中心 overview) — used after complete/snooze."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("ops.back", locale), callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW)
+                )
+            ]
         ]
     )

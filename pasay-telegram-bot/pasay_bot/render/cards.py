@@ -413,3 +413,94 @@ def payment_detail_card(income: Income, locale: str = "zh") -> str:
         locale,
     ) + f"\n#{income.id} · {H.money(income.amount)}\n{H.format_date(income.received_date)} · {H.escape(income.payment_method or '-')}"
 
+
+
+# --- V1.2 operations center (待办中心) -------------------------------------
+
+def _ops_property_name(task, properties) -> str:
+    if task.property_id:
+        prop = next((p for p in properties if p.id == task.property_id), None)
+        if prop:
+            return prop.name
+    return "—"
+
+
+def _ops_amount(task) -> Optional[str]:
+    details = task.details or {}
+    amount = details.get("amount") or details.get("total_outstanding")
+    if amount is None:
+        return None
+    return str(amount)
+
+
+def _ops_due(task) -> str:
+    due = str(task.due_at or "")[:16].replace("T", " ")
+    return due or "—"
+
+
+def operational_task_line(task, properties, locale: str = "zh") -> str:
+    """One task row: 房产 · 事项 · 金额(如有) · 到期 · 状态."""
+    prop = H.escape(_ops_property_name(task, properties))
+    title = H.escape(task.title or f"#{task.id}")
+    parts = [f"🏢 {prop}", title]
+    amount = _ops_amount(task)
+    if amount is not None:
+        parts.append(f"{H.escape(t('ops.amount', locale))}：{H.money(amount)}")
+    parts.append(f"{H.escape(t('ops.due', locale))}：{H.escape(_ops_due(task))}")
+    parts.append(f"{H.escape(t('ops.status', locale))}：{_ops_status_label(task, locale)}")
+    return " · ".join(parts)
+
+
+def _ops_status_label(task, locale: str) -> str:
+    status = (task.status or "PENDING").upper()
+    if status == "COMPLETED":
+        return H.escape(t("ops.status_completed", locale))
+    if status == "CANCELLED":
+        return H.escape(t("ops.status_cancelled", locale))
+    if getattr(task, "snoozed_until", None):
+        return "⏰ " + H.escape(t("ops.snoozed_toast", locale))
+    return H.escape(t("ops.status_pending", locale))
+
+
+def operations_overview_card(summary: dict, locale: str = "zh") -> str:
+    lines = [f"<b>{H.escape(t('ops.title', locale))}</b>"]
+    lines.append(DIVIDER)
+    lines.append(f"🔴 {H.escape(t('ops.section_overdue', locale))}：{int(summary.get('overdue', 0))}")
+    lines.append(f"🟠 {H.escape(t('ops.section_today', locale))}：{int(summary.get('due_today', 0))}")
+    lines.append(f"🟡 {H.escape(t('ops.section_next7', locale))}：{int(summary.get('due_7_days', 0))}")
+    lines.append(f"📅 {H.escape(t('ops.section_all', locale))}：{int(summary.get('pending_total', 0))}")
+    return "\n".join(lines)
+
+
+def operations_section_card(
+    title: str, tasks: list, properties, locale: str = "zh", empty_key: str = "ops.empty"
+) -> str:
+    lines = [f"<b>{H.escape(title)}</b>"]
+    if not tasks:
+        lines.append(H.escape(t(empty_key, locale)))
+        return "\n".join(lines)
+    for task in tasks[:15]:
+        lines.append(operational_task_line(task, properties, locale))
+    if len(tasks) > 15:
+        lines.append(H.escape(f"… 共 {len(tasks)} 项"))
+    return "\n\n".join(lines)
+
+
+def operational_task_detail_card(task, properties, locale: str = "zh") -> str:
+    details = task.details or {}
+    lines = [f"<b>{H.escape(t('ops.task_detail_title', locale))}</b>"]
+    lines.append(DIVIDER)
+    lines.append(f"{H.escape(t('ops.task', locale))}：{H.escape(task.title or f'#{task.id}')}")
+    lines.append(f"{H.escape(t('ops.property', locale))}：{H.escape(_ops_property_name(task, properties))}")
+    tenant_id = task.tenant_id
+    if tenant_id:
+        lines.append(f"{H.escape(t('ops.tenant', locale))}：#<code>{tenant_id}</code>")
+    amount = _ops_amount(task)
+    if amount is not None:
+        lines.append(f"{H.escape(t('ops.amount', locale))}：{H.money(amount)}")
+    lines.append(f"{H.escape(t('ops.due', locale))}：{H.escape(_ops_due(task))}")
+    lines.append(f"{H.escape(t('ops.status', locale))}：{_ops_status_label(task, locale)}")
+    lines.append(f"类型：<code>{H.escape(task.task_type or '')}</code>")
+    if task.description:
+        lines.append(H.escape(task.description))
+    return "\n".join(lines)

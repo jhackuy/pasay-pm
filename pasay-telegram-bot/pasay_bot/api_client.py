@@ -262,6 +262,47 @@ class ReportTask:
         )
 
 
+@dataclass
+class OperationalTask:
+    id: int
+    task_type: str = ""
+    title: str = ""
+    description: Optional[str] = None
+    property_id: Optional[int] = None
+    tenant_id: Optional[int] = None
+    lease_id: Optional[int] = None
+    source_type: str = ""
+    source_id: Optional[int] = None
+    assigned_user_id: Optional[int] = None
+    priority: str = "medium"
+    status: str = "PENDING"
+    due_at: Optional[str] = None
+    snoozed_until: Optional[str] = None
+    completed_at: Optional[str] = None
+    details: Optional[dict] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "OperationalTask":
+        return cls(
+            id=int(d.get("id") or 0),
+            task_type=d.get("task_type") or "",
+            title=d.get("title") or "",
+            description=d.get("description"),
+            property_id=int(d["property_id"]) if d.get("property_id") is not None else None,
+            tenant_id=int(d["tenant_id"]) if d.get("tenant_id") is not None else None,
+            lease_id=int(d["lease_id"]) if d.get("lease_id") is not None else None,
+            source_type=d.get("source_type") or "",
+            source_id=int(d["source_id"]) if d.get("source_id") is not None else None,
+            assigned_user_id=int(d["assigned_user_id"]) if d.get("assigned_user_id") is not None else None,
+            priority=d.get("priority") or "medium",
+            status=d.get("status") or "PENDING",
+            due_at=d.get("due_at"),
+            snoozed_until=d.get("snoozed_until"),
+            completed_at=d.get("completed_at"),
+            details=d.get("details") or {},
+        )
+
+
 class PasayApiError(Exception):
     def __init__(self, status_code: Optional[int], detail: str):
         self.status_code = status_code
@@ -397,6 +438,49 @@ class PasayApiClient:
     async def get_overdue_rents(self) -> list[OverdueRent]:
         data = await self._request("GET", "/reports/overdue-rents")
         return [OverdueRent.from_dict(d) for d in data]
+
+    async def get_operational_tasks(
+        self, *, status: Optional[str] = None,
+    ) -> list[OperationalTask]:
+        """V1.2 operations center: backend filters per-role (agents only see
+        their own assigned tasks)."""
+        params: dict[str, Any] = {}
+        if status:
+            params["status"] = status
+        data = await self._request("GET", "/operations/tasks", params=params)
+        return [OperationalTask.from_dict(d) for d in data]
+
+    async def get_operational_task(self, task_id: int) -> OperationalTask:
+        data = await self._request("GET", f"/operations/tasks/{task_id}")
+        return OperationalTask.from_dict(data)
+
+    async def complete_operational_task(self, task_id: int) -> OperationalTask:
+        data = await self._request("POST", f"/operations/tasks/{task_id}/complete")
+        return OperationalTask.from_dict(data["task"])
+
+    async def snooze_operational_task(
+        self, task_id: int, *, until: Optional[str] = None, preset: Optional[str] = None,
+    ) -> OperationalTask:
+        payload: dict[str, Any] = {}
+        if until:
+            payload["until"] = until
+        if preset:
+            payload["preset"] = preset
+        data = await self._request("POST", f"/operations/tasks/{task_id}/snooze", json=payload)
+        return OperationalTask.from_dict(data["task"])
+
+    async def cancel_operational_task(self, task_id: int) -> OperationalTask:
+        data = await self._request("POST", f"/operations/tasks/{task_id}/cancel")
+        return OperationalTask.from_dict(data["task"])
+
+    async def get_operations_summary(self) -> dict:
+        data = await self._request("GET", "/operations/summary")
+        return {
+            "overdue": int(data.get("overdue") or 0),
+            "due_today": int(data.get("due_today") or 0),
+            "due_7_days": int(data.get("due_7_days") or 0),
+            "pending_total": int(data.get("pending_total") or 0),
+        }
 
     async def get_tasks(
         self, *, status: Optional[str] = None, overdue: bool = False,

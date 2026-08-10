@@ -26,6 +26,8 @@ from pasay_bot.handlers import commands as pages
 from pasay_bot.handlers.commands import (
     _current_month,
     show_dashboard,
+    show_operations_center,
+    show_operations_section,
 )
 from pasay_bot.keyboards import (
     ACTION_CANCEL,
@@ -34,10 +36,17 @@ from pasay_bot.keyboards import (
     ACTION_EDIT,
     ACTION_METHOD,
     ACTION_NAV,
+    ACTION_OPS_NAV,
     ACTION_PAGE,
     ACTION_RENT,
     ACTION_REVERSE,
+    ACTION_TASK_COMPLETE,
+    ACTION_TASK_DETAIL,
+    ACTION_TASK_SNOOZE,
+    ACTION_TASK_SNOOZE_PICK,
     METHOD_LABELS,
+    OPS_OVERVIEW,
+    SNOOZE_PRESET_MAP,
     confirm_income_keyboard,
     confirm_rent_keyboard,
     decode,
@@ -49,13 +58,17 @@ from pasay_bot.keyboards import (
     home_keyboard,
     new_nonce,
     now_ts,
+    ops_back_keyboard,
     payment_method_keyboard,
     retry_confirm_keyboard,
+    snooze_preset_keyboard,
+    task_action_keyboard,
 )
 from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.render import cards, html as H
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
+    PERMISSION_OPERATIONS,
     PERMISSION_RENT_CONFIRM,
     PERMISSION_RENT_ENTRY,
     PERMISSION_REVERSE,
@@ -159,6 +172,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_detail(update, context, entity, ref, role, locale)
     elif action == ACTION_EDIT:
         await _handle_edit(update, context, entity, role, locale)
+    elif action == ACTION_OPS_NAV:
+        await _handle_ops_nav(update, context, entity, role, locale)
+    elif action == ACTION_TASK_COMPLETE:
+        await _handle_task_complete(update, context, ref, role, locale)
+    elif action == ACTION_TASK_SNOOZE:
+        await _handle_task_snooze(update, context, ref, role, locale)
+    elif action == ACTION_TASK_SNOOZE_PICK:
+        await _handle_task_snooze_pick(update, context, entity, ref, role, locale)
+    elif action == ACTION_TASK_DETAIL:
+        await _handle_task_detail(update, context, ref, role, locale)
     else:
         await _answer(update, t("common.invalid", locale))
 
@@ -852,3 +875,127 @@ async def _render_income_state(update, context, income: Income, role, locale):
         await _edit(update, cards.reversed_card(income, locale))
     else:
         await _edit(update, t("rent.pending_card", locale, income_id=income.id))
+
+
+
+# --- V1.2 operations center (待办中心) -------------------------------------
+
+def _ops_allowed(role) -> bool:
+    """View/act on the operations center; the backend re-validates per task."""
+    return has_permission(role, PERMISSION_OPERATIONS)
+
+
+async def _handle_ops_nav(update, context, entity, role, locale):
+    if not _ops_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    cq = update.callback_query
+    if entity == OPS_OVERVIEW:
+        await show_operations_center(
+            context, update.effective_chat.id, locale, message_id=cq.message.message_id
+        )
+    else:
+        await show_operations_section(
+            context, update.effective_chat.id, cq.message.message_id, entity, locale
+        )
+    await _answer(update, "")
+
+
+async def _handle_task_complete(update, context, ref, role, locale):
+    if not _ops_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    api = context.bot_data["api_client"]
+    try:
+        task = await api.complete_operational_task(task_id)
+    except PasayApiPermissionError:
+        await _answer(update, t("ops.no_permission", locale))
+        return
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(exc.detail)}")
+        return
+    text = t("ops.completed_card", locale, title=H.escape(task.title or f"#{task.id}"))
+    await _edit(update, text, ops_back_keyboard(locale))
+    await _answer(update, t("ops.completed_toast", locale))
+
+
+async def _handle_task_snooze(update, context, ref, role, locale):
+    if not _ops_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    text = H.escape(t("ops.snooze_title", locale))
+    await _edit(update, text, snooze_preset_keyboard(int(ref), locale))
+
+
+async def _handle_task_snooze_pick(update, context, entity, ref, role, locale):
+    if not _ops_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    api = context.bot_data["api_client"]
+    cq = update.callback_query
+
+    if entity == "custom":
+        store = context.bot_data["store"]
+        user_id = update.effective_user.id if update.effective_user else None
+        chat_id = update.effective_chat.id if update.effective_chat else user_id
+        if user_id is not None:
+            store.save_conversation(
+                chat_id, user_id, "ops_snooze_custom",
+                {"task_id": task_id, "message_id": cq.message.message_id},
+            )
+        await cq.edit_message_text(
+            H.escape(t("ops.snooze_ask", locale)),
+            parse_mode=HTML,
+            reply_markup=edit_input_keyboard(locale),
+        )
+        return
+
+    preset = SNOOZE_PRESET_MAP.get(entity)
+    if preset is None:
+        await _answer(update, t("common.invalid", locale))
+        return
+    try:
+        task = await api.snooze_operational_task(task_id, preset=preset)
+    except PasayApiPermissionError:
+        await _answer(update, t("ops.no_permission", locale))
+        return
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(exc.detail)}")
+        return
+    until = str(task.snoozed_until or "")[:16].replace("T", " ")
+    text = t("ops.snoozed_card", locale, title=H.escape(task.title or f"#{task.id}"), until=H.escape(until))
+    await _edit(update, text, ops_back_keyboard(locale))
+    await _answer(update, t("ops.snoozed_toast", locale))
+
+
+async def _handle_task_detail(update, context, ref, role, locale):
+    if not _ops_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    api = context.bot_data["api_client"]
+    try:
+        task, properties = await asyncio.gather(
+            api.get_operational_task(int(ref)), api.get_properties()
+        )
+    except PasayApiPermissionError:
+        await _answer(update, t("ops.no_permission", locale))
+        return
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(exc.detail)}")
+        return
+    text = cards.operational_task_detail_card(task, properties, locale)
+    await _edit(update, text, task_action_keyboard(task.id, locale))

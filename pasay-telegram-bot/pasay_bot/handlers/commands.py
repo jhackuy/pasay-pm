@@ -7,17 +7,24 @@ home -> pick unpaid unit -> confirm with smart defaults.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import PasayApiError
 from pasay_bot.keyboards import (
+    OPS_OVERVIEW,
+    OPS_SECTION_ALL,
+    OPS_SECTION_NEXT7,
+    OPS_SECTION_OVERDUE,
+    OPS_SECTION_TODAY,
     collect_list_keyboard,
     dashboard_keyboard,
     error_keyboard,
     home_keyboard,
+    ops_overview_keyboard,
+    ops_section_keyboard,
     overdue_page_keyboard,
     pending_page_keyboard,
     property_list_keyboard,
@@ -30,6 +37,7 @@ from pasay_bot.render import cards, html as H
 from pasay_bot.render.cards import PAGE_SIZE_OVERDUE, PAGE_SIZE_PROPERTIES
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
+    PERMISSION_OPERATIONS,
     PERMISSION_RENT_CONFIRM,
     Role,
     has_permission,
@@ -135,6 +143,16 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _refuse(update, context, role)
         return
     await show_pending(context, update.effective_chat.id, role, locale)
+
+
+async def cmd_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """V1.2 待办中心 (/ops, /todo)."""
+    role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
+    locale = locale_for(role)
+    if not has_permission(role, PERMISSION_OPERATIONS):
+        await _refuse(update, context, role)
+        return
+    await show_operations_center(context, update.effective_chat.id, locale)
 
 
 async def _refuse(update: Update, context: ContextTypes.DEFAULT_TYPE, role):
@@ -543,4 +561,101 @@ async def show_rent_units(context, chat_id, message_id, property_id: int, locale
         text=text,
         parse_mode=HTML,
         reply_markup=unit_list_keyboard(items, locale),
+    )
+
+
+
+# --- V1.2 operations center (待办中心) -------------------------------------
+
+def _ops_due_datetime(task):
+    raw = task.due_at
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _ops_sections(tasks: list) -> dict[str, list]:
+    """Split PENDING tasks into overdue / today / next7 / all (client-side
+    presentation; the backend is the data source of truth)."""
+    now = datetime.now()
+    start_today = datetime.combine(now.date(), datetime.min.time())
+    end_today = start_today + timedelta(days=1)
+    end_7 = start_today + timedelta(days=7)
+    overdue, today, next7, snoozed = [], [], [], []
+    for task in tasks:
+        if getattr(task, "snoozed_until", None):
+            try:
+                if datetime.fromisoformat(str(task.snoozed_until).replace("Z", "+00:00")).replace(
+                    tzinfo=None
+                ) > now:
+                    snoozed.append(task)
+                    continue
+            except ValueError:
+                pass
+        due = _ops_due_datetime(task)
+        if due is None:
+            continue
+        due_naive = due.replace(tzinfo=None)
+        if due_naive < start_today:
+            overdue.append(task)
+        elif due_naive < end_today:
+            today.append(task)
+        if start_today <= due_naive < end_7:
+            next7.append(task)
+    ordered = sorted
+    return {
+        "overdue": ordered(overdue, key=lambda x: str(x.due_at or "")),
+        "today": ordered(today, key=lambda x: str(x.due_at or "")),
+        "next7": ordered(next7, key=lambda x: str(x.due_at or "")),
+        "all": ordered(tasks, key=lambda x: str(x.due_at or "")),
+    }
+
+
+async def show_operations_center(context, chat_id: int, locale: str, message_id=None):
+    """待办中心 overview with four section buttons + counts."""
+    api = context.bot_data["api_client"]
+    try:
+        summary = await api.get_operations_summary()
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    text = cards.operations_overview_card(summary, locale)
+    await _render(context, chat_id, message_id, text, ops_overview_keyboard(summary, locale))
+
+
+async def show_operations_section(context, chat_id: int, message_id: int, section: str,
+                                  locale: str):
+    api = context.bot_data["api_client"]
+    try:
+        tasks, properties = await asyncio.gather(
+            api.get_operational_tasks(status="PENDING"),
+            api.get_properties(),
+        )
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    sections = _ops_sections(tasks)
+    if section == OPS_SECTION_OVERDUE:
+        key, rows, title = "ops.section_overdue", sections["overdue"], t("ops.section_overdue", locale)
+    elif section == OPS_SECTION_TODAY:
+        key, rows, title = "ops.section_today", sections["today"], t("ops.section_today", locale)
+    elif section == OPS_SECTION_NEXT7:
+        key, rows, title = "ops.section_next7", sections["next7"], t("ops.section_next7", locale)
+    else:  # OPS_SECTION_ALL
+        key, rows, title = "ops.section_all", sections["all"], t("ops.section_all", locale)
+    text = cards.operations_section_card(
+        title, rows, properties, locale, empty_key=key + "_empty"
+    )
+    await edit_message_text_idempotent(
+        context.bot,
+        chat_id=chat_id,
+        message_id=message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=ops_section_keyboard(rows, locale),
     )

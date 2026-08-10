@@ -26,6 +26,7 @@ PERMISSION_READ = frozenset({"properties", "finance", "overdue"})
 PERMISSION_RENT_ENTRY = "rent_entry"
 PERMISSION_RENT_CONFIRM = "rent_confirm"
 PERMISSION_REVERSE = "reverse"
+PERMISSION_OPERATIONS = "operations"  # V1.2 待办中心 (backend enforces per-task)
 
 # Mirrors the backend user_role enum (agent/manager/admin). The backend
 # enforces these against the API key; the bot mirrors them for UI + fast
@@ -33,7 +34,7 @@ PERMISSION_REVERSE = "reverse"
 API_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     "agent": frozenset(PERMISSION_READ),
     "manager": frozenset(
-        {*PERMISSION_READ, PERMISSION_RENT_ENTRY, PERMISSION_RENT_CONFIRM}
+        {*PERMISSION_READ, PERMISSION_RENT_ENTRY, PERMISSION_RENT_CONFIRM, PERMISSION_OPERATIONS}
     ),
     "admin": frozenset(
         {
@@ -41,6 +42,7 @@ API_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
             PERMISSION_RENT_ENTRY,
             PERMISSION_RENT_CONFIRM,
             PERMISSION_REVERSE,
+            PERMISSION_OPERATIONS,
         }
     ),
 }
@@ -48,8 +50,9 @@ API_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
 ROLE_PERMISSIONS: dict[Role, frozenset[str]] = {
     # OWNER: full access.
     Role.OWNER: API_ROLE_PERMISSIONS["admin"],
-    # SECRETARY: can record income (create pending) but not confirm/finalize.
-    Role.SECRETARY: frozenset({*PERMISSION_READ, PERMISSION_RENT_ENTRY}),
+    # SECRETARY: can record income (create pending) but not confirm/finalize;
+    # can view/process operational tasks (mirrors backend manager).
+    Role.SECRETARY: frozenset({*PERMISSION_READ, PERMISSION_RENT_ENTRY, PERMISSION_OPERATIONS}),
 }
 
 ROLE_LOCALES: dict[Role, str] = {

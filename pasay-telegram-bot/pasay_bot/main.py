@@ -58,6 +58,8 @@ def build_application(
     app.add_handler(CommandHandler("rent", commands.cmd_rent))
     app.add_handler(CommandHandler("pending", commands.cmd_pending))
     app.add_handler(CommandHandler("cancel", commands.cmd_cancel))
+    app.add_handler(CommandHandler("ops", commands.cmd_ops))
+    app.add_handler(CommandHandler("todo", commands.cmd_ops))
     app.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversation.handle_message))
     return app

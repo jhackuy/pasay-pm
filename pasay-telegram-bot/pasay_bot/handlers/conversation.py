@@ -22,12 +22,14 @@ from pasay_bot.keyboards import (
     home_keyboard,
     new_nonce,
     now_ts,
+    ops_back_keyboard,
     payment_method_keyboard,
 )
 from pasay_bot.render import cards
 from pasay_bot.render import html as H
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
+    PERMISSION_OPERATIONS,
     PERMISSION_RENT_CONFIRM,
     has_permission,
     locale_for,
@@ -76,6 +78,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _enter_amount(update, context, payload, locale, edit_mode=state == "rent_edit_amount")
     elif state in ("rent_date", "rent_edit_date"):
         await _enter_date(update, context, payload, locale, edit_mode=state == "rent_edit_date")
+    elif state == "ops_snooze_custom":
+        await _enter_ops_snooze_custom(update, context, payload, locale)
     else:
         from pasay_bot.handlers import nl_bridge
 
@@ -187,3 +191,77 @@ async def _return_to_confirm(update, context, payload, locale):
 
 def _has_too_many_decimals(value: Decimal) -> bool:
     return value != value.quantize(Decimal("0.01"))
+
+
+
+async def _enter_ops_snooze_custom(update, context, payload, locale: str):
+    """V1.2 custom snooze: free-text YYYY-MM-DD [HH:MM] (or a preset word)."""
+    from pasay_bot.api_client import PasayApiError
+
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    api = context.bot_data["api_client"]
+    text = (update.effective_message.text or "").strip().lower()
+    message_id = payload.get("message_id")
+    task_id = int(payload.get("task_id") or 0)
+
+    if text in ("取消", "cancel", "quit", "exit"):
+        store.delete_conversation(chat_id, user_id)
+        if message_id:
+            await edit_message_text_idempotent(
+                context.bot, chat_id=chat_id, message_id=message_id,
+                text=H.escape(t("rent.cancelled", locale)), parse_mode=HTML,
+                reply_markup=ops_back_keyboard(locale),
+            )
+        return
+
+    until = _parse_snooze_input(text)
+    if until is None:
+        await context.bot.send_message(
+            chat_id, H.escape(t("ops.snooze_invalid", locale)),
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+
+    try:
+        task = await api.snooze_operational_task(task_id, until=until.isoformat())
+    except PasayApiError as exc:
+        await context.bot.send_message(
+            chat_id, f"⚠️ {H.escape(exc.detail)}",
+            parse_mode=HTML, reply_markup=ops_back_keyboard(locale),
+        )
+        return
+    store.delete_conversation(chat_id, user_id)
+    title = H.escape(task.title or f"#{task.id}")
+    until_str = str(task.snoozed_until or "")[:16].replace("T", " ")
+    text_out = t("ops.snoozed_card", locale, title=title, until=H.escape(until_str))
+    if message_id:
+        await edit_message_text_idempotent(
+            context.bot, chat_id=chat_id, message_id=message_id,
+            text=H.truncate(text_out), parse_mode=HTML,
+            reply_markup=ops_back_keyboard(locale),
+        )
+    else:
+        await context.bot.send_message(chat_id, text_out, parse_mode=HTML)
+
+
+def _parse_snooze_input(text: str):
+    """Accept YYYY-MM-DD [HH:MM] or preset words (1h/今天下午/明天上午/3天/3天后)."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    lowered = text.strip().lower()
+    if lowered in ("1h", "1小时", "一小时"):
+        return now + timedelta(hours=1)
+    if lowered in ("今天下午", "this afternoon", "afternoon"):
+        target = now.replace(hour=17, minute=0, second=0, microsecond=0)
+        return target if target > now else target + timedelta(days=1)
+    if lowered in ("明天上午", "tomorrow morning", "tomorrow"):
+        return (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    if lowered in ("3天", "3天后", "3 days", "3d"):
+        return now + timedelta(days=3)
+    try:
+        return datetime.fromisoformat(text.strip())
+    except ValueError:
+        return None
