@@ -21,3 +21,5 @@ class User(AuditMixin, Base):
     )
     api_key_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # V1.2: where the notifier delivers Telegram notifications for this user.
+    telegram_chat_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)

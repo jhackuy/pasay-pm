@@ -8,6 +8,9 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg2://pasay_pm:pasay_pm@localhost:5432/pasay_pm"
     upload_dir: str = "uploads"
+    # V1.2: bot token used by the notifier worker for sendMessage. Leave empty
+    # to run the scheduler without sending notifications.
+    telegram_bot_token: str = ""
 
 
 settings = Settings()

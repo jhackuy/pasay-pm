@@ -9,6 +9,7 @@ from app.models.base import AuditMixin, Base, pg_enum
 
 
 class AuditAction(str, Enum):
+    # V1.1 values (never reorder / rename — old audit rows reference them).
     create = "create"
     update = "update"
     soft_delete = "soft_delete"
@@ -17,6 +18,16 @@ class AuditAction(str, Enum):
     reject = "reject"
     pay = "pay"
     reverse = "reverse"
+    # V1.2 PROACTIVE OPERATIONS values (appended only).
+    task_created = "task_created"
+    task_completed = "task_completed"
+    task_cancelled = "task_cancelled"
+    task_snoozed = "task_snoozed"
+    rule_created = "rule_created"
+    rule_updated = "rule_updated"
+    rule_disabled = "rule_disabled"
+    task_auto_completed = "task_auto_completed"
+    task_auto_cancelled = "task_auto_cancelled"
 
 
 class AuditLog(AuditMixin, Base):

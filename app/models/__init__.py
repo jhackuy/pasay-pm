@@ -10,6 +10,16 @@ from app.models.commission import (
 )
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
+from app.models.operations import (
+    NotificationOutbox,
+    NotificationStatus,
+    OperationalTask,
+    OperationalTaskPriority,
+    OperationalTaskStatus,
+    OperationalTaskType,
+    Recurrence,
+    RecurringRule,
+)
 from app.models.property import Property, Unit, UnitStatus
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.tenant import Tenant
@@ -32,7 +42,15 @@ __all__ = [
     "IncomeStatus",
     "Lease",
     "LeaseStatus",
+    "NotificationOutbox",
+    "NotificationStatus",
+    "OperationalTask",
+    "OperationalTaskPriority",
+    "OperationalTaskStatus",
+    "OperationalTaskType",
     "Property",
+    "Recurrence",
+    "RecurringRule",
     "SoftDeleteMixin",
     "Task",
     "TaskPriority",

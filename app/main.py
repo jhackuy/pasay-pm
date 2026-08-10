@@ -10,6 +10,7 @@ from app.api.routers import (
     expense,
     income,
     leases,
+    operations,
     properties,
     reports,
     tasks,
@@ -38,6 +39,7 @@ app.include_router(tasks.router, prefix=API_PREFIX)
 app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(attachments.router, prefix=API_PREFIX)
 app.include_router(audit.router, prefix=API_PREFIX)
+app.include_router(operations.router, prefix=API_PREFIX)
 
 
 @app.get("/health", summary="Health check (no auth)")
