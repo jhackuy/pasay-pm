@@ -426,6 +426,14 @@ def test_tasks_report(client, admin_headers, unit_id):
     assert resp.status_code == 200
     assert [r["title"] for r in resp.json()] == ["Scheduled A"]
 
+    # within_days window: Scheduled A is due in +10 days -> excluded at 5d, included at 15d
+    resp = client.get(f"{API}/reports/tasks?status=scheduled&within_days=5", headers=admin_headers)
+    assert resp.status_code == 200
+    assert [r["title"] for r in resp.json()] == []
+    resp = client.get(f"{API}/reports/tasks?status=scheduled&within_days=15", headers=admin_headers)
+    assert resp.status_code == 200
+    assert [r["title"] for r in resp.json()] == ["Scheduled A"]
+
 
 def test_expenses_report(client, admin_headers, unit_id):
     today = date.today()
@@ -656,3 +664,52 @@ def test_monthly_report_accounting_start_excludes_lease(
     resp = client.get(f"{API}/reports/monthly?month={_month()}", headers=admin_headers)
     assert resp.status_code == 200
     assert all(r["lease_id"] != lease_id for r in resp.json())
+
+
+def test_financial_summary_period_matches_not_received_date(client, admin_headers, unit_id, tenant_id):
+    """Regression: collected_rent/outstanding must attribute income to its RENT
+    period (YYYY-MM in description), not the received_date. A late/backdated
+    payment for a past month received during the current month must not inflate
+    this month's collected nor drive outstanding_rent negative."""
+    today = date.today()
+    start = today.replace(day=1)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(today.year + 1, 12, 31),
+        due_day=1,
+    )
+    prev_month = _shift_month(today, -1).strftime("%Y-%m")
+    # confirmed payment for LAST month, received THIS month (late/backdated)
+    _post_income(client, admin_headers, lease_id, "65000.00", today,
+                 status="confirmed", description=f"rent {prev_month}")
+    resp = client.get(f"{API}/reports/financial-summary?month={_month()}", headers=admin_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    # expected this month = 65000; no income for THIS month period -> collected 0
+    assert data["expected_rent_total"] == "65000.00"
+    assert data["collected_rent"] == "0.00"
+    assert data["outstanding_rent"] == "65000.00"
+    # cash received this month is real, but it belongs to last month's period
+    assert data["total_income"] == "65000.00"
+
+
+def test_monthly_report_period_matches_not_received_date(client, admin_headers, unit_id, tenant_id):
+    """Regression for /monthly: per-lease collected matches the rent period."""
+    today = date.today()
+    start = today.replace(day=1)
+    lease_id = _create_rent_lease(
+        client, admin_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=date(today.year + 1, 12, 31),
+        due_day=1,
+    )
+    prev_month = _shift_month(today, -1).strftime("%Y-%m")
+    _post_income(client, admin_headers, lease_id, "65000.00", today,
+                 status="confirmed", description=f"rent {prev_month}")
+    resp = client.get(f"{API}/reports/monthly?month={_month()}", headers=admin_headers)
+    assert resp.status_code == 200
+    row = [r for r in resp.json() if r["lease_id"] == lease_id][0]
+    assert row["expected"] == "65000.00"
+    assert row["collected"] == "0.00"   # last-month payment must not count for this month
+    assert row["outstanding"] == "65000.00"

@@ -126,6 +126,21 @@ def _covered_periods(
     return covered
 
 
+def _income_period(income: Income) -> str | None:
+    """The rent period (YYYY-MM) an income payment should be attributed to.
+
+    Prefers the explicit YYYY-MM in the description (strict period matching);
+    falls back to the received-date month. Returns None if the income is not
+    linked to a lease (non-rent income).
+    """
+    if income.lease_id is None:
+        return None
+    month = _month_from_description(income.description)
+    if month is None:
+        month = income.received_date.strftime("%Y-%m")
+    return month
+
+
 @router.get("/financial-summary", response_model=FinancialSummary)
 def financial_summary(
     month: str | None = Query(default=None, pattern=MONTH_PATTERN),
@@ -148,21 +163,44 @@ def financial_summary(
         func.coalesce(func.sum(Lease.monthly_rent), 0)
     ).scalar()
 
-    income_query = db.query(Income).filter(
+    # cash-basis income actually received during the month (all confirmed income)
+    cash_income_query = db.query(Income).filter(
         Income.status == IncomeStatus.confirmed,
         Income.received_date >= start,
         Income.received_date <= end,
     )
     if unit_id is not None:
-        income_query = income_query.join(Lease, Income.lease_id == Lease.id).filter(
+        cash_income_query = cash_income_query.join(Lease, Income.lease_id == Lease.id).filter(
             Lease.unit_id == unit_id
         )
-    total_income = income_query.with_entities(
+    total_income = cash_income_query.with_entities(
         func.coalesce(func.sum(Income.amount), 0)
     ).scalar()
-    collected_rent = income_query.filter(Income.lease_id.isnot(None)).with_entities(
-        func.coalesce(func.sum(Income.amount), 0)
-    ).scalar()
+
+    # period-accurate rent collected for THIS month: match confirmed income to its
+    # rent period (YYYY-MM in description, else received-date month). This is
+    # consistent with /overdue-rents and avoids late/advance/backdated payments
+    # inflating a month's collected above its expected rent (which made
+    # outstanding_rent negative and inconsistent with overdue-rents).
+    active_leases = lease_query.all()
+    lease_ids = [l.id for l in active_leases]
+    confirmed_by_lease: dict[int, list[Income]] = {}
+    if lease_ids:
+        inc_q = db.query(Income).filter(
+            Income.lease_id.in_(lease_ids),
+            Income.status == IncomeStatus.confirmed,
+        )
+        for inc in inc_q.all():
+            lid = inc.lease_id
+            if lid is not None:
+                confirmed_by_lease.setdefault(lid, []).append(inc)
+    period_collected = Decimal("0.00")
+    for lease in active_leases:
+        for inc in confirmed_by_lease.get(lease.id, []):
+            if _income_period(inc) == resolved:
+                period_collected += inc.amount
+    collected_rent = _d2(period_collected)
+    outstanding_rent = _d2(expected_rent_total - collected_rent)
 
     expense_query = db.query(Expense).filter(
         Expense.status.in_([ExpenseStatus.approved, ExpenseStatus.paid]),
@@ -186,7 +224,7 @@ def financial_summary(
         month=resolved,
         expected_rent_total=_d2(expected_rent_total),
         collected_rent=_d2(collected_rent),
-        outstanding_rent=_d2(expected_rent_total - collected_rent),
+        outstanding_rent=outstanding_rent,
         total_income=_d2(total_income),
         total_expense=_d2(total_expense),
         net_income=_d2(total_income - total_expense),
@@ -286,15 +324,19 @@ def monthly_report(
         tenant = db.query(Tenant).filter(Tenant.id == lease.tenant_id).first()
         if unit is None or tenant is None:
             continue
-        collected = (
-            db.query(func.coalesce(func.sum(Income.amount), 0))
+        confirmed_incomes = (
+            db.query(Income)
             .filter(
                 Income.lease_id == lease.id,
                 Income.status == IncomeStatus.confirmed,
-                Income.received_date >= start,
-                Income.received_date <= end,
             )
-            .scalar()
+            .all()
+        )
+        collected = _d2(
+            sum(
+                (inc.amount for inc in confirmed_incomes if _income_period(inc) == resolved),
+                Decimal("0.00"),
+            )
         )
         rows.append(
             MonthlyLeaseSummary(
@@ -304,7 +346,7 @@ def monthly_report(
                 unit=unit.unit_number,
                 tenant=tenant.full_name,
                 expected=_d2(lease.monthly_rent),
-                collected=_d2(collected),
+                collected=collected,
                 outstanding=_d2(lease.monthly_rent - collected),
             )
         )
@@ -370,6 +412,10 @@ def tasks_report(
         pattern=r"^(pending|scheduled|completed|open|in_progress)$",
     ),
     overdue: bool = False,
+    within_days: int | None = Query(
+        default=None, ge=1,
+        description="Only tasks with due_date within the next N days (future window).",
+    ),
     db: Session = Depends(get_db),
     _: User = Depends(manager_or_admin),
 ):
@@ -386,6 +432,13 @@ def tasks_report(
             Task.due_date.isnot(None),
             Task.due_date < date.today(),
             Task.status != TaskStatus.completed,
+        )
+    if within_days is not None:
+        from datetime import timedelta
+        horizon = date.today() + timedelta(days=within_days)
+        query = query.filter(
+            Task.due_date.isnot(None),
+            Task.due_date <= horizon,
         )
     tasks = (
         query.order_by(Task.due_date.is_(None), Task.due_date, Task.id)
