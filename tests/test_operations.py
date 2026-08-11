@@ -584,7 +584,23 @@ def test_rules_crud_and_disable(client, db_session, manager_headers):
     assert all(r["enabled"] is True for r in resp.json())
 
 
-def test_summary_scoped_to_agent(client, db_session, agent_headers, admin_headers):
+def test_summary_scoped_to_agent(client, db_session, agent_headers, admin_headers, monkeypatch):
+    # Freeze the real-time clock used by /operations/summary to the test's fixed
+    # NOW so the overdue / due_today bucketing is deterministic on any run day
+    # (previously date-fragile: it drifted once the real calendar moved past 2026-08-10).
+    import app.services.operations.summary as summary_mod
+    import datetime as _dt
+
+    class _FrozenDatetime:
+        @staticmethod
+        def now(tz):
+            return NOW
+
+        @staticmethod
+        def combine(*args, **kwargs):
+            return _dt.datetime.combine(*args, **kwargs)
+
+    monkeypatch.setattr(summary_mod, "datetime", _FrozenDatetime)
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
     agent = db_session.query(User).filter_by(role=UserRole.agent).first()
     _make_task(db_session, assigned_user_id=admin.id, due_at=NOW - timedelta(days=2), dedupe_key="s1")
