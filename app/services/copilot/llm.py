@@ -29,7 +29,9 @@ import httpx
 
 ENV_PREFIX = "COPILOT_LLM_"
 DEFAULT_PROVIDER = "deepseek"
-DEFAULT_TIMEOUT_SECONDS = 45.0
+# Reasoning models (deepseek-v4-*) burn tokens/time on reasoning_content;
+# 120s covers slow cold starts without hiding provider errors.
+DEFAULT_TIMEOUT_SECONDS = 120.0
 
 # Default registry (env vars override per provider). The interface is
 # OpenAI-compatible, so adding e.g. qwen/dashscope is just a new entry.

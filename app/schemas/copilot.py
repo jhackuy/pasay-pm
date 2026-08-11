@@ -32,3 +32,29 @@ class CopilotProposalRead(AuditFields):
 class CopilotProposalActionOut(BaseModel):
     proposal: CopilotProposalRead
     detail: str
+
+
+# --- V1.2.2 Phase C1 — read-only TODAY brief (no execution) ---
+
+class CopilotTodayIn(BaseModel):
+    """Optional body for POST /operations/copilot/today."""
+
+    provider: str | None = Field(default=None, max_length=64)
+    intent_note: str | None = Field(default=None, max_length=500)
+
+
+class CopilotTodayItemOut(BaseModel):
+    item_ref: str
+    reason_why_important: str
+    suggested_action: str
+
+
+class CopilotTodayOut(BaseModel):
+    """TODAY brief schema (UI shows at most 3 items + a short summary)."""
+
+    top_items: list[CopilotTodayItemOut]
+    summary: str
+    context_schema_version: str
+    provider: str
+    model: str
+    latency_ms: int

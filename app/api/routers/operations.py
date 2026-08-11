@@ -36,8 +36,16 @@ from app.schemas.operations import (
     TaskActionOut,
     TaskSnoozeIn,
 )
-from app.schemas.copilot import CopilotProposalActionOut, CopilotProposalCreate, CopilotProposalRead
+from app.schemas.copilot import (
+    CopilotProposalActionOut,
+    CopilotProposalCreate,
+    CopilotProposalRead,
+    CopilotTodayIn,
+    CopilotTodayOut,
+)
 from app.services.audit import record_audit, serialize_row
+from app.services.copilot import llm as copilot_llm
+from app.services.copilot import today as copilot_today_svc
 from app.services.operations import copilot as copilot_svc
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
@@ -471,6 +479,83 @@ def copilot_context(
     copilot_svc.log_context_run(db, actor=user, context=context)
     db.commit()
     return context
+
+
+@router.post(
+    "/copilot/today",
+    response_model=CopilotTodayOut,
+    status_code=status.HTTP_200_OK,
+)
+def copilot_today(
+    payload: CopilotTodayIn | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Read-only TODAY brief grounded to the deterministic context (C1).
+
+    Grounds from ``build_copilot_context`` (same RBAC scope as A+B), renders
+    it as injection-safe fenced data, calls the configured/requested provider,
+    and post-validates server-side: item refs must be grounded and within the
+    deterministic top-K, at most 3 items, summary at most 2 sentences.
+    Fail-closed: provider errors (unreachable/timeout/5xx) return 503 with a
+    clear reason — never a fabricated answer. The only DB write is the
+    ``copilot_runs`` audit row.
+    """
+    body = payload or CopilotTodayIn()
+    provider = body.provider
+    if provider is not None and provider not in copilot_llm.list_providers():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown copilot LLM provider {provider!r}; "
+            f"known providers: {', '.join(copilot_llm.list_providers())}",
+        )
+    try:
+        result = copilot_today_svc.build_today(db, user, provider=provider)
+    except copilot_llm.LLMProviderError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": f"copilot provider unavailable: {exc}",
+                "error_code": "llm_provider_error",
+            },
+        ) from exc
+    except copilot_today_svc.TodayError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "message": f"copilot produced no usable brief: {exc}",
+                "error_code": "copilot_today_unavailable",
+            },
+        ) from exc
+    # Optional audit row (the only C1 write): what the copilot was shown + the
+    # validated brief + internal flags (hallucinated/dropped/backfilled refs).
+    copilot_svc.log_context_run(
+        db,
+        actor=user,
+        context={
+            "context": result.context,
+            "today": {
+                "top_items": [item.to_dict() for item in result.top_items],
+                "summary": result.summary,
+                "provider": result.provider,
+                "model": result.model,
+                "latency_ms": result.latency_ms,
+                "flags": result.flags,
+                "deterministic_top_refs": result.deterministic_top_refs,
+            },
+            "intent_note": body.intent_note,
+        },
+        intent="copilot_today",
+    )
+    db.commit()
+    return CopilotTodayOut(
+        top_items=[item.to_dict() for item in result.top_items],
+        summary=result.summary,
+        context_schema_version=result.context_schema_version,
+        provider=result.provider,
+        model=result.model,
+        latency_ms=result.latency_ms,
+    )
 
 
 def _proposal_state_error(exc: Exception) -> HTTPException:

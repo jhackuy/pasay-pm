@@ -2,11 +2,10 @@
 
 Read-only by construction: nothing here writes financial state, creates or
 mutates tasks, or transitions anything. The only DB write in the whole C1
-surface is the ``copilot_runs`` audit row reusing the A+B ``log_context_run``.
-
-(WIP — llm + ranking/today/prompts land together; see V122_PHASE_C1_BRIEF.)
+surface is the ``copilot_runs`` audit row reusing the A+B ``log_context_run``
+(written by the router, never by the service layer).
 """
 
-from app.services.copilot import llm  # noqa: F401
+from app.services.copilot import llm, prompts, ranking, today  # noqa: F401
 
-__all__ = ["llm"]
+__all__ = ["llm", "prompts", "ranking", "today"]
