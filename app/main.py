@@ -1,3 +1,12 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Export .env keys to os.environ so BOTH pydantic Settings (config.py) and any
+# raw os.getenv consumers (e.g. the C1 copilot llm.py provider_config) see them.
+# The app runs with CWD=/opt/pasay-pm; fall back to the file's own dir otherwise.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
