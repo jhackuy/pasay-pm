@@ -30,13 +30,13 @@ Unit 1608 租金严重逾期。
 📋 准备安排跟进
 房产：Sunset Tower · Unit 1608
 事项：跟进逾期租金
-负责人：Maria
+负责人：Secretary
 截止：今天 17:00
 秘书将收到英文任务通知。
 [✅ 确认安排] [✏️ 修改] [取消]
 
 [✅ 确认安排] tap → POST /copilot/proposals/{id}/execute →
-✅ 已安排给 Maria（今天 17:00 截止）
+✅ 已安排给 Secretary（今天 17:00 截止）
 她将在 Telegram 收到任务通知。我会继续跟踪这个事项。
 [查看任务] [返回今日重点]
 ```

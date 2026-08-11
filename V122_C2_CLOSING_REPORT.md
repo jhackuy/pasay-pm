@@ -195,9 +195,10 @@ fully removed after (task 3780, proposals 3/6, outbox 16); **financial tables un
 1. ~~Secretary Start-on-bot onboarding~~ **RESOLVED.** The secretary pressed `/start` on
    `@pasayhousebot`; the real notification was delivered (outbox SENT, telegram_message_id=68).
    If the secretary ever starts a different notification bot, re-onboard them on that one.
-2. `maria` (secretary agent, id 7) has no `telegram_chat_id` registered — notifications currently
-   flow to `pasay_bot_manager` (id 14, bound to 1083657401). Sync `maria`'s chat id when it maps to
-   the secretary bot.
+2. `maria` (legacy referral agent, id 7) is **deactivated** (`is_active=false`) and is **NOT** a
+   secretary — do not bind a telegram chat to it or treat it as the human secretary. The human
+   secretary/operator identity is `pasay_bot_manager` (id 14, bound to `1083657401`). Monitor that
+   `maria`'s ₱3,250 legacy settlement stays intact (it is a financial record, never deleted).
 3. Execution kill-switch is now **on** in production (required for E2E). It remains a single-env
    flip to disable; monitor no autopilot regressions (C3 is out of scope until explicitly approved).
 4. Snooze due-time default (`tomorrow_morning` → 17:00 +08 observed) is displayed exactly to the
@@ -205,6 +206,63 @@ fully removed after (task 3780, proposals 3/6, outbox 16); **financial tables un
 5. Financial-wall relies on the allowlist + executor not importing financial services; defense in
    depth only (schema + denylist are cosmetic). Any future executor change must keep this structural
    boundary.
+
+---
+
+## P. Identity & Routing Cleanup (final closeout, 2026-08-11)
+
+Executed after the C2 sign-off per the canonical identity model. Commit `9d238d3`; tag `v1.2.2-c2-idcleanup`.
+
+### Final identity model (verified in production DB)
+| id | username        | role    | active | telegram | role |
+|----|-----------------|---------|--------|----------|------|
+| 1  | `admin`         | admin   | ✓ | `5177241442` | **Owner** |
+| 14 | `pasay_bot_manager` | manager | ✓ | `1083657401` | **Secretary / Operator** (human channel) |
+| 7  | `maria`         | agent   | **✗ deactivated** | — | legacy referral/commission identity |
+| 12/13 | `dev_agent_maria`/`dev_agent_john` | agent | **✗ deactivated** | — | dev leftovers |
+
+### What changed
+- Deactivated `maria`(7), `dev_agent_maria`(12), `dev_agent_john`(13) via `is_active=false` (schema's
+  clean inactivity mechanism). **No rows deleted** → financial/history preserved.
+- Added `SECRETARY_ASSIGNEE_ID` (default 14, env `OPERATIONS_SECRETARY_ASSIGNEE`) and a deterministic
+  fallback in `resolve_assignee`: with **zero** active agent candidates, C2 "安排秘书跟进" followup
+  auto-resolves to the designated Secretary/Operator (14). Stale maria/dev no longer create
+  artificial "multiple assignee candidates" ambiguity.
+
+### maria legacy preservation evidence
+- `commission_settlements` id 7 (agent 7, lease 3, **₱3,250 confirmed**) verified **unchanged**.
+- User row kept (only `is_active` flipped). No financial row touched. **No financial mutation.**
+- `expenses` count stayed **8**.
+
+### DEV-user handling
+- Deactivated (not hard-deleted) to preserve audit/commission references (2 settlements each).
+- Historical terminal FAILED outbox rows (17/18, recipients `user:13`) left as-is — they are
+  terminal (`FAILED`, max_attempts reached) and cause no runtime behavior; cleaned only via the DEV
+  cleanup script if desired, not destructively now.
+
+### Assignee candidate behavior
+- **Before**: 3 active agents (maria + 2 dev) → "安排秘书跟进" returned `multiple assignee
+  candidates; choose one` (artificial ambiguity).
+- **After**: 0 active agents → deterministic fallback to Secretary/Operator (14). Verified on live
+  production API: `POST /copilot/recommend` (followup, no assignee) → `assignee_user_id: 14`.
+
+### Routing decision (requirement #4 — NO engine built)
+- **Kept current safe behavior** for general proactive ops: `OPERATIONS_DEFAULT_ASSIGNEE` unset →
+  business reminders still route to Owner (`admin`, id 1). No category-aware engine implemented.
+- **C2 followup/assignment** uses the deterministic Secretary/Operator default (14) — this is the
+  C2 UX's Secretary channel, distinct from general proactive routing.
+- **Required C3 / V1.3 improvement (documented, NOT built):** a small deterministic routing map —
+  operational/execution-oriented → Secretary(14); Owner-decision/financial-sensitive/approval →
+  Owner(1); secretary-task overdue/escalated → secretary first then owner escalation (via the
+  existing snooze/reconcile semantics). Financial mutation stays entirely in V1.1 safe flows.
+
+### Regression
+- Backend `pytest tests/ -o addopts="-m 'not eval'"`: **281 passed / 4 deselected** (279 + 2 new
+  identity tests).
+- Bot: **167 passed**. `hermes verify` Recipe: **OK**.
+- Owner mapping (`admin`/5177241442) and secretary mapping (`pasay_bot_manager`/1083657401)
+  **unchanged**. C2 confirmed-action flow re-verified live (proposal→confirm→execute→task→outbox,
+  deterministic secretary assignee) then cleaned.
 
 ---
 
