@@ -303,6 +303,47 @@ class OperationalTask:
         )
 
 
+@dataclass
+class CopilotTodayItem:
+    """One item in the read-only TODAY brief (C1). Only human text is exposed
+    to the end user; backend entity refs stay internal."""
+
+    item_ref: str = ""
+    reason_why_important: str = ""
+    suggested_action: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotTodayItem":
+        return cls(
+            item_ref=d.get("item_ref") or "",
+            reason_why_important=d.get("reason_why_important") or "",
+            suggested_action=d.get("suggested_action") or "",
+        )
+
+
+@dataclass
+class CopilotToday:
+    """Read-only TODAY brief from POST /operations/copilot/today (C1)."""
+
+    top_items: list[CopilotTodayItem]
+    summary: str = ""
+    context_schema_version: str = "1.0"
+    provider: str = ""
+    model: str = ""
+    latency_ms: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotToday":
+        return cls(
+            top_items=[CopilotTodayItem.from_dict(i) for i in (d.get("top_items") or [])],
+            summary=d.get("summary") or "",
+            context_schema_version=d.get("context_schema_version") or "1.0",
+            provider=d.get("provider") or "",
+            model=d.get("model") or "",
+            latency_ms=int(d.get("latency_ms") or 0),
+        )
+
+
 class PasayApiError(Exception):
     def __init__(self, status_code: Optional[int], detail: str):
         self.status_code = status_code
@@ -481,6 +522,16 @@ class PasayApiClient:
             "due_7_days": int(data.get("due_7_days") or 0),
             "pending_total": int(data.get("pending_total") or 0),
         }
+
+    async def copilot_today(self, provider: Optional[str] = None) -> CopilotToday:
+        """POST /operations/copilot/today (C1, read-only). Body empty or
+        ``{provider}`` to select the LLM provider for eval/override. Raises
+        PasayApiError on 503 provider-unavailable (fail-closed)."""
+        body: dict[str, Any] = {}
+        if provider:
+            body["provider"] = provider
+        data = await self._request("POST", "/operations/copilot/today", json=body)
+        return CopilotToday.from_dict(data)
 
     async def get_tasks(
         self, *, status: Optional[str] = None, overdue: bool = False,

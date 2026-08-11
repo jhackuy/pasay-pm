@@ -6,6 +6,8 @@ from decimal import Decimal
 from typing import Optional
 
 from pasay_bot.api_client import (
+    CopilotToday,
+    CopilotTodayItem,
     FinancialSummary,
     Income,
     Lease,
@@ -504,3 +506,49 @@ def operational_task_detail_card(task, properties, locale: str = "zh") -> str:
     if task.description:
         lines.append(H.escape(task.description))
     return "\n".join(lines)
+
+
+# --- V1.2.2 C1 read-only copilot (🤖 运营助手) ---------------------------------
+
+# item_ref prefix -> emoji + zh/en cue. Matches the backend grounding refs
+# (property:{id} / lease:{id} / task:{id} / expense:{id} / settlement:{id}).
+_COPILOT_REF_EMOJI = {
+    "lease": "🔴",      # rent / overdue
+    "task": "🛠",       # maintenance / operational todo
+    "expense": "💸",    # expense approval
+    "settlement": "🤝", # commission settlement
+    "property": "🏢",   # property-level
+}
+
+
+def _copilot_emoji(item: CopilotTodayItem) -> str:
+    kind = (item.item_ref or "").split(":", 1)[0].lower()
+    return _COPILOT_REF_EMOJI.get(kind, "📋")
+
+
+def _copilot_one_line(text: str, max_chars: int = 160) -> str:
+    """Single-line, HTML-escaped, length-capped human text (no refs/JSON)."""
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[: max_chars - 1].rstrip() + "…"
+    return H.escape(cleaned)
+
+
+def copilot_today_card(today: CopilotToday, locale: str = "zh") -> str:
+    """Read-only TODAY brief (C1). ≤3 top items, each readable in seconds:
+    what / why / suggested next step. No backend IDs, refs, JSON, or model
+    terms in the user-visible text."""
+    blocks = [f"🤖 <b>{H.escape(t('copilot.title', locale))}</b>"]
+    if today.summary:
+        blocks.append(_copilot_one_line(today.summary))
+    for item in today.top_items[:3]:
+        emoji = _copilot_emoji(item)
+        why = _copilot_one_line(item.reason_why_important)
+        act = _copilot_one_line(item.suggested_action)
+        blocks.append(
+            f"{emoji} <b>{H.escape(t('copilot.why', locale))}</b>{why}\n"
+            f"<b>{H.escape(t('copilot.action', locale))}</b>{act}"
+        )
+    if not today.top_items:
+        blocks.append(H.escape(t("copilot.empty", locale)))
+    return "\n\n".join(blocks)

@@ -3,6 +3,8 @@ from datetime import date
 from decimal import Decimal
 
 from pasay_bot.api_client import (
+    CopilotToday,
+    CopilotTodayItem,
     FinancialSummary,
     Income,
     Lease,
@@ -236,3 +238,46 @@ def test_truncate_long_list_with_ampersand_names():
         assert ";" in truncated[ai + 1:], truncated
     if "<" in truncated:
         assert truncated.count("<b>") == truncated.count("</b>")
+
+
+def test_copilot_today_card_no_refs_no_ids_no_model():
+    """C1 UX hard-metrics: no backend refs/IDs/JSON/model terms leak to the
+    user; at most 3 items; each item readable with why+action; short summary."""
+    item = CopilotTodayItem(
+        item_ref="lease:3",
+        reason_why_important="Rent overdue 2 months, PHP 130,000 outstanding",
+        suggested_action="Follow up with the tenant today",
+    )
+    item2 = CopilotTodayItem(
+        item_ref="task:9",
+        reason_why_important="AC maintenance due this week",
+        suggested_action="Schedule the technician",
+    )
+    today = CopilotToday(
+        top_items=[item, item2],
+        summary="2 overdue rents and 1 lease expiring soon.",
+        model="deepseek-v4-pro",
+        provider="deepseek-pro",
+    )
+    text = cards.copilot_today_card(today)
+    for banned in ("lease:3", "task:9", "deepseek", "provider", "latency_ms", "item_ref"):
+        assert banned not in text, banned
+    assert text.count("建议：") == 2
+    assert text.count("为什么：") == 2
+    assert "2 overdue rents and 1 lease expiring soon." in text
+    assert "<b>为什么：</b>" in text
+
+
+def test_copilot_today_card_empty():
+    text = cards.copilot_today_card(CopilotToday(top_items=[]))
+    assert "今日暂无待办事项" in text
+    assert "lease:" not in text
+
+
+def test_copilot_emoji_mapping():
+    lease = cards._copilot_emoji(CopilotTodayItem(item_ref="lease:3"))
+    task = cards._copilot_emoji(CopilotTodayItem(item_ref="task:9"))
+    expense = cards._copilot_emoji(CopilotTodayItem(item_ref="expense:2"))
+    assert lease == "🔴"
+    assert task == "🛠"
+    assert expense == "💸"

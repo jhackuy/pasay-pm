@@ -155,6 +155,16 @@ async def cmd_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_operations_center(context, update.effective_chat.id, locale)
 
 
+async def cmd_copilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🤖 运营助手 (C1 read-only TODAY brief)."""
+    role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
+    locale = locale_for(role)
+    if not has_permission(role, PERMISSION_OPERATIONS):
+        await _refuse(update, context, role)
+        return
+    await show_copilot(context, update.effective_chat.id, locale)
+
+
 async def _refuse(update: Update, context: ContextTypes.DEFAULT_TYPE, role):
     await context.bot.send_message(
         update.effective_chat.id,
@@ -625,6 +635,21 @@ async def show_operations_center(context, chat_id: int, locale: str, message_id=
         return
     text = cards.operations_overview_card(summary, locale)
     await _render(context, chat_id, message_id, text, ops_overview_keyboard(summary, locale))
+
+
+async def show_copilot(context, chat_id: int, locale: str, message_id=None):
+    """🤖 运营助手 — C1 read-only TODAY brief. No free-text input needed; the
+    bot posts an empty body and renders the deterministic grounded brief."""
+    api = context.bot_data["api_client"]
+    try:
+        today = await api.copilot_today()
+    except PasayApiError as exc:
+        # 503 provider-unavailable / timeout -> clear retryable error, never fabricate.
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    text = cards.copilot_today_card(today, locale)
+    await _render(context, chat_id, message_id, text, home_keyboard(locale))
 
 
 async def show_operations_section(context, chat_id: int, message_id: int, section: str,
