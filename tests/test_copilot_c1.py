@@ -608,21 +608,32 @@ def test_copilot_today_endpoint_response_shape(db_session, client, manager_heade
     _seed_mandated_scenario(db_session)
     db_session.commit()
     clock.set_override(NOW_MANILA)
-    fake = _FakeLLM()
-    monkeypatch.setattr("app.services.copilot.llm.get_llm_client", lambda provider=None: fake)
 
+    def _boom(provider=None):
+        raise AssertionError("LLM must not be invoked on the deterministic /today path")
+
+    monkeypatch.setattr("app.services.copilot.llm.get_llm_client", _boom)
+
+    # DEFAULT body: deterministic-first brief (C1.1) — no LLM on the path.
     resp = client.post(f"{API}/operations/copilot/today", headers=manager_headers, json={})
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert set(data.keys()) == {
-        "top_items", "summary", "context_schema_version", "provider", "model", "latency_ms"
+        "top_items", "summary", "context_schema_version", "provider", "model",
+        "latency_ms", "enriched", "summary_version", "flags",
+        "deterministic_top_refs", "latency",
     }
     assert data["context_schema_version"] == CONTEXT_SCHEMA_VERSION
-    assert data["provider"] == "deepseek"
-    assert data["model"] == "fake-v1"
-    assert data["latency_ms"] == 17
+    assert data["provider"] == "deterministic"
+    assert data["model"] == "deterministic-v1"
+    assert data["enriched"] is False
+    assert data["summary_version"] == "det_v1"
+    assert data["latency"]["llm_ms"] == 0
+    assert data["latency"]["total_ms"] == data["latency_ms"]
     assert len(data["top_items"]) <= 3
     assert len(re.findall(r"[.!?](?:\s|$)", data["summary"])) <= 2
+    # deterministic top refs match the priority engine's top-K (in order)
+    assert data["deterministic_top_refs"] == [i["item_ref"] for i in data["top_items"]]
     # audit row written by the router (the only C1 write)
     run = db_session.query(CopilotRun).filter_by(intent="copilot_today").one()
     assert run.context_snapshot["today"]["top_items"]
@@ -659,19 +670,34 @@ def test_copilot_today_endpoint_provider_selection_and_rbac(db_session, client, 
     assert resp.status_code == 200
 
 
-def test_copilot_today_endpoint_503_fail_closed_on_provider_error(db_session, client, manager_headers, monkeypatch):
+def test_copilot_today_provider_down_default_fast_explicit_503(db_session, client, manager_headers, monkeypatch):
+    """C1.1: provider-down TODAY is still fast + deterministic (no LLM invoked);
+    the EXPLICIT LLM enrichment path keeps C1's fail-closed 503 contract."""
     _seed_mandated_scenario(db_session)
     db_session.commit()
     clock.set_override(NOW_MANILA)
+    calls: list = []
 
     def _boom(provider=None):
+        calls.append(provider)
         raise LLMProviderError("provider unreachable")
 
     monkeypatch.setattr("app.services.copilot.llm.get_llm_client", _boom)
+
+    # DEFAULT (no provider): deterministic brief, NO LLM, no 503, no hang.
     resp = client.post(f"{API}/operations/copilot/today", headers=manager_headers, json={})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["provider"] == "deterministic"
+    assert resp.json()["enriched"] is False
+    assert calls == []  # the provider client was never constructed
+
+    # EXPLICIT provider on the LLM enrichment path: fail-closed 503 (C1).
+    resp = client.post(f"{API}/operations/copilot/today", headers=manager_headers,
+                       json={"provider": "deepseek"})
     assert resp.status_code == 503
     assert resp.json()["detail"]["error_code"] == "llm_provider_error"
     assert "provider unavailable" in resp.json()["detail"]["message"]
+    assert calls == ["deepseek"]
 
 
 def test_today_read_only_invariant(db_session, client, admin_headers, monkeypatch):

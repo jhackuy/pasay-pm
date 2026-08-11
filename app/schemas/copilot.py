@@ -34,10 +34,14 @@ class CopilotProposalActionOut(BaseModel):
     detail: str
 
 
-# --- V1.2.2 Phase C1 — read-only TODAY brief (no execution) ---
+# --- V1.2.2 Phase C1.1 — read-only TODAY / WHY / ASK (no execution) ---
 
 class CopilotTodayIn(BaseModel):
-    """Optional body for POST /operations/copilot/today."""
+    """Optional body for POST /operations/copilot/today.
+
+    ``provider`` is an explicit LLM enrichment override (eval/measurement).
+    The DEFAULT (no provider) is the deterministic fast path — no LLM.
+    """
 
     provider: str | None = Field(default=None, max_length=64)
     intent_note: str | None = Field(default=None, max_length=500)
@@ -49,8 +53,23 @@ class CopilotTodayItemOut(BaseModel):
     suggested_action: str
 
 
+class LatencyOut(BaseModel):
+    """Structured timing breakdown (Deliverable D) — monotonic ms per phase."""
+
+    context_build_ms: int = 0
+    priority_ms: int = 0
+    grounding_ms: int = 0
+    llm_ms: int = 0
+    render_ms: int = 0
+    total_ms: int = 0
+
+
 class CopilotTodayOut(BaseModel):
-    """TODAY brief schema (UI shows at most 3 items + a short summary)."""
+    """TODAY brief schema (UI shows at most 3 items + a short summary).
+
+    ``enriched=False`` marks the deterministic-first fast response (no LLM);
+    ``summary_version`` versions the deterministic summary format.
+    """
 
     top_items: list[CopilotTodayItemOut]
     summary: str
@@ -58,3 +77,51 @@ class CopilotTodayOut(BaseModel):
     provider: str
     model: str
     latency_ms: int
+    enriched: bool = False
+    summary_version: str | None = None
+    flags: list[str] = Field(default_factory=list)
+    deterministic_top_refs: list[str] = Field(default_factory=list)
+    latency: LatencyOut = Field(default_factory=LatencyOut)
+
+
+class CopilotWhyIn(BaseModel):
+    """Per-item WHY enrichment request."""
+
+    item_ref: str = Field(min_length=1, max_length=64)
+    provider: str | None = Field(default=None, max_length=64)
+
+
+class CopilotWhyOut(BaseModel):
+    """WHY response; ``fallback=True`` means the deterministic reason/action
+    was returned because the provider was unavailable or unusable."""
+
+    item_ref: str
+    explanation: str
+    recommendation: str
+    grounded_refs: list[str]
+    provider: str
+    model: str
+    latency_ms: int
+    fallback: bool = False
+    flags: list[str] = Field(default_factory=list)
+    latency: LatencyOut = Field(default_factory=LatencyOut)
+
+
+class CopilotAskIn(BaseModel):
+    """On-demand Q&A request (grounded, read-only)."""
+
+    question: str = Field(min_length=1, max_length=500)
+    provider: str | None = Field(default=None, max_length=64)
+
+
+class CopilotAskOut(BaseModel):
+    """Q&A response; ``fallback=True`` means a friendly deterministic answer
+    was returned because the provider was unavailable or unusable."""
+
+    answer: str
+    provider: str
+    model: str
+    latency_ms: int
+    fallback: bool = False
+    flags: list[str] = Field(default_factory=list)
+    latency: LatencyOut = Field(default_factory=LatencyOut)

@@ -38,10 +38,33 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 PROVIDER_BASE_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/v1",
     "deepseek-pro": "https://api.deepseek.com/v1",
+    # C1.1 fast non-reasoning lane (same key, deepseek's chat model): wired
+    # for Hermes' latency comparison — NOT the default for any surface yet.
+    "deepseek-chat": "https://api.deepseek.com/v1",
 }
 PROVIDER_MODELS: dict[str, str] = {
     "deepseek": "deepseek-v4-flash",
     "deepseek-pro": "deepseek-v4-pro",
+    "deepseek-chat": "deepseek-chat",
+}
+
+# Reasoning kind per provider (for docs/comparison; routing is centralized).
+PROVIDER_KINDS: dict[str, str] = {
+    "deepseek": "reasoning",
+    "deepseek-pro": "reasoning",
+    "deepseek-chat": "non-reasoning",
+}
+
+# Centralized provider profile map (Requirement 6): which profile uses which
+# provider. TODAY = None (deterministic-first, NO LLM on the critical path);
+# EXPLAIN = fast non-reasoning; ASK = strong. Env-tunable per profile via
+# ``COPILOT_LLM_PROFILE_<PROFILE>`` (e.g. COPILOT_LLM_PROFILE_ASK).
+# Do NOT switch a profile's default without eval evidence (Hermes owns the
+# model-latency comparison; defaults stay conservative).
+PROVIDER_PROFILES: dict[str, str | None] = {
+    "TODAY": None,
+    "EXPLAIN": "deepseek-chat",
+    "ASK": "deepseek-pro",
 }
 
 
@@ -91,6 +114,20 @@ def _env_key(name: str) -> str:
 def list_providers() -> list[str]:
     """Stable list of configured provider names."""
     return sorted(PROVIDER_MODELS)
+
+
+def profile_provider(profile: str, requested: str | None = None) -> str | None:
+    """Resolve the provider for a surface profile (centralized routing).
+
+    ``requested`` (an explicit client-provided provider) always wins; the
+    profile default comes from the env override ``COPILOT_LLM_PROFILE_<P>``
+    then ``PROVIDER_PROFILES``. ``TODAY`` resolves to ``None`` (no LLM).
+    """
+    if requested is not None:
+        return requested
+    if profile not in PROVIDER_PROFILES:
+        raise ValueError(f"unknown copilot provider profile {profile!r}")
+    return _env(f"{ENV_PREFIX}PROFILE_{profile}") or PROVIDER_PROFILES[profile]
 
 
 def provider_config(name: str | None = None) -> ProviderConfig:

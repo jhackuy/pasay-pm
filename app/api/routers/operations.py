@@ -37,15 +37,23 @@ from app.schemas.operations import (
     TaskSnoozeIn,
 )
 from app.schemas.copilot import (
+    CopilotAskIn,
+    CopilotAskOut,
     CopilotProposalActionOut,
     CopilotProposalCreate,
     CopilotProposalRead,
     CopilotTodayIn,
     CopilotTodayOut,
+    CopilotWhyIn,
+    CopilotWhyOut,
+    LatencyOut,
 )
 from app.services.audit import record_audit, serialize_row
+from app.services.copilot import ask as copilot_ask_svc
 from app.services.copilot import llm as copilot_llm
 from app.services.copilot import today as copilot_today_svc
+from app.services.copilot import today_fast as copilot_today_fast_svc
+from app.services.copilot import why as copilot_why_svc
 from app.services.operations import copilot as copilot_svc
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
@@ -491,15 +499,19 @@ def copilot_today(
     db: Session = Depends(get_db),
     user: User = Depends(manager_or_admin),
 ):
-    """Read-only TODAY brief grounded to the deterministic context (C1).
+    """Read-only TODAY brief (C1.1 deterministic-first).
 
-    Grounds from ``build_copilot_context`` (same RBAC scope as A+B), renders
-    it as injection-safe fenced data, calls the configured/requested provider,
-    and post-validates server-side: item refs must be grounded and within the
-    deterministic top-K, at most 3 items, summary at most 2 sentences.
-    Fail-closed: provider errors (unreachable/timeout/5xx) return 503 with a
-    clear reason — never a fabricated answer. The only DB write is the
-    ``copilot_runs`` audit row.
+    DEFAULT (no ``provider``): deterministic fast path — the grounded A+B
+    context + the existing ``ranking.rank_items`` engine, top-3 items, and a
+    versioned deterministic summary. NO LLM on the critical path: no provider
+    call, no timeout, no failure path; returns in milliseconds.
+
+    Explicit ``provider`` (eval/measurement): LLM enrichment via
+    ``build_today``, post-validated server-side (grounded refs, top-K
+    restriction, <=3 items, <=2 sentences). Fail-closed: provider errors
+    (unreachable/timeout/5xx) return 503 — never a fabricated answer.
+
+    The only DB write is the optional ``copilot_runs`` audit row.
     """
     body = payload or CopilotTodayIn()
     provider = body.provider
@@ -509,6 +521,46 @@ def copilot_today(
             f"unknown copilot LLM provider {provider!r}; "
             f"known providers: {', '.join(copilot_llm.list_providers())}",
         )
+
+    if provider is None:
+        # Deterministic-first: this is the immediate Telegram response.
+        result = copilot_today_fast_svc.build_today_deterministic(db, user)
+        copilot_svc.log_context_run(
+            db,
+            actor=user,
+            context={
+                "context": result.context,
+                "today": {
+                    "top_items": [item.to_dict() for item in result.top_items],
+                    "summary": result.summary,
+                    "summary_version": result.summary_version,
+                    "provider": result.provider,
+                    "model": result.model,
+                    "latency_ms": result.latency_ms,
+                    "enriched": result.enriched,
+                    "flags": result.flags,
+                    "deterministic_top_refs": result.deterministic_top_refs,
+                    "latency": result.latency.to_dict(),
+                },
+                "intent_note": body.intent_note,
+            },
+            intent="copilot_today",
+        )
+        db.commit()
+        return CopilotTodayOut(
+            top_items=[item.to_dict() for item in result.top_items],
+            summary=result.summary,
+            context_schema_version=result.context_schema_version,
+            provider=result.provider,
+            model=result.model,
+            latency_ms=result.latency_ms,
+            enriched=result.enriched,
+            summary_version=result.summary_version,
+            flags=result.flags,
+            deterministic_top_refs=result.deterministic_top_refs,
+            latency=LatencyOut(**result.latency.to_dict()),
+        )
+
     try:
         result = copilot_today_svc.build_today(db, user, provider=provider)
     except copilot_llm.LLMProviderError as exc:
@@ -540,8 +592,10 @@ def copilot_today(
                 "provider": result.provider,
                 "model": result.model,
                 "latency_ms": result.latency_ms,
+                "enriched": result.enriched,
                 "flags": result.flags,
                 "deterministic_top_refs": result.deterministic_top_refs,
+                "latency": result.latency.to_dict(),
             },
             "intent_note": body.intent_note,
         },
@@ -554,8 +608,145 @@ def copilot_today(
         context_schema_version=result.context_schema_version,
         provider=result.provider,
         model=result.model,
-        latency_ms=result.latency_ms,
+        latency_ms=result.latency.total_ms,
+        enriched=result.enriched,
+        flags=result.flags,
+        deterministic_top_refs=result.deterministic_top_refs,
+        latency=LatencyOut(**result.latency.to_dict()),
     )
+
+
+@router.post(
+    "/copilot/why",
+    response_model=CopilotWhyOut,
+    status_code=status.HTTP_200_OK,
+)
+def copilot_why(
+    payload: CopilotWhyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Per-item WHY enrichment (on-demand LLM, deterministic fail-closed).
+
+    Grounds from ``build_copilot_context``, validates ``item_ref`` is in the
+    grounded set, and calls the EXPLAIN provider profile (fast non-reasoning
+    by default) with a scoped WHY prompt. On provider error/timeout/malformed
+    output returns HTTP 200 with ``fallback=True`` and the DETERMINISTIC
+    reason + suggested action from the priority engine — never fabricated.
+    LLM amounts/dates are post-validated against the grounded facts and
+    stripped + flagged when invented. Read-only; the only write is the
+    optional ``copilot_runs`` audit row.
+    """
+    provider = payload.provider
+    if provider is not None and provider not in copilot_llm.list_providers():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown copilot LLM provider {provider!r}; "
+            f"known providers: {', '.join(copilot_llm.list_providers())}",
+        )
+    try:
+        result = copilot_why_svc.explain_item(
+            db, user, payload.item_ref, provider=provider
+        )
+    except copilot_why_svc.WhyItemNotGrounded as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    copilot_svc.log_context_run(
+        db,
+        actor=user,
+        context={
+            "context": result.context,
+            "why": {
+                "item_ref": result.item_ref,
+                "explanation": result.explanation,
+                "recommendation": result.recommendation,
+                "provider": result.provider,
+                "model": result.model,
+                "latency_ms": result.latency_ms,
+                "fallback": result.fallback,
+                "flags": result.flags,
+                "latency": result.latency.to_dict(),
+            },
+        },
+        intent="copilot_why",
+    )
+    db.commit()
+    return CopilotWhyOut(
+        item_ref=result.item_ref,
+        explanation=result.explanation,
+        recommendation=result.recommendation,
+        grounded_refs=result.grounded_refs,
+        provider=result.provider,
+        model=result.model,
+        latency_ms=result.latency.total_ms,
+        fallback=result.fallback,
+        flags=result.flags,
+        latency=LatencyOut(**result.latency.to_dict()),
+    )
+
+
+@router.post(
+    "/copilot/ask",
+    response_model=CopilotAskOut,
+    status_code=status.HTTP_200_OK,
+)
+def copilot_ask(
+    payload: CopilotAskIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """On-demand Q&A enrichment (grounded, deterministic fail-closed).
+
+    Grounds to the current A+B context and calls the ASK provider profile
+    (strong model by default). LLM output is post-validated server-side: any
+    amount/date not resolvable in the grounded context is stripped + flagged,
+    backend refs are removed, nothing is executed or written. On provider-down
+    returns HTTP 200 with ``fallback=True`` and a friendly deterministic
+    answer — never fabricated. Read-only; the only write is the optional
+    ``copilot_runs`` audit row.
+    """
+    provider = payload.provider
+    if provider is not None and provider not in copilot_llm.list_providers():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown copilot LLM provider {provider!r}; "
+            f"known providers: {', '.join(copilot_llm.list_providers())}",
+        )
+    try:
+        result = copilot_ask_svc.ask_question(
+            db, user, payload.question, provider=provider
+        )
+    except copilot_ask_svc.AskQuestionRequired as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    copilot_svc.log_context_run(
+        db,
+        actor=user,
+        context={
+            "context": result.context,
+            "ask": {
+                "question": payload.question,
+                "answer": result.answer,
+                "provider": result.provider,
+                "model": result.model,
+                "latency_ms": result.latency_ms,
+                "fallback": result.fallback,
+                "flags": result.flags,
+                "latency": result.latency.to_dict(),
+            },
+        },
+        intent="copilot_ask",
+    )
+    db.commit()
+    return CopilotAskOut(
+        answer=result.answer,
+        provider=result.provider,
+        model=result.model,
+        latency_ms=result.latency.total_ms,
+        fallback=result.fallback,
+        flags=result.flags,
+        latency=LatencyOut(**result.latency.to_dict()),
+    )
+
+
 
 
 def _proposal_state_error(exc: Exception) -> HTTPException:
