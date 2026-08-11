@@ -86,9 +86,17 @@ def _insert_task_on_conflict_do_nothing(db: Session, *, fields: dict) -> Operati
     return db.get(OperationalTask, row[0])
 
 
-def _enqueue_for_task(db: Session, task: OperationalTask) -> bool:
+def _enqueue_for_task(
+    db: Session, task: OperationalTask, *, notification_message: str | None = None
+) -> bool:
     """Outbox row for one new task (same transaction). Returns True when
-    enqueued, False when no recipient is resolvable."""
+    enqueued, False when no recipient is resolvable.
+
+    ``notification_message`` is an OPT-IN explicit message override (the C2
+    copilot executor renders an English secretary card); when omitted the
+    Chinese ``_notification_message`` is used, so scheduler business tasks
+    keep their existing message unchanged.
+    """
     recipient = resolve_recipient(db, task.assigned_user_id)
     if recipient is None:
         return False
@@ -102,14 +110,23 @@ def _enqueue_for_task(db: Session, task: OperationalTask) -> bool:
             "task_type": task.task_type.value,
             "title": task.title,
             "due_at": task.due_at.isoformat(),
-            "message": _notification_message(task),
+            "message": (
+                notification_message
+                if notification_message is not None
+                else _notification_message(task)
+            ),
         },
         dedupe_key=f"task:{task.id}:{NOTIFY_CHANNEL_TELEGRAM}:{recipient}",
     )
 
 
 def _register_task(
-    db: Session, *, fields: dict, now: datetime, actor_id: int | None = None
+    db: Session,
+    *,
+    fields: dict,
+    now: datetime,
+    actor_id: int | None = None,
+    notification_message: str | None = None,
 ) -> tuple[OperationalTask | None, bool]:
     """Create task + audit(task_created) + outbox in one transaction.
 
@@ -136,11 +153,16 @@ def _register_task(
         actor_id=actor_id,  # None = system / scheduler
         new_value=serialize_row(task),
     )
-    return task, _enqueue_for_task(db, task)
+    return task, _enqueue_for_task(db, task, notification_message=notification_message)
 
 
 def create_operational_task(
-    db: Session, *, fields: dict, now: datetime | None = None, actor_id: int | None = None
+    db: Session,
+    *,
+    fields: dict,
+    now: datetime | None = None,
+    actor_id: int | None = None,
+    notification_message: str | None = None,
 ) -> tuple[OperationalTask | None, bool]:
     """Public seam for human-confirmed (V1.2.2 C2 copilot) task creation.
 
@@ -150,9 +172,18 @@ def create_operational_task(
     action (None = system/scheduler). Returns ``(task_or_None, enqueued)``;
     ``task_or_None`` is None when a PENDING task with the same ``dedupe_key``
     already exists (DB dedupe boundary = at-most-one active followup).
+    ``notification_message`` is an OPT-IN outbox message override (English
+    secretary card for copilot-confirmed followups); omitted keeps the
+    scheduler's Chinese ``_notification_message``.
     """
     now = now or datetime.now(timezone.utc)
-    return _register_task(db, fields=fields, now=now, actor_id=actor_id)
+    return _register_task(
+        db,
+        fields=fields,
+        now=now,
+        actor_id=actor_id,
+        notification_message=notification_message,
+    )
 
 
 def _supersede_rent_due(db: Session, lease_id: int, now: datetime) -> None:

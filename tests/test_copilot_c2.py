@@ -255,6 +255,51 @@ def test_followup_success_task_outbox_audit(db_session, manager):
         assert _audit_count(db_session, action) >= 1, action
 
 
+def test_followup_outbox_payload_message_is_english(db_session, manager):
+    """§5/§11/§12 UX: the secretary's outbox card for a confirmed follow-up is
+    an English role-reorganized card (Unit / Issue / Action / Due / Tenant),
+    not the Chinese business notification — still exactly ONE outbox row."""
+    mgr = _manager(db_session)
+    lease = _seed_lease(db_session)
+    secretary = _user(db_session, "c2-en-sec", UserRole.agent, telegram_chat_id="tg-en-sec")
+    db_session.commit()
+
+    proposal, created, payload = copilot_proposals.build_followup_proposal(
+        db_session, actor=mgr,
+        source_type="lease", source_id=lease.id, reason_code="RENT_OVERDUE",
+        assignee_user_id=secretary.id, due_at=NOW + timedelta(days=1),
+        note="contact tenant", now=NOW,
+    )
+    db_session.commit()
+    assert created
+    assert payload["display_context"]["unit"] == "1608"
+
+    _confirm(db_session, mgr, proposal.id)
+    _execute(db_session, mgr, proposal.id)
+
+    task = (
+        db_session.query(OperationalTask)
+        .filter(OperationalTask.task_type == OperationalTaskType.FOLLOWUP)
+        .one()
+    )
+    outbox = (
+        db_session.query(NotificationOutbox)
+        .filter(NotificationOutbox.task_id == task.id)
+        .all()
+    )
+    assert len(outbox) == 1  # shared outbox path — one row per task
+    assert outbox[0].recipient == "tg-en-sec"
+    message = outbox[0].payload["message"]
+    assert "Follow-up Required" in message
+    assert "Unit: 1608" in message
+    assert "Issue: Rent overdue" in message
+    assert "Action: Contact tenant and confirm payment date." in message
+    assert "Tenant: Ana P." in message
+    # English card, not the Chinese business notification
+    assert "待办提醒" not in message
+    assert "跟进" not in message
+
+
 def test_followup_unique_agent_auto_resolved(db_session, manager):
     mgr = _manager(db_session)
     lease = _seed_lease(db_session)
@@ -934,6 +979,39 @@ def test_llm_down_scheduler_operations_unaffected(db_session, monkeypatch):
         NotificationOutbox.task_id == task.id
     ).first()
     assert outbox is not None and outbox.status == NotificationStatus.PENDING
+
+
+def test_scheduler_business_task_notification_stays_chinese(db_session, monkeypatch):
+    """Scheduler business tasks keep the Chinese outbox message — the English
+    override is opt-in for copilot-confirmed followups/assignments only."""
+    _llm_down(monkeypatch)
+    admin = _user(db_session, "c2-zh-admin", UserRole.admin, telegram_chat_id="tg-zh")
+    db_session.flush()
+    rule = RecurringRule(
+        rule_type=OperationalTaskType.AC_MAINTENANCE,
+        title="季度空调保养",
+        recurrence=Recurrence.quarterly,
+        next_run_at=NOW - timedelta(days=1),
+        enabled=True,
+        assigned_user_id=admin.id,
+    )
+    db_session.add(rule)
+    db_session.commit()
+    result = run_scheduler_once(db_session, now=NOW)
+    assert result.tasks_created >= 1
+    task = db_session.query(OperationalTask).filter(
+        OperationalTask.source_type == "recurring_rule"
+    ).first()
+    assert task is not None
+    outbox = (
+        db_session.query(NotificationOutbox)
+        .filter(NotificationOutbox.task_id == task.id)
+        .all()
+    )
+    assert len(outbox) == 1
+    message = outbox[0].payload["message"]
+    assert "待办提醒" in message  # Chinese business message unchanged
+    assert "Follow-up Required" not in message
 
 
 # ---------------------------------------------------------------------------

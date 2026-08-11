@@ -340,6 +340,77 @@ def _parse_dt(value) -> datetime | None:
 
 
 # ---------------------------------------------------------------------------
+# secretary-facing (English) outbox cards
+# ---------------------------------------------------------------------------
+# The confirmed followup/assign outbox message is role-reorganized per the
+# receiver (UX design §3): the English-speaking secretary gets a card built
+# from the backend-resolved display_context — Unit / Issue / Action / Due /
+# Tenant — never a translation of the owner's Chinese text. Scheduler
+# business tasks keep the Chinese default (this override is opt-in).
+
+_FOLLOWUP_REASON_LABELS = {
+    "RENT_OVERDUE": "Rent overdue",
+    "RENT_DUE": "Rent due",
+    "LEASE_EXPIRING": "Lease expiring",
+    "PROPERTY_FEE_DUE": "Property fee due",
+    "APPROVAL_PENDING": "Approval pending",
+    "PAYMENT_PENDING": "Payment pending",
+    "FOLLOWUP": "Follow-up",
+}
+
+_FOLLOWUP_ACTION_LABELS = {
+    "RENT_OVERDUE": "Contact tenant and confirm payment date.",
+    "RENT_DUE": "Contact tenant to confirm payment date.",
+}
+
+
+def _human_reason(reason_code: str) -> str:
+    """Snake-case reason code -> short English label."""
+    return _FOLLOWUP_REASON_LABELS.get(
+        str(reason_code).upper(),
+        str(reason_code).replace("_", " ").strip().title() or "Follow-up",
+    )
+
+
+def _followup_action(reason_code: str) -> str:
+    return _FOLLOWUP_ACTION_LABELS.get(
+        str(reason_code).upper(), "Follow up and confirm resolution."
+    )
+
+
+def _secretary_followup_message(
+    *, due_at: datetime, reason_code: str, display_context: dict, note: str | None
+) -> str:
+    """English secretary card for a confirmed follow-up (one outbox row)."""
+    ctx = display_context or {}
+    lines = ["📋 Follow-up Required"]
+    unit = ctx.get("unit")
+    if unit:
+        lines.append(f"Unit: {unit}")
+    if ctx.get("property"):
+        lines.append(f"Property: {ctx['property']}")
+    lines.append(f"Issue: {_human_reason(reason_code)}")
+    if note and str(note).strip():
+        lines.append(f"Note: {str(note).strip()[:200]}")
+    lines.append(f"Action: {_followup_action(reason_code)}")
+    lines.append(f"Due: {due_at:%Y-%m-%d %H:%M}")
+    if ctx.get("tenant"):
+        lines.append(f"Tenant: {ctx['tenant']}")
+    return "\n".join(lines)
+
+
+def _secretary_assign_message(task: OperationalTask, *, display_context: dict) -> str:
+    """English secretary card for a reassignment (one outbox row)."""
+    ctx = display_context or {}
+    lines = ["📋 Task Assigned"]
+    title = ctx.get("title") or task.title
+    if title:
+        lines.append(str(title))
+    lines.append(f"Due: {task.due_at:%Y-%m-%d %H:%M}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # business mutation — routes ONLY through the existing operations service layer
 # ---------------------------------------------------------------------------
 
@@ -370,10 +441,17 @@ def _apply_followup(
     note = payload.get("note")
     title = (note or "").strip()[:120] or f"跟进 {reason_code}"
     dedupe_key = f"followup:{target_type}:{proposal.target_id}:{reason_code}"
+    display_context = payload.get("display_context") or {}
     task, _enqueued = generation.create_operational_task(
         db,
         now=now,
         actor_id=actor.id,
+        notification_message=_secretary_followup_message(
+            due_at=due_at,
+            reason_code=reason_code,
+            display_context=display_context,
+            note=note,
+        ),
         fields={
             "task_type": OperationalTaskType.FOLLOWUP,
             "title": title,
@@ -391,7 +469,7 @@ def _apply_followup(
             "details": {
                 "copilot_reason_code": reason_code,
                 "copilot_proposal_id": proposal.id,
-                "display_context": payload.get("display_context") or {},
+                "display_context": display_context,
             },
         },
     )
@@ -447,8 +525,8 @@ def _apply_assign(
                 "task_type": task.task_type.value,
                 "title": task.title,
                 "due_at": task.due_at.isoformat(),
-                "message": (
-                    f"🔔 任务已指派\n#{task.id} · {task.task_type.value}\n{task.title}"
+                "message": _secretary_assign_message(
+                    task, display_context=payload.get("display_context") or {}
                 ),
             },
             dedupe_key=f"task:{task.id}:{NOTIFY_CHANNEL_TELEGRAM}:{recipient}",
