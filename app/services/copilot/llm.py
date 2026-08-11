@@ -112,7 +112,12 @@ def provider_config(name: str | None = None) -> ProviderConfig:
         or _env(f"{ENV_PREFIX}MODEL")
         or PROVIDER_MODELS[resolved]
     )
-    api_key = _env(f"{ENV_PREFIX}API_KEY") or os.getenv("DEEPSEEK_API_KEY") or ""
+    api_key = (
+        _env(f"{ENV_PREFIX}{suffix}_API_KEY")
+        or _env(f"{ENV_PREFIX}API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY")
+        or ""
+    )
     timeout = float(_env(f"{ENV_PREFIX}TIMEOUT") or DEFAULT_TIMEOUT_SECONDS)
     return ProviderConfig(
         name=resolved,
