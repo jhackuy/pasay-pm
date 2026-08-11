@@ -128,8 +128,14 @@ Driven against production `@pasayhousebot` API token. Documented in §H/I. Key c
   PENDING, backoff), proving §12/§18 "任务已建立,通知暂时失败,系统会自动重试" with real evidence.
   Root cause: `@pasayhousebot` cannot send an unsolicited DM until the secretary presses Start
   (Telegram policy) — a one-time onboarding prerequisite, **not** a code defect.
-- **Real successful delivery** of the exact English secretary card to a reachable chat
-  (`5177241442`) → `message_id=53` confirmed the full pipeline (outbox content → real Telegram).
+- **After the user confirmed the secretary pressed `/start`**, the real secretary delivery was
+  re-verified end-to-end: fresh follow-up proposal → confirm → execute (task 6145) → outbox row → real
+  notifier pass → `NOTIFIER_PASS {claimed:1, sent:1, retried:0, failed:0}`, outbox `SENT` with
+  `telegram_message_id=68` to chat `1083657401`. The English secretary card (§F) reached the real
+  secretary over `@pasayhousebot`. (Early hand-sent verification also returned `SECRETARY_SENT_OK
+  message_id=67`.) Test artifacts cleaned; financial tables untouched.
+- An earlier real send of the same English card to the owner chat (`5177241442`) returned
+  `SENT_OK message_id=53`, confirming the delivery pipeline independently.
 
 ## I. Failure UX (human, never raw 409)
 
@@ -186,9 +192,9 @@ fully removed after (task 3780, proposals 3/6, outbox 16); **financial tables un
 
 ## O. Remaining Risks
 
-1. **Secretary Start-on-bot onboarding.** `@pasayhousebot` cannot DM the secretary until that chat
-   presses Start. Until then, English notifications retry/backlog. Recommend onboarding (one `/start`)
-   for chat `1083657401`.
+1. ~~Secretary Start-on-bot onboarding~~ **RESOLVED.** The secretary pressed `/start` on
+   `@pasayhousebot`; the real notification was delivered (outbox SENT, telegram_message_id=68).
+   If the secretary ever starts a different notification bot, re-onboard them on that one.
 2. `maria` (secretary agent, id 7) has no `telegram_chat_id` registered — notifications currently
    flow to `pasay_bot_manager` (id 14, bound to 1083657401). Sync `maria`'s chat id when it maps to
    the secretary bot.
