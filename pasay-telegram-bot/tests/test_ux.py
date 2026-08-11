@@ -61,8 +61,8 @@ def test_start_shows_dashboard(make_app):
     assert "逾期 2 笔" in text
     assert "空置 1 套" in text
     labels = [b.text for b in _buttons_of(send["reply_markup"])]
-    # V1.2: 待办中心 added to the main menu.
-    assert labels == ["💵 收租", "⚠️ 待处理", "🏘 房源", "📊 财务", "📋 待办中心"]
+    # V1.2: 待办中心 added to the main menu; C1.1: 🤖 运营助手 added.
+    assert labels == ["💵 收租", "⚠️ 待处理", "🏘 房源", "📊 财务", "📋 待办中心", "🤖 运营助手"]
 
 
 def test_dashboard_no_tasks(make_app):

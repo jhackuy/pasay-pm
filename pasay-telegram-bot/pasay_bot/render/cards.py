@@ -535,20 +535,49 @@ def _copilot_one_line(text: str, max_chars: int = 160) -> str:
 
 
 def copilot_today_card(today: CopilotToday, locale: str = "zh") -> str:
-    """Read-only TODAY brief (C1). ≤3 top items, each readable in seconds:
-    what / why / suggested next step. No backend IDs, refs, JSON, or model
-    terms in the user-visible text."""
-    blocks = [f"🤖 <b>{H.escape(t('copilot.title', locale))}</b>"]
+    """Read-only TODAY brief (C1.1 fast-first). ≤3 top items, each readable in
+    seconds as a compact what/why line: ``<emoji> why``. No backend IDs, refs,
+    JSON, or model terms in the user-visible text. The deterministic short
+    summary appears once at the top; each item's button opens WHY."""
+    blocks = [f"🤖 <b>{H.escape(t('copilot.today_title', locale))}</b>"]
     if today.summary:
         blocks.append(_copilot_one_line(today.summary))
     for item in today.top_items[:3]:
         emoji = _copilot_emoji(item)
         why = _copilot_one_line(item.reason_why_important)
-        act = _copilot_one_line(item.suggested_action)
-        blocks.append(
-            f"{emoji} <b>{H.escape(t('copilot.why', locale))}</b>{why}\n"
-            f"<b>{H.escape(t('copilot.action', locale))}</b>{act}"
-        )
+        blocks.append(f"{emoji} {why}")
     if not today.top_items:
         blocks.append(H.escape(t("copilot.empty", locale)))
+    return "\n\n".join(blocks)
+
+
+def copilot_why_card(
+    item_ref: str,
+    explanation: str,
+    recommendation: str,
+    *,
+    fallback: bool = False,
+    locale: str = "zh",
+) -> str:
+    """WHY detail card (C1.1): grounded explanation + recommendation for one
+    item. No refs / model / provider leak. ``fallback`` shows a subtle note that
+    the answer is the deterministic reason (provider unavailable)."""
+    blocks = [f"🤖 <b>{H.escape(t('copilot.why_title', locale))}</b>"]
+    blocks.append(_copilot_one_line(explanation, max_chars=400))
+    if recommendation:
+        blocks.append(
+            f"<b>{H.escape(t('copilot.action', locale))}</b>"
+            f"{_copilot_one_line(recommendation)}"
+        )
+    if fallback:
+        blocks.append(H.escape(t("copilot.fallback_note", locale)))
+    return "\n\n".join(blocks)
+
+
+def copilot_ask_card(answer: str, *, fallback: bool = False, locale: str = "zh") -> str:
+    """Q&A answer card (C1.1). Human text only."""
+    blocks = [f"🤖 <b>{H.escape(t('copilot.ask_title', locale))}</b>"]
+    blocks.append(_copilot_one_line(answer, max_chars=900))
+    if fallback:
+        blocks.append(H.escape(t("copilot.fallback_note", locale)))
     return "\n\n".join(blocks)

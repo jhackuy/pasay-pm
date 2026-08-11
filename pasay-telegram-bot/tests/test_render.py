@@ -260,12 +260,16 @@ def test_copilot_today_card_no_refs_no_ids_no_model():
         provider="deepseek-pro",
     )
     text = cards.copilot_today_card(today)
-    for banned in ("lease:3", "task:9", "deepseek", "provider", "latency_ms", "item_ref"):
+    for banned in ("lease:3", "task:9", "deepseek", "provider", "latency_ms", "item_ref", "suggested_action"):
         assert banned not in text, banned
-    assert text.count("建议：") == 2
-    assert text.count("为什么：") == 2
+    # fast-first card: one summary line + one compact line per item (emoji+why),
+    # with the deterministic-title header.
+    assert "今日重点" in text
+    assert text.count("Rent overdue 2 months") == 1
+    assert text.count("AC maintenance due this week") == 1
     assert "2 overdue rents and 1 lease expiring soon." in text
-    assert "<b>为什么：</b>" in text
+    assert "🔴" in text and "🛠" in text
+    assert "建议：" not in text  # suggested_action folded into buttons now
 
 
 def test_copilot_today_card_empty():
@@ -281,3 +285,41 @@ def test_copilot_emoji_mapping():
     assert lease == "🔴"
     assert task == "🛠"
     assert expense == "💸"
+
+
+def test_copilot_why_card_grounded_no_leak():
+    from pasay_bot.api_client import CopilotWhy
+
+    why = CopilotWhy(
+        item_ref="lease:3",
+        explanation="Lease 1203 has 7 overdue months (PHP 455,000) since January 2026.",
+        recommendation="Contact the tenant to agree a repayment plan.",
+        fallback=False,
+    )
+    text = cards.copilot_why_card(why.item_ref, why.explanation, why.recommendation)
+    assert "lease:3" not in text
+    assert "为什么这项重要？" in text
+    assert "建议：" in text
+    assert "Contact the tenant" in text
+    assert "网络暂不可用" not in text
+
+
+def test_copilot_why_card_fallback():
+    from pasay_bot.api_client import CopilotWhy
+
+    text = cards.copilot_why_card(
+        "task:9", "AC maintenance due this week", "Schedule the technician",
+        fallback=True,
+    )
+    assert "网络暂不可用" in text
+    assert "task:9" not in text
+
+
+def test_copilot_today_keyboard_has_why_and_ask():
+    from pasay_bot import keyboards
+
+    kb = keyboards.copilot_today_keyboard(3)
+    buttons = [b.text for row in kb.inline_keyboard for b in row]
+    assert "1 为什么?" in buttons and "2 为什么?" in buttons and "3 为什么?" in buttons
+    assert "问运营助手" in buttons
+    assert "🏠 首页" in buttons

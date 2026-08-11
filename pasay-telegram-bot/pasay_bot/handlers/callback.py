@@ -32,6 +32,9 @@ from pasay_bot.handlers.commands import (
 from pasay_bot.keyboards import (
     ACTION_CANCEL,
     ACTION_CONFIRM,
+    ACTION_COPILOT_ASK,
+    ACTION_COPILOT_NAV,
+    ACTION_COPILOT_WHY,
     ACTION_DETAIL,
     ACTION_EDIT,
     ACTION_METHOD,
@@ -182,6 +185,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_task_snooze_pick(update, context, entity, ref, role, locale)
     elif action == ACTION_TASK_DETAIL:
         await _handle_task_detail(update, context, ref, role, locale)
+    elif action == ACTION_COPILOT_NAV:
+        await _handle_copilot_nav(update, context, role, locale)
+    elif action == ACTION_COPILOT_WHY:
+        await _handle_copilot_why(update, context, entity, role, locale)
+    elif action == ACTION_COPILOT_ASK:
+        await _handle_copilot_ask(update, context, role, locale)
     else:
         await _answer(update, t("common.invalid", locale))
 
@@ -999,3 +1008,51 @@ async def _handle_task_detail(update, context, ref, role, locale):
         return
     text = cards.operational_task_detail_card(task, properties, locale)
     await _edit(update, text, task_action_keyboard(task.id, locale))
+
+
+# --- 🤖 运营助手 (C1.1) callbacks ---------------------------------------------
+
+async def _handle_copilot_nav(update, context, role, locale):
+    """Dashboard [🤖 运营助手] button -> fast deterministic TODAY."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    await _answer(update, "")
+    await pages.show_copilot(context, update.effective_chat.id, locale,
+                             message_id=update.callback_query.message.message_id)
+
+
+async def _handle_copilot_why(update, context, entity, role, locale):
+    """Per-item [为什么?] -> on-demand LLM explanation (deterministic fallback)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not entity.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    await _answer(update, "")
+    await pages.show_copilot_why(
+        context, update.effective_chat.id,
+        update.callback_query.message.message_id, int(entity), locale,
+    )
+
+
+async def _handle_copilot_ask(update, context, role, locale):
+    """[问运营助手] -> prompt the user for a question (Q&A flow)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    await _answer(update, t("copilot.ask_prompt"))
+    # Capture the user's free-text question in the conversation state machine,
+    # then answer via /copilot/ask when the next text message arrives.
+    store = context.bot_data["store"]
+    await asyncio.to_thread(
+        store.save_conversation,
+        update.effective_chat.id, update.effective_user.id, "copilot_ask", {},
+    )
+    await context.bot.send_message(
+        update.effective_chat.id,
+        H.escape(t("copilot.ask_prompt", locale)),
+        parse_mode=HTML,
+        reply_markup=expired_keyboard(locale),
+    )

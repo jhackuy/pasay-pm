@@ -344,6 +344,51 @@ class CopilotToday:
         )
 
 
+@dataclass
+class CopilotWhy:
+    """Per-item WHY enrichment (C1.1). ``fallback`` True when the provider was
+    down and the deterministic reason was returned instead."""
+
+    item_ref: str = ""
+    explanation: str = ""
+    recommendation: str = ""
+    provider: str = ""
+    model: str = ""
+    fallback: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotWhy":
+        return cls(
+            item_ref=d.get("item_ref") or "",
+            explanation=d.get("explanation") or "",
+            recommendation=d.get("recommendation") or "",
+            provider=d.get("provider") or "",
+            model=d.get("model") or "",
+            fallback=bool(d.get("fallback")),
+        )
+
+
+@dataclass
+class CopilotAsk:
+    """Q&A answer (C1.1). ``fallback`` True when provider-down gave the friendly
+    deterministic response."""
+
+    answer: str = ""
+    provider: str = ""
+    model: str = ""
+    fallback: bool = False
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotAsk":
+        return cls(
+            answer=d.get("answer") or "",
+            provider=d.get("provider") or "",
+            model=d.get("model") or "",
+            fallback=bool(d.get("fallback")),
+        )
+
+
+
 class PasayApiError(Exception):
     def __init__(self, status_code: Optional[int], detail: str):
         self.status_code = status_code
@@ -524,18 +569,36 @@ class PasayApiClient:
         }
 
     async def copilot_today(self, provider: Optional[str] = None) -> CopilotToday:
-        """POST /operations/copilot/today (C1, read-only). Body empty or
-        ``{provider}`` to select the LLM provider for eval/override. This is an
-        LLM-backed call that can take 15-45s (reasoning model), so it gets a
-        long request timeout (the client default 10s would time out). Raises
-        PasayApiError on 503 provider-unavailable (fail-closed)."""
+        """POST /operations/copilot/today (C1/C1.1, read-only). By default this
+        is the deterministic-first fast path (no LLM, ~ms); pass ``provider`` to
+        force the LLM enrichment path (eval/measurement). This endpoint is LLM-
+        free by default so the client default timeout is fine; the explicit
+        provider path can be slow so it gets a long per-request timeout."""
         body: dict[str, Any] = {}
         if provider:
             body["provider"] = provider
         data = await self._request(
-            "POST", "/operations/copilot/today", json=body, timeout=120.0
+            "POST", "/operations/copilot/today", json=body,
+            timeout=120.0 if provider else 15.0,
         )
         return CopilotToday.from_dict(data)
+
+    async def copilot_why(self, item_ref: str) -> CopilotWhy:
+        """POST /operations/copilot/why (C1.1, on-demand LLM explain). The
+        EXPLAIN provider is fast (non-reasoning) by default; provider-down
+        returns a deterministic HTTP-200 fallback. Use a generous timeout."""
+        data = await self._request(
+            "POST", "/operations/copilot/why", json={"item_ref": item_ref}, timeout=120.0
+        )
+        return CopilotWhy.from_dict(data)
+
+    async def copilot_ask(self, question: str) -> CopilotAsk:
+        """POST /operations/copilot/ask (C1.1, on-demand Q&A). Provider-down
+        returns a friendly deterministic fallback. Use a generous timeout."""
+        data = await self._request(
+            "POST", "/operations/copilot/ask", json={"question": question}, timeout=120.0
+        )
+        return CopilotAsk.from_dict(data)
 
     async def get_tasks(
         self, *, status: Optional[str] = None, overdue: bool = False,

@@ -35,6 +35,11 @@ ACTION_TASK_COMPLETE = "tkc"
 ACTION_TASK_SNOOZE = "tks"
 ACTION_TASK_SNOOZE_PICK = "tsp"
 ACTION_TASK_DETAIL = "tkd"
+# C1.1 运营助手 (copilot).
+ACTION_COPILOT_WHY = "cpw"
+ACTION_COPILOT_ASK = "cpa"
+ACTION_COPILOT_BACK = "cpb"
+ACTION_COPILOT_NAV = "cpn"
 
 # ops center section entities (callback entity field).
 OPS_OVERVIEW = "ops"
@@ -172,9 +177,66 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
                 t("nav.ops", locale),
                 callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW),
             ),
+            InlineKeyboardButton(
+                t("nav.copilot", locale),
+                callback_data=encode(ACTION_COPILOT_NAV, "today"),
+            ),
         ],
     ]
     return InlineKeyboardMarkup(kb)
+
+
+def copilot_today_keyboard(
+    item_count: int, locale: str = "zh",
+) -> InlineKeyboardMarkup:
+    """Operate-assistant TODAY card buttons (C1.1 fast-first): a per-item
+    [为什么?] button (index 1..N) plus [问运营助手] and [🏠 首页].
+
+    The per-item button's callback entity is the 1-based index into the
+    deterministic TODAY top-items; the handler re-fetches the fast TODAY to
+    resolve ``item_ref``, avoiding encoding backend refs in callback_data.
+    """
+    kb: list[list[InlineKeyboardButton]] = []
+    why_row = [
+        InlineKeyboardButton(
+            f"{i+1} {t('copilot.why_button', locale)}",
+            callback_data=encode(ACTION_COPILOT_WHY, str(i + 1)),
+        )
+        for i in range(min(item_count, 3))
+    ]
+    if why_row:
+        kb.append(why_row)
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("copilot.ask_button", locale),
+                callback_data=encode(ACTION_COPILOT_ASK, "ask"),
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale),
+                callback_data=encode(ACTION_NAV, "home"),
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def copilot_why_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """WHY detail card: back to TODAY + home."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("copilot.back_today", locale),
+                    callback_data=encode(ACTION_COPILOT_NAV, "today"),
+                ),
+                InlineKeyboardButton(
+                    t("common.home", locale),
+                    callback_data=encode(ACTION_NAV, "home"),
+                ),
+            ]
+        ]
+    )
 
 
 def menu_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:

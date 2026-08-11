@@ -80,10 +80,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _enter_date(update, context, payload, locale, edit_mode=state == "rent_edit_date")
     elif state == "ops_snooze_custom":
         await _enter_ops_snooze_custom(update, context, payload, locale)
+    elif state == "copilot_ask":
+        await _handle_copilot_ask_question(update, context, locale)
     else:
         from pasay_bot.handlers import nl_bridge
 
         await nl_bridge.handle_nl(update, context)
+
+
+async def _handle_copilot_ask_question(update, context, locale):
+    """[问运营助手] Q&A: user typed a question -> /copilot/ask (friendly fallback)."""
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    question = (update.effective_message.text or "").strip()
+    store.delete_conversation(chat_id, user_id)
+    if not question:
+        await context.bot.send_message(
+            chat_id, H.escape(t("copilot.ask_empty", locale)),
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+    from pasay_bot.handlers import commands
+
+    await commands.ask_copilot(context, chat_id, locale, question)
 
 
 async def _enter_amount(update, context, payload, locale, edit_mode: bool):

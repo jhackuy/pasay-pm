@@ -14,12 +14,17 @@ from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import PasayApiError
 from pasay_bot.keyboards import (
+    ACTION_COPILOT_ASK,
+    ACTION_COPILOT_NAV,
+    ACTION_COPILOT_WHY,
     OPS_OVERVIEW,
     OPS_SECTION_ALL,
     OPS_SECTION_NEXT7,
     OPS_SECTION_OVERDUE,
     OPS_SECTION_TODAY,
     collect_list_keyboard,
+    copilot_today_keyboard,
+    copilot_why_back_keyboard,
     dashboard_keyboard,
     error_keyboard,
     home_keyboard,
@@ -638,18 +643,72 @@ async def show_operations_center(context, chat_id: int, locale: str, message_id=
 
 
 async def show_copilot(context, chat_id: int, locale: str, message_id=None):
-    """🤖 运营助手 — C1 read-only TODAY brief. No free-text input needed; the
-    bot posts an empty body and renders the deterministic grounded brief."""
+    """🤖 运营助手 — C1.1 deterministic-first TODAY brief (fast, no LLM). Calls
+    /today (deterministic path), renders instantly, no free-text input needed."""
     api = context.bot_data["api_client"]
     try:
         today = await api.copilot_today()
     except PasayApiError as exc:
-        # 503 provider-unavailable / timeout -> clear retryable error, never fabricate.
         await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
                       error_keyboard("home", locale))
         return
     text = cards.copilot_today_card(today, locale)
-    await _render(context, chat_id, message_id, text, home_keyboard(locale))
+    kb = copilot_today_keyboard(len(today.top_items), locale)
+    await _render(context, chat_id, message_id, text, kb)
+
+
+async def show_copilot_why(context, chat_id: int, message_id: int, item_index: int,
+                           locale: str):
+    """[为什么?] → POST /copilot/why (on-demand LLM, deterministic fallback)."""
+    api = context.bot_data["api_client"]
+    # Re-fetch the deterministic TODAY to resolve item_ref by 1-based index
+    # (avoids encoding backend refs in callback_data).
+    try:
+        today = await api.copilot_today()
+    except PasayApiError as exc:
+        await edit_message_text_idempotent(
+            context.bot, chat_id=chat_id, message_id=message_id,
+            text=_load_error(exc.detail, locale), parse_mode=HTML,
+            reply_markup=error_keyboard("home", locale),
+        )
+        return
+    items = today.top_items
+    if item_index < 1 or item_index > len(items):
+        await _render(context, chat_id, message_id,
+                      H.escape("⚠️ 该事项已变化，请重新进入运营助手"), home_keyboard(locale))
+        return
+    item_ref = items[item_index - 1].item_ref
+    try:
+        why = await api.copilot_why(item_ref)
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id,
+                      _load_error(exc.detail, locale), error_keyboard("home", locale))
+        return
+    text = cards.copilot_why_card(
+        why.item_ref,
+        why.explanation,
+        why.recommendation,
+        fallback=why.fallback,
+        locale=locale,
+    )
+    await edit_message_text_idempotent(
+        context.bot, chat_id=chat_id, message_id=message_id, text=H.truncate(text),
+        parse_mode=HTML, reply_markup=copilot_why_back_keyboard(locale),
+    )
+
+
+async def ask_copilot(context, chat_id: int, locale: str, question: str):
+    """[问运营助手] → POST /copilot/ask (on-demand LLM, friendly fallback)."""
+    api = context.bot_data["api_client"]
+    try:
+        ask = await api.copilot_ask(question)
+    except PasayApiError as exc:
+        await _send(context, chat_id,
+                    f"⚠️ {H.escape(t('common.load_error', locale, detail=str(exc.detail))[:120])}",
+                    home_keyboard(locale))
+        return
+    text = cards.copilot_ask_card(ask.answer, fallback=ask.fallback, locale=locale)
+    await _send(context, chat_id, H.truncate(text), home_keyboard(locale))
 
 
 async def show_operations_section(context, chat_id: int, message_id: int, section: str,
