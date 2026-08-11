@@ -165,6 +165,25 @@ class FakeBackend:
         self.timeout_before_write_paths: set[str] = set()
         self.timeout_without_effect_paths: set[str] = set()
         self.fail_status: dict[str, int] = {}
+        # --- V1.2.2 C2 copilot (TODAY / WHY / recommend / confirm / execute) ---
+        self.copilot_today_payload = {
+            "top_items": [
+                {"item_ref": "lease:3", "reason_why_important": "Unit 1608 租金严重逾期。",
+                 "suggested_action": "联系租客确认付款日期。"},
+                {"item_ref": "task:9", "reason_why_important": "空调保养本周到期。",
+                 "suggested_action": "安排技师上门。"},
+            ],
+            "summary": "2 项待办。",
+        }
+        self.copilot_recommend_error = None      # (status, detail)
+        self.copilot_recommend_response = None   # full CopilotRecommendOut dict
+        self.copilot_confirm_error = None
+        self.copilot_execute_error = None
+        self.copilot_execute_response = None     # full CopilotExecuteOut dict
+        self.copilot_cancel_error = None
+        self.auth_info = {"id": 7, "username": "ana", "role": "admin", "is_active": True}
+        self._copilot_proposal_seq = 100
+        self._copilot_execute_task_id = 77
 
     def add_income(self, status="pending", lease_id=1, amount="55000.00",
                    received_date="2026-08-10", payment_method="Bank",
@@ -286,6 +305,57 @@ class FakeBackend:
         if path == "/incomes" and method == "GET":
             return httpx.Response(200, json=self.incomes)
 
+        # --- V1.2.2 C2 confirmed-action copilot ---
+        if path == "/operations/copilot/today" and method == "POST":
+            return httpx.Response(200, json=self.copilot_today_payload)
+        if path == "/operations/copilot/why" and method == "POST":
+            item_ref = (body or {}).get("item_ref") or ""
+            return httpx.Response(
+                200,
+                json={
+                    "item_ref": item_ref,
+                    "explanation": "这是本周最需要关注的待办事项。",
+                    "recommendation": "今天就联系相关方确认处理。",
+                    "provider": "fake",
+                    "model": "fake",
+                    "fallback": False,
+                },
+            )
+        if path == "/operations/copilot/recommend" and method == "POST":
+            if self.copilot_recommend_error:
+                status, detail = self.copilot_recommend_error
+                return httpx.Response(status, json={"detail": detail})
+            rec = self._copilot_recommend(body)
+            if self.copilot_recommend_response is not None:
+                rec = self.copilot_recommend_response
+            return httpx.Response(201, json=rec)
+        if method == "POST" and path.startswith("/operations/copilot/proposals/") and path.endswith("/confirm"):
+            if self.copilot_confirm_error:
+                status, detail = self.copilot_confirm_error
+                return httpx.Response(status, json={"detail": detail})
+            return httpx.Response(
+                200,
+                json={"proposal": {"id": int(path.split("/")[4])}, "detail": "Proposal confirmed"},
+            )
+        if method == "POST" and path.startswith("/operations/copilot/proposals/") and path.endswith("/execute"):
+            if self.copilot_execute_error:
+                status, detail = self.copilot_execute_error
+                return httpx.Response(status, json={"detail": detail})
+            ex = self.copilot_execute_response
+            if ex is None:
+                ex = self._copilot_execute(path)
+            return httpx.Response(200, json=ex)
+        if method == "POST" and path.startswith("/operations/copilot/proposals/") and path.endswith("/cancel"):
+            if self.copilot_cancel_error:
+                status, detail = self.copilot_cancel_error
+                return httpx.Response(status, json={"detail": detail})
+            return httpx.Response(
+                200,
+                json={"proposal": {"id": int(path.split("/")[4])}, "detail": "Proposal cancelled"},
+            )
+        if path == "/auth" and method == "POST":
+            return httpx.Response(200, json=self.auth_info)
+
         # --- V1.2 operations center ---
         if path == "/operations/summary" and method == "GET":
             return httpx.Response(200, json=self._ops_summary())
@@ -334,6 +404,112 @@ class FakeBackend:
             return httpx.Response(200, json={"task": task, "detail": "Task snoozed"})
 
         return httpx.Response(404, json={"detail": f"no route {method} {path}"})
+
+    # --- V1.2.2 C2 copilot helpers ---
+    def _copilot_recommend(self, body):
+        """Deterministic CopilotRecommendOut built from POST /recommend body."""
+        self._copilot_proposal_seq += 1
+        proposal_id = self._copilot_proposal_seq
+        body = body or {}
+        intent = str(body.get("intent") or "").lower()
+        note = str(body.get("note") or "")
+        if "snooze" in intent:
+            task_ref = int(body.get("task_ref") or 0)
+            preset = body.get("preset")
+            due_at = "2026-08-12T01:00:00+00:00"  # tomorrow morning
+            if preset == "today_afternoon":
+                due_at = "2026-08-11T09:00:00+00:00"
+            elif preset == "3d":
+                due_at = "2026-08-14T09:00:00+00:00"
+            return {
+                "proposal_id": proposal_id,
+                "action_type": "snooze_task",
+                "status": "PENDING",
+                "target_type": "task",
+                "target_id": task_ref,
+                "idempotency_key": f"snooze:{proposal_id}",
+                "expires_at": None,
+                "card": {
+                    "action_type": "snooze_task",
+                    "target_type": "task",
+                    "target_id": task_ref,
+                    "target_label": "#9 空调保养",
+                    "reason_code": None,
+                    "assignee_user_id": None,
+                    "assignee_name": None,
+                    "due_at": due_at,
+                    "note": note,
+                    "display_context": {"task_id": 9, "title": "空调保养"},
+                },
+                "detail": "Proposal created",
+                "created": True,
+            }
+        if "assign" in intent:
+            task_ref = int(body.get("task_ref") or 0)
+            return {
+                "proposal_id": proposal_id,
+                "action_type": "assign_task",
+                "status": "PENDING",
+                "target_type": "task",
+                "target_id": task_ref,
+                "idempotency_key": f"assign:{proposal_id}",
+                "expires_at": None,
+                "card": {
+                    "action_type": "assign_task",
+                    "target_type": "task",
+                    "target_id": task_ref,
+                    "target_label": "#9 空调保养",
+                    "reason_code": None,
+                    "assignee_user_id": 2,
+                    "assignee_name": "Maria",
+                    "due_at": None,
+                    "note": note,
+                    "display_context": {"task_id": 9, "title": "空调保养"},
+                },
+                "detail": "Proposal created",
+                "created": True,
+            }
+        return {
+            "proposal_id": proposal_id,
+            "action_type": "create_followup_task",
+            "status": "PENDING",
+            "target_type": str(body.get("source_type") or "lease"),
+            "target_id": int(body.get("source_id") or 0),
+            "idempotency_key": f"followup:{proposal_id}",
+            "expires_at": None,
+            "card": {
+                "action_type": "create_followup_task",
+                "target_type": str(body.get("source_type") or "lease"),
+                "target_id": int(body.get("source_id") or 0),
+                "target_label": "Lease #3 · 1608 · Juan Dela Cruz",
+                "reason_code": "FOLLOWUP",
+                "assignee_user_id": 2,
+                "assignee_name": "Maria",
+                "due_at": "2026-08-12T01:00:00+00:00",
+                "note": note,
+                "display_context": {"unit": "1608", "tenant": "Juan Dela Cruz", "lease_id": 3},
+            },
+            "detail": "Proposal created",
+            "created": True,
+        }
+
+    def _copilot_execute(self, path):
+        proposal_id = int(path.split("/")[4])
+        return {
+            "proposal": {"id": proposal_id},
+            "result": {
+                "action_type": "create_followup_task",
+                "target_type": "lease",
+                "target_id": 3,
+                "task_id": self._copilot_execute_task_id,
+                "assignee_user_id": 2,
+                "due_at": "2026-08-12T01:00:00+00:00",
+                "executed_at": "2026-08-11T04:00:00+00:00",
+                "status": "EXECUTED",
+                "replay": False,
+                "detail": "Proposal executed",
+            },
+        }
 
     # --- V1.2 ops helpers ---
     def add_ops_task(self, task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",

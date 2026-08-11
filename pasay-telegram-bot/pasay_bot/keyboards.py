@@ -40,6 +40,15 @@ ACTION_COPILOT_WHY = "cpw"
 ACTION_COPILOT_ASK = "cpa"
 ACTION_COPILOT_BACK = "cpb"
 ACTION_COPILOT_NAV = "cpn"
+# C1.2/C2 confirmed-action copilot (v1.2.2). Short ASCII action codes (the
+# callback scheme only allows ``[a-z0-9:]``); full names in the comments.
+ACTION_COPILOT_SUGGEST = "cps"          # cp_suggest (suggestion tap)
+ACTION_COPILOT_CONFIRM = "cpc"          # cp_confirm ([✅ 确认安排] -> execute)
+ACTION_COPILOT_DECLINE = "cpd"          # cp_decline ([暂不处理] -> cancel)
+ACTION_COPILOT_EDIT = "cpe"             # cp_edit ([✏️ 修改] inline pick)
+ACTION_COPILOT_RECOMMEND_BACK = "cpr"   # cp_recommend_back (return to TODAY)
+ACTION_COPILOT_SNOOZE_PICK = "csp"      # cp_snooze_pick (edit due preset)
+ACTION_COPILOT_ASSIGNEE_PICK = "cap"    # cp_assignee_pick (edit who)
 
 # ops center section entities (callback entity field).
 OPS_OVERVIEW = "ops"
@@ -221,20 +230,258 @@ def copilot_today_keyboard(
     return InlineKeyboardMarkup(kb)
 
 
-def copilot_why_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
-    """WHY detail card: back to TODAY + home."""
+# --- C2 confirmed-action copilot (v1.2.2) -----------------------------------
+# Follow-up proposals are only buildable for the backend allowlist sources.
+_COPILOT_FOLLOWUP_SOURCES = frozenset({"lease", "property", "task"})
+
+
+def _copilot_item_source(item) -> str:
+    return (getattr(item, "item_ref", "") or "").split(":", 1)[0].lower()
+
+
+def copilot_item_actionable(item) -> bool:
+    """Suggestion rows only for actionable items: a ``suggested_action`` AND a
+    follow-up-eligible source (lease/property/task — mirrors the backend
+    allowlist; expense/settlement items are never actionable here)."""
+    has_action = bool((getattr(item, "suggested_action", "") or "").strip())
+    return has_action and _copilot_item_source(item) in _COPILOT_FOLLOWUP_SOURCES
+
+
+def copilot_why_keyboard(
+    item_index: int, item, locale: str = "zh", can_suggest: bool = False,
+) -> InlineKeyboardMarkup:
+    """WHY card buttons (C2): a per-item suggestion row for actionable items
+    ([安排秘书跟进] always, [明天再提醒] for task items, [暂不处理] dismiss),
+    plus back-to-TODAY and home. ``item_index`` is the 1-based TODAY index;
+    the handler re-fetches TODAY to resolve the backend ref."""
+    kb: list[list[InlineKeyboardButton]] = []
+    if can_suggest and copilot_item_actionable(item):
+        follow = InlineKeyboardButton(
+            t("copilot.suggest_follow", locale),
+            callback_data=encode(
+                ACTION_COPILOT_SUGGEST, "follow", str(item_index),
+                nonce=new_nonce(), ts=now_ts(),
+            ),
+        )
+        if _copilot_item_source(item) == "task":
+            kb.append(
+                [
+                    follow,
+                    InlineKeyboardButton(
+                        t("copilot.suggest_snooze", locale),
+                        callback_data=encode(
+                            ACTION_COPILOT_SUGGEST, "snooze", str(item_index),
+                            nonce=new_nonce(), ts=now_ts(),
+                        ),
+                    ),
+                ]
+            )
+        else:
+            kb.append([follow])
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("copilot.suggest_dismiss", locale),
+                    callback_data=encode(
+                        ACTION_COPILOT_SUGGEST, "dismiss", str(item_index),
+                        nonce=new_nonce(), ts=now_ts(),
+                    ),
+                )
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("copilot.back_today", locale),
+                callback_data=encode(ACTION_COPILOT_RECOMMEND_BACK, "today"),
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale),
+                callback_data=encode(ACTION_NAV, "home"),
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def copilot_confirm_keyboard(proposal_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Confirmation card: [✅ 确认安排] [✏️ 修改] [暂不处理]. The [✅] tap is the
+    ONLY path that executes — every mutation needs this explicit tap."""
+    nonce, ts = new_nonce(), now_ts()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("copilot.confirm_yes", locale),
+                    callback_data=encode(
+                        ACTION_COPILOT_CONFIRM, str(proposal_id), "0",
+                        nonce=nonce, ts=ts,
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("copilot.confirm_edit", locale),
+                    callback_data=encode(
+                        ACTION_COPILOT_EDIT, "menu", str(proposal_id),
+                        nonce=nonce, ts=ts,
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("copilot.suggest_dismiss", locale),
+                    callback_data=encode(
+                        ACTION_COPILOT_DECLINE, str(proposal_id), "0",
+                        nonce=nonce, ts=ts,
+                    ),
+                ),
+            ]
+        ]
+    )
+
+
+def copilot_success_keyboard(task_id: Optional[int], locale: str = "zh") -> InlineKeyboardMarkup:
+    """Success card: [查看任务] (ops detail) + [返回今日重点] + home."""
+    kb: list[list[InlineKeyboardButton]] = []
+    if task_id is not None:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("copilot.view_task", locale),
+                    callback_data=encode(ACTION_TASK_DETAIL, "ops", str(task_id)),
+                )
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("copilot.back_today", locale),
+                callback_data=encode(ACTION_COPILOT_RECOMMEND_BACK, "today"),
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale),
+                callback_data=encode(ACTION_NAV, "home"),
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def copilot_back_today_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Replay / notify-retry cards: back to TODAY + home."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     t("copilot.back_today", locale),
-                    callback_data=encode(ACTION_COPILOT_NAV, "today"),
+                    callback_data=encode(ACTION_COPILOT_RECOMMEND_BACK, "today"),
                 ),
                 InlineKeyboardButton(
                     t("common.home", locale),
                     callback_data=encode(ACTION_NAV, "home"),
                 ),
             ]
+        ]
+    )
+
+
+def copilot_stale_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Target-changed failure: refresh the latest TODAY + home."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("copilot.refresh", locale),
+                    callback_data=encode(ACTION_COPILOT_RECOMMEND_BACK, "today"),
+                ),
+                InlineKeyboardButton(
+                    t("common.home", locale),
+                    callback_data=encode(ACTION_NAV, "home"),
+                ),
+            ]
+        ]
+    )
+
+
+def copilot_edit_menu_keyboard(
+    proposal_id: int, is_snooze: bool, locale: str = "zh",
+) -> InlineKeyboardMarkup:
+    """[✏️ 修改] inline menu: who (followups only) + due + back to confirm."""
+    nonce, ts = new_nonce(), now_ts()
+    row = []
+    if not is_snooze:
+        row.append(
+            InlineKeyboardButton(
+                t("copilot.edit_who", locale),
+                callback_data=encode(ACTION_COPILOT_EDIT, "who", str(proposal_id), nonce=nonce, ts=ts),
+            )
+        )
+    row.append(
+        InlineKeyboardButton(
+            t("copilot.edit_due", locale),
+            callback_data=encode(ACTION_COPILOT_EDIT, "due", str(proposal_id), nonce=nonce, ts=ts),
+        )
+    )
+    kb = [row]
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("copilot.back_confirm", locale),
+                callback_data=encode(ACTION_COPILOT_EDIT, "back", str(proposal_id), nonce=nonce, ts=ts),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def copilot_who_keyboard(proposal_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Who picker: [秘书] (backend default) / [我自己] (owner assigns self)."""
+    nonce, ts = new_nonce(), now_ts()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("copilot.who_secretary", locale),
+                    callback_data=encode(ACTION_COPILOT_ASSIGNEE_PICK, "sec", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+                InlineKeyboardButton(
+                    t("copilot.who_me", locale),
+                    callback_data=encode(ACTION_COPILOT_ASSIGNEE_PICK, "me", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("copilot.back_confirm", locale),
+                    callback_data=encode(ACTION_COPILOT_EDIT, "back", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+            ],
+        ]
+    )
+
+
+def copilot_due_keyboard(proposal_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Due picker: 今天下午 / 明天上午 / 3 天后 (exact time resolved backend-side
+    and always shown on the resulting confirmation card)."""
+    nonce, ts = new_nonce(), now_ts()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("copilot.due_today", locale),
+                    callback_data=encode(ACTION_COPILOT_SNOOZE_PICK, "today", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+                InlineKeyboardButton(
+                    t("copilot.due_tomorrow", locale),
+                    callback_data=encode(ACTION_COPILOT_SNOOZE_PICK, "tomorrow", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+                InlineKeyboardButton(
+                    t("copilot.due_3d", locale),
+                    callback_data=encode(ACTION_COPILOT_SNOOZE_PICK, "3d", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("copilot.back_confirm", locale),
+                    callback_data=encode(ACTION_COPILOT_EDIT, "back", str(proposal_id), nonce=nonce, ts=ts),
+                ),
+            ],
         ]
     )
 

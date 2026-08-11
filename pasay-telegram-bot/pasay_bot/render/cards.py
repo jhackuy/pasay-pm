@@ -2,10 +2,14 @@
 html helpers) — no ad-hoc f-string message assembly in handlers."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from pasay_bot.api_client import (
+    CopilotExecute,
+    CopilotRecommend,
     CopilotToday,
     CopilotTodayItem,
     FinancialSummary,
@@ -21,6 +25,7 @@ from pasay_bot.render.i18n import t
 DIVIDER = "━" * 12
 PAGE_SIZE_PROPERTIES = 5
 PAGE_SIZE_OVERDUE = 5
+MANILA_TZ = ZoneInfo("Asia/Manila")
 
 
 def _stats_by_property(units: list[Unit]) -> dict[int, dict[str, int]]:
@@ -557,17 +562,25 @@ def copilot_why_card(
     recommendation: str,
     *,
     fallback: bool = False,
+    suggested_action: str = "",
     locale: str = "zh",
 ) -> str:
     """WHY detail card (C1.1): grounded explanation + recommendation for one
     item. No refs / model / provider leak. ``fallback`` shows a subtle note that
-    the answer is the deterministic reason (provider unavailable)."""
+    the answer is the deterministic reason (provider unavailable).
+    ``suggested_action`` (C2) appends the owner-facing suggestion block that
+    the per-item action buttons sit under."""
     blocks = [f"🤖 <b>{H.escape(t('copilot.why_title', locale))}</b>"]
     blocks.append(_copilot_one_line(explanation, max_chars=400))
     if recommendation:
         blocks.append(
             f"<b>{H.escape(t('copilot.action', locale))}</b>"
             f"{_copilot_one_line(recommendation)}"
+        )
+    if suggested_action:
+        blocks.append(
+            f"<b>{H.escape(t('copilot.suggest_title', locale))}</b>\n"
+            f"{_copilot_one_line(suggested_action, max_chars=200)}"
         )
     if fallback:
         blocks.append(H.escape(t("copilot.fallback_note", locale)))
@@ -581,3 +594,114 @@ def copilot_ask_card(answer: str, *, fallback: bool = False, locale: str = "zh")
     if fallback:
         blocks.append(H.escape(t("copilot.fallback_note", locale)))
     return "\n\n".join(blocks)
+
+
+# --- V1.2.2 C2 confirmed-action copilot (render-safe, owner zh) --------------
+
+
+def _format_due(value, locale: str = "zh") -> str:
+    """Manila-local human due time: 今天 17:00 / 明天 09:00 / 8月13日 09:00."""
+    if not value:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return str(value)
+    local = dt.astimezone(MANILA_TZ)
+    now = datetime.now(MANILA_TZ)
+    if locale == "en":
+        hm = local.strftime("%I:%M %p").lstrip("0")
+        if local.date() == now.date():
+            return f"Today {hm}"
+        if local.date() == now.date() + timedelta(days=1):
+            return f"Tomorrow {hm}"
+        return f"{local.strftime('%b %d')} {hm}"
+    hm = local.strftime("%H:%M")
+    if local.date() == now.date():
+        return f"今天 {hm}"
+    if local.date() == now.date() + timedelta(days=1):
+        return f"明天 {hm}"
+    return f"{local.strftime('%m月%d日')} {hm}"
+
+
+def _copilot_topic(card) -> str:
+    """Human topic line for the confirmation card: the follow-up note, else the
+    task title / tenant, else the render-safe target label (last resort)."""
+    dc = card.display_context or {}
+    raw = (
+        card.note
+        or dc.get("title")
+        or dc.get("tenant")
+        or card.target_label
+        or ""
+    )
+    return _copilot_one_line(raw, max_chars=60)
+
+
+def _copilot_property_line(card) -> str:
+    """房产 line: property name + unit when available, else target label."""
+    dc = card.display_context or {}
+    parts = []
+    if dc.get("property"):
+        parts.append(str(dc["property"]))
+    if dc.get("unit"):
+        parts.append(f"Unit {dc['unit']}")
+    if not parts:
+        parts.append(card.target_label or "")
+    return " · ".join(parts)
+
+
+def copilot_suggest_card(rec: CopilotRecommend, locale: str = "zh") -> str:
+    """C2 confirmation card (owner, zh): 房产 / 事项 / 负责人 / 截止 + secretary
+    note. Built ONLY from ``rec.card`` (display_context + assignee_name +
+    due_at + note) — never the proposal id, internal enums, JSON or raw
+    status."""
+    card = rec.card
+    if card is None:
+        return H.escape(t("copilot.confirm_title", locale))
+    action = (card.action_type or "").lower()
+    lines = [f"🤖 <b>{H.escape(t('copilot.confirm_title', locale))}</b>"]
+    if action == "snooze_task":
+        lines.append(f"{H.escape(t('copilot.role_topic', locale))}：{_copilot_topic(card)}")
+        lines.append(f"{H.escape(t('copilot.role_due', locale))}：{H.escape(_format_due(card.due_at, locale))}")
+    elif action == "assign_task":
+        lines.append(f"{H.escape(t('copilot.role_topic', locale))}：{_copilot_topic(card)}")
+        lines.append(f"{H.escape(t('copilot.role_owner', locale))}：{H.escape(card.assignee_name or '-')}")
+    else:  # create_followup_task
+        lines.append(f"{H.escape(t('copilot.role_property', locale))}：{H.escape(_copilot_property_line(card))}")
+        lines.append(f"{H.escape(t('copilot.role_topic', locale))}：{_copilot_topic(card)}")
+        lines.append(f"{H.escape(t('copilot.role_owner', locale))}：{H.escape(card.assignee_name or '-')}")
+        lines.append(f"{H.escape(t('copilot.role_due', locale))}：{H.escape(_format_due(card.due_at, locale))}")
+        lines.append(H.escape(t("copilot.hint_secretary_note", locale)))
+    return "\n".join(lines)
+
+
+def copilot_success_card(
+    result: CopilotExecute, assignee_name: str = "", locale: str = "zh",
+) -> str:
+    """C2 success card: role-aware human text. Never shows proposal_id / raw
+    status; ``assignee_name`` is the render-safe name from the recommend card
+    (the execute result only carries the backend user id)."""
+    action = (result.action_type or "").lower()
+    due = _format_due(result.due_at, locale)
+    assignee = H.escape(assignee_name or "-")
+    if action == "snooze_task":
+        return t("copilot.success_snooze", locale, due=H.escape(due))
+    if action == "assign_task":
+        return t("copilot.success_assign", locale, assignee=assignee)
+    return t("copilot.success_follow", locale, assignee=assignee, due=H.escape(due))
+
+
+def copilot_stale_card(locale: str = "zh") -> str:
+    """Target changed / stale proposal: human warning, refresh button beside."""
+    return H.escape(t("copilot.stale", locale))
+
+
+def copilot_replayed_card(locale: str = "zh") -> str:
+    """Duplicate callback / already executed: no second mutation."""
+    return H.escape(t("copilot.executed_already", locale))
+
+
+def copilot_notify_retry_card(locale: str = "zh") -> str:
+    """Task created but the secretary notification is retrying."""
+    return H.escape(t("copilot.notify_retry", locale))

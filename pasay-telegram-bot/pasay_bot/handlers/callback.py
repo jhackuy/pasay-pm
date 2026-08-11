@@ -10,12 +10,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from datetime import date
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import (
+    CopilotExecute,
+    CopilotRecommend,
     PasayApiConflictError,
     PasayApiError,
     PasayApiPermissionError,
@@ -33,7 +37,14 @@ from pasay_bot.keyboards import (
     ACTION_CANCEL,
     ACTION_CONFIRM,
     ACTION_COPILOT_ASK,
+    ACTION_COPILOT_ASSIGNEE_PICK,
+    ACTION_COPILOT_CONFIRM,
+    ACTION_COPILOT_DECLINE,
+    ACTION_COPILOT_EDIT,
     ACTION_COPILOT_NAV,
+    ACTION_COPILOT_RECOMMEND_BACK,
+    ACTION_COPILOT_SNOOZE_PICK,
+    ACTION_COPILOT_SUGGEST,
     ACTION_COPILOT_WHY,
     ACTION_DETAIL,
     ACTION_EDIT,
@@ -52,6 +63,13 @@ from pasay_bot.keyboards import (
     SNOOZE_PRESET_MAP,
     confirm_income_keyboard,
     confirm_rent_keyboard,
+    copilot_back_today_keyboard,
+    copilot_confirm_keyboard,
+    copilot_due_keyboard,
+    copilot_edit_menu_keyboard,
+    copilot_stale_keyboard,
+    copilot_success_keyboard,
+    copilot_who_keyboard,
     decode,
     edit_date_keyboard,
     edit_input_keyboard,
@@ -75,6 +93,7 @@ from pasay_bot.roles import (
     PERMISSION_RENT_CONFIRM,
     PERMISSION_RENT_ENTRY,
     PERMISSION_REVERSE,
+    Role,
     has_permission,
     has_read_permission,
     locale_for,
@@ -191,6 +210,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_copilot_why(update, context, entity, role, locale)
     elif action == ACTION_COPILOT_ASK:
         await _handle_copilot_ask(update, context, role, locale)
+    elif action == ACTION_COPILOT_SUGGEST:
+        await _handle_copilot_suggest(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_COPILOT_CONFIRM:
+        await _handle_copilot_confirm(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_COPILOT_DECLINE:
+        await _handle_copilot_decline(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_COPILOT_EDIT:
+        await _handle_copilot_edit(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_COPILOT_RECOMMEND_BACK:
+        await _handle_copilot_recommend_back(update, context, role, locale)
+    elif action == ACTION_COPILOT_SNOOZE_PICK:
+        await _handle_copilot_snooze_pick(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_COPILOT_ASSIGNEE_PICK:
+        await _handle_copilot_assignee_pick(update, context, entity, ref, nonce, ts, role, locale)
     else:
         await _answer(update, t("common.invalid", locale))
 
@@ -1034,6 +1067,7 @@ async def _handle_copilot_why(update, context, entity, role, locale):
     await pages.show_copilot_why(
         context, update.effective_chat.id,
         update.callback_query.message.message_id, int(entity), locale,
+        can_suggest=(role == Role.OWNER),
     )
 
 
@@ -1056,3 +1090,424 @@ async def _handle_copilot_ask(update, context, role, locale):
         parse_mode=HTML,
         reply_markup=expired_keyboard(locale),
     )
+
+
+# --- 🤖 运营助手 · C2 confirmed-action copilot (v1.2.2) -----------------------
+# Owner flow (zh): suggestion tap -> POST /recommend -> confirmation card ->
+# [✅ 确认安排] -> POST /confirm + /execute -> success card. Every mutation
+# needs the explicit [确认安排] tap; the secretary's English task notification
+# is delivered by the backend outbox, never rendered here.
+
+_COPILOT_DUE_PRESET_MAP = {
+    "today": "today_afternoon",
+    "tomorrow": "tomorrow_morning",
+    "3d": "3d",
+}
+
+_COPILOT_STALE_CODES = frozenset(
+    {
+        "business_stale",
+        "target_missing",
+        "target_out_of_scope",
+        "target_type_unknown",
+        "action_target_illegal",
+    }
+)
+
+
+def _copilot_allowed(role) -> bool:
+    """The C2 confirm/execute surface is the OWNER flow (zh)."""
+    return role == Role.OWNER
+
+
+def _copilot_split_item_ref(item_ref: str) -> tuple[str, Optional[int]]:
+    """'lease:3' -> ('lease', 3); anything else -> ('', None)."""
+    source_type, _, raw = (item_ref or "").partition(":")
+    if not raw.isdigit():
+        return "", None
+    return source_type, int(raw)
+
+
+def _copilot_due_iso(preset_code: str) -> str:
+    """Manila wall-clock due for the followup due picker (今天 17:00 /
+    明天 09:00 / 3 天后), returned as UTC ISO for POST /recommend."""
+    now = datetime.now(cards.MANILA_TZ)
+    if preset_code == "today":
+        target = now.replace(hour=17, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+    elif preset_code == "tomorrow":
+        target = (now + timedelta(days=1)).replace(
+            hour=9, minute=0, second=0, microsecond=0
+        )
+    else:  # "3d"
+        target = now + timedelta(days=3)
+    return target.astimezone(timezone.utc).isoformat()
+
+
+def _copilot_conv(update, context) -> Optional[dict]:
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] != "copilot_confirm":
+        return None
+    return conv["payload"] or {}
+
+
+def _copilot_failure_text(exc: Exception, locale: str) -> tuple[str, object]:
+    """HTTP 409 error_code / detail -> human strings (contract §5). Never
+    surfaces a raw error code, JSON, or internal enum."""
+    code = str(getattr(exc, "error_code", None) or "")
+    detail = str(getattr(exc, "detail", "") or "")
+    d = detail.lower()
+    if "notif" in d or "retry" in d:
+        return cards.copilot_notify_retry_card(locale), copilot_back_today_keyboard(locale)
+    if "already" in d or "executed" in d:
+        return cards.copilot_replayed_card(locale), copilot_back_today_keyboard(locale)
+    if "expired" in d or code == "proposal_expired":
+        return H.escape(t("common.expired", locale)), home_keyboard(locale)
+    if code in _COPILOT_STALE_CODES or "stale" in code or "target" in d:
+        return cards.copilot_stale_card(locale), copilot_stale_keyboard(locale)
+    # Generic fail-closed rejection: human backend message, no raw code.
+    return H.escape(detail or t("common.error", locale, detail="")), copilot_back_today_keyboard(locale)
+
+
+async def _render_copilot_failure(update, context, exc: Exception, locale: str):
+    text, keyboard = _copilot_failure_text(exc, locale)
+    await _edit(update, text, keyboard)
+
+
+async def _render_copilot_confirm_card(update, context, rec: CopilotRecommend, src: dict, locale: str):
+    """Render the confirmation card and persist the recommend params so the
+    [✏️ 修改] pickers can re-recommend with overrides."""
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else chat_id
+    payload = dict(src)
+    payload["proposal_id"] = rec.proposal_id
+    payload["assignee_name"] = (rec.card.assignee_name if rec.card else None) or ""
+    store.save_conversation(chat_id, user_id, "copilot_confirm", payload)
+    text = cards.copilot_suggest_card(rec, locale)
+    await _edit(update, text, copilot_confirm_keyboard(rec.proposal_id, locale))
+
+
+async def _re_recommend(update, context, payload: dict, overrides: dict, locale: str):
+    """Re-run POST /copilot/recommend with the stored source params +
+    overrides, then render the fresh confirmation card. The backend resolves
+    the final values (idempotent replay when the logical request is
+    unchanged); nothing executes here."""
+    api = context.bot_data["api_client"]
+    intent = payload.get("intent")
+    try:
+        if intent == "snooze":
+            rec = await api.copilot_recommend(
+                intent="snooze",
+                task_ref=payload.get("task_ref"),
+                preset=overrides.get("preset", payload.get("preset")),
+                note=payload.get("note"),
+            )
+        elif intent == "assign":
+            rec = await api.copilot_recommend(
+                intent="assign",
+                task_ref=payload.get("task_ref"),
+                assignee_user_id=overrides.get("assignee_user_id"),
+                note=payload.get("note"),
+            )
+        else:
+            rec = await api.copilot_recommend(
+                intent="followup",
+                source_type=payload.get("source_type"),
+                source_id=payload.get("source_id"),
+                reason_code=payload.get("reason_code"),
+                assignee_user_id=overrides.get("assignee_user_id"),
+                due_at=overrides.get("due_at"),
+                note=payload.get("note"),
+            )
+    except PasayApiError as exc:
+        await _render_copilot_failure(update, context, exc, locale)
+        return
+    src = dict(payload)
+    src.update(overrides)
+    await _render_copilot_confirm_card(update, context, rec, src, locale)
+
+
+async def _handle_copilot_suggest(update, context, entity, ref, nonce, ts, role, locale):
+    """Suggestion tap -> POST /copilot/recommend -> confirmation card. The card
+    is NOT executed until [✅ 确认安排] is tapped."""
+    if not _copilot_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if entity == "dismiss":
+        # [暂不处理] on the WHY card: no-op dismiss (never mutates).
+        await _answer(update, "")
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    if entity not in ("follow", "snooze") or not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    api = context.bot_data["api_client"]
+    try:
+        today = await api.copilot_today()
+    except PasayApiError as exc:
+        await _edit(update, _load_error(exc.detail, locale), error_keyboard("home", locale))
+        return
+    index = int(ref)
+    items = today.top_items
+    if index < 1 or index > len(items):
+        await _edit(update, H.escape("⚠️ 该事项已变化，请重新进入运营助手"), home_keyboard(locale))
+        return
+    item = items[index - 1]
+    if not (item.suggested_action or "").strip():
+        await _answer(update, t("common.invalid", locale))
+        return
+    source_type, source_id = _copilot_split_item_ref(item.item_ref)
+    if source_id is None:
+        await _answer(update, t("common.invalid", locale))
+        return
+    note = item.suggested_action
+    try:
+        if entity == "follow":
+            rec = await api.copilot_recommend(
+                intent="followup",
+                source_type=source_type,
+                source_id=source_id,
+                reason_code=None,
+                note=note,
+            )
+            src = {
+                "intent": "followup",
+                "source_type": source_type,
+                "source_id": source_id,
+                "task_ref": None,
+                "reason_code": None,
+                "preset": None,
+                "note": note,
+            }
+        else:  # snooze — only task items can be snoozed
+            if source_type != "task":
+                await _answer(update, t("common.invalid", locale))
+                return
+            rec = await api.copilot_recommend(
+                intent="snooze",
+                task_ref=source_id,
+                preset="tomorrow_morning",
+                note=note,
+            )
+            src = {
+                "intent": "snooze",
+                "source_type": None,
+                "source_id": None,
+                "task_ref": source_id,
+                "reason_code": None,
+                "preset": "tomorrow_morning",
+                "note": note,
+            }
+    except PasayApiError as exc:
+        await _render_copilot_failure(update, context, exc, locale)
+        return
+    await _answer(update, "")
+    await _render_copilot_confirm_card(update, context, rec, src, locale)
+
+
+async def _handle_copilot_confirm(update, context, entity, ref, nonce, ts, role, locale):
+    """[✅ 确认安排] -> POST /confirm + /execute (the ONLY mutation path)."""
+    if not _copilot_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    if not entity.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    proposal_id = int(entity)
+    guard = context.bot_data["idempotency"]
+    api = context.bot_data["api_client"]
+    key = f"ik:cp:exec:{proposal_id}:{nonce or '0'}"
+    status = guard.acquire(key, kind="copilot", resource=str(proposal_id))
+    if status == "done":
+        await _edit(update, cards.copilot_replayed_card(locale), copilot_back_today_keyboard(locale))
+        await _answer(update, t("copilot.executed_already", locale))
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale))
+        return
+    payload = _copilot_conv(update, context) or {}
+    assignee_name = str(payload.get("assignee_name") or "")
+    try:
+        try:
+            await api.copilot_confirm(proposal_id)
+        except PasayApiConflictError as exc:
+            if "executed" not in str(getattr(exc, "detail", "")).lower():
+                raise
+            # Stale-card replay of an already-EXECUTED proposal: /execute
+            # returns the idempotent replay result.
+        result: CopilotExecute = await api.copilot_execute(proposal_id)
+    except PasayApiConflictError as exc:
+        guard.fail(key, resource=str(proposal_id))
+        await _render_copilot_failure(update, context, exc, locale)
+        return
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(proposal_id))
+        await _render_copilot_failure(update, context, exc, locale)
+        return
+    guard.settle(key, asdict(result), resource=str(proposal_id))
+    if result.replay or "already" in (result.detail or "").lower():
+        await _edit(update, cards.copilot_replayed_card(locale), copilot_back_today_keyboard(locale))
+        await _answer(update, t("copilot.executed_already", locale))
+        return
+    text = cards.copilot_success_card(result, assignee_name=assignee_name, locale=locale)
+    await _edit(update, text, copilot_success_keyboard(result.task_id, locale))
+    await _answer(update, "")
+
+
+async def _handle_copilot_decline(update, context, entity, ref, nonce, ts, role, locale):
+    """[暂不处理] -> POST /proposals/{id}/cancel (no execution)."""
+    if not _copilot_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    if not entity.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    proposal_id = int(entity)
+    guard = context.bot_data["idempotency"]
+    api = context.bot_data["api_client"]
+    key = f"ik:cp:cancel:{proposal_id}:{nonce or '0'}"
+    status = guard.acquire(key, kind="copilot", resource=str(proposal_id))
+    if status == "done":
+        await _edit(update, H.escape(t("copilot.cancelled_card", locale)), copilot_back_today_keyboard(locale))
+        await _answer(update, "")
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale))
+        return
+    try:
+        await api.copilot_cancel(proposal_id)
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(proposal_id))
+        await _render_copilot_failure(update, context, exc, locale)
+        return
+    guard.settle(key, {"proposal_id": proposal_id}, resource=str(proposal_id))
+    await _edit(update, H.escape(t("copilot.cancelled_card", locale)), copilot_back_today_keyboard(locale))
+    await _answer(update, "")
+
+
+async def _handle_copilot_edit(update, context, entity, ref, nonce, ts, role, locale):
+    """[✏️ 修改] -> inline pick for who/due; picks re-recommend (still PENDING,
+    still needs [✅ 确认安排] to execute)."""
+    if not _copilot_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    proposal_id = int(ref)
+    payload = _copilot_conv(update, context)
+    if payload is None:
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    await _answer(update, "")
+    if entity == "menu":
+        await _edit(
+            update, H.escape(t("copilot.edit_title", locale)),
+            copilot_edit_menu_keyboard(proposal_id, payload.get("intent") == "snooze", locale),
+        )
+    elif entity == "back":
+        await _re_recommend(update, context, payload, {}, locale)
+    elif entity == "who":
+        if payload.get("intent") == "snooze":
+            await _answer(update, t("common.invalid", locale))
+            return
+        await _edit(update, H.escape(t("copilot.ask_who", locale)), copilot_who_keyboard(proposal_id, locale))
+    elif entity == "due":
+        await _edit(update, H.escape(t("copilot.ask_due", locale)), copilot_due_keyboard(proposal_id, locale))
+    else:
+        await _answer(update, t("common.invalid", locale))
+
+
+async def _handle_copilot_snooze_pick(update, context, entity, ref, nonce, ts, role, locale):
+    """Due-pick choice -> re-recommend with the preset (snooze) or a
+    Manila-resolved due_at (followup) -> fresh confirmation card."""
+    if not _copilot_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    payload = _copilot_conv(update, context)
+    if payload is None:
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    await _answer(update, "")
+    preset = _COPILOT_DUE_PRESET_MAP.get(entity)
+    if preset is None:
+        await _answer(update, t("common.invalid", locale))
+        return
+    if payload.get("intent") == "snooze":
+        await _re_recommend(update, context, payload, {"preset": preset}, locale)
+    else:
+        await _re_recommend(update, context, payload, {"due_at": _copilot_due_iso(entity)}, locale)
+
+
+async def _handle_copilot_assignee_pick(update, context, entity, ref, nonce, ts, role, locale):
+    """Who-pick choice -> re-recommend with the assignee override."""
+    if not _copilot_allowed(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    payload = _copilot_conv(update, context)
+    if payload is None:
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    await _answer(update, "")
+    api = context.bot_data["api_client"]
+    if entity == "me":
+        try:
+            me = await api.get_me()
+        except PasayApiError as exc:
+            await _render_copilot_failure(update, context, exc, locale)
+            return
+        assignee_user_id = int(me.get("id") or 0)
+    elif entity == "sec":
+        assignee_user_id = None  # backend resolves the default secretary
+    else:
+        await _answer(update, t("common.invalid", locale))
+        return
+    await _re_recommend(update, context, payload, {"assignee_user_id": assignee_user_id}, locale)
+
+
+async def _handle_copilot_recommend_back(update, context, role, locale):
+    """[返回今日重点] / [刷新最新状态] -> deterministic TODAY card."""
+    await _handle_copilot_nav(update, context, role, locale)

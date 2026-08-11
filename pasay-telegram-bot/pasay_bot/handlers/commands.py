@@ -23,8 +23,8 @@ from pasay_bot.keyboards import (
     OPS_SECTION_OVERDUE,
     OPS_SECTION_TODAY,
     collect_list_keyboard,
+    copilot_why_keyboard,
     copilot_today_keyboard,
-    copilot_why_back_keyboard,
     dashboard_keyboard,
     error_keyboard,
     home_keyboard,
@@ -658,8 +658,10 @@ async def show_copilot(context, chat_id: int, locale: str, message_id=None):
 
 
 async def show_copilot_why(context, chat_id: int, message_id: int, item_index: int,
-                           locale: str):
-    """[为什么?] → POST /copilot/why (on-demand LLM, deterministic fallback)."""
+                           locale: str, can_suggest: bool = False):
+    """[为什么?] → POST /copilot/why (on-demand LLM, deterministic fallback).
+    ``can_suggest`` (C2, owner) adds per-item suggestion action rows for
+    actionable items — tapping one leads to the confirm/execute flow."""
     api = context.bot_data["api_client"]
     # Re-fetch the deterministic TODAY to resolve item_ref by 1-based index
     # (avoids encoding backend refs in callback_data).
@@ -677,7 +679,8 @@ async def show_copilot_why(context, chat_id: int, message_id: int, item_index: i
         await _render(context, chat_id, message_id,
                       H.escape("⚠️ 该事项已变化，请重新进入运营助手"), home_keyboard(locale))
         return
-    item_ref = items[item_index - 1].item_ref
+    item = items[item_index - 1]
+    item_ref = item.item_ref
     try:
         why = await api.copilot_why(item_ref)
     except PasayApiError as exc:
@@ -689,11 +692,13 @@ async def show_copilot_why(context, chat_id: int, message_id: int, item_index: i
         why.explanation,
         why.recommendation,
         fallback=why.fallback,
+        suggested_action=item.suggested_action if can_suggest else "",
         locale=locale,
     )
     await edit_message_text_idempotent(
         context.bot, chat_id=chat_id, message_id=message_id, text=H.truncate(text),
-        parse_mode=HTML, reply_markup=copilot_why_back_keyboard(locale),
+        parse_mode=HTML,
+        reply_markup=copilot_why_keyboard(item_index, item, locale, can_suggest=can_suggest),
     )
 
 

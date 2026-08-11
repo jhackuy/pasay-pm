@@ -494,11 +494,23 @@ class CopilotExecute:
 
 
 class PasayApiError(Exception):
-    def __init__(self, status_code: Optional[int], detail: str):
+    """API failure with an optional backend ``error_code``.
+
+    The backend surfaces fail-closed copilot rejections as a structured 409
+    ``{"message": ..., "error_code": ...}``. The bot maps ``error_code`` to
+    human strings (never showing the raw code).
+    """
+
+    def __init__(
+        self,
+        status_code: Optional[int],
+        detail: str,
+        error_code: Optional[str] = None,
+    ):
         self.status_code = status_code
         self.detail = detail
+        self.error_code = error_code
         super().__init__(f"Pasay API error {status_code}: {detail}")
-
 
 class PasayApiAuthError(PasayApiError):
     """401 — invalid/missing API key."""
@@ -519,15 +531,25 @@ class PasayApiTimeoutError(PasayApiError):
         super().__init__(None, message)
 
 
-def _extract_detail(resp: httpx.Response) -> str:
+def _extract_detail(resp: httpx.Response) -> tuple[str, Optional[str]]:
+    """Return ``(detail, error_code)`` from an error response body.
+
+    Structured 409s carry ``{"message": ..., "error_code": ...}`` under
+    ``detail``; plain-string details return ``error_code=None``.
+    """
     try:
         body = resp.json()
     except Exception:
-        return (resp.text or "").strip() or f"HTTP {resp.status_code}"
+        return (resp.text or "").strip() or f"HTTP {resp.status_code}", None
     if isinstance(body, dict):
-        return str(body.get("detail") or body)
-    return str(body)
-
+        detail = body.get("detail")
+        if isinstance(detail, dict):
+            return (
+                str(detail.get("message") or detail),
+                str(detail.get("error_code") or None) or None,
+            )
+        return str(detail or body), None
+    return str(body), None
 
 class PasayApiClient:
     def __init__(
@@ -556,14 +578,14 @@ class PasayApiClient:
         except httpx.HTTPError as exc:
             raise PasayApiError(None, f"network error: {exc}") from exc
         if resp.status_code >= 400:
-            detail = _extract_detail(resp)
+            detail, error_code = _extract_detail(resp)
             if resp.status_code == 401:
-                raise PasayApiAuthError(resp.status_code, detail)
+                raise PasayApiAuthError(resp.status_code, detail, error_code)
             if resp.status_code == 403:
-                raise PasayApiPermissionError(resp.status_code, detail)
+                raise PasayApiPermissionError(resp.status_code, detail, error_code)
             if resp.status_code == 409:
-                raise PasayApiConflictError(resp.status_code, detail)
-            raise PasayApiError(resp.status_code, detail)
+                raise PasayApiConflictError(resp.status_code, detail, error_code)
+            raise PasayApiError(resp.status_code, detail, error_code)
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()
@@ -749,6 +771,27 @@ class PasayApiClient:
             "POST", f"/operations/copilot/proposals/{proposal_id}/execute", timeout=30.0
         )
         return CopilotExecute.from_dict(data)
+
+    async def copilot_confirm(self, proposal_id: int) -> dict:
+        """POST /operations/copilot/proposals/{id}/confirm (C2): the owner's
+        [✅ 确认安排] tap transitions PENDING -> CONFIRMED. Idempotent replay
+        when already CONFIRMED; a structured 409 surfaces fail-closed
+        revalidation (stale target / expired / permissions)."""
+        return await self._request(
+            "POST", f"/operations/copilot/proposals/{proposal_id}/confirm", timeout=30.0
+        )
+
+    async def copilot_cancel(self, proposal_id: int) -> dict:
+        """POST /operations/copilot/proposals/{id}/cancel (C2): [暂不处理]
+        cancels a PENDING proposal (idempotent replay when already CANCELLED)."""
+        return await self._request(
+            "POST", f"/operations/copilot/proposals/{proposal_id}/cancel", timeout=30.0
+        )
+
+    async def get_me(self) -> dict:
+        """POST /auth — the API key's backend user (used by the [我自己]
+        assignee pick so the owner can assign to themselves)."""
+        return await self._request("POST", "/auth", timeout=15.0)
 
     async def get_tasks(
         self, *, status: Optional[str] = None, overdue: bool = False,
