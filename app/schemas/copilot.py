@@ -125,3 +125,78 @@ class CopilotAskOut(BaseModel):
     fallback: bool = False
     flags: list[str] = Field(default_factory=list)
     latency: LatencyOut = Field(default_factory=LatencyOut)
+
+
+# --- V1.2.2 Phase C2 — CONFIRMED-action copilot (recommend + execute) ---
+# Render-safe schemas shared with the bot (mirrored dataclasses in the bot's
+# api_client.py). The bot must never display the raw ``proposal_id``; the
+# ``card`` / ``result`` blocks carry the human-renderable data.
+
+class CopilotRecommendIn(BaseModel):
+    """The bot posts an intent + resolved refs; ALL critical fields
+    (assignee / due / target) are resolved backend-side by the canonical
+    builder. Free text (``note``) is DATA only — never a mutation."""
+
+    intent: str = Field(min_length=1, max_length=200)
+    source_type: str | None = Field(default=None, max_length=50)
+    source_id: int | None = None
+    task_ref: int | None = None
+    reason_code: str | None = Field(default=None, max_length=50)
+    assignee_user_id: int | None = None
+    due_at: datetime | None = None
+    preset: str | None = Field(default=None, max_length=32)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class CopilotProposalCard(BaseModel):
+    """Confirmation-card data for the UX (role-aware, no raw proposal id)."""
+
+    action_type: str
+    target_type: str
+    target_id: int
+    target_label: str = ""
+    reason_code: str | None = None
+    assignee_user_id: int | None = None
+    assignee_name: str | None = None
+    due_at: datetime | None = None
+    note: str | None = None
+    display_context: dict = Field(default_factory=dict)
+
+
+class CopilotRecommendOut(BaseModel):
+    """Canonical PENDING proposal + card. ``proposal_id`` is for the backend /
+    bot wiring only — the bot must NOT display it."""
+
+    proposal_id: int
+    action_type: str
+    status: str
+    target_type: str
+    target_id: int
+    idempotency_key: str
+    expires_at: datetime | None = None
+    card: CopilotProposalCard
+    detail: str
+    created: bool = True
+
+
+class CopilotExecuteResult(BaseModel):
+    """Rendering-friendly execution outcome for the bot (role-aware text)."""
+
+    action_type: str
+    target_type: str
+    target_id: int
+    task_id: int | None = None
+    assignee_user_id: int | None = None
+    due_at: datetime | None = None
+    executed_at: datetime | None = None
+    status: str
+    replay: bool = False
+    detail: str
+
+
+class CopilotExecuteOut(BaseModel):
+    """POST /copilot/proposals/{id}/execute response: the proposal (now
+    EXECUTED) plus the render block for the bot."""
+
+    proposal: CopilotProposalRead
+    result: CopilotExecuteResult

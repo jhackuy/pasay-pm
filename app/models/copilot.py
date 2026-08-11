@@ -22,6 +22,8 @@ from app.models.base import AuditMixin, Base, pg_enum
 COPILOT_ACTION_TYPES = (
     "summarize", "analyze", "explain", "risk_scan",
     "create_task", "assign_task", "snooze_task", "follow_up",
+    # V1.2.2 Phase C2: the canonical EXECUTABLE follow-up action code.
+    "create_followup_task",
 )
 COPILOT_TARGET_TYPES = ("property", "lease", "task", "expense", "income", "settlement")
 
@@ -86,7 +88,8 @@ class CopilotActionProposal(AuditMixin, Base):
         ),
         CheckConstraint(
             "action_type IN ('summarize','analyze','explain','risk_scan',"
-            "'create_task','assign_task','snooze_task','follow_up')",
+            "'create_task','assign_task','snooze_task','follow_up',"
+            "'create_followup_task')",
             name="ck_copilot_action_proposals_action_type",
         ),
         CheckConstraint(

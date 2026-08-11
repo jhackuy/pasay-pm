@@ -38,6 +38,11 @@ class AuditAction(str, Enum):
     copilot_proposal_cancelled = "copilot_proposal_cancelled"
     copilot_proposal_expired = "copilot_proposal_expired"
     copilot_proposal_confirm_rejected = "copilot_proposal_confirm_rejected"
+    # V1.2.2 Phase C2 (appended only).
+    copilot_proposal_executing = "copilot_proposal_executing"
+    copilot_proposal_executed = "copilot_proposal_executed"
+    copilot_proposal_execution_rejected = "copilot_proposal_execution_rejected"
+    task_reassigned = "task_reassigned"
 
 
 class AuditLog(AuditMixin, Base):

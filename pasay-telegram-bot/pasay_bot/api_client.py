@@ -388,6 +388,110 @@ class CopilotAsk:
         )
 
 
+@dataclass
+class CopilotRecommendCard:
+    """Confirmation-card data from POST /operations/copilot/recommend (C2).
+    Render-safe: the bot must NOT display the raw proposal_id."""
+
+    action_type: str = ""
+    target_type: str = ""
+    target_id: int = 0
+    target_label: str = ""
+    reason_code: Optional[str] = None
+    assignee_user_id: Optional[int] = None
+    assignee_name: Optional[str] = None
+    due_at: Optional[str] = None
+    note: Optional[str] = None
+    display_context: dict = None  # type: ignore[assignment]
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotRecommendCard":
+        return cls(
+            action_type=d.get("action_type") or "",
+            target_type=d.get("target_type") or "",
+            target_id=int(d.get("target_id") or 0),
+            target_label=d.get("target_label") or "",
+            reason_code=d.get("reason_code"),
+            assignee_user_id=(
+                int(d["assignee_user_id"]) if d.get("assignee_user_id") is not None else None
+            ),
+            assignee_name=d.get("assignee_name"),
+            due_at=d.get("due_at"),
+            note=d.get("note"),
+            display_context=d.get("display_context") or {},
+        )
+
+
+@dataclass
+class CopilotRecommend:
+    """Canonical PENDING proposal + card from /copilot/recommend (C2)."""
+
+    proposal_id: int = 0
+    action_type: str = ""
+    status: str = ""
+    target_type: str = ""
+    target_id: int = 0
+    idempotency_key: str = ""
+    expires_at: Optional[str] = None
+    card: Optional[CopilotRecommendCard] = None
+    detail: str = ""
+    created: bool = True
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotRecommend":
+        card = d.get("card") or {}
+        return cls(
+            proposal_id=int(d.get("proposal_id") or 0),
+            action_type=d.get("action_type") or "",
+            status=d.get("status") or "",
+            target_type=d.get("target_type") or "",
+            target_id=int(d.get("target_id") or 0),
+            idempotency_key=d.get("idempotency_key") or "",
+            expires_at=d.get("expires_at"),
+            card=CopilotRecommendCard.from_dict(card) if card else None,
+            detail=d.get("detail") or "",
+            created=bool(d.get("created", True)),
+        )
+
+
+@dataclass
+class CopilotExecute:
+    """Result of POST /operations/copilot/proposals/{id}/execute (C2)."""
+
+    action_type: str = ""
+    target_type: str = ""
+    target_id: int = 0
+    task_id: Optional[int] = None
+    assignee_user_id: Optional[int] = None
+    due_at: Optional[str] = None
+    executed_at: Optional[str] = None
+    status: str = ""
+    replay: bool = False
+    detail: str = ""
+    proposal_id: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CopilotExecute":
+        result = d.get("result") or {}
+        proposal = d.get("proposal") or {}
+        return cls(
+            action_type=result.get("action_type") or "",
+            target_type=result.get("target_type") or "",
+            target_id=int(result.get("target_id") or 0),
+            task_id=int(result["task_id"]) if result.get("task_id") is not None else None,
+            assignee_user_id=(
+                int(result["assignee_user_id"])
+                if result.get("assignee_user_id") is not None else None
+            ),
+            due_at=result.get("due_at"),
+            executed_at=result.get("executed_at"),
+            status=result.get("status") or "",
+            replay=bool(result.get("replay")),
+            detail=result.get("detail") or "",
+            proposal_id=int(proposal.get("id") or 0),
+        )
+
+
 
 class PasayApiError(Exception):
     def __init__(self, status_code: Optional[int], detail: str):
@@ -599,6 +703,52 @@ class PasayApiClient:
             "POST", "/operations/copilot/ask", json={"question": question}, timeout=120.0
         )
         return CopilotAsk.from_dict(data)
+
+    async def copilot_recommend(
+        self,
+        intent: str,
+        *,
+        source_type: Optional[str] = None,
+        source_id: Optional[int] = None,
+        task_ref: Optional[int] = None,
+        reason_code: Optional[str] = None,
+        assignee_user_id: Optional[int] = None,
+        due_at: Optional[str] = None,
+        preset: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> CopilotRecommend:
+        """POST /operations/copilot/recommend (C2): intent + resolved refs ->
+        canonical PENDING proposal card. Deterministic (no LLM)."""
+        body: dict[str, Any] = {"intent": intent}
+        if source_type is not None:
+            body["source_type"] = source_type
+        if source_id is not None:
+            body["source_id"] = source_id
+        if task_ref is not None:
+            body["task_ref"] = task_ref
+        if reason_code is not None:
+            body["reason_code"] = reason_code
+        if assignee_user_id is not None:
+            body["assignee_user_id"] = assignee_user_id
+        if due_at is not None:
+            body["due_at"] = due_at
+        if preset is not None:
+            body["preset"] = preset
+        if note is not None:
+            body["note"] = note
+        data = await self._request(
+            "POST", "/operations/copilot/recommend", json=body, timeout=15.0
+        )
+        return CopilotRecommend.from_dict(data)
+
+    async def copilot_execute(self, proposal_id: int) -> CopilotExecute:
+        """POST /operations/copilot/proposals/{id}/execute (C2): CONFIRMED ->
+        EXECUTED with execute-time revalidation. Replay-safe (``replay=True``
+        on bot retries; never a second business effect)."""
+        data = await self._request(
+            "POST", f"/operations/copilot/proposals/{proposal_id}/execute", timeout=30.0
+        )
+        return CopilotExecute.from_dict(data)
 
     async def get_tasks(
         self, *, status: Optional[str] = None, overdue: bool = False,

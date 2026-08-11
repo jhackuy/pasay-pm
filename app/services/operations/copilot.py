@@ -1,23 +1,39 @@
-"""Deterministic Copilot Context + Action Proposal Safety (V1.2.2 Phase B).
+"""Deterministic Copilot Context + Action Proposal Safety (V1.2.2 Phase B/C2).
 
-NO LLM integration and NO action execution in this phase:
-- ``build_copilot_context`` is strictly read-only (SELECTs only). The single
-  write is the ``copilot_runs`` audit row, written explicitly by
-  ``log_context_run``.
-- Proposals can be created / confirmed / cancelled / expired, but NOTHING may
-  transition a proposal to EXECUTED and ``executed_at`` is never set — that is
-  Phase C (``COPILOT_EXECUTION_ENABLED`` is False and every execution path is
-  guarded).
-- Financial mutation is structurally impossible: the ``action_type`` allowlist
-  contains no financial-write verb, an OPERATIONAL proposal may not target a
-  financial entity (expense / income / settlement), and payloads may not carry
-  SQL / execution / bypass keys. Phase C will be forced to route financial
-  intents into the existing V1.1 state machine (no second financial write path).
-- The security boundary is ARCHITECTURAL, not lexical: the Copilot surface has
-  no raw DB access and no SQL execution — it only ever calls parameterized
-  backend services against a structured schema with enum allowlists. The SQL /
-  execution keyword denylist is defense-in-depth only (a cosmetic guard), never
-  the security boundary, and is NOT a substitute for the allowlist + schema.
+Phase A+B built the read-only context + proposal lifecycle. Phase C2 (this
+module) authorizes the EXECUTABLE allowlist — EXACTLY three actions:
+
+    create_followup_task / assign_task / snooze_task
+
+Action mapping (documented, enforced here AND by the DB CHECK):
+- ``create_followup_task`` is the canonical EXECUTABLE follow-up code. The
+  legacy ``follow_up`` / ``create_task`` codes keep their READ-side proposal
+  semantics (they may still be proposed/confirmed/cancelled) but are NOT
+  executable — the executor rejects them with ``ERR_ACTION_NOT_EXECUTABLE``.
+- READ actions (``summarize`` / ``analyze`` / ``explain`` / ``risk_scan``) are
+  never executable.
+- ABSENT action codes — any financial verb (income confirm/reverse, expense
+  approve/reject/pay/reverse, settlement confirm), COMPLETE/CANCEL variants,
+  unknown strings, and confusable/Unicode variants — are rejected with a stable
+  ``error_code`` and a ``copilot_proposal_*_rejected`` audit at every boundary.
+  ``canonicalize()`` (NFC + invisible-character strip) is the first gate.
+
+Execution is gated by ``COPILOT_EXECUTION_ENABLED`` (env-driven, default
+False). When False the executor refuses (fail closed). Every execution path
+passes through the flag; there is no autonomous (no-confirm) path.
+
+Financial mutation is structurally impossible: the ``action_type`` allowlist
+contains no financial-write verb, an OPERATIONAL proposal may not target a
+financial entity (expense / income / settlement), the executor only calls the
+operations task service layer (no financial service reachable), and payloads
+may not carry SQL / execution / bypass keys. Financial intents route through
+the existing V1.1 state machine (no second financial write path).
+
+The security boundary is ARCHITECTURAL, not lexical: the Copilot surface has
+no raw DB access and no SQL execution — it only ever calls parameterized
+backend services against a structured schema with enum allowlists. The SQL /
+execution keyword denylist is defense-in-depth only (a cosmetic guard), never
+the security boundary, and is NOT a substitute for the allowlist + schema.
 
 Context contract (stable for Phase C):
 - ``context_schema_version = "1.0"`` identifies the schema.
@@ -59,6 +75,7 @@ from app.models.property import Property, Unit
 from app.models.task import Task, TaskStatus
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
+from app.config import settings
 from app.services.audit import record_audit, serialize_row
 from app.services.operations.config import LEASE_EXPIRY_WINDOW_DAYS
 from app.services.operations.rent_math import covered_periods, lease_periods
@@ -85,9 +102,15 @@ ACTION_SAFETY: dict[str, str] = {
     "assign_task": "OPERATIONAL",
     "snooze_task": "OPERATIONAL",
     "follow_up": "OPERATIONAL",
+    "create_followup_task": "OPERATIONAL",
 }
 READ_ACTIONS = frozenset(a for a, s in ACTION_SAFETY.items() if s == "READ")
 OPERATIONAL_ACTIONS = frozenset(a for a, s in ACTION_SAFETY.items() if s == "OPERATIONAL")
+# V1.2.2 Phase C2: the EXACT executor allowlist. ONLY these three codes may
+# ever transition a proposal to EXECUTED; everything else (including legacy
+# create_task / follow_up and every financial verb) is rejected at execute
+# time with ERR_ACTION_NOT_EXECUTABLE.
+EXECUTABLE_ACTIONS = frozenset({"create_followup_task", "assign_task", "snooze_task"})
 FINANCIAL_TARGET_TYPES = frozenset({"expense", "income", "settlement"})
 TARGET_TYPES = frozenset({"property", "lease", "task", "expense", "income", "settlement"})
 
@@ -101,6 +124,10 @@ PAYLOAD_DENYLIST_KEYS = frozenset({
     "sql", "raw_sql", "query", "statement", "script", "execute", "exec",
     "financial_write", "bypass", "bypass_safety",
     "action_type", "status", "target_type", "target_id",
+    # V1.2.2 Phase C2: financial / irreversible verbs can never be smuggled
+    # into an executable payload key (defense-in-depth only).
+    "approve", "confirm_income", "financial", "reverse", "settle",
+    "complete", "cancel", "status_transition",
 })
 PAYLOAD_MAX_BYTES = 16 * 1024  # 16 KiB serialized-JSON cap
 IDEMPOTENCY_KEY_MAX_LENGTH = 128
@@ -135,10 +162,17 @@ ERR_TARGET_OUT_OF_SCOPE = "target_out_of_scope"
 ERR_ACTION_TARGET_ILLEGAL = "action_target_illegal"
 ERR_PAYLOAD_INVALID = "payload_invalid"
 ERR_BUSINESS_STALE = "business_stale"
+# V1.2.2 Phase C2 execute-time codes (append-only).
+ERR_ACTION_NOT_EXECUTABLE = "action_not_executable"
+ERR_ASSIGNEE_INVALID = "assignee_invalid"
+ERR_SNOOZE_WINDOW_INVALID = "snooze_window_invalid"
 
-# Phase A+B: execution is disabled. Phase C flips this flag only with an
-# approved design; every execution path must pass through it.
-COPILOT_EXECUTION_ENABLED = False
+# V1.2.2 Phase C2: execution is enabled ONLY when the environment says so
+# (``COPILOT_EXECUTION_ENABLED``; default False in .env.example and app/config).
+# One source of truth: env wins, module default matches .env.example. The
+# executor refuses (fail closed) while this is False. ``COPILOT_EXECUTION_ENABLED``
+# is kept in sync with ``settings.copilot_execution_enabled`` (same env var).
+COPILOT_EXECUTION_ENABLED = settings.copilot_execution_enabled
 
 # Deterministic size caps (top-N per section).
 CONTEXT_CAPS: dict[str, int] = {
@@ -210,6 +244,12 @@ class ProposalConfirmRejectedError(ProposalStateError):
     def __init__(self, error_code: str, message: str):
         super().__init__(message)
         self.error_code = error_code
+
+
+class ExecutionDisabledError(RuntimeError):
+    """``COPILOT_EXECUTION_ENABLED`` is off — the executor refuses (fail
+    closed). Raised by ``_guard_execution_disabled`` on every execution path."""
+
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +752,7 @@ def _validate_proposal(
             f"action '{action_type}' may not target financial entity '{target_type}'"
         )
     _validate_payload(payload)
+    validate_action_payload(action_type, payload)
     if not idempotency_key or len(idempotency_key) > IDEMPOTENCY_KEY_MAX_LENGTH:
         raise ProposalValidationError("idempotency_key is required (max 128 chars)")
     if expires_at is not None and expires_at <= now:
@@ -746,6 +787,88 @@ def _validate_payload(payload) -> None:
         raise ProposalValidationError(
             f"payload exceeds the {PAYLOAD_MAX_BYTES}-byte cap"
         )
+
+
+# Strict per-action payload schemas (V1.2.2 Phase C2). Only the three
+# EXECUTABLE actions get a structured schema; every critical field
+# (assignee_user_id / due_at / until / reason_code) is backend-resolved and
+# enum-validated at create, re-validated at confirm, and re-validated at
+# execute. Free text (note / display_context) is DATA only — a follow-up task
+# can never carry a financial or irreversible verb.
+ACTION_PAYLOAD_SCHEMAS: dict[str, frozenset[str]] = {
+    "create_followup_task": frozenset(
+        {"action", "reason_code", "assignee_user_id", "due_at", "note", "display_context"}
+    ),
+    "assign_task": frozenset(
+        {"action", "assignee_user_id", "note", "display_context"}
+    ),
+    "snooze_task": frozenset(
+        {"action", "until", "preset", "note", "display_context"}
+    ),
+}
+_NOTE_MAX_LENGTH = 2000
+
+
+def _require_payload_str(payload: dict, key: str, *, max_length: int | None = None) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ProposalValidationError(f"payload.{key} must be a non-empty string")
+    if max_length is not None and len(value) > max_length:
+        raise ProposalValidationError(f"payload.{key} exceeds {max_length} chars")
+    return value
+
+
+def _require_payload_int(payload: dict, key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProposalValidationError(f"payload.{key} must be an integer")
+    return value
+
+
+def _require_payload_dt(payload: dict, key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise ProposalValidationError(f"payload.{key} must be an ISO-8601 datetime string")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ProposalValidationError(f"payload.{key} is not a valid ISO-8601 datetime") from exc
+    if parsed.tzinfo is None:
+        raise ProposalValidationError(f"payload.{key} must be timezone-aware")
+    return value
+
+
+def validate_action_payload(action_type: str, payload) -> None:
+    """Strict per-action payload schema (beyond the generic denylist).
+
+    No-op for non-executable actions (READ / legacy create_task / follow_up
+    keep the generic denylist + size checks). Executable actions reject
+    unknown keys, missing/invalid required fields, and a mismatched ``action``
+    echo — fail closed at create, confirm AND execute.
+    """
+    allowed = ACTION_PAYLOAD_SCHEMAS.get(canonicalize(action_type))
+    if allowed is None:
+        return
+    if not isinstance(payload, dict):
+        raise ProposalValidationError("payload must be a JSON object")
+    for key in payload:
+        if not isinstance(key, str) or canonicalize(key) not in allowed:
+            raise ProposalValidationError(f"payload contains disallowed key '{key}'")
+    echo = payload.get("action")
+    if echo is not None and canonicalize(echo) != canonicalize(action_type):
+        raise ProposalValidationError("payload.action must match action_type")
+    if action_type == "create_followup_task":
+        _require_payload_str(payload, "reason_code", max_length=50)
+        _require_payload_int(payload, "assignee_user_id")
+        _require_payload_dt(payload, "due_at")
+    elif action_type == "assign_task":
+        _require_payload_int(payload, "assignee_user_id")
+    elif action_type == "snooze_task":
+        _require_payload_dt(payload, "until")
+    if payload.get("note") is not None and (
+        not isinstance(payload["note"], str) or len(payload["note"]) > _NOTE_MAX_LENGTH
+    ):
+        raise ProposalValidationError(f"payload.note must be a string (max {_NOTE_MAX_LENGTH} chars)")
 
 
 def _resolve_target(db: Session, target_type: str, target_id: int):
@@ -822,9 +945,11 @@ def _revalidate_proposal_for_confirm(
             f"action '{action_type}' may not target financial entity '{target_type}'",
         )
 
-    # 4) payload still schema-valid (same rules as create)
+    # 4) payload still schema-valid (same rules as create; strict for
+    # executable actions)
     try:
         _validate_payload(proposal.payload_json)
+        validate_action_payload(action_type, proposal.payload_json)
     except ProposalValidationError as exc:
         _reject(ERR_PAYLOAD_INVALID, str(exc))
 
@@ -924,9 +1049,8 @@ def confirm_proposal(
     ``copilot_proposal_confirm_rejected`` and raises
     ``ProposalConfirmRejectedError`` (nothing executes, proposal stays
     PENDING). Never sets ``executed_at`` and never transitions to EXECUTED
-    (Phase C).
+    (Phase C2).
     """
-    _guard_execution_disabled()
     now = now or datetime.now(timezone.utc)
     # Row lock serializes concurrent confirms/cancels/expiry so the
     # revalidation + transition are atomic w.r.t. other proposal transitions.
@@ -1112,6 +1236,14 @@ def _expire_one(
 
 
 def _guard_execution_disabled() -> None:
-    """Structural guard: nothing may execute Copilot actions in Phase A+B."""
-    if COPILOT_EXECUTION_ENABLED:
-        raise RuntimeError("copilot action execution is not enabled in Phase A+B")
+    """Structural gate for the Copilot execution surface (V1.2.2 Phase C2).
+
+    Fail closed: while ``COPILOT_EXECUTION_ENABLED`` is False (the default;
+    env ``COPILOT_EXECUTION_ENABLED``) the executor refuses to run. C2
+    authorizes execution ONLY when the env switch is on — the kill-switch is
+    checked on every execution path.
+    """
+    if not COPILOT_EXECUTION_ENABLED:
+        raise ExecutionDisabledError(
+            "copilot action execution is disabled (COPILOT_EXECUTION_ENABLED=false)"
+        )

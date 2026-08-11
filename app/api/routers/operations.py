@@ -39,9 +39,13 @@ from app.schemas.operations import (
 from app.schemas.copilot import (
     CopilotAskIn,
     CopilotAskOut,
+    CopilotExecuteOut,
     CopilotProposalActionOut,
+    CopilotProposalCard,
     CopilotProposalCreate,
     CopilotProposalRead,
+    CopilotRecommendIn,
+    CopilotRecommendOut,
     CopilotTodayIn,
     CopilotTodayOut,
     CopilotWhyIn,
@@ -54,7 +58,9 @@ from app.services.copilot import llm as copilot_llm
 from app.services.copilot import today as copilot_today_svc
 from app.services.copilot import today_fast as copilot_today_fast_svc
 from app.services.copilot import why as copilot_why_svc
+from app.services.copilot import execute as copilot_execute
 from app.services.operations import copilot as copilot_svc
+from app.services.operations import proposals as copilot_proposals
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
 
@@ -747,6 +753,164 @@ def copilot_ask(
     )
 
 
+
+
+def _target_label(db: Session, target_type: str, target_id: int) -> str:
+    """Human label for the confirmation card (rendering only)."""
+    from app.models.tenant import Tenant
+    from app.models.property import Unit
+    target = copilot_svc._resolve_target(db, target_type, target_id)
+    if target is None:
+        return ""
+    if target_type == "lease":
+        unit = db.get(Unit, target.unit_id)
+        tenant = db.get(Tenant, target.tenant_id)
+        return (
+            f"Lease #{target.id} · {unit.unit_number if unit else '?'} · "
+            f"{tenant.full_name if tenant else '?'}"
+        )
+    if target_type == "property":
+        return f"{target.name} (#{target.id})"
+    if target_type == "task":
+        return f"#{target.id} {target.title}"
+    return f"{target_type} #{target_id}"
+
+
+def _build_recommend_card(db: Session, proposal: CopilotActionProposal) -> CopilotProposalCard:
+    """Render-safe card data (the bot must not display the raw proposal id)."""
+    payload = proposal.payload_json or {}
+    assignee_id = payload.get("assignee_user_id")
+    assignee_name = None
+    if assignee_id is not None:
+        assignee = db.get(User, assignee_id)
+        assignee_name = assignee.username if assignee else None
+    due = None
+    for key in ("due_at", "until"):
+        raw = payload.get(key)
+        if isinstance(raw, str):
+            try:
+                due = datetime.fromisoformat(raw)
+            except ValueError:
+                due = None
+            break
+    return CopilotProposalCard(
+        action_type=proposal.action_type,
+        target_type=proposal.target_type,
+        target_id=proposal.target_id,
+        target_label=_target_label(db, proposal.target_type, proposal.target_id),
+        reason_code=payload.get("reason_code"),
+        assignee_user_id=assignee_id,
+        assignee_name=assignee_name,
+        due_at=due,
+        note=payload.get("note"),
+        display_context=payload.get("display_context") or {},
+    )
+
+
+@router.post(
+    "/copilot/recommend",
+    response_model=CopilotRecommendOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def copilot_recommend(
+    payload: CopilotRecommendIn,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Canonical proposal builder endpoint (V1.2.2 Phase C2).
+
+    The bot posts an intent + resolved refs; the backend deterministically
+    resolves EVERYTHING (action code, target, assignee, due time, property
+    scope, idempotency key) and returns the canonical PENDING proposal card.
+    Nothing executes here — the owner must tap the confirmation card, then
+    POST /copilot/proposals/{id}/execute.
+    """
+    try:
+        proposal, created, _payload = copilot_proposals.build_proposal_from_intent(
+            db,
+            actor=user,
+            intent=payload.intent,
+            source_type=payload.source_type,
+            source_id=payload.source_id,
+            task_ref=payload.task_ref,
+            reason_code=payload.reason_code,
+            assignee_user_id=payload.assignee_user_id,
+            due_at=payload.due_at,
+            preset=payload.preset,
+            note=payload.note,
+        )
+    except copilot_proposals.ProposalNeedsClarification as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    except copilot_svc.ProposalValidationError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    db.commit()
+    db.refresh(proposal)
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return CopilotRecommendOut(
+        proposal_id=proposal.id,
+        action_type=proposal.action_type,
+        status=proposal.status.value,
+        target_type=proposal.target_type,
+        target_id=proposal.target_id,
+        idempotency_key=proposal.idempotency_key,
+        expires_at=proposal.expires_at,
+        card=_build_recommend_card(db, proposal),
+        detail=(
+            "Proposal already exists (idempotent replay)"
+            if not created
+            else "Proposal created"
+        ),
+        created=created,
+    )
+
+
+@router.post(
+    "/copilot/proposals/{proposal_id}/execute",
+    response_model=CopilotExecuteOut,
+)
+def execute_copilot_proposal(
+    proposal_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """CONFIRMED -> EXECUTED (V1.2.2 Phase C2).
+
+    Fail-closed, in ONE DB transaction: the proposal row is locked and
+    EVERYTHING is revalidated against CURRENT state (kill-switch, actor
+    existence/activity/permission/ownership, EXACT executable allowlist,
+    payload schema, target existence/scope/staleness, assignee eligibility,
+    snooze window), then the mutation routes through the EXISTING operations
+    service layer and the proposal is marked EXECUTED. Replay when already
+    EXECUTED returns the existing result with ``replay=true`` and creates no
+    second effect. Rejections return a structured 409
+    ``{"message", "error_code"}`` with a ``copilot_proposal_execution_rejected``
+    audit and NO mutation.
+    """
+    before = db.get(CopilotActionProposal, proposal_id)
+    before_status = before.status if before is not None else None
+    try:
+        proposal = copilot_execute.execute_proposal(
+            db, actor=user, proposal_id=proposal_id
+        )
+    except copilot_execute.ExecutionDisabledError as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except copilot_execute.ProposalExecuteRejectedError as exc:
+        db.commit()  # persist the execution_rejected audit (+ EXPIRED transition)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={"message": str(exc), "error_code": exc.error_code},
+        ) from exc
+    except copilot_svc.ProposalStateError as exc:
+        raise _proposal_state_error(exc) from exc
+    db.commit()
+    db.refresh(proposal)
+    was_replay = before_status == CopilotActionStatus.EXECUTED
+    return CopilotExecuteOut(
+        proposal=CopilotProposalRead.model_validate(proposal),
+        result=copilot_execute.execution_result(db, proposal, replay=was_replay),
+    )
 
 
 def _proposal_state_error(exc: Exception) -> HTTPException:

@@ -108,7 +108,9 @@ def _enqueue_for_task(db: Session, task: OperationalTask) -> bool:
     )
 
 
-def _register_task(db: Session, *, fields: dict, now: datetime) -> tuple[OperationalTask | None, bool]:
+def _register_task(
+    db: Session, *, fields: dict, now: datetime, actor_id: int | None = None
+) -> tuple[OperationalTask | None, bool]:
     """Create task + audit(task_created) + outbox in one transaction.
 
     Business-source tasks with no explicit assignee fall back to
@@ -131,10 +133,26 @@ def _register_task(db: Session, *, fields: dict, now: datetime) -> tuple[Operati
         table_name="operational_tasks",
         record_id=task.id,
         action="task_created",
-        actor_id=None,  # system / scheduler
+        actor_id=actor_id,  # None = system / scheduler
         new_value=serialize_row(task),
     )
     return task, _enqueue_for_task(db, task)
+
+
+def create_operational_task(
+    db: Session, *, fields: dict, now: datetime | None = None, actor_id: int | None = None
+) -> tuple[OperationalTask | None, bool]:
+    """Public seam for human-confirmed (V1.2.2 C2 copilot) task creation.
+
+    Same atomic create + audit + outbox in ONE transaction as the scheduler's
+    private ``_register_task`` — there is exactly ONE write path for
+    ``operational_tasks``. ``actor_id`` records the human who confirmed the
+    action (None = system/scheduler). Returns ``(task_or_None, enqueued)``;
+    ``task_or_None`` is None when a PENDING task with the same ``dedupe_key``
+    already exists (DB dedupe boundary = at-most-one active followup).
+    """
+    now = now or datetime.now(timezone.utc)
+    return _register_task(db, fields=fields, now=now, actor_id=actor_id)
 
 
 def _supersede_rent_due(db: Session, lease_id: int, now: datetime) -> None:
