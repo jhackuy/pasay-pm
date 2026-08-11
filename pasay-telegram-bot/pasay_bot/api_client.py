@@ -525,12 +525,16 @@ class PasayApiClient:
 
     async def copilot_today(self, provider: Optional[str] = None) -> CopilotToday:
         """POST /operations/copilot/today (C1, read-only). Body empty or
-        ``{provider}`` to select the LLM provider for eval/override. Raises
+        ``{provider}`` to select the LLM provider for eval/override. This is an
+        LLM-backed call that can take 15-45s (reasoning model), so it gets a
+        long request timeout (the client default 10s would time out). Raises
         PasayApiError on 503 provider-unavailable (fail-closed)."""
         body: dict[str, Any] = {}
         if provider:
             body["provider"] = provider
-        data = await self._request("POST", "/operations/copilot/today", json=body)
+        data = await self._request(
+            "POST", "/operations/copilot/today", json=body, timeout=120.0
+        )
         return CopilotToday.from_dict(data)
 
     async def get_tasks(
