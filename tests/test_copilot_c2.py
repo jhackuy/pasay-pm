@@ -330,6 +330,55 @@ def test_followup_ambiguous_assignee_needs_clarification(db_session, manager):
         )
 
 
+def test_followup_no_active_agent_falls_back_to_designated_secretary(
+    db_session, manager, monkeypatch,
+):
+    """Deterministic Secretary/Operator fallback (identity-routing cleanup):
+    with ZERO active agent candidates and the designated secretary identity
+    active+eligible, "安排秘书跟进" resolves deterministically to the secretary
+    instead of surfacing MARIA/DEV-candidate ambiguity."""
+    mgr = _manager(db_session)
+    lease = _seed_lease(db_session)
+    # Designate a manager as the Secretary/Operator default for this test.
+    sec = _user(db_session, "c2-designated-sec", UserRole.manager, telegram_chat_id="tg-sec")
+    db_session.commit()
+    monkeypatch.setattr(
+        copilot_proposals, "SECRETARY_ASSIGNEE_ID", sec.id
+    )
+    # No agent candidates exist in this test DB (only admin/manager/designated).
+    proposal, created, payload = copilot_proposals.build_followup_proposal(
+        db_session, actor=mgr,
+        source_type="lease", source_id=lease.id, reason_code="RENT_OVERDUE",
+        now=NOW,
+    )
+    db_session.commit()
+    assert created
+    assert payload["assignee_user_id"] == sec.id
+
+
+def test_followup_designated_secretary_inactive_raises(
+    db_session, manager, monkeypatch,
+):
+    """Fallback fails closed when the designated secretary is inactive (so a
+    deactivated identity can never silently become the followup assignee)."""
+    mgr = _manager(db_session)
+    lease = _seed_lease(db_session)
+    sec = _user(
+        db_session, "c2-designated-inactive", UserRole.manager,
+        telegram_chat_id="tg-sec", is_active=False,
+    )
+    db_session.commit()
+    monkeypatch.setattr(
+        copilot_proposals, "SECRETARY_ASSIGNEE_ID", sec.id
+    )
+    with pytest.raises(copilot_proposals.ProposalNeedsClarification):
+        copilot_proposals.build_followup_proposal(
+            db_session, actor=mgr,
+            source_type="lease", source_id=lease.id, reason_code="RENT_OVERDUE",
+            now=NOW,
+        )
+
+
 # ---------------------------------------------------------------------------
 # assign_task
 # ---------------------------------------------------------------------------

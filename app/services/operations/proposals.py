@@ -31,6 +31,7 @@ from app.models.property import Unit
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.services.operations import copilot as copilot_svc
+from app.services.operations.config import SECRETARY_ASSIGNEE_ID
 
 MANILA_TZ = ZoneInfo("Asia/Manila")
 PROPOSAL_DEFAULT_TTL = timedelta(hours=24)
@@ -96,9 +97,21 @@ def resolve_assignee(db: Session, *, preferred_user_id: int | None = None) -> Us
     )
     if len(candidates) == 1:
         return candidates[0]
+    # No unique active agent -> deterministic fallback to the designated
+    # Secretary/Operator (human) identity, if it is active and eligible. This
+    # is what makes "安排秘书跟进" resolve deterministically to the real secretary
+    # channel instead of surfacing MARIA/DEV-candidate ambiguity. It is NOT a
+    # routing engine (requirement #4); general proactive-ops routing stays on
+    # the existing DEFAULT_ASSIGNED_USER_ID path.
     if not candidates:
-        raise ProposalNeedsClarification("no assignee candidate available")
-    raise ProposalNeedsClarification("multiple assignee candidates; choose one")
+        sec = db.get(User, SECRETARY_ASSIGNEE_ID)
+        if (
+            sec is not None
+            and sec.is_active
+            and sec.role.value in ASSIGNEE_ROLES
+        ):
+            return sec
+    raise ProposalNeedsClarification("no eligible assignee candidate available")
 
 
 def resolve_snooze_until(
