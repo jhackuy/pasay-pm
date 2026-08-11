@@ -197,13 +197,18 @@ class LLMClient:
             )
         try:
             data = resp.json()
-            text = data["choices"][0]["message"]["content"]
+            text = data["choices"][0]["message"].get("content")
             returned_model = data.get("model") or self.config.model
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise LLMProviderError(
                 f"copilot LLM provider {self.config.name!r} returned a "
                 "malformed response"
             ) from exc
+        if not text or not str(text).strip():
+            raise LLMProviderError(
+                f"copilot LLM provider {self.config.name!r} returned empty "
+                "completion content (reasoning model consumed the budget?)"
+            )
         return LLMResult(
             text=text,
             model=self.config.model,

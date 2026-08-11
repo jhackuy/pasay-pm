@@ -196,7 +196,7 @@ def build_today(
     result = client.complete(
         messages,
         temperature=0.2,
-        max_tokens=2500,  # reasoning models consume tokens on reasoning_content
+        max_tokens=4000,  # reasoning models consume tokens on reasoning_content
         response_format={"type": "json_object"},
     )
 

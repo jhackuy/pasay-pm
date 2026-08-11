@@ -573,6 +573,20 @@ def test_llm_client_fail_closed_5xx_and_timeout():
         )
 
 
+def test_llm_client_fail_closed_on_empty_content():
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": ""}}], "model": "m",
+        })
+
+    config = ProviderConfig(name="deepseek", base_url="https://example.com/v1",
+                            api_key="k", model="m", timeout=5.0)
+    with pytest.raises(LLMProviderError, match="empty completion"):
+        LLMClient(config, transport=httpx.MockTransport(handler)).complete(
+            [{"role": "user", "content": "hi"}]
+        )
+
+
 def test_unknown_provider_and_missing_key(monkeypatch):
     with pytest.raises(UnknownProviderError):
         llm.provider_config("not-a-provider")
