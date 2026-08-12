@@ -46,6 +46,7 @@ def route_for_text(text: str):
 
 async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle a free-text message that has no active conversation state."""
+    pages._bind_identity(update, context)
     user = update.effective_user
     role = role_for_telegram_id(user.id if user else None)
     locale = locale_for(role)

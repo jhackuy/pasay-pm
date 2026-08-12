@@ -108,7 +108,7 @@ def _seed_default_assignee(db, monkeypatch):
     (and notification recipients) resolve in tests."""
     from app.services.operations import generation
 
-    user = _user(db, "default-admin", UserRole.admin)
+    user = _user(db, "default-admin", UserRole.admin, "tg-default")
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", user.id)
     return user
 
@@ -152,7 +152,8 @@ class _OkSender:
 # scheduler: idempotency + recurring rules
 # ---------------------------------------------------------------------------
 
-def test_scheduler_repeat_run_creates_no_duplicates(db_session):
+def test_scheduler_repeat_run_creates_no_duplicates(db_session, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     _seed_lease(db_session)  # rent overdue (due day 5, today Aug 10)
     _seed_rule(db_session, user_id=_user(db_session, "m1", UserRole.manager, "tg1").id)
     db_session.commit()
@@ -207,7 +208,8 @@ def test_disabled_rule_not_claimed(db_session):
 # scheduler: real-PG concurrency
 # ---------------------------------------------------------------------------
 
-def test_two_schedulers_concurrent_no_duplicates(db_session, test_engine):
+def test_two_schedulers_concurrent_no_duplicates(db_session, test_engine, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     _seed_lease(db_session)
     _seed_rule(db_session, user_id=_user(db_session, "m3", UserRole.manager, "tg3").id)
     db_session.commit()
@@ -617,11 +619,13 @@ def test_summary_scoped_to_agent(client, db_session, agent_headers, admin_header
 
 def test_scheduler_run_endpoint(client, db_session, manager_headers, monkeypatch):
     from app.services.operations import config as ops_config
+    from app.services.operations import generation
 
     admin = _seed_valid_default_admin(db_session, "tg-sched")  # valid notifiable default
     # endpoint validates against config DEFAULT_ASSIGNED_USER_ID; pin it to the
     # seeded valid admin so the manager-triggered pass is allowed.
     monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", admin.id)
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", admin.id)
     _seed_lease(db_session)
     db_session.commit()
     resp = client.post(f"{API}/operations/scheduler/run", headers=manager_headers)
@@ -663,7 +667,8 @@ def test_audit_action_enum_append_only(db_session):
 # reconciliation
 # ---------------------------------------------------------------------------
 
-def test_reconciliation_payment_pending_completes_when_paid(client, db_session, admin_headers):
+def test_reconciliation_payment_pending_completes_when_paid(client, db_session, admin_headers, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
                       payee="Fix-It Co", status=ExpenseStatus.approved,
@@ -689,7 +694,8 @@ def test_reconciliation_payment_pending_completes_when_paid(client, db_session, 
     assert _audit_count(db_session, "task_auto_completed") >= 1
 
 
-def test_financial_write_path_not_bypassed(client, db_session, admin_headers):
+def test_financial_write_path_not_bypassed(client, db_session, admin_headers, monkeypatch):
+    _seed_default_assignee(db_session, monkeypatch)
     """Completing a PAYMENT_PENDING task must NOT change the expense."""
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
@@ -795,7 +801,7 @@ def test_reconciliation_lease_expiring_completes_when_renewed(db_session, monkey
 
 def test_settlement_pending_task_and_reconciliation(db_session, monkeypatch):
     _seed_default_assignee(db_session, monkeypatch)
-    agent = _user(db_session, "ag1", UserRole.agent)
+    agent = _user(db_session, "ag1", UserRole.agent, "tg-agent")
     lease = _seed_lease(db_session)
     rule = CommissionRule(name="出租", rule_type=CommissionRuleType.percentage,
                           value="50.00", agent_role="出租")
@@ -814,7 +820,7 @@ def test_settlement_pending_task_and_reconciliation(db_session, monkeypatch):
     ).one()
     assert task.assigned_user_id == agent.id
     outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
-    assert outbox.recipient == f"user:{agent.id}"  # agent has no telegram id
+    assert outbox.recipient == "tg-agent"
 
     settlement.status = CommissionSettlementStatus.confirmed
     db_session.commit()

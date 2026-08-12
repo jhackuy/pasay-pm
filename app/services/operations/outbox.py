@@ -11,7 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.operations import NotificationOutbox
-from app.models.user import User
+from app.services.identity import resolve_telegram_destination
 
 
 def resolve_recipient(db: Session, user_id: int | None) -> str | None:
@@ -23,12 +23,7 @@ def resolve_recipient(db: Session, user_id: int | None) -> str | None:
     """
     if user_id is None:
         return None
-    user = db.get(User, user_id)
-    if user is None:
-        return None
-    if user.telegram_chat_id:
-        return user.telegram_chat_id
-    return f"user:{user.id}"
+    return resolve_telegram_destination(db, user_id)
 
 
 def enqueue_notification(

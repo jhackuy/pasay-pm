@@ -1,4 +1,5 @@
 import secrets
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,8 +14,10 @@ from app.database import get_db
 from app.models.base import Base
 from app.main import app
 from app.models.user import User, UserRole
+from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
+from app.services.audit import audit_context
 
-TEST_DB_NAME = "pasay_pm_test"
+TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 
 
 def _test_url():
@@ -42,10 +45,19 @@ def test_engine():
 @pytest.fixture()
 def db_session(test_engine):
     """Rebuild the schema for every test (simple, deterministic)."""
+    audit_context.set((None, None, None, None))
     Base.metadata.drop_all(test_engine)
     Base.metadata.create_all(test_engine)
     Session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     db = Session()
+    for name in ("scheduler", "reconcile", "notifier", "backfill"):
+        principal = Principal(name=name, principal_type=PrincipalType.SYSTEM)
+        db.add(principal)
+        db.flush()
+        db.add(ApiCredential(principal_id=principal.id,
+            key_hash=hash_api_key(f"pasay-v13-internal-record:{name}"),
+            purpose=f"internal:{name}", state=CredentialState.ACTIVE))
+    db.commit()
     try:
         yield db
     finally:

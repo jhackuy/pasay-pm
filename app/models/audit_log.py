@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import BigInteger, DateTime, String, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -54,6 +54,10 @@ class AuditLog(AuditMixin, Base):
         pg_enum(AuditAction, "audit_action"), nullable=False
     )
     actor_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    subject_principal_id: Mapped[int | None] = mapped_column(ForeignKey("principals.id"), nullable=True)
+    caller_principal_id: Mapped[int | None] = mapped_column(ForeignKey("principals.id"), nullable=True)
+    credential_id: Mapped[int | None] = mapped_column(ForeignKey("api_credentials.id"), nullable=True)
+    channel: Mapped[str | None] = mapped_column(String(30), nullable=True)
     changed_fields: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     old_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     new_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

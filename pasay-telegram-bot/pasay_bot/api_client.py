@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
+from contextvars import ContextVar
 
 import httpx
 
@@ -559,6 +560,8 @@ class PasayApiClient:
         timeout: float = 10.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
+        self._telegram_user_id: ContextVar[int | None] = ContextVar(
+            f"telegram_user_id_{id(self)}", default=None)
         self.base_url = base_url.rstrip("/")
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
@@ -571,6 +574,11 @@ class PasayApiClient:
         await self._client.aclose()
 
     async def _request(self, method: str, path: str, **kwargs) -> Any:
+        user_id = self._telegram_user_id.get()
+        if user_id is not None:
+            headers = dict(kwargs.pop("headers", {}) or {})
+            headers["X-Telegram-User-Id"] = str(user_id)
+            kwargs["headers"] = headers
         try:
             resp = await self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
@@ -589,6 +597,12 @@ class PasayApiClient:
         if resp.status_code == 204 or not resp.content:
             return None
         return resp.json()
+
+    def bind_telegram_user(self, effective_user_id: int) -> None:
+        """Bind authentication to effective_user.id for the current async task."""
+        if not isinstance(effective_user_id, int) or effective_user_id <= 0:
+            raise ValueError("effective_user.id must be a positive integer")
+        self._telegram_user_id.set(effective_user_id)
 
     # --- read endpoints ---
     async def get_properties(self) -> list[Property]:

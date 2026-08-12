@@ -14,6 +14,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from app.models.user import User, UserRole
+from app.services.identity import resolve_telegram_destination
 
 # Roles allowed to own proactive business tasks (admin / manager).
 _ALLOWED_DEFAULT_ASSIGNEE_ROLES: frozenset[str] = frozenset(
@@ -61,11 +62,13 @@ def validate_default_assignee(db: Session, user_id: int | None) -> User:
             f"must be an admin or manager (got one of "
             f"{sorted(_ALLOWED_DEFAULT_ASSIGNEE_ROLES)})."
         )
-    if not user.telegram_chat_id:
+    try:
+        resolve_telegram_destination(db, user.id)
+    except LookupError as exc:
         raise RuntimeError(
             f"OPERATIONS_DEFAULT_ASSIGNEE={user_id} is invalid: user "
             f"'{user.username}' has no Telegram chat id, so they can never receive "
             "the proactive notifications the system generates. Register "
             "telegram_chat_id for this user or pick a different admin/manager."
-        )
+        ) from exc
     return user

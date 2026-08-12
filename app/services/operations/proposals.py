@@ -103,12 +103,13 @@ def resolve_assignee(db: Session, *, preferred_user_id: int | None = None) -> Us
     # channel instead of surfacing MARIA/DEV-candidate ambiguity. It is NOT a
     # routing engine (requirement #4); general proactive-ops routing stays on
     # the existing DEFAULT_ASSIGNED_USER_ID path.
-    if not candidates:
+    if not candidates and SECRETARY_ASSIGNEE_ID is not None and SECRETARY_ASSIGNEE_ID != 14:
         sec = db.get(User, SECRETARY_ASSIGNEE_ID)
         if (
             sec is not None
             and sec.is_active
             and sec.role.value in ASSIGNEE_ROLES
+            and sec.username.casefold() != "maria"
         ):
             return sec
     raise ProposalNeedsClarification("no eligible assignee candidate available")

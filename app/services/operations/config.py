@@ -16,13 +16,15 @@ SETTLEMENT_PENDING_AFTER_DAYS = 1
 
 # Fallback assignee for business-source tasks with no explicit owner (the
 # admin owner by default) so proactive notifications get a real recipient.
-DEFAULT_ASSIGNED_USER_ID = int(os.getenv("OPERATIONS_DEFAULT_ASSIGNEE", "1"))
+_default_assignee = os.getenv("OPERATIONS_DEFAULT_ASSIGNEE")
+DEFAULT_ASSIGNED_USER_ID = int(_default_assignee) if _default_assignee else None
 
 # Designated Secretary/Operator (human) identity: the deterministic default
 # for C2 "安排秘书跟进" / secretary-role followup/assignment when there is no
 # unique active agent candidate. Human operator channel, NOT the AI agent and
 # NOT a legacy identity. Env-tunable override: OPERATIONS_SECRETARY_ASSIGNEE.
-SECRETARY_ASSIGNEE_ID = int(os.getenv("OPERATIONS_SECRETARY_ASSIGNEE", "14"))
+_secretary_assignee = os.getenv("OPERATIONS_SECRETARY_ASSIGNEE")
+SECRETARY_ASSIGNEE_ID = int(_secretary_assignee) if _secretary_assignee else None
 
 # Recurring-rule periods.
 QUARTERLY_MONTHS = 3

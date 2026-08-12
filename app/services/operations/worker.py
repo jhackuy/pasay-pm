@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 
 from app.config import settings
 from app.database import SessionLocal
-from app.models.user import User
+from app.services.identity import resolve_telegram_destination
 from app.services.operations.config import (
     DEFAULT_ASSIGNED_USER_ID,
     NOTIFY_BACKOFF_BASE_SECONDS,
@@ -33,8 +33,7 @@ def _build_sender() -> TelegramSender:
     def resolve_user(user_id_str: str) -> str | None:
         db = SessionLocal()
         try:
-            user = db.get(User, int(user_id_str))
-            return user.telegram_chat_id if user else None
+            return resolve_telegram_destination(db, int(user_id_str))
         finally:
             db.close()
 

@@ -75,8 +75,9 @@ from app.models.property import Property, Unit
 from app.models.task import Task, TaskStatus
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
+from app.models.identity import Principal, PrincipalType
 from app.config import settings
-from app.services.audit import record_audit, serialize_row
+from app.services.audit import audit_context, record_audit, serialize_row
 from app.services.operations.config import LEASE_EXPIRY_WINDOW_DAYS
 from app.services.operations.rent_math import covered_periods, lease_periods
 from app.services.operations.summary import build_operations_summary
@@ -702,6 +703,7 @@ def create_proposal(
             expires_at=expires_at,
             created_by=actor.id,
             updated_by=actor.id,
+            proposed_principal_id=audit_context.get()[0],
         )
         .on_conflict_do_nothing(index_elements=["actor_user_id", "idempotency_key"])
         .returning(CopilotActionProposal.id)
@@ -1087,6 +1089,10 @@ def confirm_proposal(
         )
         raise ProposalExpiredError("proposal has expired")
     _revalidate_proposal_for_confirm(db, actor=actor, proposal=proposal)
+    origin = db.get(Principal, proposal.proposed_principal_id) if proposal.proposed_principal_id else None
+    current_subject = audit_context.get()[0]
+    if origin is not None and origin.principal_type == PrincipalType.HUMAN and current_subject != origin.id:
+        raise ProposalConfirmRejectedError(ERR_ACTOR_PERMISSION, "human proposal subject changed before confirm")
 
     old = serialize_row(proposal)
     result = db.execute(
@@ -1100,6 +1106,7 @@ def confirm_proposal(
             confirmed_at=now,
             updated_at=now,
             updated_by=actor.id,
+            confirmed_principal_id=audit_context.get()[0],
         ),
         execution_options={"synchronize_session": False},
     )

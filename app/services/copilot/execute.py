@@ -43,8 +43,9 @@ from app.models.operations import (
 )
 from app.models.property import Unit
 from app.models.user import User, UserRole
+from app.models.identity import Principal, PrincipalType
 from app.schemas.copilot import CopilotExecuteResult
-from app.services.audit import record_audit, serialize_row
+from app.services.audit import audit_context, record_audit, serialize_row
 from app.services.operations import copilot as copilot_svc
 from app.services.operations import generation
 from app.services.operations.config import NOTIFY_CHANNEL_TELEGRAM
@@ -135,6 +136,7 @@ def execute_proposal(
             executed_at=now,
             updated_at=now,
             updated_by=actor.id,
+            executed_principal_id=audit_context.get()[0],
         ),
         execution_options={"synchronize_session": False},
     )
@@ -235,6 +237,10 @@ def _revalidate_for_execute(
                 "actor no longer has permission to execute proposals")
     if proposal.actor_user_id != actor_row.id:
         _reject(copilot_svc.ERR_ACTOR_PERMISSION, "actor does not own this proposal")
+    origin = db.get(Principal, proposal.proposed_principal_id) if proposal.proposed_principal_id else None
+    if (origin is not None and origin.principal_type == PrincipalType.HUMAN
+            and audit_context.get()[0] != origin.id):
+        _reject(copilot_svc.ERR_ACTOR_PERMISSION, "human proposal subject changed before execute")
 
     # 2) EXACT executable allowlist + target allowlist (current constants)
     action_type = copilot_svc.canonicalize(proposal.action_type)

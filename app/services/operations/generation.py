@@ -141,6 +141,8 @@ def _register_task(
         fields.get("source_type") in BUSINESS_SOURCE_TYPES
         and fields.get("assigned_user_id") is None
     ):
+        if DEFAULT_ASSIGNED_USER_ID is None:
+            raise RuntimeError("OPERATIONS_DEFAULT_ASSIGNEE is not configured")
         fields["assigned_user_id"] = DEFAULT_ASSIGNED_USER_ID
     task = _insert_task_on_conflict_do_nothing(db, fields=fields)
     if task is None:

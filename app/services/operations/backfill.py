@@ -36,6 +36,7 @@ from app.services.operations.assignee import validate_default_assignee
 from app.services.operations.config import NOTIFY_CHANNEL_TELEGRAM
 from app.services.operations.generation import BUSINESS_SOURCE_TYPES, _notification_message
 from app.services.operations.outbox import enqueue_notification, resolve_recipient
+from app.services.identity import bind_internal_audit
 
 # System actor for backfill audit rows. Falls back to the validated default assignee id
 # when ``actor_id`` is not provided (so the row always carries who owns it afterwards).
@@ -67,8 +68,8 @@ def backfill_unassigned_business_tasks(
     one unit).
     """
     now = now or datetime.now(timezone.utc)
-    default_user = validate_default_assignee(db, default_assignee_id)
-    actor_id = actor_id if actor_id is not None else default_user.id
+    validate_default_assignee(db, default_assignee_id)
+    bind_internal_audit(db, "backfill")
 
     report = BackfillReport()
 

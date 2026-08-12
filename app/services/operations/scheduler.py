@@ -22,6 +22,7 @@ from app.services.operations.config import SCHEDULER_RULE_BATCH
 from app.services.operations.generation import generate_business_tasks, generate_rule_task
 from app.services.operations.reconcile import reconcile_tasks
 from app.services.operations.redelivery import redeliver_due_snoozes
+from app.services.identity import bind_internal_audit
 
 
 def claim_due_rules(db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_BATCH) -> list[RecurringRule]:
@@ -51,6 +52,7 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
     tasks still PENDING after reconciliation).
     """
     now = now or datetime.now(timezone.utc)
+    bind_internal_audit(db, "scheduler")
     rules = claim_due_rules(db, now=now)
     tasks_created = 0
     notifications_enqueued = 0
@@ -63,8 +65,10 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
     tasks_created += biz_created
     notifications_enqueued += biz_notif
 
+    bind_internal_audit(db, "reconcile")
     auto_completed, auto_cancelled = reconcile_tasks(db, now=now)
 
+    bind_internal_audit(db, "scheduler")
     snooze_redelivered = redeliver_due_snoozes(db, now=now)
 
     db.commit()

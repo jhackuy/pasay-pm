@@ -46,6 +46,7 @@ from app.services.operations.config import (
     SNOOZE_REDELIVERY_KEY_PREFIX,
 )
 from app.services.operations.redelivery import is_snooze_redelivery_key
+from app.services.identity import bind_internal_audit
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,7 @@ def process_notifications_once(
     Returns ``{"claimed": n, "sent": n, "retried": n, "failed": n}``.
     """
     now = now or datetime.now(timezone.utc)
+    bind_internal_audit(db, "notifier")
     candidates = claim_pending_notifications(db, now=now, batch=batch)
     db.commit()  # release the SKIP LOCKED batch locks; the per-row claim is conditional
     result = {"claimed": 0, "sent": 0, "retried": 0, "failed": 0}

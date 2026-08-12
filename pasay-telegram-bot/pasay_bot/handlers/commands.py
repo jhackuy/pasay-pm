@@ -57,6 +57,15 @@ EXPIRING_LEASE_DAYS = 60
 TASK_WINDOW_DAYS = 7
 
 
+def _bind_identity(update, context):
+    if update.effective_user is None:
+        raise ValueError("Telegram update has no effective_user")
+    context.bot_data["api_client"].bind_telegram_user(update.effective_user.id)
+    admin = context.bot_data.get("admin_api_client")
+    if admin is not None:
+        admin.bind_telegram_user(update.effective_user.id)
+
+
 def _current_month() -> str:
     return date.today().strftime("%Y-%m")
 
@@ -85,6 +94,7 @@ def _last_income_for_lease(incomes, lease_id: int):
 # --- commands ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     if not has_read_permission(role):
         await _refuse(update, context, role)
@@ -97,6 +107,7 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
     text = (
@@ -109,6 +120,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     if not has_read_permission(role):
         await _refuse(update, context, role)
@@ -117,6 +129,7 @@ async def cmd_properties(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     if not has_read_permission(role):
         await _refuse(update, context, role)
@@ -125,6 +138,7 @@ async def cmd_finance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     if not has_read_permission(role):
         await _refuse(update, context, role)
@@ -133,6 +147,7 @@ async def cmd_overdue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     if not has_read_permission(role):
         await _refuse(update, context, role)
@@ -141,6 +156,7 @@ async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     """Aggregated to-do page (B2): overdue, pending confirm, expiring leases, tasks."""
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
@@ -151,6 +167,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     """V1.2 待办中心 (/ops, /todo)."""
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
@@ -161,6 +178,7 @@ async def cmd_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_copilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     """🤖 运营助手 (C1 read-only TODAY brief)."""
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
@@ -179,6 +197,7 @@ async def _refuse(update: Update, context: ContextTypes.DEFAULT_TYPE, role):
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
     store = context.bot_data["store"]

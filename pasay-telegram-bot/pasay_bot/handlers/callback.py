@@ -160,6 +160,7 @@ def _can_reverse(context, role) -> bool:
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pages._bind_identity(update, context)
     cq = update.callback_query
     parsed = decode(cq.data)
     if parsed is None:

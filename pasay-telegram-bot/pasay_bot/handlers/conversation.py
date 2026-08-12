@@ -46,6 +46,8 @@ _WRITE_STATES = (
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from pasay_bot.handlers.commands import _bind_identity
+    _bind_identity(update, context)
     user = update.effective_user
     chat_id = update.effective_chat.id
     user_id = user.id if user else None

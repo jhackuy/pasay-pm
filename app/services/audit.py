@@ -2,10 +2,15 @@
 from datetime import date, datetime
 from decimal import Decimal
 from enum import Enum
+from contextvars import ContextVar
 
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction, AuditLog
+from app.models.identity import ApiCredential, Principal
+
+audit_context: ContextVar[tuple[int | None, int | None, int | None, str | None]] = ContextVar(
+    "audit_context", default=(None, None, None, None))
 
 
 def jsonable(value):
@@ -60,6 +65,15 @@ def record_audit(
     new_value: dict | None = None,
 ) -> AuditLog:
     """Persist one audit log row. The caller is responsible for committing."""
+    subject_principal_id, caller_principal_id, credential_id, channel = audit_context.get()
+    # ContextVars intentionally cross helper layers, but a recycled worker/test
+    # context must never attach stale foreign keys from a prior transaction.
+    if subject_principal_id is not None and db.get(Principal, subject_principal_id) is None:
+        subject_principal_id = None
+    if caller_principal_id is not None and db.get(Principal, caller_principal_id) is None:
+        caller_principal_id = None
+    if credential_id is not None and db.get(ApiCredential, credential_id) is None:
+        credential_id = None
     entry = AuditLog(
         table_name=table_name,
         record_id=record_id,
@@ -68,6 +82,10 @@ def record_audit(
         changed_fields=changed_fields,
         old_value=old_value,
         new_value=new_value,
+        subject_principal_id=subject_principal_id,
+        caller_principal_id=caller_principal_id,
+        credential_id=credential_id,
+        channel=channel,
     )
     db.add(entry)
     return entry

@@ -105,6 +105,9 @@ class CopilotActionProposal(AuditMixin, Base):
     actor_user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id"), nullable=False, index=True
     )
+    proposed_principal_id: Mapped[int | None] = mapped_column(ForeignKey("principals.id"), nullable=True)
+    confirmed_principal_id: Mapped[int | None] = mapped_column(ForeignKey("principals.id"), nullable=True)
+    executed_principal_id: Mapped[int | None] = mapped_column(ForeignKey("principals.id"), nullable=True)
     action_type: Mapped[str] = mapped_column(String(50), nullable=False)
     target_type: Mapped[str] = mapped_column(String(50), nullable=False)
     target_id: Mapped[int] = mapped_column(BigInteger, nullable=False)

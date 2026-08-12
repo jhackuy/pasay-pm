@@ -15,6 +15,10 @@ from app.models.copilot import (
     CopilotRunStatus,
 )
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
+from app.models.identity import (
+    ApiCredential, CommunicationEndpoint, CredentialLifecycle, CredentialState,
+    Principal, PrincipalType, SecurityEvent, TelegramIdentityBinding,
+)
 from app.models.lease import Lease, LeaseStatus
 from app.models.operations import (
     NotificationOutbox,
@@ -50,6 +54,8 @@ __all__ = [
     "ExpenseStatus",
     "Income",
     "IncomeStatus",
+    "ApiCredential", "CommunicationEndpoint", "CredentialLifecycle", "CredentialState",
+    "Principal", "PrincipalType", "SecurityEvent", "TelegramIdentityBinding",
     "Lease",
     "LeaseStatus",
     "NotificationOutbox",
