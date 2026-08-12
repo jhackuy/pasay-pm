@@ -3,17 +3,34 @@
 The Hermes NLU adapter is intentionally NOT wired up in this phase. Recognized
 Chinese/English phrases route to the same deterministic pages as the buttons;
 anything else gets a "use the buttons" reply.
+
+V1.3 Slice 2 (Entry B): rent-payment statements ("1608租金收到了",
+"John的70000到了", "昨天收到1608房租") are recognized BEFORE the button
+routes and resolved by the backend matcher into an action-at-source confirm
+card. The matcher is read-only; confirmation reuses the existing Income
+create + Owner-only confirm chain.
 """
 from __future__ import annotations
+
+import re
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
+from pasay_bot.api_client import PasayApiError
 from pasay_bot.handlers import commands as pages
-from pasay_bot.keyboards import menu_keyboard
+from pasay_bot.keyboards import (
+    confirm_income_keyboard,
+    menu_keyboard,
+    new_nonce,
+    now_ts,
+    rent_match_keyboard,
+)
 from pasay_bot.render import html as H
+from pasay_bot.render import cards
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
+    PERMISSION_RENT_CONFIRM,
     has_permission,
     has_read_permission,
     locale_for,
@@ -21,6 +38,13 @@ from pasay_bot.roles import (
 )
 
 HTML = "HTML"
+
+_RENT_WORDS_CN = ("租金", "房租")
+_RENT_WORD_EN = re.compile(r"\brent\b")
+_RECEIVE_VERBS_CN = ("收到", "到了", "到账", "已收", "入账", "收款")
+_RECEIVE_VERB_EN = re.compile(r"\b(received|paid)\b")
+_AMOUNT_IN_TEXT = re.compile(r"\d[\d,]{4,}")
+_QUERY_SUFFIX = re.compile(r"(吗|么|？|\?|没有|没)\s*$")
 
 _ROUTES = [
     (("房源", "property", "properties"), "properties"),
@@ -32,6 +56,22 @@ _ROUTES = [
     (("菜单", "menu", "主菜单", "home", "start"), "menu"),
     (("帮助", "help", "帮助"), "help"),
 ]
+
+
+def is_rent_payment_statement(text: str) -> bool:
+    """Deterministic detector for "rent was received" statements. Queries
+    ("收到租金了吗？") and menu words ("收租") are NOT statements."""
+    raw = text or ""
+    lowered = raw.strip().lower()
+    if not lowered:
+        return False
+    if _QUERY_SUFFIX.search(raw):
+        return False
+    has_rent_word = any(w in raw for w in _RENT_WORDS_CN) or bool(_RENT_WORD_EN.search(lowered))
+    has_verb = any(v in raw for v in _RECEIVE_VERBS_CN) or bool(_RECEIVE_VERB_EN.search(lowered))
+    if has_rent_word and has_verb:
+        return True
+    return has_verb and bool(_AMOUNT_IN_TEXT.search(lowered))
 
 
 def route_for_text(text: str):
@@ -53,6 +93,11 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     locale = locale_for(role)
     chat_id = update.effective_chat.id
     text = update.effective_message.text or ""
+
+    if is_rent_payment_statement(text):
+        await _handle_rent_payment_statement(update, context, text, role, locale)
+        return
+
     route = route_for_text(text)
     if route in ("properties", "finance", "overdue", "rent", "pending", "menu", "more"):
         if not has_read_permission(role):
@@ -92,3 +137,110 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML,
             reply_markup=menu_keyboard(locale),
         )
+
+
+async def _handle_rent_payment_statement(update, context, text, role, locale):
+    """Entry B: NL statement -> backend match -> action-at-source card."""
+    if not has_read_permission(role):
+        await context.bot.send_message(
+            update.effective_chat.id,
+            H.escape(t("common.no_permission", locale)),
+            parse_mode=HTML,
+        )
+        return
+    api = context.bot_data["api_client"]
+    chat_id = update.effective_chat.id
+    try:
+        result = await api.match_rent_payment(text)
+    except PasayApiError:
+        await context.bot.send_message(
+            chat_id, H.escape(t("rent.match_error", locale)), parse_mode=HTML
+        )
+        return
+    best = result.best
+    if best is None:
+        await context.bot.send_message(
+            chat_id, H.escape(t("rent.match_none", locale)), parse_mode=HTML
+        )
+        return
+    if best.kind == "duplicate":
+        # Already booked: friendly message, zero writes, no second record.
+        await context.bot.send_message(
+            chat_id, cards.rent_already_booked_card(best, locale), parse_mode=HTML
+        )
+        return
+    if best.kind == "pending":
+        await _render_pending_match(update, context, best, result, role, locale)
+        return
+    if best.confidence != "high":
+        await _send_ambiguous(update, context, result, locale)
+        return
+    await _render_match_confirm(update, context, best, result, role, locale)
+
+
+async def _render_match_confirm(update, context, candidate, result, role, locale):
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    payload = {
+        "unit_id": candidate.unit_id,
+        "lease_id": candidate.lease_id,
+        "property_id": candidate.property_id,
+        "property_name": candidate.property_name,
+        "unit_number": candidate.unit_number,
+        "monthly_rent": str(candidate.amount),
+        "amount": str(candidate.amount),
+        "received_date": result.received_date.isoformat(),
+        "period": candidate.period,
+        "method": store.get_user_default_method(user_id),
+        "flow": "nl",
+        "open_count": candidate.open_count,
+        "remaining_balance": str(candidate.remaining_balance),
+    }
+    can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)
+    nonce, ts = "", 0
+    if can_confirm:
+        nonce = new_nonce()
+        ts = now_ts()
+        store.save_conversation(chat_id, user_id, "rent_confirm", payload, nonce=nonce)
+    text = cards.rent_match_card(
+        candidate, result.received_date.isoformat(), locale, can_confirm=can_confirm
+    )
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=rent_match_keyboard(nonce, ts, can_confirm, locale),
+    )
+
+
+async def _render_pending_match(update, context, candidate, result, role, locale):
+    """A matching pending income already exists: confirm THAT record instead of
+    ever creating a second one."""
+    chat_id = update.effective_chat.id
+    can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)
+    text = cards.rent_match_pending_card(
+        candidate, result.received_date.isoformat(), locale
+    )
+    keyboard = None
+    if can_confirm:
+        keyboard = confirm_income_keyboard(
+            candidate.income_id or 0, new_nonce(), now_ts(),
+            can_reverse=False, locale=locale,
+        )
+    await context.bot.send_message(
+        chat_id, H.truncate(text), parse_mode=HTML, reply_markup=keyboard
+    )
+
+
+async def _send_ambiguous(update, context, result, locale):
+    """Multiple plausible bills: a short human list, no menu detour. The
+    selection/partial/overpayment cards are later slices."""
+    chat_id = update.effective_chat.id
+    lines = [H.escape(t("rent.match_ambiguous", locale))]
+    for cand in result.candidates[:5]:
+        lines.append(
+            f"• {H.escape(cand.property_name)} {H.escape(cand.unit_number)}"
+            f" · {cards.period_label(cand.period, locale)} · {H.money(cand.amount)}"
+        )
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=HTML)

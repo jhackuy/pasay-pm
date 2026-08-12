@@ -561,12 +561,13 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
                 await _answer(update, t("rent.processed_toast", locale))
             return
 
+        period = payload.get("period") or str(payload.get("received_date", ""))[:7]
         income = await api.create_income(
             lease_id=payload.get("lease_id"),
             amount=payload.get("amount"),
             received_date=payload.get("received_date"),
             payment_method=payload.get("method"),
-            description=f"rent {str(payload.get('received_date', ''))[:7]}",
+            description=f"rent {period}",
             # Backend-level idempotency (P0): the same guard key is sent so a
             # timeout-after-commit retry or stale card replay reuses the row
             # the backend already committed, instead of creating a second one.
@@ -1035,9 +1036,21 @@ async def _render_done_card(update, context, income, payload, role, locale):
     if income.status == "pending":
         await _render_pending_card(update, context, income, payload, role, locale)
         return
-    text = cards.rent_success_card(
-        income, payload.get("property_name", ""), payload.get("unit_number", ""), locale
-    )
+    if payload.get("flow") == "nl":
+        # Entry B exact-payment success: period + remaining balance instead of
+        # the legacy success card (no income_id / raw state on screen).
+        text = cards.rent_match_success_card(
+            payload.get("property_name", ""),
+            payload.get("unit_number", ""),
+            payload.get("period", ""),
+            income.amount,
+            payload.get("remaining_balance") or 0,
+            locale,
+        )
+    else:
+        text = cards.rent_success_card(
+            income, payload.get("property_name", ""), payload.get("unit_number", ""), locale
+        )
     keyboard = None
     if _can_reverse(context, role):
         keyboard = confirm_income_keyboard(

@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from types import SimpleNamespace
 from typing import Any, Optional
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -163,6 +165,8 @@ class FakeBackend:
              "outstanding": "24000.00", "days_overdue": 40},
         ]
         self.overdue: Optional[list] = None
+        # --- V1.3 Slice 2: Entry B rent-payment matcher ---
+        self.rent_match_response: Optional[dict] = None
         self.tasks: list[dict] = []
         self.timeout_after_write_paths: set[str] = set()
         self.timeout_before_write_paths: set[str] = set()
@@ -334,6 +338,12 @@ class FakeBackend:
         if path == "/incomes" and method == "GET":
             return httpx.Response(200, json=self.incomes)
 
+        # --- V1.3 Slice 2: Entry B rent-payment matcher ---
+        if path == "/payments/match" and method == "POST":
+            if self.rent_match_response is not None:
+                return httpx.Response(200, json=self.rent_match_response)
+            return httpx.Response(200, json=self._rent_match(body or {}))
+
         # --- V1.3 expense approval ---
         if path == "/expenses" and method == "GET":
             return httpx.Response(200, json=self.expenses)
@@ -459,6 +469,118 @@ class FakeBackend:
             return httpx.Response(200, json={"task": task, "detail": "Task snoozed"})
 
         return httpx.Response(404, json={"detail": f"no route {method} {path}"})
+
+    # --- V1.3 Slice 2: Entry B matcher (deterministic fake over fake data) ---
+    def _rent_match(self, body):
+        text = str(body.get("text") or "")
+        lower = text.lower()
+        unit = None
+        for u in self.units:
+            un = (u.get("unit_number") or "").lower()
+            if any(
+                un == tok or un.endswith(tok) or tok.endswith(un)
+                for tok in re.findall(r"[a-z0-9._-]+", lower)
+            ):
+                unit = u
+                break
+        amount = None
+        for m in re.findall(r"\d[\d,]*", text):
+            val = int(m.replace(",", ""))
+            if val >= 10000 and amount is None:
+                amount = str(val)
+        lease = None
+        if unit:
+            lease = next(
+                (l for l in self.leases if l["unit_id"] == unit["id"] and l["status"] == "active"),
+                None,
+            )
+        if lease is None:
+            return {"received_date": TODAY, "candidates": []}
+        start = date.fromisoformat(lease["start_date"])
+        today_m = TODAY[:7]
+        periods = []
+        y, m = start.year, start.month
+        while f"{y:04d}-{m:02d}" <= today_m:
+            periods.append(f"{y:04d}-{m:02d}")
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+        covered, pending = set(), set()
+        for inc in self.incomes:
+            if inc["lease_id"] != lease["id"]:
+                continue
+            desc = inc.get("description") or ""
+            month = desc.split()[-1] if "rent " in desc else (inc.get("received_date") or "")[:7]
+            if month not in periods:
+                continue
+            if inc["status"] == "confirmed":
+                covered.add(month)
+            elif inc["status"] == "pending":
+                pending.add(month)
+        open_p = [p for p in periods if p not in covered and p not in pending]
+        if open_p:
+            cand = self._match_candidate(
+                unit, lease, open_p[0], "open",
+                "high" if len(open_p) == 1 else "low",
+                len(open_p),
+            )
+            return {"received_date": TODAY, "candidates": [cand]}
+        for inc in reversed(self.incomes):
+            if inc["lease_id"] != lease["id"]:
+                continue
+            desc = inc.get("description") or ""
+            month = desc.split()[-1] if "rent " in desc else (inc.get("received_date") or "")[:7]
+            if inc["status"] == "confirmed":
+                return {
+                    "received_date": TODAY,
+                    "candidates": [
+                        self._match_candidate(
+                            unit, lease, month, "duplicate", "high", 0,
+                            income_id=inc["id"], income_status="confirmed",
+                        )
+                    ],
+                }
+            if inc["status"] == "pending":
+                return {
+                    "received_date": TODAY,
+                    "candidates": [
+                        self._match_candidate(
+                            unit, lease, month, "pending", "high", 0,
+                            income_id=inc["id"], income_status="pending",
+                        )
+                    ],
+                }
+        return {"received_date": TODAY, "candidates": []}
+
+    def _match_candidate(self, unit, lease, period, kind, confidence, open_count,
+                         income_id=None, income_status=None):
+        prop = next(
+            (p for p in self.properties if p["id"] == unit["property_id"]),
+            {"name": ""},
+        )
+        tenant = next(
+            (t for t in self.tenants if t["id"] == lease["tenant_id"]),
+            {"full_name": ""},
+        )
+        rent = Decimal(str(lease["monthly_rent"]))
+        return {
+            "kind": kind,
+            "confidence": confidence,
+            "lease_id": lease["id"],
+            "unit_id": unit["id"],
+            "unit_number": unit["unit_number"],
+            "property_id": unit["property_id"],
+            "property_name": prop["name"],
+            "tenant_id": lease["tenant_id"],
+            "tenant_name": tenant["full_name"],
+            "period": period,
+            "due_date": None,
+            "amount": str(rent),
+            "open_count": open_count,
+            "remaining_balance": str(rent * max(open_count - 1, 0)) if open_count else "0.00",
+            "income_id": income_id,
+            "income_status": income_status,
+        }
 
     # --- V1.2.2 C2 copilot helpers ---
     def _copilot_recommend(self, body):

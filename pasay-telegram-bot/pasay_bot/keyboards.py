@@ -625,6 +625,26 @@ def confirm_rent_keyboard(
     return InlineKeyboardMarkup(kb)
 
 
+def rent_match_keyboard(
+    nonce: str, ts: int, can_confirm: bool, locale: str = "zh"
+) -> Optional[InlineKeyboardMarkup]:
+    """Entry B exact-payment card: a single [✓ 确认入账] for the Owner; no
+    buttons at all when the role cannot confirm (Secretary). Navigation stays
+    on the persistent bottom keyboard."""
+    if not can_confirm:
+        return None
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("rent.match_confirm", locale),
+                    callback_data=encode(ACTION_CONFIRM, "ren", nonce=nonce, ts=ts),
+                )
+            ]
+        ]
+    )
+
+
 def confirm_income_keyboard(
     income_id: int, nonce: str, ts: int, can_reverse: bool, locale: str = "zh"
 ) -> InlineKeyboardMarkup:

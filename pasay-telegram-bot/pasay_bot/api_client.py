@@ -171,6 +171,74 @@ class Income:
 
 
 @dataclass
+class RentMatchCandidate:
+    """One candidate from POST /payments/match (Slice 2, Entry B).
+
+    ``kind``/``confidence`` carry enum VALUES (open/pending/duplicate and
+    high/medium/low); the bot renders them as human text and never shows the
+    raw values."""
+
+    kind: str = "open"
+    confidence: str = "low"
+    lease_id: int = 0
+    unit_id: int = 0
+    unit_number: str = ""
+    property_id: int = 0
+    property_name: str = ""
+    tenant_id: int = 0
+    tenant_name: str = ""
+    period: str = ""
+    due_date: Optional[date] = None
+    amount: Decimal = Decimal("0")
+    open_count: int = 0
+    remaining_balance: Decimal = Decimal("0")
+    income_id: Optional[int] = None
+    income_status: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RentMatchCandidate":
+        return cls(
+            kind=d.get("kind") or "open",
+            confidence=d.get("confidence") or "low",
+            lease_id=int(d.get("lease_id") or 0),
+            unit_id=int(d.get("unit_id") or 0),
+            unit_number=d.get("unit_number") or "",
+            property_id=int(d.get("property_id") or 0),
+            property_name=d.get("property_name") or "",
+            tenant_id=int(d.get("tenant_id") or 0),
+            tenant_name=d.get("tenant_name") or "",
+            period=d.get("period") or "",
+            due_date=_to_date(d.get("due_date")),
+            amount=_to_decimal(d.get("amount")),
+            open_count=int(d.get("open_count") or 0),
+            remaining_balance=_to_decimal(d.get("remaining_balance")),
+            income_id=int(d["income_id"]) if d.get("income_id") is not None else None,
+            income_status=d.get("income_status"),
+        )
+
+
+@dataclass
+class RentMatchResult:
+    received_date: date = date.today()
+    candidates: list[RentMatchCandidate] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.candidates is None:
+            self.candidates = []
+
+    @property
+    def best(self) -> Optional[RentMatchCandidate]:
+        return self.candidates[0] if self.candidates else None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RentMatchResult":
+        return cls(
+            received_date=_to_date(d.get("received_date")) or date.today(),
+            candidates=[RentMatchCandidate.from_dict(c) for c in (d.get("candidates") or [])],
+        )
+
+
+@dataclass
 class Expense:
     """Expense record (V1.3 expense approval). ``status`` is one of the backend
     values (pending/approved/rejected/paid/reversed); UI text is derived in
@@ -740,6 +808,15 @@ class PasayApiClient:
             ):
                 return inc
         return None
+
+    async def match_rent_payment(self, text: str, amount: Any = None) -> RentMatchResult:
+        """POST /payments/match (Slice 2, Entry B): resolve a natural-language
+        payment statement to open receivables. Read-only — never writes."""
+        body: dict[str, Any] = {"text": text}
+        if amount is not None:
+            body["amount"] = str(_to_decimal(amount))
+        data = await self._request("POST", "/payments/match", json=body)
+        return RentMatchResult.from_dict(data)
 
     async def get_financial_summary(self, month: str) -> FinancialSummary:
         data = await self._request("GET", "/reports/financial-summary", params={"month": month})

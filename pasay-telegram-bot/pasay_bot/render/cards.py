@@ -18,6 +18,7 @@ from pasay_bot.api_client import (
     Lease,
     OverdueRent,
     Property,
+    RentMatchCandidate,
     Unit,
 )
 from pasay_bot.render import html as H
@@ -227,6 +228,87 @@ def rent_confirm_card(
         f"{H.escape(t('rent.method', locale))}：{H.escape(method)}",
     ]
     return "\n".join(lines)
+
+
+def period_label(period: str, locale: str = "zh") -> str:
+    """'2026-08' -> '8月租金' / 'Aug rent' (human only)."""
+    year, _, mm = str(period).partition("-")
+    if not mm.isdigit() or not 1 <= int(mm) <= 12:
+        return str(period)
+    if locale == "en":
+        names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        return f"{names[int(mm) - 1]} rent"
+    return f"{int(mm)}月租金"
+
+
+def rent_match_card(
+    candidate: RentMatchCandidate,
+    received_date: str,
+    locale: str = "zh",
+    can_confirm: bool = True,
+) -> str:
+    """Entry B confirm card: exact payment found, action-at-source."""
+    lines = [
+        f"💵 <b>{H.escape(t('rent.match_found_title', locale))}</b>",
+        f"{H.escape(candidate.property_name)} {H.escape(candidate.unit_number)}"
+        f" · {period_label(candidate.period, locale)}",
+        f"{H.escape(t('rent.match_expected', locale))}：{H.money(candidate.amount)}",
+        f"{H.escape(t('rent.match_received', locale))}：{H.money(candidate.amount)}",
+        "",
+        H.escape(t("rent.match_amount_ok", locale)),
+        H.escape(t("rent.match_unique", locale)),
+        H.escape(t("rent.match_no_duplicate", locale)),
+    ]
+    if not can_confirm:
+        lines.append(H.escape(t("rent.owner_only_confirm", locale)))
+    return "\n".join(lines)
+
+
+def rent_match_success_card(
+    property_name: str,
+    unit_number: str,
+    period: str,
+    amount,
+    balance,
+    locale: str = "zh",
+) -> str:
+    return t(
+        "rent.match_success",
+        locale,
+        property=H.escape(property_name),
+        unit=H.escape(unit_number),
+        month=period_label(period, locale),
+        amount=H.money(amount),
+        balance=H.money(balance),
+    )
+
+
+def rent_already_booked_card(candidate: RentMatchCandidate, locale: str = "zh") -> str:
+    return t(
+        "rent.already_booked",
+        locale,
+        property=H.escape(candidate.property_name),
+        unit=H.escape(candidate.unit_number),
+        month=period_label(candidate.period, locale),
+        amount=H.money(candidate.amount),
+    )
+
+
+def rent_match_pending_card(
+    candidate: RentMatchCandidate,
+    received_date: str,
+    locale: str = "zh",
+) -> str:
+    return t(
+        "rent.match_pending",
+        locale,
+        property=H.escape(candidate.property_name),
+        unit=H.escape(candidate.unit_number),
+        month=period_label(candidate.period, locale),
+        amount=H.money(candidate.amount),
+        date=H.format_date(received_date),
+    )
 
 
 def rent_success_card(
