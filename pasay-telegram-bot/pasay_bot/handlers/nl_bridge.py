@@ -12,12 +12,18 @@ create + Owner-only confirm chain.
 """
 from __future__ import annotations
 
+import logging
 import re
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from pasay_bot.api_client import PasayApiError
+from pasay_bot.api_client import (
+    PasayApiConflictError,
+    PasayApiError,
+    PasayApiPermissionError,
+    PasayApiTimeoutError,
+)
 from pasay_bot.handlers import commands as pages
 from pasay_bot.keyboards import (
     confirm_income_keyboard,
@@ -25,19 +31,24 @@ from pasay_bot.keyboards import (
     new_nonce,
     now_ts,
     rent_match_keyboard,
+    secretary_registered_keyboard,
 )
 from pasay_bot.render import html as H
 from pasay_bot.render import cards
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
+    PERMISSION_RENT_ENTRY,
     PERMISSION_RENT_CONFIRM,
+    Role,
     has_permission,
     has_read_permission,
     locale_for,
     role_for_telegram_id,
+    telegram_id_for_role,
 )
 
 HTML = "HTML"
+logger = logging.getLogger(__name__)
 
 _RENT_WORDS_CN = ("租金", "房租")
 _RENT_WORD_EN = re.compile(r"\brent\b")
@@ -165,17 +176,167 @@ async def _handle_rent_payment_statement(update, context, text, role, locale):
         return
     if best.kind == "duplicate":
         # Already booked: friendly message, zero writes, no second record.
+        if role == Role.SECRETARY:
+            await context.bot.send_message(
+                chat_id,
+                cards.secretary_already_confirmed_card(best, locale),
+                parse_mode=HTML,
+            )
+            return
         await context.bot.send_message(
             chat_id, cards.rent_already_booked_card(best, locale), parse_mode=HTML
         )
         return
     if best.kind == "pending":
+        if role == Role.SECRETARY:
+            # Same payment already reported and waiting for the Owner: never
+            # create a second pending income (duplicate rule A).
+            await context.bot.send_message(
+                chat_id,
+                cards.secretary_already_waiting_card(best, locale),
+                parse_mode=HTML,
+            )
+            return
         await _render_pending_match(update, context, best, result, role, locale)
         return
     if best.confidence != "high":
         await _send_ambiguous(update, context, result, locale)
         return
+    if role == Role.SECRETARY:
+        # Unique HIGH-confidence exact match: register ONE pending income and
+        # hand the confirmation card to the Owner (action-at-source).
+        await _register_pending_for_owner(update, context, best, result, role, locale)
+        return
     await _render_match_confirm(update, context, best, result, role, locale)
+
+
+async def _register_pending_for_owner(update, context, candidate, result, role, locale):
+    """Secretary one-line register (V1.3 Slice 2, Entry B).
+
+    Reuses the existing Income create + idempotency_key chain (backend is the
+    atomic backstop; ``created_by``/audit actor stays the Secretary subject)
+    and the Owner-only confirm chain for the follow-up card. Never asks the
+    Secretary for month / property / amount / date the matcher already knows.
+    """
+    store = context.bot_data["store"]
+    guard = context.bot_data["idempotency"]
+    api = context.bot_data["api_client"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not has_permission(role, PERMISSION_RENT_ENTRY):
+        await context.bot.send_message(
+            chat_id, H.escape(t("common.no_permission", locale)), parse_mode=HTML
+        )
+        return
+
+    period = candidate.period or str(result.received_date)[:7]
+    received = result.received_date.isoformat()
+    method = store.get_user_default_method(user_id)
+    # Deterministic business-fact key: identical duplicate reports (and
+    # Telegram redeliveries) share one backend idempotency_key, so a race can
+    # never produce a second pending income.
+    key = f"ik:sec:{candidate.lease_id}:{period}:{received}:{candidate.amount}"
+    status = guard.acquire(key, kind="income", resource="")
+    if status in ("done", "in_flight"):
+        # Replay / concurrent duplicate: no second pending row, and the Owner
+        # has already been notified once.
+        await context.bot.send_message(
+            chat_id,
+            cards.secretary_already_waiting_card(candidate, locale),
+            parse_mode=HTML,
+        )
+        return
+
+    income = None
+    try:
+        income = await api.create_income(
+            lease_id=candidate.lease_id,
+            amount=candidate.amount,
+            received_date=received,
+            payment_method=method,
+            description=f"rent {period}",
+            idempotency_key=key,
+        )
+        guard.settle(key, income.as_dict(), resource=str(income.id))
+    except PasayApiConflictError:
+        # A concurrent identical create landed server-side under the same key.
+        await context.bot.send_message(
+            chat_id,
+            cards.secretary_already_waiting_card(candidate, locale),
+            parse_mode=HTML,
+        )
+        return
+    except PasayApiTimeoutError:
+        # The create may have landed: reconcile before telling anyone to retry,
+        # so a committed pending row is never duplicated.
+        current = await api.find_income(
+            lease_id=candidate.lease_id,
+            amount=candidate.amount,
+            received_date=received,
+            payment_method=method,
+        )
+        if current is not None:
+            income = current
+            guard.settle(key, income.as_dict(), resource=str(income.id))
+        else:
+            guard.fail(key)
+            await context.bot.send_message(
+                chat_id, H.escape(t("rent.match_error", locale)), parse_mode=HTML
+            )
+            return
+    except PasayApiPermissionError:
+        guard.fail(key)
+        await context.bot.send_message(
+            chat_id, H.escape(t("common.no_permission", locale)), parse_mode=HTML
+        )
+        return
+    except PasayApiError:
+        guard.fail(key)
+        await context.bot.send_message(
+            chat_id, H.escape(t("rent.match_error", locale)), parse_mode=HTML
+        )
+        return
+
+    # English confirmation to the Secretary (no re-entry, no form).
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(cards.secretary_matched_reply(candidate, locale)),
+        parse_mode=HTML,
+    )
+
+    # Chinese action-at-source card to the Owner's private chat.
+    owner_chat_id = telegram_id_for_role(Role.OWNER)
+    if owner_chat_id is None:
+        logger.warning(
+            "No Owner telegram id configured; pending income %s registered "
+            "without an Owner confirmation card", income.id,
+        )
+        return
+    nonce = new_nonce()
+    ts = now_ts()
+    payload = {
+        "income_id": income.id,
+        "lease_id": candidate.lease_id,
+        "property_id": candidate.property_id,
+        "property_name": candidate.property_name,
+        "unit_number": candidate.unit_number,
+        "period": period,
+        "amount": str(income.amount),
+        "received_date": received,
+        "flow": "secretary_register",
+        "registrar": "Secretary",
+        "remaining_balance": str(candidate.remaining_balance),
+    }
+    store.save_conversation(
+        owner_chat_id, owner_chat_id, "rent_secretary_confirm",
+        payload, nonce=nonce,
+    )
+    await context.bot.send_message(
+        owner_chat_id,
+        H.truncate(cards.secretary_registered_card(candidate, "zh")),
+        parse_mode=HTML,
+        reply_markup=secretary_registered_keyboard(income.id, nonce, ts, "zh"),
+    )
 
 
 async def _render_match_confirm(update, context, candidate, result, role, locale):

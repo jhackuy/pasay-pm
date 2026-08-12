@@ -51,6 +51,7 @@ from pasay_bot.keyboards import (
     ACTION_EXPENSE_APPROVE,
     ACTION_EXPENSE_DETAIL,
     ACTION_EXPENSE_REJECT,
+    ACTION_ISSUE,
     ACTION_METHOD,
     ACTION_NAV,
     ACTION_OPS_NAV,
@@ -206,6 +207,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_expense_detail(update, context, entity, role, locale)
     elif action == ACTION_EDIT:
         await _handle_edit(update, context, entity, role, locale)
+    elif action == ACTION_ISSUE:
+        await _handle_issue(update, context, ref, role, locale)
     elif action == ACTION_OPS_NAV:
         await _handle_ops_nav(update, context, entity, role, locale)
     elif action == ACTION_TASK_COMPLETE:
@@ -468,6 +471,33 @@ async def _handle_confirm(update, context, entity, ref, nonce, ts, role, locale)
         await _confirm_income(update, context, ref, nonce, ts, role, locale)
     else:
         await _answer(update, t("common.invalid", locale))
+
+
+async def _handle_issue(update, context, ref, role, locale):
+    """[有问题] on the Secretary-registered Owner card: read-only status hint.
+
+    Never writes a financial record, never changes state. The backend state
+    (pending vs confirmed) is read via GET and turned into a friendly tip so
+    no internal status/ID ever reaches the screen.
+    """
+    if not has_permission(role, PERMISSION_RENT_CONFIRM):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    api = context.bot_data["api_client"]
+    try:
+        income = await api.get_income(int(ref))
+    except PasayApiError:
+        await _answer(update, t("rent.issue_error", locale))
+        return
+    if income.status == "pending":
+        await _answer(update, t("rent.issue_pending", locale))
+    elif income.status == "confirmed":
+        await _answer(update, t("rent.issue_confirmed", locale))
+    else:
+        await _answer(update, t("rent.issue_error", locale))
 
 
 async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
@@ -1080,6 +1110,32 @@ async def _render_pending_card(update, context, income, payload, role, locale):
 async def _render_income_state(update, context, income: Income, role, locale):
     """Render a known income state onto the current card."""
     if income.status == "confirmed":
+        # Secretary-registered card (V1.3 Slice 2): terminal Chinese state with
+        # balance + registrar; falls back to the generic success card when the
+        # local conversation context is missing or belongs to another income.
+        conv = context.bot_data["store"].get_conversation(
+            update.effective_chat.id, update.effective_user.id
+        )
+        if (
+            conv is not None
+            and conv["state"] == "rent_secretary_confirm"
+            and int(conv["payload"].get("income_id") or 0) == income.id
+        ):
+            text = cards.secretary_terminal_card(conv["payload"], income, locale)
+            keyboard = (
+                confirm_income_keyboard(
+                    income.id,
+                    new_nonce(),
+                    now_ts(),
+                    can_reverse=True,
+                    locale=locale,
+                    show_confirm=False,
+                )
+                if _can_reverse(context, role)
+                else None
+            )
+            await _edit(update, text, keyboard)
+            return
         text = t(
             "rent.success",
             locale,

@@ -479,7 +479,10 @@ class FakeBackend:
             un = (u.get("unit_number") or "").lower()
             if any(
                 un == tok or un.endswith(tok) or tok.endswith(un)
-                for tok in re.findall(r"[a-z0-9._-]+", lower)
+                for tok in (
+                    t.rstrip(".,;:!?")
+                    for t in re.findall(r"[a-z0-9._-]+", lower)
+                )
             ):
                 unit = u
                 break

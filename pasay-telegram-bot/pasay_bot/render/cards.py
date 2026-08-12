@@ -311,6 +311,80 @@ def rent_match_pending_card(
     )
 
 
+def secretary_registered_card(
+    candidate: RentMatchCandidate, locale: str = "zh",
+) -> str:
+    """Owner confirmation card after the Secretary registers a rent payment
+    (V1.3 Slice 2). Human text only: no income_id / internal state."""
+    lines = [
+        f"📋 <b>{H.escape(t('rent.secretary_registered_title', locale))}</b>",
+        "",
+        f"{H.escape(candidate.property_name)} {H.escape(candidate.unit_number)}"
+        f" · {period_label(candidate.period, locale)}",
+        f"{H.escape(t('rent.match_expected', locale))}：{H.money(candidate.amount)}",
+        f"{H.escape(t('rent.match_received', locale))}：{H.money(candidate.amount)}",
+        f"{H.escape(t('rent.registered_by', locale))}：Secretary",
+        "",
+        H.escape(t("rent.match_amount_ok", locale)),
+        H.escape(t("rent.match_unique", locale)),
+    ]
+    return "\n".join(lines)
+
+
+def secretary_matched_reply(candidate: RentMatchCandidate, locale: str = "en") -> str:
+    """English confirmation to the Secretary after the pending income lands
+    (V1.3 Slice 2): one sentence, no re-entry, no internal identifiers."""
+    return t(
+        "rent.secretary_matched",
+        locale,
+        property=H.escape(candidate.property_name),
+        unit=H.escape(candidate.unit_number),
+        month=period_label(candidate.period, locale),
+        amount=H.money(candidate.amount),
+    )
+
+
+def secretary_terminal_card(payload: dict, income: Income, locale: str = "zh") -> str:
+    """Terminal state of the Owner's confirmation card after confirm: no
+    confirm button remains; balance + registrar keep the entry human."""
+    return t(
+        "rent.secretary_terminal",
+        locale,
+        property=H.escape(payload.get("property_name", "")),
+        unit=H.escape(payload.get("unit_number", "")),
+        month=period_label(payload.get("period", ""), locale),
+        amount=H.money(income.amount),
+        balance=H.money(payload.get("remaining_balance") or 0),
+        registrar=H.escape(payload.get("registrar", "Secretary")),
+    )
+
+
+def secretary_already_waiting_card(candidate: RentMatchCandidate, locale: str = "en") -> str:
+    """Secretary duplicate report while a pending income awaits the Owner:
+    friendly English, never a second pending row."""
+    return t(
+        "rent.already_waiting_owner",
+        locale,
+        property=H.escape(candidate.property_name),
+        unit=H.escape(candidate.unit_number),
+        month=period_label(candidate.period, locale),
+        amount=H.money(candidate.amount),
+    )
+
+
+def secretary_already_confirmed_card(candidate: RentMatchCandidate, locale: str = "en") -> str:
+    """Secretary duplicate report after the Owner confirmed: friendly English,
+    never a new pending row."""
+    return t(
+        "rent.already_recorded_confirmed",
+        locale,
+        property=H.escape(candidate.property_name),
+        unit=H.escape(candidate.unit_number),
+        month=period_label(candidate.period, locale),
+        amount=H.money(candidate.amount),
+    )
+
+
 def rent_success_card(
     income: Income, property_name: str, unit_number: str, locale: str = "zh"
 ) -> str:

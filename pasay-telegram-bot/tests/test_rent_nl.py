@@ -227,16 +227,29 @@ def test_nl_pending_confirms_existing_without_create(make_app):
 
 # --- role-aware / ambiguous / none ------------------------------------------
 
-def test_nl_secretary_no_confirm_button(make_app):
-    """Secretary sees the match card but NEVER the Owner-only confirm button."""
+def test_nl_secretary_statement_registers_pending_for_owner(make_app):
+    """V1.3 Slice 2: a Secretary statement registers ONE pending income and
+    routes the Owner-only confirm card to the Owner's chat — the Secretary
+    never receives a confirm button."""
     env = make_app()
     add_unit_1608(env)
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "1608租金收到了", bot=env.bot)])
 
-    send = env.bot.sends()[-1]
-    assert "Rent found" in send["text"]
-    assert "Only the Owner can confirm" in send["text"]
-    assert send["reply_markup"] is None
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    assert env.backend.incomes[-1]["status"] == "pending"
+
+    sends = env.bot.sends()
+    secretary_reply = sends[-2]
+    assert secretary_reply["chat_id"] == SECRETARY_ID
+    assert "Rent payment matched" in secretary_reply["text"]
+    assert secretary_reply["reply_markup"] is None
+
+    owner_card = sends[-1]
+    assert owner_card["chat_id"] == OWNER_ID
+    assert "秘书登记了一笔租金" in owner_card["text"]
+    kb = owner_card["reply_markup"]
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "✓ 确认入账" in labels
     assert env.store.get_conversation(SECRETARY_ID, SECRETARY_ID) is None
 
 

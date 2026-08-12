@@ -30,6 +30,8 @@ ACTION_REVERSE = "rv"
 ACTION_CANCEL = "ccl"
 ACTION_DETAIL = "det"
 ACTION_EDIT = "ed"
+# V1.3 Slice 2 (Entry B, Secretary register): read-only "有问题" status hint.
+ACTION_ISSUE = "iss"
 # V1.3 Slice 1: expense approval (exa = approve, exr = reject, exd = detail).
 ACTION_EXPENSE_APPROVE = "exa"
 ACTION_EXPENSE_REJECT = "exr"
@@ -673,6 +675,31 @@ def confirm_income_keyboard(
             ]
         )
     return InlineKeyboardMarkup(kb)
+
+
+def secretary_registered_keyboard(
+    income_id: int, nonce: str, ts: int, locale: str = "zh",
+) -> InlineKeyboardMarkup:
+    """Owner confirmation card for a Secretary-registered pending rent payment
+    (V1.3 Slice 2): [✓ 确认入账] reuses the Owner-only income confirm chain
+    (entity ``inc``) and [有问题] is a read-only status hint, never a write."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("rent.match_confirm", locale),
+                    callback_data=encode(
+                        ACTION_CONFIRM, "inc", str(income_id),
+                        nonce=nonce, ts=ts,
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("rent.issue_button", locale),
+                    callback_data=encode(ACTION_ISSUE, "inc", str(income_id)),
+                ),
+            ]
+        ]
+    )
 
 
 def overdue_page_keyboard(rows, page: int, total_pages: int, locale: str = "zh"):

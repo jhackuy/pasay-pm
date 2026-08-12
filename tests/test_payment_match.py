@@ -92,6 +92,21 @@ def test_parse_unit_phrase():
     assert hints.received_date == TODAY
 
 
+def test_english_sentence_with_trailing_period():
+    """SLICE2-RENT-002 Secretary examples end with '.', which must not hide
+    the unit hint: 'Received rent for 1608.' and '1608 rent received.' both
+    resolve to the unique open bill (HIGH)."""
+    for text in ("Received rent for 1608.", "1608 rent received."):
+        hints = parse_hints(text, ["1608", "1708"], TODAY)
+        assert hints.unit_hints == ["1608"]
+        result = match_from_leases([_ctx(_paid_jan_jul())], text, today=TODAY)
+        best = result.best
+        assert best is not None
+        assert best.kind == MatchKind.OPEN
+        assert best.confidence == MatchConfidence.HIGH
+        assert best.period == "2026-08"
+
+
 def test_parse_tenant_amount_phrase():
     hints = parse_hints("John的70000到了", ["1608", "1708"], TODAY)
     assert hints.unit_hints == []

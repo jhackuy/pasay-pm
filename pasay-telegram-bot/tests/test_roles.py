@@ -9,6 +9,7 @@ from pasay_bot.roles import (
     locale_for,
     permissions_for_api_role,
     role_for_telegram_id,
+    telegram_id_for_role,
 )
 
 OWNER_TG = 5177241442
@@ -21,6 +22,13 @@ def test_owner_mapping():
 
 def test_secretary_mapping():
     assert role_for_telegram_id(SECRETARY_TG) == Role.SECRETARY
+
+
+def test_reverse_role_lookup():
+    """SLICE2-RENT-002: the Owner's private chat id for notifications."""
+    assert telegram_id_for_role(Role.OWNER) == OWNER_TG
+    assert telegram_id_for_role(Role.SECRETARY) == SECRETARY_TG
+    assert telegram_id_for_role(None) is None
 
 
 def test_unknown_user_none():

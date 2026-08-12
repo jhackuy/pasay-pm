@@ -128,7 +128,8 @@ class MatchResult:
 
 
 def _unit_matches(token: str, unit_number: str) -> bool:
-    t = token.lower().strip()
+    # Trailing sentence punctuation ("1608.") must not hide the unit hint.
+    t = (token or "").lower().strip().rstrip(".,;:!?")
     u = (unit_number or "").lower().strip()
     return bool(u) and (t == u or u.endswith(t) or t.endswith(u))
 
@@ -137,8 +138,11 @@ def _parse_unit_hints(text: str, unit_numbers: Iterable[str]) -> list[str]:
     units = sorted({u for u in unit_numbers if u})
     hints: list[str] = []
     for token in _TOKEN.findall(text):
-        if any(_unit_matches(token, u) for u in units) and token not in hints:
-            hints.append(token)
+        # Normalize the hint (strip sentence punctuation) so downstream
+        # consumers see the unit reference, not the raw token.
+        normalized = (token or "").lower().strip().rstrip(".,;:!?")
+        if normalized and any(_unit_matches(token, u) for u in units) and normalized not in hints:
+            hints.append(normalized)
     return hints
 
 

@@ -68,6 +68,21 @@ def role_for_telegram_id(telegram_id: Optional[int]) -> Optional[Role]:
     return TELEGRAM_USER_ID_TO_ROLE.get(telegram_id)
 
 
+def telegram_id_for_role(role: Optional[Role]) -> Optional[int]:
+    """Reverse lookup: the Telegram user id bound to a role.
+
+    Used to route role-targeted notifications (e.g. the Owner confirmation
+    card after the Secretary registers a rent payment) to the recipient's
+    private chat (chat_id == user id).
+    """
+    if role is None:
+        return None
+    for telegram_id, mapped in TELEGRAM_USER_ID_TO_ROLE.items():
+        if mapped == role:
+            return telegram_id
+    return None
+
+
 def has_permission(role: Optional[Role], permission: str) -> bool:
     if role is None:
         return False
