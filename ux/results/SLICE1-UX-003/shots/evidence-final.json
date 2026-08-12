@@ -1,0 +1,67 @@
+{
+  "outbox_24": {
+    "status": "SENT",
+    "telegram_message_id": 80,
+    "message": "🔔 待办提醒\n待批准支出 · 维修\n金额：₱3,500\n到期：2026-08-10 08:00",
+    "buttons": [
+      [
+        "✅ 批准",
+        "❌ 拒绝"
+      ],
+      [
+        "📎 查看凭证"
+      ]
+    ]
+  },
+  "outbox_25": {
+    "status": "SENT",
+    "telegram_message_id": 79,
+    "message": "🔔 待办提醒\n待批准支出 · 清洁\n金额：₱1,200\n到期：2026-08-12 08:00",
+    "buttons": [
+      [
+        "✅ 批准",
+        "❌ 拒绝"
+      ],
+      [
+        "查看详情"
+      ]
+    ]
+  },
+  "approved_card": {
+    "text": "✅ <b>已批准</b>\n维修 · ₱3,500\n下一步：等待付款",
+    "buttons": [
+      [
+        "🏠 首页"
+      ]
+    ]
+  },
+  "owner_reply_keyboard": [
+    [
+      "🏠 房源",
+      "✅ 待办"
+    ],
+    [
+      "💰 财务",
+      "☰ 更多"
+    ]
+  ],
+  "secretary_reply_keyboard": [
+    [
+      "🏠 Properties",
+      "✅ Tasks"
+    ],
+    [
+      "💰 Finance",
+      "☰ More"
+    ]
+  ],
+  "secretary_task_card": {
+    "text": "🗂 <b>Tasks</b>\n\n🛠 Follow-up · Unit 1608\nNext: Contact tenant about overdue rent\nDue: Today 17:00\nStatus: Pending",
+    "buttons": [
+      [
+        "✅ Done",
+        "👁 Detail"
+      ]
+    ]
+  }
+}
