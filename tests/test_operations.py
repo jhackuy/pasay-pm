@@ -19,6 +19,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
+from app.models.attachment import Attachment
 from app.models.audit_log import AuditAction, AuditLog
 from app.models.commission import (
     CommissionRule,
@@ -436,11 +437,17 @@ def test_expense_notification_detail_button_shows_receipt_label(db_session, monk
     admin = _user(db_session, "exp-owner-2", UserRole.admin, "tg-owner-2")
     db_session.commit()
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", admin.id)
+    attachment = Attachment(
+        filedata="/tmp/fix-it-receipt.pdf",
+        original_filename="fix-it-receipt.pdf",
+    )
+    db_session.add(attachment)
+    db_session.flush()
     expense = Expense(
         expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
         payee="Fix-It Co", status=ExpenseStatus.pending,
         created_at=NOW - timedelta(days=10),
-        receipt_attachment_id=99,
+        receipt_attachment_id=attachment.id,
     )
     db_session.add(expense)
     db_session.commit()
