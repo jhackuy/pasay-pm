@@ -1,0 +1,52 @@
+{
+  "task_id": "SLICE1-UX-003-WORKER",
+  "gate": "V1.3 Slice 1 真实 Telegram 实机验收 (Owner + Secretary + Expense Approval)",
+  "status": "CODE_AND_TEST_PASS_REAL_RUN_BLOCKED",
+  "summary": "All 5 acceptance items PASS at code/render/test level; real Telegram screenshots blocked by sandbox (no DNS to api.telegram.org, no TCP to local API/Postgres, bot token not resolvable, results dir not writable). Orchestrator must run the real observation outside the sandbox.",
+  "items": {
+    "1_owner_bottom_keyboard": {
+      "status": "PASS_CODE_TEST / BLOCKED_SCREENSHOT",
+      "evidence": "reply_keyboard(OWNER)=[[🏠 房源,✅ 待办],[💰 财务,☰ 更多]] resize=True; test_reply_keyboard_role_specific_labels; SLICE1-UX-003-render-evidence.txt"
+    },
+    "2_expense_approval_card": {
+      "status": "PASS_CODE_TEST / BLOCKED_SCREENSHOT",
+      "evidence": "human card + bold amount + no enums/ids; buttons on event message via backend outbox markup; render-evidence + backend-markup"
+    },
+    "3_approved_mutation_and_stale": {
+      "status": "PASS_TEST / BLOCKED_SCREENSHOT",
+      "evidence": "1 write, 1 edit, 0 sends, answer-first; stale -> human toast + re-render, no repeat write (3 tests)"
+    },
+    "4_secretary_view": {
+      "status": "PASS_CODE_TEST / BLOCKED_SCREENSHOT",
+      "evidence": "English 2x2 keyboard; secretary /todo excludes expense rows; unauthorized approve refused with English toast, card unchanged"
+    },
+    "5_detail_button_two_states": {
+      "status": "PASS_CODE_TEST / BLOCKED_SCREENSHOT",
+      "evidence": "receipt->📎 查看凭证, no receipt->查看详情; callback v1:exd:<id>; bot + backend markup both verified"
+    }
+  },
+  "fixes_this_round": [
+    "cards._expense_location: removed degraded-path 'Unit {id}' technical fallback",
+    "cards._expense_status_label: unknown status renders '—' instead of raw enum",
+    "cards.todo_overview_card: unnamed task shows '事项/Task' instead of '#<task_id>'",
+    "handlers conversation.py/callback.py: completed/snoozed cards use '事项/Task' instead of '#<task_id>'",
+    "handlers commands.py: missing property name uses '房产/Property' instead of '#<property_id>'",
+    "tests: assertions + test_todo_unnamed_task_never_shows_internal_id"
+  ],
+  "tests": {
+    "bot_suite": "188 passed",
+    "backend_suite": "BLOCKED - Postgres socket denied by sandbox (Operation not permitted)"
+  },
+  "environment_blockers": [
+    "DNS: Could not resolve host api.telegram.org",
+    "TCP 127.0.0.1:8000 and 127.0.0.1:5432: Operation not permitted (sandbox)",
+    "PASSAY_TG_BOT_TOKEN not resolvable from dev workspace (pasay-telegram-bot/.env missing; dry-run reports not set)",
+    "/Users/jhackuy/.pasay-control/results: not writable (PermissionError)",
+    "git add/commit forbidden by task wrapper; changes left uncommitted"
+  ],
+  "handoff": {
+    "run_outside_sandbox": "start API+bot+worker, seed dev expense with/without receipt, capture 5 screenshots at 360-420px into /Users/jhackuy/.pasay-control/results/SLICE1-UX-003-*.png",
+    "copy_evidence": "cp ux/results/SLICE1-UX-003/* /Users/jhackuy/.pasay-control/results/",
+    "suggested_commit": "SLICE1-UX-003: render-layer + handler technical-language guards"
+  }
+}

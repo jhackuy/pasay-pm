@@ -1,0 +1,32 @@
+# Backend outbox notification markup (app/services/operations/generation.py::_expense_reply_markup)
+# Verified in this sandbox with the dev venv (pure function, no DB/network needed).
+# Nonce/timestamp values are random per call and shown only to prove the callback slot layout.
+
+WITH receipt (receipt_attachment_id set):
+{
+  "inline_keyboard": [
+    [
+      {"text": "✅ 批准", "callback_data": "v1:exa:5::<nonce>:<ts>"},
+      {"text": "❌ 拒绝", "callback_data": "v1:exr:5::<nonce>:<ts>"}
+    ],
+    [
+      {"text": "📎 查看凭证", "callback_data": "v1:exd:5"}
+    ]
+  ]
+}
+
+NO receipt (receipt_attachment_id None):
+{
+  "inline_keyboard": [
+    [
+      {"text": "✅ 批准", "callback_data": "v1:exa:5::<nonce>:<ts>"},
+      {"text": "❌ 拒绝", "callback_data": "v1:exr:5::<nonce>:<ts>"}
+    ],
+    [
+      {"text": "查看详情", "callback_data": "v1:exd:5"}
+    ]
+  ]
+}
+
+Both states: approve/reject ride on the event message (action-at-source); detail button
+label switches on receipt existence; callback_data stays v1:exd:<id> in both cases.

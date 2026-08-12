@@ -731,7 +731,7 @@ async def show_rent_units(context, chat_id, message_id, property_id: int, locale
         )
         return
     prop = next((p for p in properties if p.id == property_id), None)
-    prop_name = prop.name if prop else f"#{property_id}"
+    prop_name = prop.name if prop else t("ops.property", locale)
     items = sorted(
         (u for u in units if u.property_id == property_id), key=lambda u: u.unit_number
     )

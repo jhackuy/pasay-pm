@@ -1,0 +1,88 @@
+# SLICE1-UX-003 static render evidence (sandbox: no Telegram/network access)
+
+## 1. Owner persistent reply keyboard (zh)
+[['🏠 房源', '✅ 待办'], ['💰 财务', '☰ 更多']]
+
+## 1b. Secretary persistent reply keyboard (en)
+[['🏠 Properties', '✅ Tasks'], ['💰 Finance', '☰ More']]
+
+## 2. Expense approval card (zh, WITH receipt) + buttons
+<b>💳 支出待批准</b>
+Pasay Premier Residences · 16B
+<b>₱5,000</b>
+收款方：Fix-It Co
+用途：维修 · 空调维修
+日期：2026-08-10 · 到期：2026-08-15
+✓ 有凭证
+BUTTONS: [['✅ 批准', '❌ 拒绝'], ['📎 查看凭证', '🏠 首页']]
+
+## 2b. Expense approval card (zh, WITHOUT receipt) + buttons
+<b>💳 支出待批准</b>
+Pasay Premier Residences · 16B
+<b>₱5,000</b>
+收款方：Fix-It Co
+用途：维修 · 空调维修
+日期：2026-08-10 · 到期：2026-08-15
+无凭证
+BUTTONS: [['✅ 批准', '❌ 拒绝'], ['查看详情', '🏠 首页']]
+
+## 2c. Expense approval card (en, for reference) + buttons
+<b>💳 Expense awaiting approval</b>
+Pasay Premier Residences · 16B
+<b>₱5,000</b>
+Payee：Fix-It Co
+Purpose：维修 · 空调维修
+Date：2026-08-10 · Due：2026-08-15
+✓ Receipt attached
+BUTTONS: [['✅ Approve', '❌ Reject'], ['📎 Receipt', '🏠 Home']]
+
+## 3. Approved result card (zh) + result keyboard
+✅ <b>已批准</b>
+维修 · ₱5,000
+下一步：等待付款
+BUTTONS: [['🏠 首页']]
+
+## 3b. Rejected result card (zh)
+❌ <b>已拒绝</b>
+维修 · ₱5,000
+这笔支出已结束。
+BUTTONS: [['🏠 首页']]
+
+## 4. Detail card (zh, with receipt) + detail keyboard (pending)
+<b>💳 支出详情</b>
+Pasay Premier Residences · 16B
+用途：维修
+空调维修
+收款方：Fix-It Co
+金额：<b>₱5,000</b>
+日期：2026-08-10
+到期：2026-08-15
+状态：待批准
+✓ 有凭证
+BUTTONS: [['✅ 批准', '❌ 拒绝'], ['🏠 首页']]
+
+## 4b. Detail card (zh, no receipt) + detail keyboard (processed)
+<b>💳 支出详情</b>
+Pasay Premier Residences · 16B
+用途：维修
+空调维修
+收款方：Fix-It Co
+金额：<b>₱5,000</b>
+日期：2026-08-10
+到期：2026-08-15
+状态：待批准
+无凭证
+BUTTONS: [['🏠 首页']]
+
+## 5. English secretary strings (i18n)
+nav.properties: 🏘 Properties
+nav.tasks: ✅ Tasks
+nav.finance: 📊 Finance
+nav.more: ☰ More
+expense.title: 💳 Expense awaiting approval
+expense.approve: ✅ Approve
+expense.reject: ❌ Reject
+expense.view_receipt: 📎 Receipt
+expense.view_detail: View details
+expense.owner_only: ⚠️ Only the Owner can approve or reject expenses.
+

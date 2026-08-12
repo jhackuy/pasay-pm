@@ -1125,7 +1125,10 @@ async def _handle_task_complete(update, context, ref, role, locale):
     except PasayApiError as exc:
         await _answer(update, f"⚠️ {H.escape(exc.detail)}")
         return
-    text = t("ops.completed_card", locale, title=H.escape(task.title or f"#{task.id}"))
+    text = t(
+        "ops.completed_card", locale,
+        title=H.escape(task.title or t("ops.task", locale)),
+    )
     await _edit(update, text, ops_back_keyboard(locale))
     await _answer(update, t("ops.completed_toast", locale))
 
@@ -1181,7 +1184,11 @@ async def _handle_task_snooze_pick(update, context, entity, ref, role, locale):
         await _answer(update, f"⚠️ {H.escape(exc.detail)}")
         return
     until = str(task.snoozed_until or "")[:16].replace("T", " ")
-    text = t("ops.snoozed_card", locale, title=H.escape(task.title or f"#{task.id}"), until=H.escape(until))
+    text = t(
+        "ops.snoozed_card", locale,
+        title=H.escape(task.title or t("ops.task", locale)),
+        until=H.escape(until),
+    )
     await _edit(update, text, ops_back_keyboard(locale))
     await _answer(update, t("ops.snoozed_toast", locale))
 

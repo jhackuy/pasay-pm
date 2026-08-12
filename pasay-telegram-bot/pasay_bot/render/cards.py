@@ -523,13 +523,15 @@ def _expense_status_label(status: str, locale: str = "zh") -> str:
         "paid": "expense.status_paid",
         "reversed": "expense.status_reversed",
     }.get((status or "").lower())
-    return H.escape(t(key, locale)) if key else H.escape(status or "")
+    # Unknown statuses never reach the user as raw enum text; a neutral dash
+    # keeps the card human (SLICE1-UX-003).
+    return H.escape(t(key, locale)) if key else "—"
 
 
 def _expense_location(expense: Expense, location: str = "") -> str:
-    return H.escape(location) if location else (
-        f"Unit {expense.unit_id}" if expense.unit_id else ""
-    )
+    # No technical "Unit {id}" fallback on the degraded path (SLICE1-UX-003):
+    # when the property/unit lookup fails the location line is simply hidden.
+    return H.escape(location) if location else ""
 
 
 def expense_approval_card(
@@ -661,7 +663,7 @@ def todo_overview_card(sections: dict, locale: str = "zh") -> str:
     tasks = sections.get("tasks") or []
     if tasks:
         items = [
-            f"🛠 {H.escape(tk.title or f'#{tk.id}')}"
+            f"🛠 {H.escape(tk.title or t('ops.task', locale))}"
             + (f" · {H.escape(_ops_due(tk))}" if getattr(tk, "due_at", None) else "")
             for tk in tasks
         ]

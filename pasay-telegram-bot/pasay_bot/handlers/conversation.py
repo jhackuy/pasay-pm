@@ -255,7 +255,7 @@ async def _enter_ops_snooze_custom(update, context, payload, locale: str):
         )
         return
     store.delete_conversation(chat_id, user_id)
-    title = H.escape(task.title or f"#{task.id}")
+    title = H.escape(task.title or t("ops.task", locale))
     until_str = str(task.snoozed_until or "")[:16].replace("T", " ")
     text_out = t("ops.snoozed_card", locale, title=title, until=H.escape(until_str))
     if message_id:

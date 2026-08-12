@@ -6,6 +6,8 @@ fallback, human-readable status (no internal enums) and the role-specific
 persistent bottom keyboards."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from conftest import (
     OWNER_ID,
     SECRETARY_ID,
@@ -114,6 +116,18 @@ def test_expense_cards_never_show_internal_enums():
     for banned in ("APPROVAL_PENDING", "PAYMENT_PENDING", "RENT_DUE", "expense_id", "#5"):
         assert banned not in approval
 
+    # Degraded path (property/unit lookup failed): no technical "Unit {id}"
+    # fallback; the location line is hidden instead (SLICE1-UX-003).
+    approval_no_loc = cards.expense_approval_card(expense, "zh")
+    assert "Unit 1" not in approval_no_loc
+    assert "Unit" not in approval_no_loc
+
+    # Unknown status never renders as a raw enum in the detail card.
+    unknown = Expense.from_dict(expense.as_dict() | {"status": "APPROVAL_PENDING"})
+    detail_unknown = cards.expense_detail_card(unknown, "zh", location="Pasay Premier Residences · Unit 16B")
+    assert "APPROVAL_PENDING" not in detail_unknown
+    assert "状态：—" in detail_unknown
+
     approved = Expense.from_dict(expense.as_dict() | {"status": "approved"})
     result = cards.expense_result_card(approved, "zh")
     assert "✅ <b>已批准</b>" in result
@@ -123,6 +137,14 @@ def test_expense_cards_never_show_internal_enums():
     result_rej = cards.expense_result_card(rejected, "zh")
     assert "❌ <b>已拒绝</b>" in result_rej
     assert "已结束" in result_rej
+
+
+def test_todo_unnamed_task_never_shows_internal_id():
+    """A task without a title falls back to a human label, not #<id>."""
+    task = SimpleNamespace(id=42, title=None, due_at=None)
+    text = cards.todo_overview_card({"tasks": [task]}, "zh")
+    assert "#42" not in text
+    assert "🛠 事项" in text
 
 
 # --- approval / rejection callbacks -----------------------------------------
