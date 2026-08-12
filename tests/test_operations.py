@@ -412,6 +412,8 @@ def test_expense_approval_task_human_notification_with_actions(db_session, monke
     message = outbox.payload["message"]
     assert "待办提醒" in message
     assert "待批准支出 · repair" in message
+    assert "金额：₱5,000" in message
+    assert "金额：5000.00" not in message
     for banned in ("APPROVAL_PENDING", "REPAIR", f"#{expense.id}"):
         assert banned not in message
     kb = outbox.payload["reply_markup"]
@@ -427,6 +429,14 @@ def test_expense_approval_task_human_notification_with_actions(db_session, monke
     secondary = kb["inline_keyboard"][1]
     assert secondary[0]["text"] == "查看详情"
     assert secondary[0]["callback_data"] == f"v1:exd:{expense.id}"
+
+
+def test_notification_money_formatting():
+    from app.services.operations.generation import _money
+    assert _money("5000") == "₱5,000"
+    assert _money("5000.50") == "₱5,000.50"
+    assert _money("0") == "₱0"
+    assert _money(None) == "₱0"
 
 
 def test_expense_notification_detail_button_shows_receipt_label(db_session, monkeypatch):

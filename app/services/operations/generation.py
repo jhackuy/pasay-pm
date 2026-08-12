@@ -48,6 +48,20 @@ from app.services.operations.reconcile import auto_transition
 BUSINESS_SOURCE_TYPES = frozenset({"lease", "expense", "commission_settlement"})
 
 
+def _money(value) -> str:
+    """3500.00 -> ₱3,500 ; 3500.50 -> ₱3,500.50 ; -500 -> -₱500."""
+    from decimal import Decimal
+    d = Decimal(str(value or 0)).quantize(Decimal("0.01"))
+    sign = "-" if d < 0 else ""
+    s = format(abs(d), "f")
+    if "." in s:
+        int_part, _, frac = s.partition(".")
+        s = int_part if frac == "00" else f"{int_part}.{frac}"
+    int_part, sep, frac = s.partition(".")
+    int_part = f"{int(int_part):,}"
+    return f"{sign}₱{int_part}" + (f".{frac}" if frac else "")
+
+
 def _notification_message(task: OperationalTask) -> str:
     """Humanized proactive notification (V1.3): '待办提醒' + human title +
     amount/period/due. No task_type enum values, no internal #ids."""
@@ -55,7 +69,7 @@ def _notification_message(task: OperationalTask) -> str:
     lines = ["🔔 待办提醒", task.title]
     amount = details.get("amount") or details.get("total_outstanding")
     if amount is not None:
-        lines.append(f"金额：{amount}")
+        lines.append(f"金额：{_money(amount)}")
     period = details.get("period") or details.get("periods")
     if period:
         if isinstance(period, list):
