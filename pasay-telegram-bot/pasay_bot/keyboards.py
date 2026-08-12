@@ -646,16 +646,23 @@ def rent_match_keyboard(
 
 
 def confirm_income_keyboard(
-    income_id: int, nonce: str, ts: int, can_reverse: bool, locale: str = "zh"
+    income_id: int,
+    nonce: str,
+    ts: int,
+    can_reverse: bool,
+    locale: str = "zh",
+    show_confirm: bool = True,
 ) -> InlineKeyboardMarkup:
-    kb = [
-        [
-            InlineKeyboardButton(
-                t("rent.confirm", locale),
-                callback_data=encode(ACTION_CONFIRM, "inc", str(income_id), nonce=nonce, ts=ts),
-            )
-        ]
-    ]
+    kb = []
+    if show_confirm:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("rent.confirm", locale),
+                    callback_data=encode(ACTION_CONFIRM, "inc", str(income_id), nonce=nonce, ts=ts),
+                )
+            ]
+        )
     if can_reverse:
         kb.append(
             [

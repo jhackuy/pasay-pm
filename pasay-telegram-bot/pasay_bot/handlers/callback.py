@@ -1054,7 +1054,12 @@ async def _render_done_card(update, context, income, payload, role, locale):
     keyboard = None
     if _can_reverse(context, role):
         keyboard = confirm_income_keyboard(
-            income.id, new_nonce(), now_ts(), can_reverse=True, locale=locale
+            income.id,
+            new_nonce(),
+            now_ts(),
+            can_reverse=True,
+            locale=locale,
+            show_confirm=False,
         )
     await _edit(update, text, keyboard)
 
@@ -1086,7 +1091,14 @@ async def _render_income_state(update, context, income: Income, role, locale):
             income_id=income.id,
         )
         keyboard = (
-            confirm_income_keyboard(income.id, new_nonce(), now_ts(), can_reverse=True, locale=locale)
+            confirm_income_keyboard(
+                income.id,
+                new_nonce(),
+                now_ts(),
+                can_reverse=True,
+                locale=locale,
+                show_confirm=False,
+            )
             if _can_reverse(context, role)
             else None
         )

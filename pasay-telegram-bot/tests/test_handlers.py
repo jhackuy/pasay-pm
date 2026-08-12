@@ -169,6 +169,11 @@ def test_rent_confirm(make_app):
     assert inc["description"] == f"rent {date.today().strftime('%Y-%m')}"
     assert env.bot.last_answer()["text"] == "✅ 已入账"
     assert "收租成功" in env.bot.edits()[-1]["text"]
+    assert "编号" not in env.bot.edits()[-1]["text"]  # no income_id on the user-facing card
+    kb = env.bot.edits()[-1]["reply_markup"]
+    labels = [b.text for row in kb.inline_keyboard for b in row] if kb else []
+    assert "✅ 确认入账" not in labels  # no stale confirm button after confirmation
+    assert "↩️ 撤销" in labels
     # conversation is retained (15-min TTL) so a second click can replay
     conv = env.store.get_conversation(OWNER_ID, OWNER_ID)
     assert conv is not None and conv["state"] == "rent_confirm"
@@ -267,6 +272,10 @@ def test_double_confirm_backend_409_path(make_app):
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
     assert env.bot.last_answer()["text"] == "✅ 已处理"
     assert "收租成功" in env.bot.edits()[-1]["text"]
+    assert "编号" not in env.bot.edits()[-1]["text"]
+    kb = env.bot.edits()[-1]["reply_markup"]
+    labels = [b.text for row in kb.inline_keyboard for b in row] if kb else []
+    assert "✅ 确认入账" not in labels
 
 
 def test_expired_callback(make_app):
