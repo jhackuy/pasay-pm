@@ -589,6 +589,7 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
                 "payee": e.payee,
                 "amount": e.amount,
                 "location": _expense_location(e, units, properties),
+                "has_receipt": bool(e.receipt_attachment_id),
             }
             for e in pending_expenses
         ]

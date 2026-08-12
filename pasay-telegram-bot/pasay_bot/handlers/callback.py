@@ -793,7 +793,9 @@ async def _render_expense_state(update, context, expense, locale):
     location = await _expense_location(update, context, expense)
     if (expense.status or "").lower() == "pending":
         text = cards.expense_approval_card(expense, locale, location=location)
-        kb = expense_approval_keyboard(expense.id, locale)
+        kb = expense_approval_keyboard(
+            expense.id, locale, has_receipt=bool(expense.receipt_attachment_id)
+        )
     else:
         text = cards.expense_result_card(expense, locale)
         kb = expense_result_keyboard(locale)

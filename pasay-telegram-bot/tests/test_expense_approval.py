@@ -17,7 +17,14 @@ from conftest import (
 from telegram.error import BadRequest
 
 from pasay_bot.api_client import Expense
-from pasay_bot.keyboards import decode, encode, new_nonce, now_ts, reply_keyboard
+from pasay_bot.keyboards import (
+    decode,
+    encode,
+    expense_approval_keyboard,
+    new_nonce,
+    now_ts,
+    reply_keyboard,
+)
 from pasay_bot.render import cards
 from pasay_bot.roles import Role
 
@@ -263,3 +270,40 @@ def test_todo_page_human_readable_no_internal_enums(make_app):
     actions = [decode(b.callback_data)["action"] for b in _buttons(kb) if decode(b.callback_data)]
     assert "exa" in actions and "exr" in actions and "exd" in actions
     assert "tkc" in actions and "tkd" in actions
+
+
+def test_expense_approval_keyboard_secondary_label_depends_on_receipt():
+    """★ Secondary button says 📎 查看凭证 only when a receipt exists; without
+    one it says 查看详情. The callback data stays v1:exd:<id> either way."""
+    with_receipt = _buttons(expense_approval_keyboard(5, "zh", has_receipt=True))
+    labels = [b.text for b in with_receipt]
+    assert "📎 查看凭证" in labels
+    assert "查看详情" not in labels
+
+    without_receipt = _buttons(expense_approval_keyboard(5, "zh", has_receipt=False))
+    labels = [b.text for b in without_receipt]
+    assert "查看详情" in labels
+    assert "📎 查看凭证" not in labels
+
+    for kb in (with_receipt, without_receipt):
+        detail = [b for b in kb if decode(b.callback_data)["action"] == "exd"]
+        assert len(detail) == 1
+        assert detail[0].callback_data == "v1:exd:5"
+
+
+def test_todo_page_detail_button_label_depends_on_receipt(make_app):
+    """★ The /todo expense row labels the detail button 📎 查看凭证 with a
+    receipt attached and 查看详情 without one."""
+    env = make_app()
+    _seed_pending_expense(env, receipt=True)
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/todo", bot=env.bot)])
+    labels = [b.text for b in _buttons(env.bot.last_send()["reply_markup"])]
+    assert "📎 查看凭证" in labels
+    assert "查看详情" not in labels
+
+    env = make_app()
+    _seed_pending_expense(env, receipt=False)
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/todo", bot=env.bot)])
+    labels = [b.text for b in _buttons(env.bot.last_send()["reply_markup"])]
+    assert "查看详情" in labels
+    assert "📎 查看凭证" not in labels

@@ -422,6 +422,38 @@ def test_expense_approval_task_human_notification_with_actions(db_session, monke
     assert any(c.startswith("v1:exa:") for c in callbacks)
     assert any(c.startswith("v1:exr:") for c in callbacks)
     assert any(c == f"v1:exd:{expense.id}" for c in callbacks)
+    # no receipt attached -> generic 查看详情, never 查看凭证
+    secondary = kb["inline_keyboard"][1]
+    assert secondary[0]["text"] == "查看详情"
+    assert secondary[0]["callback_data"] == f"v1:exd:{expense.id}"
+
+
+def test_expense_notification_detail_button_shows_receipt_label(db_session, monkeypatch):
+    """V1.3: an expense WITH a receipt attachment gets the 📎 查看凭证 label on
+    its detail button; the callback data stays v1:exd:<id>."""
+    from app.services.operations import generation
+
+    admin = _user(db_session, "exp-owner-2", UserRole.admin, "tg-owner-2")
+    db_session.commit()
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", admin.id)
+    expense = Expense(
+        expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
+        payee="Fix-It Co", status=ExpenseStatus.pending,
+        created_at=NOW - timedelta(days=10),
+        receipt_attachment_id=99,
+    )
+    db_session.add(expense)
+    db_session.commit()
+
+    run_scheduler_once(db_session, now=NOW)
+    task = db_session.query(OperationalTask).filter_by(
+        task_type=OperationalTaskType.APPROVAL_PENDING
+    ).one()
+    outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    kb = outbox.payload["reply_markup"]
+    secondary = kb["inline_keyboard"][1]
+    assert secondary[0]["text"] == "📎 查看凭证"
+    assert secondary[0]["callback_data"] == f"v1:exd:{expense.id}"
 
 
 def test_worker_crash_after_claim_recovers_via_skip_locked(db_session, test_engine):

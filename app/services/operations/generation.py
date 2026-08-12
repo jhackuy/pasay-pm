@@ -66,21 +66,22 @@ def _notification_message(task: OperationalTask) -> str:
     return "\n".join(lines)
 
 
-def _expense_reply_markup(expense_id: int) -> dict:
+def _expense_reply_markup(expense_id: int, has_receipt: bool) -> dict:
     """Inline keyboard dict for an expense notification (V1.3): approve/reject
     callbacks use the bot's v1:exa/exr:<id>:<nonce>:<ts> slot layout (the
     middle ref slot stays empty: v1:exa:<id>::<nonce>:<ts> so the bot's fixed
     decoder parses nonce/ts correctly); the detail button is a plain
-    v1:exd:<id>."""
+    v1:exd:<id> and its label depends on whether a real receipt exists."""
     nonce = secrets.token_hex(4)
     ts = int(_time.time())
+    detail_label = "📎 查看凭证" if has_receipt else "查看详情"
     return {
         "inline_keyboard": [
             [
                 {"text": "✅ 批准", "callback_data": f"v1:exa:{expense_id}::{nonce}:{ts}"},
                 {"text": "❌ 拒绝", "callback_data": f"v1:exr:{expense_id}::{nonce}:{ts}"},
             ],
-            [{"text": "📎 查看凭证", "callback_data": f"v1:exd:{expense_id}"}],
+            [{"text": detail_label, "callback_data": f"v1:exd:{expense_id}"}],
         ]
     }
 
@@ -401,7 +402,9 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "payee": expense.payee,
                 },
             },
-            reply_markup=_expense_reply_markup(expense.id),
+            reply_markup=_expense_reply_markup(
+                expense.id, has_receipt=bool(expense.receipt_attachment_id)
+            ),
         )
         if task is not None:
             created += 1
@@ -438,7 +441,9 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "payee": expense.payee,
                 },
             },
-            reply_markup=_expense_reply_markup(expense.id),
+            reply_markup=_expense_reply_markup(
+                expense.id, has_receipt=bool(expense.receipt_attachment_id)
+            ),
         )
         if task is not None:
             created += 1

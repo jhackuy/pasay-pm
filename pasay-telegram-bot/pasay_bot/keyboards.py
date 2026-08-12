@@ -1016,8 +1016,10 @@ def ops_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 # --- V1.3 Slice 1: expense approval action cards ---------------------------
 
-def expense_approval_keyboard(expense_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
-    """Expense approval card: [✅ 批准][❌ 拒绝] + secondary [📎 查看凭证/详情]."""
+def expense_approval_keyboard(
+    expense_id: int, locale: str = "zh", has_receipt: bool = False
+) -> InlineKeyboardMarkup:
+    """Expense approval card: [✅ 批准][❌ 拒绝] + secondary [查看凭证/详情]."""
     nonce, ts = new_nonce(), now_ts()
     return InlineKeyboardMarkup(
         [
@@ -1037,7 +1039,9 @@ def expense_approval_keyboard(expense_id: int, locale: str = "zh") -> InlineKeyb
             ],
             [
                 InlineKeyboardButton(
-                    t("expense.view_receipt", locale),
+                    t("expense.view_receipt", locale)
+                    if has_receipt
+                    else t("expense.view_detail", locale),
                     callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
                 ),
                 InlineKeyboardButton(
@@ -1116,7 +1120,9 @@ def todo_keyboard(
                     ),
                 ),
                 InlineKeyboardButton(
-                    t("expense.view_receipt", locale),
+                    t("expense.view_receipt", locale)
+                    if row.get("has_receipt")
+                    else t("expense.view_detail", locale),
                     callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
                 ),
             ]
