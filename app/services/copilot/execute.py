@@ -43,9 +43,9 @@ from app.models.operations import (
 )
 from app.models.property import Unit
 from app.models.user import User, UserRole
-from app.models.identity import Principal, PrincipalType
 from app.schemas.copilot import CopilotExecuteResult
-from app.services.audit import audit_context, record_audit, serialize_row
+from app.services.audit import record_audit, serialize_row
+from app.services.identity import eligible_human
 from app.services.operations import copilot as copilot_svc
 from app.services.operations import generation
 from app.services.operations.config import NOTIFY_CHANNEL_TELEGRAM
@@ -111,7 +111,7 @@ def execute_proposal(
             copilot_svc.ERR_PROPOSAL_EXPIRED, "proposal has expired",
         )
 
-    _revalidate_for_execute(db, actor=actor, proposal=proposal, now=now)
+    subject = _revalidate_for_execute(db, actor=actor, proposal=proposal, now=now)
 
     record_audit(
         db,
@@ -136,7 +136,7 @@ def execute_proposal(
             executed_at=now,
             updated_at=now,
             updated_by=actor.id,
-            executed_principal_id=audit_context.get()[0],
+            executed_principal_id=subject.id if subject is not None else None,
         ),
         execution_options={"synchronize_session": False},
     )
@@ -146,6 +146,7 @@ def execute_proposal(
         )
     proposal.status = CopilotActionStatus.EXECUTED
     proposal.executed_at = now
+    proposal.executed_principal_id = subject.id if subject is not None else None
     record_audit(
         db,
         table_name="copilot_action_proposals",
@@ -222,12 +223,12 @@ def execution_result(
 
 def _revalidate_for_execute(
     db: Session, *, actor: User, proposal: CopilotActionProposal, now: datetime
-) -> None:
+):
     def _reject(error_code: str, reason: str) -> None:
         _reject_audit(db, actor, proposal, error_code, reason)
 
     # 1) actor still exists, active, and holds manager/admin
-    actor_row = db.get(User, actor.id)
+    actor_row = copilot_svc._fresh_user(db, actor.id)
     if actor_row is None:
         _reject(copilot_svc.ERR_ACTOR_NOT_FOUND, "actor user no longer exists")
     if not actor_row.is_active:
@@ -237,10 +238,15 @@ def _revalidate_for_execute(
                 "actor no longer has permission to execute proposals")
     if proposal.actor_user_id != actor_row.id:
         _reject(copilot_svc.ERR_ACTOR_PERMISSION, "actor does not own this proposal")
-    origin = db.get(Principal, proposal.proposed_principal_id) if proposal.proposed_principal_id else None
-    if (origin is not None and origin.principal_type == PrincipalType.HUMAN
-            and audit_context.get()[0] != origin.id):
-        _reject(copilot_svc.ERR_ACTOR_PERMISSION, "human proposal subject changed before execute")
+    try:
+        subject = copilot_svc._validate_proposal_principals(
+            db,
+            actor=actor_row,
+            proposal=proposal,
+            require_confirmed_subject=True,
+        )
+    except copilot_svc._PrincipalValidationError as exc:
+        _reject(exc.error_code, str(exc))
 
     # 2) EXACT executable allowlist + target allowlist (current constants)
     action_type = copilot_svc.canonicalize(proposal.action_type)
@@ -288,6 +294,7 @@ def _revalidate_for_execute(
         _validate_action_specific(db, action_type, proposal.payload_json, now=now)
     except _ActionValidationError as exc:
         _reject(exc.error_code, str(exc))
+    return subject
 
 
 def _validate_action_specific(
@@ -310,7 +317,7 @@ def _validate_action_specific(
 def _require_assignee(db: Session, user_id: int) -> User:
     user = db.get(User, user_id)
     eligible = {UserRole.agent, UserRole.manager, UserRole.admin}
-    if user is None or not user.is_active or user.role not in eligible:
+    if user is None or not eligible_human(user) or user.role not in eligible:
         raise _ActionValidationError(
             copilot_svc.ERR_ASSIGNEE_INVALID,
             f"assignee user {user_id} is not an active, eligible assignee",

@@ -57,6 +57,10 @@ def db_session(test_engine):
         db.add(ApiCredential(principal_id=principal.id,
             key_hash=hash_api_key(f"pasay-v13-internal-record:{name}"),
             purpose=f"internal:{name}", state=CredentialState.ACTIVE))
+    db.add_all([
+        Principal(name="lily", principal_type=PrincipalType.AI_AGENT),
+        Principal(name="hermes", principal_type=PrincipalType.AI_AGENT),
+    ])
     db.commit()
     try:
         yield db
@@ -79,6 +83,21 @@ def make_user(db, username, role, active=True):
     key = secrets.token_urlsafe(24)
     user = User(username=username, role=role, api_key_hash=hash_api_key(key), is_active=active)
     db.add(user)
+    db.flush()
+    principal = Principal(
+        name=username,
+        principal_type=PrincipalType.HUMAN,
+        user_id=user.id,
+        is_active=active,
+    )
+    db.add(principal)
+    db.flush()
+    db.add(ApiCredential(
+        principal_id=principal.id,
+        key_hash=hash_api_key(key),
+        purpose="legacy_human",
+        state=CredentialState.ACTIVE,
+    ))
     db.commit()
     db.refresh(user)
     return user, key

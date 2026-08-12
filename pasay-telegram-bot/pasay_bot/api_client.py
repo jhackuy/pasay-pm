@@ -14,6 +14,8 @@ from contextvars import ContextVar
 
 import httpx
 
+MAX_TELEGRAM_USER_ID = 2**63 - 1
+
 
 def _to_decimal(value: Any) -> Decimal:
     if isinstance(value, Decimal):
@@ -600,9 +602,18 @@ class PasayApiClient:
 
     def bind_telegram_user(self, effective_user_id: int) -> None:
         """Bind authentication to effective_user.id for the current async task."""
-        if not isinstance(effective_user_id, int) or effective_user_id <= 0:
+        if (
+            isinstance(effective_user_id, bool)
+            or not isinstance(effective_user_id, int)
+            or effective_user_id <= 0
+            or effective_user_id > MAX_TELEGRAM_USER_ID
+        ):
             raise ValueError("effective_user.id must be a positive integer")
         self._telegram_user_id.set(effective_user_id)
+
+    def clear_telegram_user(self) -> None:
+        """Clear any identity inherited from an earlier sequential update."""
+        self._telegram_user_id.set(None)
 
     # --- read endpoints ---
     async def get_properties(self) -> list[Property]:

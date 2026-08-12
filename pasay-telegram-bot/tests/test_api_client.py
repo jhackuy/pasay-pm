@@ -155,3 +155,30 @@ def test_unknown_status_error_is_pasay_api_error():
             run(client.get_properties())
     finally:
         run(client.aclose())
+
+
+def test_telegram_identity_binding_is_positive_bounded_and_task_local():
+    captured = []
+
+    async def handler(request):
+        captured.append(request.headers.get("x-telegram-user-id"))
+        return httpx.Response(200, json=[])
+
+    client = make_client(handler)
+
+    async def request_as(user_id):
+        client.bind_telegram_user(user_id)
+        await asyncio.sleep(0)
+        await client.get_properties()
+
+    async def scenario():
+        await asyncio.gather(request_as(111), request_as(222))
+
+    try:
+        run(scenario())
+        assert sorted(captured) == ["111", "222"]
+        for invalid in (True, 0, -1, 2**63):
+            with pytest.raises(ValueError):
+                client.bind_telegram_user(invalid)
+    finally:
+        run(client.aclose())

@@ -24,12 +24,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.operations import OperationalTask, OperationalTaskStatus
 from app.models.property import Unit
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
+from app.services.identity import eligible_human
 from app.services.operations import copilot as copilot_svc
 from app.services.operations.config import SECRETARY_ASSIGNEE_ID
 
@@ -84,14 +86,19 @@ def resolve_assignee(db: Session, *, preferred_user_id: int | None = None) -> Us
     """
     if preferred_user_id is not None:
         user = db.get(User, preferred_user_id)
-        if user is None or not user.is_active or user.role.value not in ASSIGNEE_ROLES:
+        if user is None or not eligible_human(user) or user.role.value not in ASSIGNEE_ROLES:
             raise copilot_svc.ProposalValidationError(
                 f"assignee user {preferred_user_id} is not an active, eligible assignee"
             )
         return user
     candidates = (
         db.query(User)
-        .filter(User.is_active.is_(True), User.role == UserRole.agent)
+        .filter(
+            User.is_active.is_(True),
+            User.role == UserRole.agent,
+            User.id != 14,
+            func.lower(User.username) != "maria",
+        )
         .order_by(User.id)
         .all()
     )
@@ -107,9 +114,8 @@ def resolve_assignee(db: Session, *, preferred_user_id: int | None = None) -> Us
         sec = db.get(User, SECRETARY_ASSIGNEE_ID)
         if (
             sec is not None
-            and sec.is_active
+            and eligible_human(sec)
             and sec.role.value in ASSIGNEE_ROLES
-            and sec.username.casefold() != "maria"
         ):
             return sec
     raise ProposalNeedsClarification("no eligible assignee candidate available")

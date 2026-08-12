@@ -111,6 +111,7 @@ class FakeBackend:
     def __init__(self):
         self.calls: list[tuple[str, str, Optional[dict]]] = []
         self.auth_calls: list[str] = []
+        self.telegram_user_calls: list[Optional[str]] = []
         self.properties = [
             {"id": 1, "name": "Pasay Premier Residences", "address": "5 Roxas Blvd",
              "city": "Pasay", "total_units": 2, "is_active": True},
@@ -229,6 +230,7 @@ class FakeBackend:
                 body = None
         self.calls.append((method, path, body))
         self.auth_calls.append(request.headers.get("authorization") or "")
+        self.telegram_user_calls.append(request.headers.get("x-telegram-user-id"))
 
         if path in self.fail_status:
             return httpx.Response(self.fail_status[path], json={"detail": f"forced {self.fail_status[path]}"})

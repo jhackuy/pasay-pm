@@ -6,8 +6,12 @@ from app.core.security import hash_api_key
 from app.database import get_db
 from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.user import User, UserRole
-from app.services.audit import audit_context
-from app.services.identity import eligible_human, resolve_telegram_human
+from app.services.audit import set_audit_context
+from app.services.identity import (
+    eligible_human,
+    normalize_telegram_user_id,
+    resolve_telegram_human,
+)
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
@@ -17,6 +21,9 @@ def get_current_user(
     x_telegram_user_id: str | None = Header(default=None, alias="X-Telegram-User-Id"),
     db: Session = Depends(get_db),
 ) -> User:
+    # A failed request must not leave provenance from an earlier request in a
+    # recycled async context.
+    set_audit_context(db, (None, None, None, None))
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -32,13 +39,17 @@ def get_current_user(
         if credential.state != CredentialState.ACTIVE or credential.revoked_at is not None or not caller.is_active:
             raise HTTPException(status_code=401, detail="Revoked or inactive credential")
         if caller.principal_type == PrincipalType.SERVICE:
-            if credential.purpose != "telegram_bot" or x_telegram_user_id is None:
+            if caller.name != "native-bot" or credential.purpose != "telegram_bot" or x_telegram_user_id is None:
                 raise HTTPException(status_code=401, detail="Telegram Bot credential requires its purpose and X-Telegram-User-Id")
             try:
-                user, subject = resolve_telegram_human(db, int(x_telegram_user_id))
-            except (ValueError, LookupError) as exc:
+                user, subject = resolve_telegram_human(
+                    db, normalize_telegram_user_id(x_telegram_user_id)
+                )
+            except LookupError as exc:
                 raise HTTPException(status_code=401, detail=str(exc)) from exc
-            audit_context.set((subject.id, caller.id, credential.id, "telegram"))
+            set_audit_context(
+                db, (subject.id, caller.id, credential.id, "telegram")
+            )
             return user
         if caller.principal_type == PrincipalType.HUMAN:
             if x_telegram_user_id is not None:
@@ -48,7 +59,7 @@ def get_current_user(
             user = db.get(User, caller.user_id)
             if user is None or not user.is_active or not eligible_human(user):
                 raise HTTPException(status_code=401, detail="Ineligible human identity")
-            audit_context.set((caller.id, caller.id, credential.id, "api"))
+            set_audit_context(db, (caller.id, caller.id, credential.id, "api"))
             return user
         raise HTTPException(status_code=401, detail="Credential principal cannot authenticate a human endpoint")
     user = (
@@ -62,10 +73,30 @@ def get_current_user(
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # Compatibility read path for canonical human keys only.
-    principal = db.query(Principal).filter(Principal.user_id == user.id,
-        Principal.principal_type == PrincipalType.HUMAN).one_or_none()
-    audit_context.set((principal.id if principal else None, principal.id if principal else None, None, "api"))
+    if x_telegram_user_id is not None:
+        raise HTTPException(status_code=401, detail="Human credentials cannot delegate a Telegram subject")
+    # Compatibility read path for canonical HUMAN key hashes. The V1.3
+    # migration creates the principal; a missing, inactive, or ambiguous
+    # canonical principal is not a valid human identity.
+    principals = db.query(Principal).filter(
+        Principal.user_id == user.id,
+        Principal.principal_type == PrincipalType.HUMAN,
+    ).all()
+    if len(principals) != 1 or not principals[0].is_active:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing, inactive, or ambiguous human principal",
+        )
+    principal = principals[0]
+    set_audit_context(
+        db,
+        (
+            principal.id,
+            principal.id,
+            None,
+            "api",
+        ),
+    )
     return user
 
 

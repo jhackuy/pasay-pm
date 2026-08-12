@@ -58,10 +58,16 @@ TASK_WINDOW_DAYS = 7
 
 
 def _bind_identity(update, context):
+    api = context.bot_data["api_client"]
+    admin = context.bot_data.get("admin_api_client")
+    # Clear first so even a malformed update cannot inherit the previous
+    # sequential update's identity in the same asyncio task.
+    api.clear_telegram_user()
+    if admin is not None:
+        admin.clear_telegram_user()
     if update.effective_user is None:
         raise ValueError("Telegram update has no effective_user")
-    context.bot_data["api_client"].bind_telegram_user(update.effective_user.id)
-    admin = context.bot_data.get("admin_api_client")
+    api.bind_telegram_user(update.effective_user.id)
     if admin is not None:
         admin.bind_telegram_user(update.effective_user.id)
 

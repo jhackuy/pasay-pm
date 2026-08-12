@@ -77,7 +77,7 @@ from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.models.identity import Principal, PrincipalType
 from app.config import settings
-from app.services.audit import audit_context, record_audit, serialize_row
+from app.services.audit import current_audit_context, record_audit, serialize_row
 from app.services.operations.config import LEASE_EXPIRY_WINDOW_DAYS
 from app.services.operations.rent_math import covered_periods, lease_periods
 from app.services.operations.summary import build_operations_summary
@@ -155,6 +155,9 @@ def canonicalize(value: str) -> str:
 ERR_ACTOR_NOT_FOUND = "actor_not_found"
 ERR_ACTOR_INACTIVE = "actor_inactive"
 ERR_ACTOR_PERMISSION = "actor_permission"
+ERR_PRINCIPAL_INACTIVE = "principal_inactive"
+ERR_SUBJECT_CONTINUITY = "subject_continuity"
+ERR_PROPOSER_INACTIVE = "proposer_inactive"
 ERR_PROPOSAL_STATE = "proposal_state"
 ERR_PROPOSAL_EXPIRED = "proposal_expired"
 ERR_TARGET_TYPE_UNKNOWN = "target_type_unknown"
@@ -653,6 +656,161 @@ def _money(value) -> str:
 # Action proposals (no execution — Phase C)
 # ---------------------------------------------------------------------------
 
+COPILOT_PROPOSER_NAMES = frozenset({"lily", "hermes"})
+COPILOT_RUNTIME_PROPOSER = "lily"
+
+
+class _PrincipalValidationError(ValueError):
+    def __init__(self, error_code: str, message: str):
+        super().__init__(message)
+        self.error_code = error_code
+
+
+def _fresh_user(db: Session, user_id: int) -> User | None:
+    """Force a current database read instead of trusting the identity map."""
+    return (
+        db.query(User)
+        .execution_options(populate_existing=True)
+        .filter(User.id == user_id)
+        .one_or_none()
+    )
+
+
+def _current_human_subject(db: Session, actor: User) -> Principal | None:
+    """Validate the authenticated human subject against the canonical actor.
+
+    Every transition requires the exact active canonical HUMAN principal bound
+    by authentication. Direct pre-auth service tests may have no principal and
+    no request channel; an authenticated request never receives that escape
+    hatch.
+    """
+    principals = (
+        db.query(Principal)
+        .execution_options(populate_existing=True)
+        .filter(
+            Principal.user_id == actor.id,
+            Principal.principal_type == PrincipalType.HUMAN,
+        )
+        .all()
+    )
+    subject_id, _caller_id, _credential_id, channel = current_audit_context(db)
+    if not principals:
+        if subject_id is None and channel is None:
+            return None
+        raise _PrincipalValidationError(
+            ERR_SUBJECT_CONTINUITY,
+            "authenticated subject is not the actor's canonical HUMAN principal",
+        )
+    if len(principals) != 1:
+        raise _PrincipalValidationError(
+            ERR_SUBJECT_CONTINUITY,
+            "actor does not have exactly one canonical HUMAN principal",
+        )
+    principal = principals[0]
+    if not principal.is_active:
+        raise _PrincipalValidationError(
+            ERR_PRINCIPAL_INACTIVE,
+            "actor's canonical HUMAN principal is inactive",
+        )
+    if subject_id != principal.id:
+        raise _PrincipalValidationError(
+            ERR_SUBJECT_CONTINUITY,
+            "authenticated HUMAN subject changed during the proposal lifecycle",
+        )
+    return principal
+
+
+def _active_runtime_proposer(db: Session) -> Principal:
+    proposer = (
+        db.query(Principal)
+        .execution_options(populate_existing=True)
+        .filter(
+            Principal.name == COPILOT_RUNTIME_PROPOSER,
+            Principal.principal_type == PrincipalType.AI_AGENT,
+        )
+        .one_or_none()
+    )
+    if proposer is None or not proposer.is_active:
+        raise _PrincipalValidationError(
+            ERR_PROPOSER_INACTIVE,
+            f"active AI proposer {COPILOT_RUNTIME_PROPOSER!r} is unavailable",
+        )
+    return proposer
+
+
+def _validate_proposal_principals(
+    db: Session,
+    *,
+    actor: User,
+    proposal: CopilotActionProposal,
+    require_confirmed_subject: bool,
+) -> Principal | None:
+    """Revalidate current human continuity and stored AI/human attribution."""
+    subject = _current_human_subject(db, actor)
+    if proposal.proposed_principal_id is not None:
+        origin = (
+            db.query(Principal)
+            .execution_options(populate_existing=True)
+            .filter(Principal.id == proposal.proposed_principal_id)
+            .one_or_none()
+        )
+        if origin is None or not origin.is_active:
+            raise _PrincipalValidationError(
+                ERR_PROPOSER_INACTIVE,
+                "proposal origin principal is missing or inactive",
+            )
+        if origin.principal_type == PrincipalType.AI_AGENT:
+            if origin.name.casefold() not in COPILOT_PROPOSER_NAMES:
+                raise _PrincipalValidationError(
+                    ERR_SUBJECT_CONTINUITY,
+                    "proposal origin is not an approved Copilot AI principal",
+                )
+        elif origin.principal_type == PrincipalType.HUMAN:
+            # Compatibility for proposals created by the initial Gate A
+            # dual-read implementation before AI attribution was separated.
+            if subject is None or origin.id != subject.id:
+                raise _PrincipalValidationError(
+                    ERR_SUBJECT_CONTINUITY,
+                    "historical human proposal subject changed",
+                )
+        else:
+            raise _PrincipalValidationError(
+                ERR_SUBJECT_CONTINUITY,
+                "SERVICE or SYSTEM principals cannot be Copilot proposers",
+            )
+    if (
+        require_confirmed_subject
+        and proposal.confirmed_principal_id is None
+        and subject is not None
+    ):
+        raise _PrincipalValidationError(
+            ERR_SUBJECT_CONTINUITY,
+            "confirmed proposal has no HUMAN confirmation subject",
+        )
+    if require_confirmed_subject and proposal.confirmed_principal_id is not None:
+        confirmed = (
+            db.query(Principal)
+            .execution_options(populate_existing=True)
+            .filter(Principal.id == proposal.confirmed_principal_id)
+            .one_or_none()
+        )
+        if confirmed is None or not confirmed.is_active:
+            raise _PrincipalValidationError(
+                ERR_PRINCIPAL_INACTIVE,
+                "confirming HUMAN principal is missing or inactive",
+            )
+        if (
+            confirmed.principal_type != PrincipalType.HUMAN
+            or confirmed.user_id != actor.id
+            or subject is None
+            or confirmed.id != subject.id
+        ):
+            raise _PrincipalValidationError(
+                ERR_SUBJECT_CONTINUITY,
+                "human subject changed between confirm and execute",
+            )
+    return subject
+
 def create_proposal(
     db: Session,
     *,
@@ -677,6 +835,18 @@ def create_proposal(
     confusable variants cannot bypass the allowlists or split a key.
     """
     now = now or datetime.now(timezone.utc)
+    actor_row = _fresh_user(db, actor.id)
+    if actor_row is None:
+        raise ProposalValidationError("actor user no longer exists")
+    if not actor_row.is_active:
+        raise ProposalValidationError("actor user is deactivated")
+    if actor_row.role not in (UserRole.manager, UserRole.admin):
+        raise ProposalValidationError("actor does not have permission to create proposals")
+    try:
+        _current_human_subject(db, actor_row)
+        proposer = _active_runtime_proposer(db)
+    except _PrincipalValidationError as exc:
+        raise ProposalValidationError(str(exc)) from exc
     action_type = canonicalize(action_type)
     target_type = canonicalize(target_type)
     idempotency_key = canonicalize(idempotency_key)
@@ -693,7 +863,7 @@ def create_proposal(
     stmt = (
         pg_insert(CopilotActionProposal)
         .values(
-            actor_user_id=actor.id,
+            actor_user_id=actor_row.id,
             action_type=action_type,
             target_type=target_type,
             target_id=target_id,
@@ -701,9 +871,9 @@ def create_proposal(
             status=CopilotActionStatus.PENDING.value,
             idempotency_key=idempotency_key,
             expires_at=expires_at,
-            created_by=actor.id,
-            updated_by=actor.id,
-            proposed_principal_id=audit_context.get()[0],
+            created_by=actor_row.id,
+            updated_by=actor_row.id,
+            proposed_principal_id=proposer.id,
         )
         .on_conflict_do_nothing(index_elements=["actor_user_id", "idempotency_key"])
         .returning(CopilotActionProposal.id)
@@ -716,14 +886,14 @@ def create_proposal(
             table_name="copilot_action_proposals",
             record_id=proposal.id,
             action="copilot_proposal_created",
-            actor_id=actor.id,
+            actor_id=actor_row.id,
             new_value=serialize_row(proposal),
         )
         return proposal, True
     proposal = (
         db.query(CopilotActionProposal)
         .filter(
-            CopilotActionProposal.actor_user_id == actor.id,
+                CopilotActionProposal.actor_user_id == actor_row.id,
             CopilotActionProposal.idempotency_key == idempotency_key,
         )
         .one()
@@ -901,7 +1071,7 @@ def _resolve_target(db: Session, target_type: str, target_id: int):
 
 def _revalidate_proposal_for_confirm(
     db: Session, *, actor: User, proposal: CopilotActionProposal
-) -> None:
+) -> Principal | None:
     """FAIL-CLOSED revalidation of a PENDING proposal at confirm time.
 
     Runs inside the caller's single DB transaction against CURRENT state
@@ -922,7 +1092,7 @@ def _revalidate_proposal_for_confirm(
         raise ProposalConfirmRejectedError(error_code, reason)
 
     # 1) actor still exists and is active
-    actor_row = db.get(User, actor.id)
+    actor_row = _fresh_user(db, actor.id)
     if actor_row is None:
         _reject(ERR_ACTOR_NOT_FOUND, "actor user no longer exists")
     if not actor_row.is_active:
@@ -933,6 +1103,16 @@ def _revalidate_proposal_for_confirm(
         _reject(ERR_ACTOR_PERMISSION, "actor no longer has permission to confirm proposals")
     if proposal.actor_user_id != actor_row.id:
         _reject(ERR_ACTOR_PERMISSION, "actor does not own this proposal")
+
+    try:
+        subject = _validate_proposal_principals(
+            db,
+            actor=actor_row,
+            proposal=proposal,
+            require_confirmed_subject=False,
+        )
+    except _PrincipalValidationError as exc:
+        _reject(exc.error_code, str(exc))
 
     # 3) action x target allowlists (revalidated against CURRENT constants)
     action_type = canonicalize(proposal.action_type)
@@ -974,6 +1154,7 @@ def _revalidate_proposal_for_confirm(
     stale = _business_stale_reason(target_type, target)
     if stale is not None:
         _reject(ERR_BUSINESS_STALE, stale)
+    return subject
 
 
 def _target_in_actor_scope(actor: User, target_type: str, target) -> bool:
@@ -1088,11 +1269,7 @@ def confirm_proposal(
             },
         )
         raise ProposalExpiredError("proposal has expired")
-    _revalidate_proposal_for_confirm(db, actor=actor, proposal=proposal)
-    origin = db.get(Principal, proposal.proposed_principal_id) if proposal.proposed_principal_id else None
-    current_subject = audit_context.get()[0]
-    if origin is not None and origin.principal_type == PrincipalType.HUMAN and current_subject != origin.id:
-        raise ProposalConfirmRejectedError(ERR_ACTOR_PERMISSION, "human proposal subject changed before confirm")
+    subject = _revalidate_proposal_for_confirm(db, actor=actor, proposal=proposal)
 
     old = serialize_row(proposal)
     result = db.execute(
@@ -1106,7 +1283,7 @@ def confirm_proposal(
             confirmed_at=now,
             updated_at=now,
             updated_by=actor.id,
-            confirmed_principal_id=audit_context.get()[0],
+            confirmed_principal_id=subject.id if subject is not None else None,
         ),
         execution_options={"synchronize_session": False},
     )
@@ -1119,6 +1296,7 @@ def confirm_proposal(
     proposal.status = CopilotActionStatus.CONFIRMED
     proposal.confirmed_at = now
     proposal.updated_at = now
+    proposal.confirmed_principal_id = subject.id if subject is not None else None
     record_audit(
         db,
         table_name="copilot_action_proposals",

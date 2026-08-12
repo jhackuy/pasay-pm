@@ -17,6 +17,7 @@ import secrets
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -39,6 +40,7 @@ from app.models.commission import (
 )
 from app.models.copilot import CopilotActionProposal, CopilotRun
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
+from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.lease import Lease, LeaseStatus
 from app.models.operations import (
     NotificationOutbox,
@@ -51,6 +53,7 @@ from app.models.property import Property, Unit, UnitStatus
 from app.models.task import Task
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
+from app.services.audit import set_audit_context
 from app.services.operations.copilot import (
     CONTEXT_SCHEMA_VERSION,
     COPILOT_EXECUTION_ENABLED,
@@ -98,6 +101,20 @@ def _user_with_key(db, username, role):
         is_active=True,
     )
     db.add(user)
+    db.flush()
+    principal = Principal(
+        name=username,
+        principal_type=PrincipalType.HUMAN,
+        user_id=user.id,
+    )
+    db.add(principal)
+    db.flush()
+    db.add(ApiCredential(
+        principal_id=principal.id,
+        key_hash=hash_api_key(key),
+        purpose="legacy_human",
+        state=CredentialState.ACTIVE,
+    ))
     db.commit()
     db.refresh(user)
     return user, key
@@ -983,7 +1000,9 @@ def test_alembic_migration_upgrade_downgrade_copilot(monkeypatch, test_engine):
         settings, "database_url", scratch_url.render_as_string(hide_password=False)
     )
 
-    cfg = Config("alembic.ini")
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "alembic"))
     try:
         command.upgrade(cfg, "head")
         engine = create_engine(scratch_url)
@@ -1084,8 +1103,38 @@ def _confirm_rejected_code(resp) -> str:
     return body["detail"]["error_code"]
 
 
+def _bind_actor_subject(db_session, actor):
+    principal = db_session.query(Principal).filter_by(
+        user_id=actor.id,
+        principal_type=PrincipalType.HUMAN,
+    ).one_or_none()
+    if principal is None:
+        principal = Principal(
+            name=f"test-human-{actor.id}",
+            principal_type=PrincipalType.HUMAN,
+            user_id=actor.id,
+        )
+        db_session.add(principal)
+        db_session.flush()
+    credential = db_session.query(ApiCredential).filter_by(
+        principal_id=principal.id,
+        state=CredentialState.ACTIVE,
+    ).one_or_none()
+    set_audit_context(
+        db_session,
+        (
+            principal.id,
+            principal.id,
+            credential.id if credential is not None else None,
+            "api",
+        ),
+    )
+    return actor
+
+
 def _manager(db_session):
-    return db_session.query(User).filter_by(username="manager").one()
+    actor = db_session.query(User).filter_by(username="manager").one()
+    return _bind_actor_subject(db_session, actor)
 
 
 # ---------------------------------------------------------------------------
@@ -1683,6 +1732,7 @@ def test_executed_at_schema_supports_executed_invariant(db_session):
 
 def test_current_code_paths_never_set_executed_at(db_session):
     mgr = _user(db_session, "h-noexec", UserRole.manager)
+    _bind_actor_subject(db_session, mgr)
     task = _task(db_session, dedupe_key="h-noexec")
     db_session.commit()
 
@@ -1744,7 +1794,10 @@ def _scratch_migration_db(monkeypatch, name: str):
     monkeypatch.setattr(
         settings, "database_url", scratch_url.render_as_string(hide_password=False)
     )
-    return Config("alembic.ini"), _drop_scratch, scratch_url
+    repo_root = Path(__file__).resolve().parents[1]
+    config = Config(str(repo_root / "alembic.ini"))
+    config.set_main_option("script_location", str(repo_root / "alembic"))
+    return config, _drop_scratch, scratch_url
 
 
 def test_ab1_migration_up_and_down(monkeypatch, test_engine):

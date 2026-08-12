@@ -29,6 +29,8 @@ from app.models.commission import (
 )
 from app.models.copilot import CopilotActionProposal, CopilotActionStatus
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
+from app.models.audit_log import AuditLog
+from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.lease import Lease, LeaseStatus
 from app.models.operations import (
     NotificationOutbox,
@@ -52,6 +54,7 @@ from app.services.operations import proposals as copilot_proposals
 from app.services.operations.notifier import process_notifications_once
 from app.services.operations.redelivery import redeliver_due_snoozes
 from app.services.operations.scheduler import run_scheduler_once
+from app.services.audit import set_audit_context
 
 API = "/api/v1"
 NOW = datetime(2026, 8, 11, 4, 0, 0, tzinfo=timezone.utc)  # 12:00 Asia/Manila
@@ -90,6 +93,20 @@ def _user_with_key(db, username, role):
         is_active=True,
     )
     db.add(user)
+    db.flush()
+    principal = Principal(
+        name=username,
+        principal_type=PrincipalType.HUMAN,
+        user_id=user.id,
+    )
+    db.add(principal)
+    db.flush()
+    db.add(ApiCredential(
+        principal_id=principal.id,
+        key_hash=hash_api_key(key),
+        purpose="legacy_human",
+        state=CredentialState.ACTIVE,
+    ))
     db.commit()
     db.refresh(user)
     return user, key
@@ -99,8 +116,30 @@ def _headers(key):
     return {"Authorization": f"Bearer {key}"}
 
 
+def _bind_actor_subject(db, actor):
+    principal = db.query(Principal).filter_by(
+        user_id=actor.id,
+        principal_type=PrincipalType.HUMAN,
+    ).one()
+    active_credential = db.query(ApiCredential).filter_by(
+        principal_id=principal.id,
+        state=CredentialState.ACTIVE,
+    ).one_or_none()
+    set_audit_context(
+        db,
+        (
+            principal.id,
+            principal.id,
+            active_credential.id if active_credential is not None else None,
+            "api",
+        ),
+    )
+    return actor
+
+
 def _manager(db):
-    return db.query(User).filter_by(username="manager").one()
+    actor = db.query(User).filter_by(username="manager").one()
+    return _bind_actor_subject(db, actor)
 
 
 def _task(
@@ -158,8 +197,28 @@ def _seed_lease(db):
 def _make_proposal(db, *, actor_id, action_type="follow_up", target_type="task",
                    target_id=1, payload=None, idempotency_key=None, expires_at=None,
                    status="PENDING", confirmed_at=None, executed_at=None):
+    proposer = db.query(Principal).filter_by(
+        name="lily",
+        principal_type=PrincipalType.AI_AGENT,
+    ).one()
+    human_subject = db.query(Principal).filter_by(
+        user_id=actor_id,
+        principal_type=PrincipalType.HUMAN,
+    ).one_or_none()
+    has_confirmation = status in {"CONFIRMED", "EXECUTED"}
     proposal = CopilotActionProposal(
         actor_user_id=actor_id,
+        proposed_principal_id=proposer.id,
+        confirmed_principal_id=(
+            human_subject.id
+            if has_confirmation and human_subject is not None
+            else None
+        ),
+        executed_principal_id=(
+            human_subject.id
+            if status == "EXECUTED" and human_subject is not None
+            else None
+        ),
         action_type=action_type,
         target_type=target_type,
         target_id=target_id,
@@ -515,6 +574,7 @@ def test_parallel_execute_single_logical_effect(db_session, test_engine, manager
         db = Session()
         try:
             actor = db.query(User).filter_by(id=mgr.id).one()
+            _bind_actor_subject(db, actor)
             execute_proposal(db, actor=actor, proposal_id=proposal.id)
             db.commit()
         except Exception as exc:  # pragma: no cover - surfaced via errors
@@ -584,6 +644,138 @@ def test_revoked_rbac_demoted_actor_rejected(db_session, manager):
     assert db_session.query(OperationalTask).filter(
         OperationalTask.task_type == OperationalTaskType.FOLLOWUP
     ).count() == 0
+
+
+def test_ai_proposal_attribution_and_human_principal_continuity(db_session, manager):
+    mgr = _manager(db_session)
+    human_principal = db_session.query(Principal).filter_by(
+        user_id=mgr.id,
+        principal_type=PrincipalType.HUMAN,
+    ).one()
+    human_credential = db_session.query(ApiCredential).filter_by(
+        principal_id=human_principal.id,
+        state=CredentialState.ACTIVE,
+    ).one()
+    set_audit_context(db_session, (
+        human_principal.id,
+        human_principal.id,
+        human_credential.id,
+        "api",
+    ))
+    task = _task(
+        db_session,
+        assigned_user_id=mgr.id,
+        snoozed_until=NOW + timedelta(hours=1),
+        dedupe_key="copilot-principal-continuity",
+    )
+
+    proposal, created, _payload = copilot_proposals.build_snooze_proposal(
+        db_session,
+        actor=mgr,
+        task_ref=task.id,
+        until=NOW + timedelta(hours=2),
+        now=NOW,
+    )
+    db_session.commit()
+    assert created
+    lily = db_session.query(Principal).filter_by(
+        name="lily", principal_type=PrincipalType.AI_AGENT
+    ).one()
+    hermes = db_session.query(Principal).filter_by(
+        name="hermes", principal_type=PrincipalType.AI_AGENT
+    ).one()
+    assert proposal.proposed_principal_id == lily.id
+    assert proposal.proposed_principal_id not in (human_principal.id, hermes.id)
+    created_audit = db_session.query(AuditLog).filter_by(
+        action="copilot_proposal_created", record_id=proposal.id
+    ).one()
+    assert created_audit.actor_id == mgr.id
+    assert created_audit.subject_principal_id == human_principal.id
+
+    _confirm(db_session, mgr, proposal.id, now=NOW)
+    _execute(db_session, mgr, proposal.id, now=NOW)
+    assert proposal.confirmed_principal_id == human_principal.id
+    assert proposal.executed_principal_id == human_principal.id
+    assert proposal.proposed_principal_id != proposal.confirmed_principal_id
+
+
+def test_copilot_principal_revocation_rechecked_at_confirm_and_execute(db_session, manager):
+    mgr = _manager(db_session)
+    human_principal = db_session.query(Principal).filter_by(
+        user_id=mgr.id,
+        principal_type=PrincipalType.HUMAN,
+    ).one()
+    set_audit_context(
+        db_session, (human_principal.id, human_principal.id, None, "api")
+    )
+    task = _task(
+        db_session,
+        assigned_user_id=mgr.id,
+        snoozed_until=NOW + timedelta(hours=1),
+        dedupe_key="copilot-principal-revocation",
+    )
+    proposal, _, _ = copilot_proposals.build_snooze_proposal(
+        db_session,
+        actor=mgr,
+        task_ref=task.id,
+        until=NOW + timedelta(hours=3),
+        now=NOW,
+    )
+    db_session.commit()
+
+    human_principal.is_active = False
+    db_session.commit()
+    with pytest.raises(copilot_svc.ProposalConfirmRejectedError) as confirm_error:
+        copilot_svc.confirm_proposal(
+            db_session, actor=mgr, proposal_id=proposal.id, now=NOW
+        )
+    assert confirm_error.value.error_code == "principal_inactive"
+    db_session.commit()
+    db_session.refresh(proposal)
+    assert proposal.status == CopilotActionStatus.PENDING
+
+    human_principal.is_active = True
+    db_session.commit()
+    _confirm(db_session, mgr, proposal.id, now=NOW)
+    human_principal.is_active = False
+    db_session.commit()
+    with pytest.raises(ProposalExecuteRejectedError) as execute_error:
+        execute_proposal(db_session, actor=mgr, proposal_id=proposal.id, now=NOW)
+    assert execute_error.value.error_code == "principal_inactive"
+    db_session.commit()
+    db_session.refresh(proposal)
+    db_session.refresh(task)
+    assert proposal.status == CopilotActionStatus.CONFIRMED
+    assert task.snoozed_until == NOW + timedelta(hours=1)
+
+
+def test_copilot_execute_rejects_missing_confirmation_subject(db_session, manager):
+    mgr = _manager(db_session)
+    task = _task(
+        db_session,
+        assigned_user_id=mgr.id,
+        snoozed_until=NOW + timedelta(hours=1),
+        dedupe_key="copilot-confirmation-subject-required",
+    )
+    proposal, _, _ = copilot_proposals.build_snooze_proposal(
+        db_session,
+        actor=mgr,
+        task_ref=task.id,
+        until=NOW + timedelta(hours=2),
+        now=NOW,
+    )
+    _confirm(db_session, mgr, proposal.id, now=NOW)
+    proposal.confirmed_principal_id = None
+    db_session.commit()
+
+    with pytest.raises(ProposalExecuteRejectedError) as error:
+        execute_proposal(db_session, actor=mgr, proposal_id=proposal.id, now=NOW)
+    assert error.value.error_code == "subject_continuity"
+    db_session.commit()
+    db_session.refresh(proposal)
+    db_session.refresh(task)
+    assert proposal.status == CopilotActionStatus.CONFIRMED
+    assert task.snoozed_until == NOW + timedelta(hours=1)
 
 
 def test_target_stale_task_completed_rejected(db_session, manager):

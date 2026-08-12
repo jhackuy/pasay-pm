@@ -23,6 +23,10 @@ class CredentialState(str, Enum):
 class Principal(AuditMixin, Base):
     __tablename__ = "principals"
     __table_args__ = (
+        CheckConstraint(
+            "principal_type IN ('HUMAN','SERVICE','AI_AGENT','SYSTEM')",
+            name="ck_principals_principal_type",
+        ),
         Index("uq_principals_human_user", "user_id", unique=True,
               postgresql_where=text("principal_type = 'HUMAN'")),
         Index("uq_principals_name_type", "name", "principal_type", unique=True),
@@ -36,7 +40,25 @@ class Principal(AuditMixin, Base):
 
 class ApiCredential(AuditMixin, Base):
     __tablename__ = "api_credentials"
-    __table_args__ = (Index("ix_api_credentials_hash_state", "key_hash", "state"),)
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('ACTIVE','REVOKED')",
+            name="ck_api_credentials_state",
+        ),
+        CheckConstraint(
+            "(state = 'ACTIVE' AND revoked_at IS NULL) OR "
+            "(state = 'REVOKED' AND revoked_at IS NOT NULL)",
+            name="ck_api_credentials_state_revocation",
+        ),
+        Index("ix_api_credentials_hash_state", "key_hash", "state"),
+        Index(
+            "uq_api_credentials_active_principal_purpose",
+            "principal_id",
+            "purpose",
+            unique=True,
+            postgresql_where=text("state = 'ACTIVE' AND revoked_at IS NULL"),
+        ),
+    )
     principal_id: Mapped[int] = mapped_column(ForeignKey("principals.id"), nullable=False, index=True)
     key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     purpose: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
@@ -48,6 +70,12 @@ class ApiCredential(AuditMixin, Base):
 
 class CredentialLifecycle(AuditMixin, Base):
     __tablename__ = "credential_lifecycle_history"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('ACTIVE','REVOKED')",
+            name="ck_credential_lifecycle_state",
+        ),
+    )
     credential_id: Mapped[int] = mapped_column(ForeignKey("api_credentials.id"), nullable=False, index=True)
     state: Mapped[CredentialState] = mapped_column(pg_enum(CredentialState, "credential_history_state"), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -72,7 +100,13 @@ class TelegramIdentityBinding(AuditMixin, Base):
 
 class CommunicationEndpoint(AuditMixin, Base):
     __tablename__ = "communication_endpoints"
-    __table_args__ = (Index("ix_endpoint_owner_channel", "human_principal_id", "channel"),)
+    __table_args__ = (
+        CheckConstraint(
+            "length(btrim(destination)) > 0",
+            name="ck_communication_endpoint_destination_nonblank",
+        ),
+        Index("ix_endpoint_owner_channel", "human_principal_id", "channel"),
+    )
     human_principal_id: Mapped[int] = mapped_column(ForeignKey("principals.id"), nullable=False)
     channel: Mapped[str] = mapped_column(String(30), nullable=False)
     destination: Mapped[str] = mapped_column(String(200), nullable=False)

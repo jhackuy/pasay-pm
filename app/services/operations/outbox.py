@@ -17,9 +17,9 @@ from app.services.identity import resolve_telegram_destination
 def resolve_recipient(db: Session, user_id: int | None) -> str | None:
     """Map a backend user to a notifier recipient.
 
-    Prefers the user's registered Telegram chat id; falls back to a
-    ``user:{id}`` placeholder that the notifier can resolve or drop.
-    Returns None when there is no user at all (no recipient -> no outbox).
+    Resolution is fail-closed through the canonical HUMAN endpoint history,
+    with legacy chat-id compatibility only when no endpoint history exists.
+    ``None`` is returned only when no assignee was supplied.
     """
     if user_id is None:
         return None

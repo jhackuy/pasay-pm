@@ -28,6 +28,7 @@ from app.core.security import hash_api_key
 from app.models.commission import CommissionSettlement, CommissionSettlementStatus
 from app.models.copilot import CopilotRun
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
+from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.lease import Lease, LeaseStatus
 from app.models.operations import (
     OperationalTask,
@@ -67,6 +68,20 @@ def _user_with_key(db, username, role):
         is_active=True,
     )
     db.add(user)
+    db.flush()
+    principal = Principal(
+        name=username,
+        principal_type=PrincipalType.HUMAN,
+        user_id=user.id,
+    )
+    db.add(principal)
+    db.flush()
+    db.add(ApiCredential(
+        principal_id=principal.id,
+        key_hash=hash_api_key(key),
+        purpose="legacy_human",
+        state=CredentialState.ACTIVE,
+    ))
     db.commit()
     db.refresh(user)
     return user, key

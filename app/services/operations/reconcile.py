@@ -24,6 +24,7 @@ from app.models.operations import (
 from app.services.audit import record_audit, serialize_row
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.rent_math import covered_periods, lease_periods
+from app.services.identity import bind_internal_audit
 
 
 def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskStatus,
@@ -76,6 +77,7 @@ def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskSt
 
 def reconcile_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
     """Settle stale PENDING tasks. Returns (auto_completed, auto_cancelled)."""
+    bind_internal_audit(db, "reconcile")
     completed = 0
     cancelled = 0
     tasks = (

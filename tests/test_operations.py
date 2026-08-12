@@ -12,13 +12,14 @@ import concurrent.futures
 import threading
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
-from app.models.audit_log import AuditAction
+from app.models.audit_log import AuditAction, AuditLog
 from app.models.commission import (
     CommissionRule,
     CommissionRuleType,
@@ -39,10 +40,12 @@ from app.models.operations import (
 from app.models.property import Property, Unit, UnitStatus
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
+from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.services.operations.generation import generate_business_tasks
 from app.services.operations.notifier import claim_pending_notifications, process_notifications_once
 from app.services.operations.outbox import enqueue_notification
 from app.services.operations.scheduler import run_scheduler_once
+from app.services.operations.reconcile import reconcile_tasks
 from app.services.operations.backfill import (
     backfill_unassigned_business_tasks,
     enqueue_missing_notifications,
@@ -907,7 +910,9 @@ def test_alembic_migration_upgrade_downgrade(monkeypatch, test_engine):
         settings, "database_url", scratch_url.render_as_string(hide_password=False)
     )
 
-    cfg = Config("alembic.ini")
+    repo_root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(repo_root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(repo_root / "alembic"))
     try:
         command.upgrade(cfg, "head")
         engine = create_engine(scratch_url)
@@ -941,6 +946,98 @@ def test_alembic_migration_upgrade_downgrade(monkeypatch, test_engine):
     finally:
         monkeypatch.setattr(settings, "database_url", original_url)
         _drop_scratch()
+
+
+# ---------------------------------------------------------------------------
+# V1.3 explicit SYSTEM provenance
+# ---------------------------------------------------------------------------
+
+def test_all_four_workers_record_explicit_system_provenance(db_session):
+    def assert_system(action, record_id, name):
+        audit = db_session.query(AuditLog).filter_by(
+            action=action, record_id=record_id
+        ).order_by(AuditLog.id.desc()).first()
+        assert audit is not None
+        principal = db_session.query(Principal).filter_by(
+            name=name, principal_type=PrincipalType.SYSTEM
+        ).one()
+        credential = db_session.query(ApiCredential).filter_by(
+            principal_id=principal.id,
+            purpose=f"internal:{name}",
+            state=CredentialState.ACTIVE,
+        ).one()
+        assert audit.actor_id is None
+        assert audit.subject_principal_id == principal.id
+        assert audit.caller_principal_id == principal.id
+        assert audit.credential_id == credential.id
+        assert audit.channel == "internal"
+
+    # scheduler
+    assignee = _user(db_session, "system-provenance-admin", UserRole.admin, "tg-system")
+    _seed_rule(db_session, user_id=assignee.id)
+    db_session.commit()
+    run_scheduler_once(db_session, now=NOW)
+    scheduled_task = db_session.query(OperationalTask).filter_by(
+        source_type="recurring_rule"
+    ).one()
+    assert_system("task_created", scheduled_task.id, "scheduler")
+
+    # reconcile
+    expense = Expense(
+        expense_date=date(2026, 8, 1),
+        category="repair",
+        amount="5000.00",
+        payee="Vendor",
+        status=ExpenseStatus.paid,
+    )
+    db_session.add(expense)
+    db_session.flush()
+    reconcile_task = _make_task(
+        db_session,
+        task_type=OperationalTaskType.PAYMENT_PENDING,
+        source_type="expense",
+        source_id=expense.id,
+        dedupe_key="system-provenance-reconcile",
+    )
+    db_session.commit()
+    reconcile_tasks(db_session, now=NOW)
+    db_session.commit()
+    assert_system("task_auto_completed", reconcile_task.id, "reconcile")
+
+    # notifier: a stale snooze reminder is durably dropped before any send.
+    stale_task = _make_task(
+        db_session,
+        status=OperationalTaskStatus.CANCELLED,
+        assigned_user_id=assignee.id,
+        dedupe_key="system-provenance-stale-task",
+    )
+    stale_outbox = NotificationOutbox(
+        task_id=stale_task.id,
+        channel="telegram",
+        recipient="tg-system",
+        payload={"message": "stale"},
+        status=NotificationStatus.PENDING,
+        dedupe_key=f"snooze-redelivery:{stale_task.id}:0:{NOW.isoformat()}",
+    )
+    db_session.add(stale_outbox)
+    db_session.commit()
+    process_notifications_once(db_session, _OkSender(), now=NOW)
+    db_session.refresh(stale_outbox)
+    assert stale_outbox.status == NotificationStatus.DROPPED
+    assert_system("outbox_dropped", stale_outbox.id, "notifier")
+
+    # backfill: assignee is ownership only and is never substituted as actor.
+    backfill_task = _business_task(
+        db_session,
+        dedupe_key="system-provenance-backfill",
+    )
+    db_session.commit()
+    backfill_unassigned_business_tasks(
+        db_session,
+        default_assignee_id=assignee.id,
+        now=NOW,
+    )
+    assert_system("task_backfilled", backfill_task.id, "backfill")
 
 
 # ---------------------------------------------------------------------------
@@ -991,7 +1088,7 @@ def test_backfill_assigns_unassigned_business_task_and_enqueues(db_session):
         .one()
     )
     assert audit.changed_fields["assigned_user_id"] == [None, admin.id]
-    assert audit.actor_id is None or audit.actor_id == admin.id
+    assert audit.actor_id is None
 
 
 def test_backfill_does_not_overwrite_already_assigned_task(db_session):

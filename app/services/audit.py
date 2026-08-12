@@ -11,6 +11,29 @@ from app.models.identity import ApiCredential, Principal
 
 audit_context: ContextVar[tuple[int | None, int | None, int | None, str | None]] = ContextVar(
     "audit_context", default=(None, None, None, None))
+AUDIT_SESSION_KEY = "pasay.audit_context"
+
+
+def set_audit_context(
+    db: Session,
+    value: tuple[int | None, int | None, int | None, str | None],
+) -> None:
+    """Bind provenance to both execution context and the request DB session.
+
+    FastAPI may execute a synchronous dependency and endpoint in separate
+    copied contexts, so ContextVar writes alone are not a reliable hand-off.
+    The request-scoped SQLAlchemy session is shared across both layers and is
+    therefore the canonical transport; the ContextVar remains compatible with
+    direct service calls and async code.
+    """
+    audit_context.set(value)
+    db.info[AUDIT_SESSION_KEY] = value
+
+
+def current_audit_context(
+    db: Session,
+) -> tuple[int | None, int | None, int | None, str | None]:
+    return db.info.get(AUDIT_SESSION_KEY, audit_context.get())
 
 
 def jsonable(value):
@@ -65,7 +88,9 @@ def record_audit(
     new_value: dict | None = None,
 ) -> AuditLog:
     """Persist one audit log row. The caller is responsible for committing."""
-    subject_principal_id, caller_principal_id, credential_id, channel = audit_context.get()
+    subject_principal_id, caller_principal_id, credential_id, channel = (
+        current_audit_context(db)
+    )
     # ContextVars intentionally cross helper layers, but a recycled worker/test
     # context must never attach stale foreign keys from a prior transaction.
     if subject_principal_id is not None and db.get(Principal, subject_principal_id) is None:

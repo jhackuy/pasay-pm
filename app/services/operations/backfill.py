@@ -38,8 +38,8 @@ from app.services.operations.generation import BUSINESS_SOURCE_TYPES, _notificat
 from app.services.operations.outbox import enqueue_notification, resolve_recipient
 from app.services.identity import bind_internal_audit
 
-# System actor for backfill audit rows. Falls back to the validated default assignee id
-# when ``actor_id`` is not provided (so the row always carries who owns it afterwards).
+# Backfill audits always keep the legacy actor field null. SYSTEM provenance is
+# recorded separately through subject/caller/credential/channel.
 _DEFAULT_BACKFILL_REASON = "backfill:default_assignee:v1.2.0"
 
 
@@ -58,7 +58,6 @@ def backfill_unassigned_business_tasks(
     *,
     default_assignee_id: int,
     now: datetime | None = None,
-    actor_id: int | None = None,
     reason: str = _DEFAULT_BACKFILL_REASON,
 ) -> BackfillReport:
     """Assign the default assignee + re-enqueue notifications, in one transaction.
@@ -68,8 +67,8 @@ def backfill_unassigned_business_tasks(
     one unit).
     """
     now = now or datetime.now(timezone.utc)
-    validate_default_assignee(db, default_assignee_id)
     bind_internal_audit(db, "backfill")
+    validate_default_assignee(db, default_assignee_id)
 
     report = BackfillReport()
 
@@ -109,7 +108,7 @@ def backfill_unassigned_business_tasks(
             table_name="operational_tasks",
             record_id=task.id,
             action="task_backfilled",
-            actor_id=actor_id,
+            actor_id=None,
             changed_fields={"assigned_user_id": [None, default_assignee_id], "reason": reason},
             old_value=before,
             new_value=serialize_row(task),
@@ -140,6 +139,7 @@ def enqueue_missing_notifications(
     Returns (task_ids_missing_a_sent_notification, notifications_enqueued_this_run).
     """
     _ = now  # kept for a stable signature / potential future timestamped payloads
+    bind_internal_audit(db, "backfill")
     missing, enqueued = _select_and_enqueue_missing(db, channel=channel, report_notifications=False)
     db.commit()
     return missing, enqueued
