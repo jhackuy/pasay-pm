@@ -12,10 +12,11 @@ import secrets
 import time
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from pasay_bot.render import html as H
 from pasay_bot.render.i18n import t
+from pasay_bot.roles import Role
 
 VERSION = "v1"
 MAX_CALLBACK_BYTES = 64
@@ -29,6 +30,10 @@ ACTION_REVERSE = "rv"
 ACTION_CANCEL = "ccl"
 ACTION_DETAIL = "det"
 ACTION_EDIT = "ed"
+# V1.3 Slice 1: expense approval (exa = approve, exr = reject, exd = detail).
+ACTION_EXPENSE_APPROVE = "exa"
+ACTION_EXPENSE_REJECT = "exr"
+ACTION_EXPENSE_DETAIL = "exd"
 # V1.2 operations center (待办中心).
 ACTION_OPS_NAV = "opn"
 ACTION_TASK_COMPLETE = "tkc"
@@ -161,38 +166,46 @@ def overdue_pagination_keyboard(page: int, total_pages: int, locale: str = "zh")
 
 
 def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
-    """Home dashboard buttons (B1): rent, to-do, properties, finance + V1.2 待办中心."""
+    """Minimal fallback for the ☰ 更多 page (V1.3): infrequent actions that no
+    longer live on the primary bottom navigation. The six-grid is gone; the
+    persistent reply keyboard is the primary nav."""
     kb = [
         [
             InlineKeyboardButton(
                 t("nav.rent", locale), callback_data=encode(ACTION_NAV, "rent")
             ),
             InlineKeyboardButton(
-                t("nav.pending", locale), callback_data=encode(ACTION_NAV, "pending")
+                t("nav.overdue", locale), callback_data=encode(ACTION_NAV, "overdue")
             ),
         ],
         [
-            InlineKeyboardButton(
-                t("nav.properties", locale),
-                callback_data=encode(ACTION_NAV, "properties"),
-            ),
-            InlineKeyboardButton(
-                t("nav.finance", locale),
-                callback_data=encode(ACTION_NAV, "finance"),
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                t("nav.ops", locale),
-                callback_data=encode(ACTION_OPS_NAV, OPS_OVERVIEW),
-            ),
             InlineKeyboardButton(
                 t("nav.copilot", locale),
                 callback_data=encode(ACTION_COPILOT_NAV, "today"),
             ),
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            ),
         ],
     ]
     return InlineKeyboardMarkup(kb)
+
+
+def reply_keyboard(role) -> ReplyKeyboardMarkup:
+    """Persistent bottom navigation (V1.3): Owner sees Chinese decision labels,
+    Secretary sees English execution labels. The buttons are plain text and
+    route through nl_bridge like any natural-language input."""
+    if role == Role.SECRETARY:
+        rows = [
+            [KeyboardButton("🏠 Properties"), KeyboardButton("✅ Tasks")],
+            [KeyboardButton("💰 Finance"), KeyboardButton("☰ More")],
+        ]
+    else:
+        rows = [
+            [KeyboardButton("🏠 房源"), KeyboardButton("✅ 待办")],
+            [KeyboardButton("💰 财务"), KeyboardButton("☰ 更多")],
+        ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def copilot_today_keyboard(
@@ -999,3 +1012,157 @@ def ops_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# --- V1.3 Slice 1: expense approval action cards ---------------------------
+
+def expense_approval_keyboard(expense_id: int, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Expense approval card: [✅ 批准][❌ 拒绝] + secondary [📎 查看凭证/详情]."""
+    nonce, ts = new_nonce(), now_ts()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("expense.approve", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.reject", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("expense.view_receipt", locale),
+                    callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
+                ),
+                InlineKeyboardButton(
+                    t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+                ),
+            ],
+        ]
+    )
+
+
+def expense_detail_keyboard(
+    expense_id: int, *, still_pending: bool = False, locale: str = "zh",
+) -> InlineKeyboardMarkup:
+    """Detail card buttons: keep approve/reject while the expense is still
+    pending (the handler re-checks the backend state before rendering)."""
+    kb: list[list[InlineKeyboardButton]] = []
+    if still_pending:
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("expense.approve", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.reject", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def expense_result_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Result card (approved/rejected): back home; nothing else to do."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))]]
+    )
+
+
+def todo_keyboard(
+    sections: dict,
+    *,
+    owner_view: bool,
+    locale: str = "zh",
+) -> InlineKeyboardMarkup:
+    """Unified to-do page action-at-source buttons (V1.3): every row carries
+    the action directly — no 'go to the task center' detour."""
+    kb: list[list[InlineKeyboardButton]] = []
+    for row in sections.get("expenses") or []:
+        expense_id = int(row["id"])
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("expense.approve", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.reject", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.view_receipt", locale),
+                    callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
+                ),
+            ]
+        )
+    for row in sections.get("confirm") or []:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("todo.confirm_income", locale),
+                    callback_data=encode(
+                        ACTION_CONFIRM, "inc", str(row["id"]),
+                        nonce=new_nonce(), ts=now_ts(),
+                    ),
+                )
+            ]
+        )
+    for row in sections.get("overdue") or []:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("todo.collect", locale),
+                    callback_data=encode(ACTION_RENT, "go", str(row["unit_id"])),
+                )
+            ]
+        )
+    for task in sections.get("tasks") or []:
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("ops.complete", locale),
+                    callback_data=encode(
+                        ACTION_TASK_COMPLETE, "ops", str(task.id), nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("ops.detail", locale),
+                    callback_data=encode(ACTION_TASK_DETAIL, "ops", str(task.id)),
+                ),
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)

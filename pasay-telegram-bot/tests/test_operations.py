@@ -46,28 +46,38 @@ def _open_ops(env):
     return env.bot.last_send()
 
 
-def test_dashboard_has_ops_button(make_app):
+def _open_section(env, section):
+    """Open a legacy ops-center section directly via the still-supported
+    callback (the section callbacks remain available in the callback layer)."""
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, encode(ACTION_OPS_NAV, section), bot=env.bot)],
+    )
+    return env.bot.last_edit()
+
+
+def test_dashboard_uses_persistent_todo_nav(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
-    labels = _button_labels(env.bot.last_send()["reply_markup"])
-    assert "📋 待办中心" in labels
+    kb = env.bot.last_send()["reply_markup"]
+    assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
+    labels = [b.text for row in kb.keyboard for b in row]
+    assert "✅ 待办" in labels
+    assert "📋 待办中心" not in labels  # no longer a primary nav entry
 
 
-def test_ops_command_shows_overview(make_app):
+def test_todo_command_shows_unified_page(make_app):
     env = make_app()
-    env.backend.add_ops_task(task_id=1, due_at=f"{TODAY}T00:00:00+08:00")
-    env.backend.add_ops_task(task_id=2, due_at=f"{_add_days(TODAY, -3)}T00:00:00+08:00")
+    env.backend.add_ops_task(task_id=1, title="季度空调保养",
+                             due_at=f"{TODAY}T00:00:00+08:00")
     send = _open_ops(env)
     text = send["text"]
-    assert "<b>📋 待办中心</b>" in text
-    assert "🔴 已逾期：1" in text
-    assert "🟠 今天：1" in text
-    assert "📅 全部待办：2" in text
+    assert "<b>✅ 待办</b>" in text
+    assert "季度空调保养" in text
     labels = _button_labels(send["reply_markup"])
-    assert any("🔴" in l and "已逾期" in l for l in labels)
-    assert any("🟠" in l and "今天" in l for l in labels)
-    assert any("🟡" in l and "未来 7 天" in l for l in labels)
-    assert any("📅" in l and "全部待办" in l for l in labels)
+    assert labels.count("✅ 完成") == 1
+    assert labels.count("👁 查看详情") == 1
+    assert "🏠 首页" in labels
 
 
 def test_ops_section_lists_tasks_with_actions(make_app):
@@ -76,10 +86,7 @@ def test_ops_section_lists_tasks_with_actions(make_app):
         task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
         due_at=f"{TODAY}T00:00:00+08:00", details={"amount": "3000.00", "period": "2026-Q3"},
     )
-    _open_ops(env)
-    section = _find_button(env.bot.last_send()["reply_markup"], "🟠 今天 · 1")
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, section.callback_data, bot=env.bot)])
-    edit = env.bot.last_edit()
+    edit = _open_section(env, "otd")
     text = edit["text"]
     assert "Pasay Premier Residences" in text  # property name resolved
     assert "季度空调保养" in text
@@ -97,36 +104,26 @@ def test_ops_section_splits_overdue_today_next7(make_app):
     env.backend.add_ops_task(task_id=1, title="逾期任务A", due_at=f"{_add_days(TODAY, -5)}T00:00:00+08:00")
     env.backend.add_ops_task(task_id=2, title="今日任务B", due_at=f"{TODAY}T00:00:00+08:00")
     env.backend.add_ops_task(task_id=3, title="未来任务C", due_at=f"{_add_days(TODAY, 3)}T00:00:00+08:00")
-    _open_ops(env)
-
-    def _open_section(label):
-        btn = _find_button(env.bot.last_send()["reply_markup"], label)
-        run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, btn.callback_data, bot=env.bot)])
-        return env.bot.last_edit()["text"]
-
-    overdue_text = _open_section("🔴 已逾期 · 1")
+    overdue_text = _open_section(env, "oov")["text"]
     assert "逾期任务A" in overdue_text
     assert "今日任务B" not in overdue_text
 
-    today_text = _open_section("🟠 今天 · 1")
+    today_text = _open_section(env, "otd")["text"]
     assert "今日任务B" in today_text
 
-    next7_text = _open_section("🟡 未来 7 天 · 2")
+    next7_text = _open_section(env, "on7")["text"]
     assert "今日任务B" in next7_text and "未来任务C" in next7_text
 
 
 def test_ops_complete_edits_message(make_app):
     env = make_app()
     env.backend.add_ops_task(task_id=7, title="待付款支出 #5", due_at=f"{TODAY}T00:00:00+08:00")
-    _open_ops(env)
-    section = _find_button(env.bot.last_send()["reply_markup"], "🟠 今天 · 1")
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, section.callback_data, bot=env.bot)])
+    _open_section(env, "otd")
     done = _find_button(env.bot.last_edit()["reply_markup"], "✅ 完成")
     before = len(env.bot.calls)
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, done.callback_data, bot=env.bot)])
     # original message edited (no new send_message) + backend POST /complete
-    assert env.bot.of_type("send_message")[0]["text"]  # only the /ops send
-    assert len(env.bot.sends()) == 1, "complete must edit, not send a new message"
+    assert len(env.bot.sends()) == 0, "complete must edit, not send a new message"
     assert ("POST", "/operations/tasks/7/complete") in [
         (m, p) for m, p, _ in env.backend.calls
     ]
@@ -141,9 +138,7 @@ def test_ops_complete_edits_message(make_app):
 def test_ops_snooze_preset_calls_backend_and_edits(make_app):
     env = make_app()
     env.backend.add_ops_task(task_id=7, title="租金到期 2026-08", due_at=f"{TODAY}T00:00:00+08:00")
-    _open_ops(env)
-    section = _find_button(env.bot.last_send()["reply_markup"], "🟠 今天 · 1")
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, section.callback_data, bot=env.bot)])
+    _open_section(env, "otd")
     snooze = _find_button(env.bot.last_edit()["reply_markup"], "⏰ 稍后提醒")
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, snooze.callback_data, bot=env.bot)])
     picker = env.bot.last_edit()
@@ -167,9 +162,7 @@ def test_ops_snooze_preset_calls_backend_and_edits(make_app):
 def test_ops_snooze_custom_flow(make_app):
     env = make_app()
     env.backend.add_ops_task(task_id=9, title="季度空调保养", due_at=f"{TODAY}T00:00:00+08:00")
-    _open_ops(env)
-    section = _find_button(env.bot.last_send()["reply_markup"], "🟠 今天 · 1")
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, section.callback_data, bot=env.bot)])
+    _open_section(env, "otd")
     snooze = _find_button(env.bot.last_edit()["reply_markup"], "⏰ 稍后提醒")
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, snooze.callback_data, bot=env.bot)])
     custom = _find_button(env.bot.last_edit()["reply_markup"], "✏️ 自定义")
@@ -189,15 +182,13 @@ def test_ops_detail_card(make_app):
     env.backend.add_ops_task(task_id=3, title="待确认佣金结算 #2", task_type="SETTLEMENT_PENDING",
                              due_at=f"{_add_days(TODAY, 2)}T00:00:00+08:00",
                              details={"amount": "1500.00", "settlement_id": 2})
-    _open_ops(env)
-    section = _find_button(env.bot.last_send()["reply_markup"], "🟡 未来 7 天 · 1")
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, section.callback_data, bot=env.bot)])
+    _open_section(env, "on7")
     detail = _find_button(env.bot.last_edit()["reply_markup"], "👁 查看详情")
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, detail.callback_data, bot=env.bot)])
     edit = env.bot.last_edit()
     assert "<b>📄 任务详情</b>" in edit["text"]
     assert "待确认佣金结算 #2" in edit["text"]
-    assert "SETTLEMENT_PENDING" in edit["text"]
+    assert "SETTLEMENT_PENDING" not in edit["text"]  # V1.3: no raw enums in UI
     assert "₱1,500" in edit["text"]
     assert "✅ 完成" in _button_labels(edit["reply_markup"])
     assert "◀️ 返回" in _button_labels(edit["reply_markup"])
@@ -206,9 +197,7 @@ def test_ops_detail_card(make_app):
 def test_ops_back_returns_to_overview(make_app):
     env = make_app()
     env.backend.add_ops_task(task_id=1, due_at=f"{TODAY}T00:00:00+08:00")
-    _open_ops(env)
-    section = _find_button(env.bot.last_send()["reply_markup"], "🟠 今天 · 1")
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, section.callback_data, bot=env.bot)])
+    _open_section(env, "otd")
     back = _find_button(env.bot.last_edit()["reply_markup"], "◀️ 返回")
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, back.callback_data, bot=env.bot)])
     assert "<b>📋 待办中心</b>" in env.bot.last_edit()["text"]
@@ -244,5 +233,5 @@ def test_secretary_can_view_ops(make_app):
     env.backend.add_ops_task(task_id=1, due_at=f"{TODAY}T00:00:00+08:00")
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/ops", bot=env.bot)])
     send = env.bot.last_send()
-    # SECRETARY locale is English.
-    assert "<b>📋 Task Center</b>" in send["text"]
+    # V1.3: /ops opens the unified Tasks page; SECRETARY locale is English.
+    assert "<b>✅ Tasks</b>" in send["text"]

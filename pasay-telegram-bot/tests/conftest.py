@@ -141,6 +141,8 @@ class FakeBackend:
         ]
         self.incomes: list[dict] = []
         self._next_income_id = 1
+        self.expenses: list[dict] = []
+        self._next_expense_id = 1
         self.operational_tasks: list[dict] = []
         self.ops_forbidden_task_ids: set[int] = set()
         self.financial_summary = {
@@ -203,6 +205,31 @@ class FakeBackend:
         self._next_income_id = max(self._next_income_id, inc["id"]) + 1
         self.incomes.append(inc)
         return inc
+
+    def add_expense(self, status="pending", expense_id=None, category="维修",
+                    amount="5000.00", payee="Fix-It Co", unit_id=1,
+                    expense_date="2026-08-01", due_date=None,
+                    description=None, receipt_attachment_id=None):
+        exp = {
+            "id": expense_id or self._next_expense_id,
+            "expense_date": expense_date,
+            "due_date": due_date,
+            "category": category,
+            "amount": amount,
+            "payee": payee,
+            "description": description,
+            "unit_id": unit_id,
+            "status": status,
+            "receipt_attachment_id": receipt_attachment_id,
+            "approved_by": None,
+            "approved_at": None,
+        }
+        self._next_expense_id = max(self._next_expense_id, exp["id"]) + 1
+        self.expenses.append(exp)
+        return exp
+
+    def _get_expense(self, expense_id):
+        return next((e for e in self.expenses if e["id"] == expense_id), None)
 
     def _get_income(self, income_id):
         return next((i for i in self.incomes if i["id"] == income_id), None)
@@ -306,6 +333,32 @@ class FakeBackend:
             return httpx.Response(200, json=inc)
         if path == "/incomes" and method == "GET":
             return httpx.Response(200, json=self.incomes)
+
+        # --- V1.3 expense approval ---
+        if path == "/expenses" and method == "GET":
+            return httpx.Response(200, json=self.expenses)
+        if path.startswith("/expenses/") and path.endswith("/approve") and method == "POST":
+            expense = self._get_expense(int(path.split("/")[2]))
+            if expense is None:
+                return httpx.Response(404, json={"detail": "Expense not found"})
+            if expense["status"] != "pending":
+                return httpx.Response(409, json={"detail": "Only pending expenses can be approved"})
+            expense["status"] = "approved"
+            expense["approved_at"] = "2026-08-12T12:00:00Z"
+            return httpx.Response(200, json=expense)
+        if path.startswith("/expenses/") and path.endswith("/reject") and method == "POST":
+            expense = self._get_expense(int(path.split("/")[2]))
+            if expense is None:
+                return httpx.Response(404, json={"detail": "Expense not found"})
+            if expense["status"] != "pending":
+                return httpx.Response(409, json={"detail": "Only pending expenses can be rejected"})
+            expense["status"] = "rejected"
+            return httpx.Response(200, json=expense)
+        if path.startswith("/expenses/") and method == "GET":
+            expense = self._get_expense(int(path.split("/")[2]))
+            if expense is None:
+                return httpx.Response(404, json={"detail": "Expense not found"})
+            return httpx.Response(200, json=expense)
 
         # --- V1.2.2 C2 confirmed-action copilot ---
         if path == "/operations/copilot/today" and method == "POST":

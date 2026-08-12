@@ -11,6 +11,8 @@ only read; their real state transitions stay in the V1.1 routers.
 """
 from __future__ import annotations
 
+import secrets
+import time as _time
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 
@@ -47,20 +49,40 @@ BUSINESS_SOURCE_TYPES = frozenset({"lease", "expense", "commission_settlement"})
 
 
 def _notification_message(task: OperationalTask) -> str:
+    """Humanized proactive notification (V1.3): '待办提醒' + human title +
+    amount/period/due. No task_type enum values, no internal #ids."""
     details = task.details or {}
-    lines = [
-        "🔔 待办提醒",
-        f"#{task.id} · {task.task_type.value}",
-        f"{task.title}",
-    ]
-    amount = details.get("amount")
+    lines = ["🔔 待办提醒", task.title]
+    amount = details.get("amount") or details.get("total_outstanding")
     if amount is not None:
         lines.append(f"金额：{amount}")
     period = details.get("period") or details.get("periods")
     if period:
+        if isinstance(period, list):
+            period = "、".join(str(p) for p in period)
         lines.append(f"账期：{period}")
-    lines.append(f"到期：{task.due_at:%Y-%m-%d %H:%M}")
+    if task.due_at:
+        lines.append(f"到期：{task.due_at:%Y-%m-%d %H:%M}")
     return "\n".join(lines)
+
+
+def _expense_reply_markup(expense_id: int) -> dict:
+    """Inline keyboard dict for an expense notification (V1.3): approve/reject
+    callbacks use the bot's v1:exa/exr:<id>:<nonce>:<ts> slot layout (the
+    middle ref slot stays empty: v1:exa:<id>::<nonce>:<ts> so the bot's fixed
+    decoder parses nonce/ts correctly); the detail button is a plain
+    v1:exd:<id>."""
+    nonce = secrets.token_hex(4)
+    ts = int(_time.time())
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ 批准", "callback_data": f"v1:exa:{expense_id}::{nonce}:{ts}"},
+                {"text": "❌ 拒绝", "callback_data": f"v1:exr:{expense_id}::{nonce}:{ts}"},
+            ],
+            [{"text": "📎 查看凭证", "callback_data": f"v1:exd:{expense_id}"}],
+        ]
+    }
 
 
 def _insert_task_on_conflict_do_nothing(db: Session, *, fields: dict) -> OperationalTask | None:
@@ -87,7 +109,11 @@ def _insert_task_on_conflict_do_nothing(db: Session, *, fields: dict) -> Operati
 
 
 def _enqueue_for_task(
-    db: Session, task: OperationalTask, *, notification_message: str | None = None
+    db: Session,
+    task: OperationalTask,
+    *,
+    notification_message: str | None = None,
+    reply_markup: dict | None = None,
 ) -> bool:
     """Outbox row for one new task (same transaction). Returns True when
     enqueued, False when no recipient is resolvable.
@@ -100,22 +126,27 @@ def _enqueue_for_task(
     recipient = resolve_recipient(db, task.assigned_user_id)
     if recipient is None:
         return False
+    details = task.details or {}
+    payload = {
+        "task_id": task.id,
+        "task_type": task.task_type.value,
+        "title": task.title,
+        "due_at": task.due_at.isoformat() if task.due_at else None,
+        "amount": details.get("amount") or details.get("total_outstanding"),
+        "message": (
+            notification_message
+            if notification_message is not None
+            else _notification_message(task)
+        ),
+    }
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
     return enqueue_notification(
         db,
         task_id=task.id,
         channel=NOTIFY_CHANNEL_TELEGRAM,
         recipient=recipient,
-        payload={
-            "task_id": task.id,
-            "task_type": task.task_type.value,
-            "title": task.title,
-            "due_at": task.due_at.isoformat(),
-            "message": (
-                notification_message
-                if notification_message is not None
-                else _notification_message(task)
-            ),
-        },
+        payload=payload,
         dedupe_key=f"task:{task.id}:{NOTIFY_CHANNEL_TELEGRAM}:{recipient}",
     )
 
@@ -127,6 +158,7 @@ def _register_task(
     now: datetime,
     actor_id: int | None = None,
     notification_message: str | None = None,
+    reply_markup: dict | None = None,
 ) -> tuple[OperationalTask | None, bool]:
     """Create task + audit(task_created) + outbox in one transaction.
 
@@ -155,7 +187,11 @@ def _register_task(
         actor_id=actor_id,  # None = system / scheduler
         new_value=serialize_row(task),
     )
-    return task, _enqueue_for_task(db, task, notification_message=notification_message)
+    return task, _enqueue_for_task(
+        db, task,
+        notification_message=notification_message,
+        reply_markup=reply_markup,
+    )
 
 
 def create_operational_task(
@@ -165,6 +201,7 @@ def create_operational_task(
     now: datetime | None = None,
     actor_id: int | None = None,
     notification_message: str | None = None,
+    reply_markup: dict | None = None,
 ) -> tuple[OperationalTask | None, bool]:
     """Public seam for human-confirmed (V1.2.2 C2 copilot) task creation.
 
@@ -185,6 +222,7 @@ def create_operational_task(
         now=now,
         actor_id=actor_id,
         notification_message=notification_message,
+        reply_markup=reply_markup,
     )
 
 
@@ -347,9 +385,10 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             now=now,
             fields={
                 "task_type": OperationalTaskType.APPROVAL_PENDING,
-                "title": f"待审批支出 #{expense.id}",
+                "title": f"待批准支出 · {expense.category}",
                 "source_type": "expense",
                 "source_id": expense.id,
+                "assigned_user_id": DEFAULT_ASSIGNED_USER_ID,
                 "priority": OperationalTaskPriority.medium,
                 "status": OperationalTaskStatus.PENDING,
                 "due_at": expense.due_date and datetime.combine(expense.due_date, time.min, tzinfo=now.tzinfo)
@@ -362,6 +401,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "payee": expense.payee,
                 },
             },
+            reply_markup=_expense_reply_markup(expense.id),
         )
         if task is not None:
             created += 1
@@ -382,9 +422,10 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             now=now,
             fields={
                 "task_type": OperationalTaskType.PAYMENT_PENDING,
-                "title": f"待付款支出 #{expense.id}",
+                "title": f"待付款支出 · {expense.category}",
                 "source_type": "expense",
                 "source_id": expense.id,
+                "assigned_user_id": DEFAULT_ASSIGNED_USER_ID,
                 "priority": OperationalTaskPriority.high,
                 "status": OperationalTaskStatus.PENDING,
                 "due_at": expense.due_date and datetime.combine(expense.due_date, time.min, tzinfo=now.tzinfo)
@@ -397,6 +438,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "payee": expense.payee,
                 },
             },
+            reply_markup=_expense_reply_markup(expense.id),
         )
         if task is not None:
             created += 1

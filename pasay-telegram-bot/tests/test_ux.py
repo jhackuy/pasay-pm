@@ -47,7 +47,8 @@ def _paid_unit1(env):
 # --- dashboard (B1) ---
 
 def test_start_shows_dashboard(make_app):
-    """★ /start renders the live dashboard with data + 4 task-first buttons."""
+    """★ /start renders the live dashboard with data + the persistent 2x2
+    bottom reply keyboard (V1.3: no more six-grid as primary nav)."""
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     send = env.bot.last_send()
@@ -60,9 +61,53 @@ def test_start_shows_dashboard(make_app):
     assert "今日待处理" in text
     assert "逾期 2 笔" in text
     assert "空置 1 套" in text
-    labels = [b.text for b in _buttons_of(send["reply_markup"])]
-    # V1.2: 待办中心 added to the main menu; C1.1: 🤖 运营助手 added.
-    assert labels == ["💵 收租", "⚠️ 待处理", "🏘 房源", "📊 财务", "📋 待办中心", "🤖 运营助手"]
+    kb = send["reply_markup"]
+    assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
+    labels = [b.text for row in kb.keyboard for b in row]
+    assert labels == ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
+
+
+def test_secretary_start_has_english_persistent_keyboard(make_app):
+    """★ SECRETARY /start mounts the English 2x2 persistent keyboard."""
+    env = make_app()
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/start", bot=env.bot)])
+    send = env.bot.last_send()
+    kb = send["reply_markup"]
+    assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
+    labels = [b.text for row in kb.keyboard for b in row]
+    assert labels == ["🏠 Properties", "✅ Tasks", "💰 Finance", "☰ More"]
+
+
+def test_more_keyword_opens_fallback_inline_menu(make_app):
+    """★ typing ☰ 更多 / More opens the dashboard with the minimal inline
+    fallback (rent / overdue / copilot / home), not the six-grid."""
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "☰ 更多", bot=env.bot)])
+    send = env.bot.last_send()
+    kb = send["reply_markup"]
+    assert kb.__class__.__name__ == "InlineKeyboardMarkup"
+    labels = [b.text for row in kb.inline_keyboard for b in row]
+    assert "💵 收租" in labels
+    assert "⚠️ 逾期" in labels
+    assert "🤖 运营助手" in labels
+    assert "🏠 首页" in labels
+    assert "📋 待办中心" not in labels
+
+
+def test_nl_todo_keyword_opens_unified_page(make_app):
+    """★ tapping the persistent ✅ 待办 button (plain text) routes to the
+    unified to-do page with action buttons, not the old pending aggregation."""
+    env = make_app()
+    env.backend.add_ops_task(
+        task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
+        due_at=f"{TODAY}T00:00:00+08:00",
+    )
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "✅ 待办", bot=env.bot)])
+    send = env.bot.last_send()
+    assert "季度空调保养" in send["text"]
+    kb = send["reply_markup"]
+    assert kb.__class__.__name__ == "InlineKeyboardMarkup"
+    assert "✅ 完成" in [b.text for row in kb.inline_keyboard for b in row]
 
 
 def test_dashboard_no_tasks(make_app):
@@ -382,7 +427,7 @@ def test_i18n_en(make_app):
     assert "overdue" in start.lower()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending",
                                        message_id=2, update_id=2, bot=env.bot)])
-    assert "To-do" in env.bot.last_send()["text"]
+    assert "Tasks" in env.bot.last_send()["text"]
     run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID,
                                            encode("cnf", "inc", "1", nonce=new_nonce(),
                                                   ts=now_ts() - 10000),
@@ -393,23 +438,36 @@ def test_i18n_en(make_app):
 # --- pending aggregation (B2/B3) ---
 
 def test_pending_aggregates_overdue_and_tasks(make_app):
-    """★ the to-do page aggregates overdue, pending income and tasks."""
+    """★ the unified to-do page aggregates overdue, pending income and tasks,
+    each with action-at-source buttons."""
     env = make_app()
-    env.backend.tasks = [
-        {"id": 1, "title": "Fix AC in 16B", "unit_id": 1, "unit": "16B",
-         "status": "open", "priority": "high", "due_date": TODAY,
-         "assigned_to": None, "recurring": False, "interval_months": None,
-         "next_due_date": None},
-    ]
+    env.backend.add_ops_task(
+        task_id=1, title="Fix AC in 16B", task_type="AC_MAINTENANCE",
+        due_at=f"{TODAY}T00:00:00+08:00",
+    )
     env.backend.add_income(status="pending", income_id=9, lease_id=2,
                            amount="12000.00", received_date=TODAY,
                            payment_method="GCash", description=f"rent {CUR_MONTH}")
+    env.backend.add_expense(expense_id=5, category="维修", amount="3000.00",
+                            payee="Fix-It Co", unit_id=1)
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
     text = env.bot.last_send()["text"]
     assert "逾期租金 · 2笔" in text
-    assert "待确认收入 · 1笔" in text
-    assert "待办任务 · 1项" in text
+    assert "待确认收款 · 1笔" in text
+    assert "支出待批准 · 1笔" in text
+    assert "我的任务 · 1项" in text
     assert "Fix AC in 16B" in text
+    kb = env.bot.last_send()["reply_markup"]
+    actions = [
+        decode(b.callback_data)["action"]
+        for row in kb.inline_keyboard
+        for b in row
+        if decode(b.callback_data) is not None
+    ]
+    assert "exa" in actions and "exr" in actions and "exd" in actions  # expense row
+    assert "cnf" in actions  # pending income row
+    assert "rn" in actions  # overdue row
+    assert "tkc" in actions and "tkd" in actions  # task row
 
 
 def test_pending_empty_positive(make_app):
@@ -419,5 +477,5 @@ def test_pending_empty_positive(make_app):
     env.backend.tasks = []
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "✅ 今天没有紧急事项" in text
-    assert "0" not in text.replace("✅ 今天没有紧急事项", "")
+    assert "✅ 暂无待办事项" in text
+    assert "0" not in text.replace("✅ 暂无待办事项", "")

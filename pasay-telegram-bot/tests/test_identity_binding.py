@@ -38,6 +38,7 @@ def test_registered_commands_bind_identity_before_page_or_api_work(make_app):
         "cmd_pending",
         "cmd_cancel",
         "cmd_ops",
+        "cmd_todo",
         "cmd_copilot",
     }
     for callback in callbacks:

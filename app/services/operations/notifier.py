@@ -56,7 +56,9 @@ TELEGRAM_API = "https://api.telegram.org"
 class NotificationSender(Protocol):
     """Send one notification; returns the provider message id (or None)."""
 
-    def send(self, recipient: str, text: str) -> str | None: ...
+    def send(
+        self, recipient: str, text: str, reply_markup: dict | None = None,
+    ) -> str | None: ...
 
 
 class TelegramSender:
@@ -71,7 +73,9 @@ class TelegramSender:
         self._resolve_user = resolve_user
         self._timeout = timeout
 
-    def send(self, recipient: str, text: str) -> str | None:
+    def send(
+        self, recipient: str, text: str, reply_markup: dict | None = None,
+    ) -> str | None:
         chat_id = recipient
         if recipient.startswith("user:"):
             if self._resolve_user is None:
@@ -79,9 +83,12 @@ class TelegramSender:
             chat_id = self._resolve_user(recipient[5:])
             if not chat_id:
                 raise ValueError(f"no telegram chat id for user {recipient[5:]}")
+        body = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+        if reply_markup is not None:
+            body["reply_markup"] = reply_markup
         resp = httpx.post(
             f"{TELEGRAM_API}/bot{self._token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            json=body,
             timeout=self._timeout,
         )
         if resp.status_code >= 400:
@@ -121,12 +128,24 @@ def claim_pending_notifications(
 
 
 def _message_text(item: NotificationOutbox) -> str:
+    """Humanized notification text (V1.3): no task_type codes, no #id prefixes.
+    An explicit payload ``message`` (the human card from generation or the
+    English copilot override) wins; otherwise compose from title/amount/due."""
     payload = item.payload or {}
-    return (
-        payload.get("message")
-        or payload.get("title")
-        or f"🔔 待办提醒 #{item.task_id}"
-    )
+    explicit = payload.get("message")
+    if explicit:
+        return explicit
+    lines = ["🔔 待办提醒"]
+    title = payload.get("title")
+    if title:
+        lines.append(title)
+    amount = payload.get("amount")
+    if amount is not None and str(amount) not in ("", "None"):
+        lines.append(f"金额：{amount}")
+    due = payload.get("due_at")
+    if due:
+        lines.append(f"到期：{str(due)[:16].replace('T', ' ')}")
+    return "\n".join(lines)
 
 
 def process_notifications_once(
@@ -155,7 +174,10 @@ def process_notifications_once(
         result["claimed"] += 1
         text = _message_text(row)
         try:
-            message_id = sender.send(row.recipient, text)
+            message_id = sender.send(
+                row.recipient, text,
+                reply_markup=row.payload.get("reply_markup") if row.payload else None,
+            )
             if not _finalize_sent(db, row, message_id=message_id, now=now):
                 # The row was concurrently DROPPED (task no longer warrants the
                 # reminder) or re-claimed: never retry a possibly-stale send.

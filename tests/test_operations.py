@@ -137,7 +137,7 @@ class _FailingSender:
         self.error = error
         self.calls = 0
 
-    def send(self, recipient, text):
+    def send(self, recipient, text, reply_markup=None):
         self.calls += 1
         raise RuntimeError(self.error)
 
@@ -146,8 +146,8 @@ class _OkSender:
     def __init__(self):
         self.sent = []
 
-    def send(self, recipient, text):
-        self.sent.append((recipient, text))
+    def send(self, recipient, text, reply_markup=None):
+        self.sent.append((recipient, text, reply_markup))
         return "777"
 
 
@@ -354,6 +354,74 @@ def test_notification_success_marks_sent_and_records_message_id(db_session):
     assert item.status == NotificationStatus.SENT
     assert item.sent_at == NOW
     assert item.telegram_message_id == 777
+
+
+def test_notifier_passes_reply_markup_through(db_session):
+    """V1.3: process_notifications_once forwards the outbox payload's
+    reply_markup to the Telegram sender (approve/reject buttons)."""
+    reply_markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ 批准", "callback_data": "v1:exa:5:abc12345:1700000000"},
+                {"text": "❌ 拒绝", "callback_data": "v1:exr:5:abc12345:1700000000"},
+            ],
+            [{"text": "📎 查看凭证", "callback_data": "v1:exd:5"}],
+        ]
+    }
+    item = NotificationOutbox(
+        channel="telegram", recipient="tg1",
+        payload={"message": "x", "reply_markup": reply_markup},
+        status=NotificationStatus.PENDING, attempts=0,
+    )
+    db_session.add(item)
+    db_session.commit()
+    sender = _OkSender()
+    result = process_notifications_once(db_session, sender, now=NOW)
+    assert result == {"claimed": 1, "sent": 1, "retried": 0, "failed": 0}
+    assert sender.sent[0][2] == reply_markup
+
+
+def test_expense_approval_task_human_notification_with_actions(db_session, monkeypatch):
+    """V1.3: APPROVAL_PENDING tasks get a human title (no #expense_id), resolve
+    to the Owner, and their outbox notification carries approve/reject/detail
+    reply_markup plus a humanized message (no internal enums)."""
+    from app.services.operations import generation
+
+    admin = _user(db_session, "exp-owner", UserRole.admin, "tg-owner")
+    db_session.commit()
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", admin.id)
+    expense = Expense(
+        expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
+        payee="Fix-It Co", status=ExpenseStatus.pending,
+        created_at=NOW - timedelta(days=10),
+    )
+    db_session.add(expense)
+    db_session.commit()
+
+    run_scheduler_once(db_session, now=NOW)
+    task = db_session.query(OperationalTask).filter_by(
+        task_type=OperationalTaskType.APPROVAL_PENDING
+    ).one()
+    assert task.title == "待批准支出 · repair"
+    assert "#" not in task.title
+    assert task.assigned_user_id == admin.id
+
+    outbox = db_session.query(NotificationOutbox).filter_by(task_id=task.id).one()
+    assert outbox.recipient == "tg-owner"
+    message = outbox.payload["message"]
+    assert "待办提醒" in message
+    assert "待批准支出 · repair" in message
+    for banned in ("APPROVAL_PENDING", "REPAIR", f"#{expense.id}"):
+        assert banned not in message
+    kb = outbox.payload["reply_markup"]
+    callbacks = [
+        button["callback_data"]
+        for row in kb["inline_keyboard"]
+        for button in row
+    ]
+    assert any(c.startswith("v1:exa:") for c in callbacks)
+    assert any(c.startswith("v1:exr:") for c in callbacks)
+    assert any(c == f"v1:exd:{expense.id}" for c in callbacks)
 
 
 def test_worker_crash_after_claim_recovers_via_skip_locked(db_session, test_engine):

@@ -12,6 +12,7 @@ from pasay_bot.api_client import (
     CopilotRecommend,
     CopilotToday,
     CopilotTodayItem,
+    Expense,
     FinancialSummary,
     Income,
     Lease,
@@ -499,18 +500,174 @@ def operational_task_detail_card(task, properties, locale: str = "zh") -> str:
     lines.append(DIVIDER)
     lines.append(f"{H.escape(t('ops.task', locale))}：{H.escape(task.title or f'#{task.id}')}")
     lines.append(f"{H.escape(t('ops.property', locale))}：{H.escape(_ops_property_name(task, properties))}")
-    tenant_id = task.tenant_id
-    if tenant_id:
-        lines.append(f"{H.escape(t('ops.tenant', locale))}：#<code>{tenant_id}</code>")
+    tenant_name = details.get("tenant_name")
+    if tenant_name:
+        lines.append(f"{H.escape(t('ops.tenant', locale))}：{H.escape(tenant_name)}")
     amount = _ops_amount(task)
     if amount is not None:
         lines.append(f"{H.escape(t('ops.amount', locale))}：{H.money(amount)}")
     lines.append(f"{H.escape(t('ops.due', locale))}：{H.escape(_ops_due(task))}")
     lines.append(f"{H.escape(t('ops.status', locale))}：{_ops_status_label(task, locale)}")
-    lines.append(f"类型：<code>{H.escape(task.task_type or '')}</code>")
     if task.description:
         lines.append(H.escape(task.description))
     return "\n".join(lines)
+
+
+# --- V1.3 Slice 1: expense approval + unified to-do -------------------------
+
+def _expense_status_label(status: str, locale: str = "zh") -> str:
+    key = {
+        "pending": "expense.status_pending",
+        "approved": "expense.status_approved",
+        "rejected": "expense.status_rejected",
+        "paid": "expense.status_paid",
+        "reversed": "expense.status_reversed",
+    }.get((status or "").lower())
+    return H.escape(t(key, locale)) if key else H.escape(status or "")
+
+
+def _expense_location(expense: Expense, location: str = "") -> str:
+    return H.escape(location) if location else (
+        f"Unit {expense.unit_id}" if expense.unit_id else ""
+    )
+
+
+def expense_approval_card(
+    expense: Expense, locale: str = "zh", location: str = "",
+) -> str:
+    """Owner-facing approval card (zh default): location/unit, amount, payee,
+    purpose and date. Raw statuses and expense ids never appear."""
+    lines = [f"<b>{H.escape(t('expense.title', locale))}</b>"]
+    loc = _expense_location(expense, location)
+    if loc:
+        lines.append(loc)
+    lines.append(f"<b>{H.money(expense.amount)}</b>")
+    lines.append(
+        f"{H.escape(t('expense.payee', locale))}：{H.escape(expense.payee or '-')}"
+    )
+    purpose = " · ".join(
+        x for x in (expense.category, expense.description or "") if x
+    )
+    if purpose:
+        lines.append(f"{H.escape(t('expense.purpose', locale))}：{H.escape(purpose)}")
+    lines.append(
+        f"{H.escape(t('expense.date', locale))}：{H.format_date(expense.expense_date)}"
+        + (
+            f" · {H.escape(t('expense.due_date', locale))}：{H.format_date(expense.due_date)}"
+            if expense.due_date else ""
+        )
+    )
+    lines.append(
+        H.escape(t("expense.receipt_present", locale))
+        if expense.receipt_attachment_id
+        else H.escape(t("expense.receipt_missing", locale))
+    )
+    return "\n".join(lines)
+
+
+def expense_result_card(expense: Expense, locale: str = "zh") -> str:
+    """Message-mutation result card: the tapped decision + the human next step.
+    No raw status enum, no expense_id."""
+    status = (expense.status or "").lower()
+    if status == "approved":
+        title = t("expense.approved_card", locale)
+        next_step = H.escape(t("expense.approved_next", locale))
+    elif status == "rejected":
+        title = t("expense.rejected_card", locale)
+        next_step = H.escape(t("expense.rejected_next", locale))
+    elif status == "paid":
+        title = t("expense.paid_card", locale)
+        next_step = H.escape(t("expense.rejected_next", locale))
+    elif status == "reversed":
+        title = t("expense.reversed_card", locale)
+        next_step = H.escape(t("expense.rejected_next", locale))
+    else:
+        return expense_approval_card(expense, locale)
+    lines = [title, f"{H.escape(expense.category or '')} · {H.money(expense.amount)}", next_step]
+    return "\n".join(x for x in lines if x)
+
+
+def expense_detail_card(
+    expense: Expense, locale: str = "zh", location: str = "",
+) -> str:
+    """Human-readable expense detail. Receipt presence is shown as a label;
+    raw attachment ids stay internal."""
+    lines = [f"<b>{H.escape(t('expense.detail_title', locale))}</b>"]
+    loc = _expense_location(expense, location)
+    if loc:
+        lines.append(loc)
+    lines.append(f"{H.escape(t('expense.purpose', locale))}：{H.escape(expense.category)}")
+    if expense.description:
+        lines.append(H.escape(expense.description))
+    lines.append(f"{H.escape(t('expense.payee', locale))}：{H.escape(expense.payee or '-')}")
+    lines.append(f"{H.escape(t('rent.amount', locale))}：<b>{H.money(expense.amount)}</b>")
+    lines.append(
+        f"{H.escape(t('expense.date', locale))}：{H.format_date(expense.expense_date)}"
+    )
+    if expense.due_date:
+        lines.append(
+            f"{H.escape(t('expense.due_date', locale))}：{H.format_date(expense.due_date)}"
+        )
+    lines.append(
+        f"{H.escape(t('ops.status', locale))}：{_expense_status_label(expense.status, locale)}"
+    )
+    lines.append(
+        H.escape(t("expense.receipt_present", locale))
+        if expense.receipt_attachment_id
+        else H.escape(t("expense.receipt_missing", locale))
+    )
+    return "\n".join(lines)
+
+
+def todo_overview_card(sections: dict, locale: str = "zh") -> str:
+    """Unified to-do page (V1.3): only what the current user must act on.
+    Rows are human-readable; action buttons ride below each row."""
+    blocks = [f"<b>{H.escape(t('todo.title', locale))}</b>"]
+    if not any(sections.values()):
+        return "\n".join(
+            [
+                f"<b>{H.escape(t('todo.title', locale))}</b>",
+                H.escape(t("todo.empty", locale)),
+            ]
+        )
+    expenses = sections.get("expenses") or []
+    if expenses:
+        items = [
+            f"💳 {H.escape(r.get('category', ''))} · {H.escape(r.get('payee', ''))}"
+            f" · <b>{H.money(r.get('amount'))}</b>"
+            + (f"\n{H.escape(r.get('location', ''))}" if r.get("location") else "")
+            for r in expenses
+        ]
+        blocks.append(H.escape(t("todo.section_expenses", locale, count=len(expenses))))
+        blocks.append("\n".join(items))
+    confirm = sections.get("confirm") or []
+    if confirm:
+        items = [
+            f"⏳ {H.escape(r.get('where', ''))} · {H.money(r.get('amount'))}"
+            for r in confirm
+        ]
+        blocks.append(H.escape(t("todo.section_confirm", locale, count=len(confirm))))
+        blocks.append("\n".join(items))
+    overdue = sections.get("overdue") or []
+    if overdue:
+        items = [
+            f"🔴 {H.escape(r.get('unit', ''))} · {H.money(r.get('total_outstanding'))}"
+            f" · {H.escape(t('overdue.days', locale))} {r.get('overdue_days')}"
+            f"{H.escape(t('overdue.days_unit', locale))}"
+            for r in overdue
+        ]
+        blocks.append(H.escape(t("todo.section_overdue", locale, count=len(overdue))))
+        blocks.append("\n".join(items))
+    tasks = sections.get("tasks") or []
+    if tasks:
+        items = [
+            f"🛠 {H.escape(tk.title or f'#{tk.id}')}"
+            + (f" · {H.escape(_ops_due(tk))}" if getattr(tk, "due_at", None) else "")
+            for tk in tasks
+        ]
+        blocks.append(H.escape(t("todo.section_tasks", locale, count=len(tasks))))
+        blocks.append("\n".join(items))
+    return "\n\n".join(blocks)
 
 
 # --- V1.2.2 C1 read-only copilot (🤖 运营助手) ---------------------------------

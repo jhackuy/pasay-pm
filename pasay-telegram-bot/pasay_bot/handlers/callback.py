@@ -48,6 +48,9 @@ from pasay_bot.keyboards import (
     ACTION_COPILOT_WHY,
     ACTION_DETAIL,
     ACTION_EDIT,
+    ACTION_EXPENSE_APPROVE,
+    ACTION_EXPENSE_DETAIL,
+    ACTION_EXPENSE_REJECT,
     ACTION_METHOD,
     ACTION_NAV,
     ACTION_OPS_NAV,
@@ -75,6 +78,9 @@ from pasay_bot.keyboards import (
     edit_input_keyboard,
     edit_menu_keyboard,
     error_keyboard,
+    expense_approval_keyboard,
+    expense_detail_keyboard,
+    expense_result_keyboard,
     expired_keyboard,
     home_keyboard,
     new_nonce,
@@ -85,7 +91,10 @@ from pasay_bot.keyboards import (
     snooze_preset_keyboard,
     task_action_keyboard,
 )
-from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
+from pasay_bot.handlers.edit_utils import (
+    edit_message_text_idempotent,
+    edit_message_text_or_send,
+)
 from pasay_bot.render import cards, html as H
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
@@ -189,6 +198,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_cancel(update, context, locale)
     elif action == ACTION_DETAIL:
         await _handle_detail(update, context, entity, ref, role, locale)
+    elif action == ACTION_EXPENSE_APPROVE:
+        await _handle_expense_approve(update, context, entity, nonce, ts, role, locale)
+    elif action == ACTION_EXPENSE_REJECT:
+        await _handle_expense_reject(update, context, entity, nonce, ts, role, locale)
+    elif action == ACTION_EXPENSE_DETAIL:
+        await _handle_expense_detail(update, context, entity, role, locale)
     elif action == ACTION_EDIT:
         await _handle_edit(update, context, entity, role, locale)
     elif action == ACTION_OPS_NAV:
@@ -243,7 +258,7 @@ async def _handle_nav(update, context, entity, role, locale):
     elif entity == "rent":
         await pages.show_rent(context, chat_id, locale, message_id=message_id)
     elif entity == "pending":
-        await pages.show_pending(context, chat_id, role, locale, message_id=message_id)
+        await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
     else:  # home / menu
         await show_dashboard(context, chat_id, locale, message_id=message_id)
 
@@ -753,6 +768,160 @@ async def _handle_detail(update, context, entity, ref, role, locale):
                     home_keyboard(locale))
         return
     await _answer(update, t("common.invalid", locale))
+
+
+# --- V1.3 expense approval (exa / exr / exd) --------------------------------
+
+async def _expense_location(update, context, expense) -> str:
+    """Best-effort Property · Unit label for an expense card; empty when the
+    expense has no unit or the lookup fails (expense_id stays internal)."""
+    if not getattr(expense, "unit_id", None):
+        return ""
+    try:
+        units, properties = await asyncio.gather(
+            context.bot_data["api_client"].get_units(),
+            context.bot_data["api_client"].get_properties(),
+        )
+    except PasayApiError:
+        return ""
+    return pages._expense_location(expense, units, properties)
+
+
+async def _render_expense_state(update, context, expense, locale):
+    """Render the CURRENT expense state onto the tapped card (message
+    mutation). Pending -> fresh approval card; otherwise the human result card."""
+    location = await _expense_location(update, context, expense)
+    if (expense.status or "").lower() == "pending":
+        text = cards.expense_approval_card(expense, locale, location=location)
+        kb = expense_approval_keyboard(expense.id, locale)
+    else:
+        text = cards.expense_result_card(expense, locale)
+        kb = expense_result_keyboard(locale)
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
+
+
+async def _handle_expense_action(
+    update, context, action: str, expense_id_raw: str, nonce: str, ts, role, locale
+):
+    """Approve/reject core (V1.3): answer first (no loading spinner), Owner
+    only, idempotency-guarded, original message mutated to the result card.
+    Backend errors never destroy the original card."""
+    await _answer(update, "")
+    if role != Role.OWNER:
+        await _answer(update, t("expense.owner_only", locale))
+        return
+    if not expense_id_raw.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        return
+    expense_id = int(expense_id_raw)
+    api = context.bot_data["api_client"]
+    guard = context.bot_data["idempotency"]
+    key = f"ik:exp:{action}:{expense_id}:{nonce or '0'}"
+    status = guard.acquire(key, kind="expense", resource=str(expense_id))
+    if status == "done":
+        await _answer(update, t("expense.already_processed", locale))
+        try:
+            expense = await api.get_expense(expense_id)
+        except PasayApiError:
+            return
+        await _render_expense_state(update, context, expense, locale)
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale))
+        return
+    try:
+        current = await api.get_expense(expense_id)
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}")
+        return
+    if (current.status or "").lower() != "pending":
+        guard.settle(key, current.as_dict(), resource=str(expense_id))
+        await _answer(update, t("expense.already_processed", locale))
+        await _render_expense_state(update, context, current, locale)
+        return
+    try:
+        if action == "approve":
+            updated = await api.approve_expense(expense_id)
+        else:
+            updated = await api.reject_expense(expense_id)
+        guard.settle(key, updated.as_dict(), resource=str(expense_id))
+        await _render_expense_state(update, context, updated, locale)
+        await _answer(update, "")
+    except PasayApiConflictError:
+        # 409 = only pending expenses can change -> processed elsewhere.
+        try:
+            current = await api.get_expense(expense_id)
+        except PasayApiError:
+            guard.fail(key, resource=str(expense_id))
+            return
+        guard.settle(key, current.as_dict(), resource=str(expense_id))
+        await _answer(update, t("expense.already_processed", locale))
+        await _render_expense_state(update, context, current, locale)
+    except PasayApiTimeoutError:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("common.timeout", locale))
+    except PasayApiPermissionError:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("common.no_permission", locale))
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}")
+
+
+async def _handle_expense_approve(update, context, expense_id_raw, nonce, ts, role, locale):
+    await _handle_expense_action(
+        update, context, "approve", expense_id_raw, nonce, ts, role, locale
+    )
+
+
+async def _handle_expense_reject(update, context, expense_id_raw, nonce, ts, role, locale):
+    await _handle_expense_action(
+        update, context, "reject", expense_id_raw, nonce, ts, role, locale
+    )
+
+
+async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
+    """[📎 查看凭证/详情]: human-readable detail. Approve/reject stay on the
+    card while the expense is still pending AND the user is the Owner."""
+    await _answer(update, "")
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not expense_id_raw.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    api = context.bot_data["api_client"]
+    try:
+        expense = await api.get_expense(int(expense_id_raw))
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}")
+        return
+    location = await _expense_location(update, context, expense)
+    text = cards.expense_detail_card(expense, locale, location=location)
+    still_pending = (
+        role == Role.OWNER and (expense.status or "").lower() == "pending"
+    )
+    kb = expense_detail_keyboard(expense.id, still_pending=still_pending, locale=locale)
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
 
 
 # --- timeout reconciliation (design §13) ---

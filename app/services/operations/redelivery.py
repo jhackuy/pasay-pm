@@ -139,7 +139,7 @@ def redeliver_due_snoozes(
                 "due_at": task.due_at.isoformat(),
                 "snooze_window": _utc_iso(window),
                 "reminder_generation": generation,
-                "message": f"🔔 待办提醒（继续）\n#{task.id} · {task.task_type.value}\n{task.title}",
+                "message": f"🔔 待办提醒（继续）\n{task.title}",
             },
             dedupe_key=dedupe_key,
         )

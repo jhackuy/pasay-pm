@@ -215,7 +215,7 @@ class _FailingSender:
         self.error = error
         self.calls = 0
 
-    def send(self, recipient, text):
+    def send(self, recipient, text, reply_markup=None):
         self.calls += 1
         raise RuntimeError(self.error)
 
@@ -224,8 +224,8 @@ class _OkSender:
     def __init__(self):
         self.sent = []
 
-    def send(self, recipient, text):
-        self.sent.append((recipient, text))
+    def send(self, recipient, text, reply_markup=None):
+        self.sent.append((recipient, text, reply_markup))
         return "777"
 
 
@@ -1090,8 +1090,8 @@ class _SharedSender:
     def __init__(self, sent: list):
         self.sent = sent
 
-    def send(self, recipient, text):
-        self.sent.append((recipient, text))
+    def send(self, recipient, text, reply_markup=None):
+        self.sent.append((recipient, text, reply_markup))
         return "777"
 
 

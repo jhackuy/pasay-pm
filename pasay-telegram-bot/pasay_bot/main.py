@@ -59,7 +59,7 @@ def build_application(
     app.add_handler(CommandHandler("pending", commands.cmd_pending))
     app.add_handler(CommandHandler("cancel", commands.cmd_cancel))
     app.add_handler(CommandHandler("ops", commands.cmd_ops))
-    app.add_handler(CommandHandler("todo", commands.cmd_ops))
+    app.add_handler(CommandHandler("todo", commands.cmd_todo))
     app.add_handler(CommandHandler("copilot", commands.cmd_copilot))
     app.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversation.handle_message))

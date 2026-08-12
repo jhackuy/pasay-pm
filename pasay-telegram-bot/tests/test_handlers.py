@@ -579,7 +579,7 @@ def test_owner_confirms_secretary_pending_via_pending_command(make_app):
 
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
     send = env.bot.last_send()
-    assert "待确认收入" in send["text"]
+    assert "待确认收款" in send["text"]
     kb = send["reply_markup"]
     assert kb is not None
     btn = next(
@@ -602,14 +602,14 @@ def test_owner_confirms_secretary_pending_via_pending_command(make_app):
 
 
 def test_secretary_pending_list_has_no_confirm_buttons(make_app):
-    """★ F5: SECRETARY can view the pending to-do page but gets no confirm
-    buttons (only the overdue collect + home buttons)."""
+    """★ F5/V1.3: SECRETARY's unified Tasks page shows her tasks only — the
+    Owner's decision rows (pending income etc.) never appear with confirm."""
     env = make_app()
     env.backend.add_income(status="pending", income_id=1)
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending", bot=env.bot)])
     send = env.bot.last_send()
-    assert "To-do" in send["text"]  # SECRETARY locale is en
-    assert "Pending income · 1" in send["text"]
+    assert "Tasks" in send["text"]  # SECRETARY locale is en (✅ Tasks title)
+    assert "Pending income" not in send["text"]  # not her decision
     kb = send["reply_markup"]
     assert kb is not None
     cnf = [

@@ -171,6 +171,62 @@ class Income:
 
 
 @dataclass
+class Expense:
+    """Expense record (V1.3 expense approval). ``status`` is one of the backend
+    values (pending/approved/rejected/paid/reversed); UI text is derived in
+    render/cards.py — never shown raw."""
+
+    id: int
+    expense_date: date = date.today()
+    due_date: Optional[date] = None
+    category: str = ""
+    amount: Decimal = Decimal("0")
+    payee: str = ""
+    description: Optional[str] = None
+    unit_id: Optional[int] = None
+    status: str = "pending"
+    receipt_attachment_id: Optional[int] = None
+    approved_by: Optional[int] = None
+    approved_at: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Expense":
+        return cls(
+            id=int(d.get("id") or 0),
+            expense_date=_to_date(d.get("expense_date")) or date.today(),
+            due_date=_to_date(d.get("due_date")),
+            category=d.get("category") or "",
+            amount=_to_decimal(d.get("amount")),
+            payee=d.get("payee") or "",
+            description=d.get("description"),
+            unit_id=int(d["unit_id"]) if d.get("unit_id") is not None else None,
+            status=d.get("status") or "pending",
+            receipt_attachment_id=(
+                int(d["receipt_attachment_id"])
+                if d.get("receipt_attachment_id") is not None else None
+            ),
+            approved_by=int(d["approved_by"]) if d.get("approved_by") is not None else None,
+            approved_at=d.get("approved_at"),
+        )
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "expense_date": self.expense_date.isoformat(),
+            "due_date": self.due_date.isoformat() if self.due_date else None,
+            "category": self.category,
+            "amount": str(self.amount),
+            "payee": self.payee,
+            "description": self.description,
+            "unit_id": self.unit_id,
+            "status": self.status,
+            "receipt_attachment_id": self.receipt_attachment_id,
+            "approved_by": self.approved_by,
+            "approved_at": self.approved_at,
+        }
+
+
+@dataclass
 class FinancialSummary:
     month: str = ""
     expected_rent_total: Decimal = Decimal("0")
@@ -643,6 +699,23 @@ class PasayApiClient:
     async def list_incomes(self) -> list[Income]:
         data = await self._request("GET", "/incomes")
         return [Income.from_dict(d) for d in data]
+
+    # --- expenses (read + approval/rejection) ---
+    async def list_expenses(self) -> list[Expense]:
+        data = await self._request("GET", "/expenses")
+        return [Expense.from_dict(d) for d in data]
+
+    async def get_expense(self, expense_id: int) -> Expense:
+        data = await self._request("GET", f"/expenses/{expense_id}")
+        return Expense.from_dict(data)
+
+    async def approve_expense(self, expense_id: int) -> Expense:
+        data = await self._request("POST", f"/expenses/{expense_id}/approve")
+        return Expense.from_dict(data)
+
+    async def reject_expense(self, expense_id: int) -> Expense:
+        data = await self._request("POST", f"/expenses/{expense_id}/reject")
+        return Expense.from_dict(data)
 
     async def find_income(
         self,

@@ -1074,7 +1074,7 @@ class _FailingSender:
     def __init__(self):
         self.calls = 0
 
-    def send(self, recipient, text):
+    def send(self, recipient, text, reply_markup=None):
         self.calls += 1
         raise RuntimeError("telegram down")
 

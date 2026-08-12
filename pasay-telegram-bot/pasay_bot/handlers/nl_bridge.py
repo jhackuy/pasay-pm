@@ -27,7 +27,8 @@ _ROUTES = [
     (("财务", "finance", "summary", "收支", "报表"), "finance"),
     (("逾期", "overdue", "欠租", "overdue rent"), "overdue"),
     (("收租", "rent", "登记"), "rent"),
-    (("待处理", "pending", "待办", "待确认"), "pending"),
+    (("待处理", "pending", "待办", "todo", "tasks", "待确认"), "pending"),
+    (("更多", "more"), "more"),
     (("菜单", "menu", "主菜单", "home", "start"), "menu"),
     (("帮助", "help", "帮助"), "help"),
 ]
@@ -53,7 +54,7 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.effective_message.text or ""
     route = route_for_text(text)
-    if route in ("properties", "finance", "overdue", "rent", "pending", "menu"):
+    if route in ("properties", "finance", "overdue", "rent", "pending", "menu", "more"):
         if not has_read_permission(role):
             await context.bot.send_message(
                 chat_id,
@@ -70,14 +71,19 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif route == "rent":
         await pages.show_rent(context, chat_id, locale)
     elif route == "pending":
-        await pages.show_pending(context, chat_id, role, locale)
+        await pages.show_todo(context, chat_id, role, locale)
+    elif route == "more":
+        await pages.show_dashboard(
+            context, chat_id, locale, role=role, fallback_inline=True
+        )
     elif route == "menu":
-        await pages.show_menu(context, chat_id, locale)
+        await pages.show_menu(context, chat_id, locale, role=role)
     elif route == "help":
         await context.bot.send_message(
             chat_id,
             f"📖 <b>{H.escape(t('help.title', locale))}</b>\n\n{H.escape(t('help.text', locale))}",
             parse_mode=HTML,
+            reply_markup=pages.reply_keyboard(role),
         )
     else:
         await context.bot.send_message(

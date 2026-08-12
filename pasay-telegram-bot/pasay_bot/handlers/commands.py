@@ -28,16 +28,19 @@ from pasay_bot.keyboards import (
     dashboard_keyboard,
     error_keyboard,
     home_keyboard,
+    reply_keyboard,
     ops_overview_keyboard,
     ops_section_keyboard,
     overdue_page_keyboard,
     pending_page_keyboard,
     property_list_keyboard,
     property_pagination_keyboard,
+    todo_keyboard,
     unit_list_keyboard,
     unit_page_keyboard,
 )
 from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
+from pasay_bot.roles import Role
 from pasay_bot.render import cards, html as H
 from pasay_bot.render.cards import PAGE_SIZE_OVERDUE, PAGE_SIZE_PROPERTIES
 from pasay_bot.render.i18n import t
@@ -105,7 +108,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_read_permission(role):
         await _refuse(update, context, role)
         return
-    await show_dashboard(context, update.effective_chat.id, locale_for(role))
+    await show_dashboard(context, update.effective_chat.id, locale_for(role), role=role)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -121,7 +124,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{H.escape(t('help.text', locale))}"
     )
     await context.bot.send_message(
-        update.effective_chat.id, text, parse_mode=HTML, reply_markup=dashboard_keyboard(locale)
+        update.effective_chat.id, text, parse_mode=HTML,
+        reply_markup=reply_keyboard(role),
     )
 
 
@@ -163,24 +167,34 @@ async def cmd_rent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _bind_identity(update, context)
-    """Aggregated to-do page (B2): overdue, pending confirm, expiring leases, tasks."""
+    """Unified to-do page (V1.3): everything the current user must act on."""
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
     if not has_read_permission(role):
         await _refuse(update, context, role)
         return
-    await show_pending(context, update.effective_chat.id, role, locale)
+    await show_todo(context, update.effective_chat.id, role, locale)
 
 
 async def cmd_ops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _bind_identity(update, context)
-    """V1.2 待办中心 (/ops, /todo)."""
+    """/ops and /todo both open the unified to-do page (V1.3)."""
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     locale = locale_for(role)
     if not has_permission(role, PERMISSION_OPERATIONS):
         await _refuse(update, context, role)
         return
-    await show_operations_center(context, update.effective_chat.id, locale)
+    await show_todo(context, update.effective_chat.id, role, locale)
+
+
+async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _bind_identity(update, context)
+    role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
+    locale = locale_for(role)
+    if not has_permission(role, PERMISSION_OPERATIONS):
+        await _refuse(update, context, role)
+        return
+    await show_todo(context, update.effective_chat.id, role, locale)
 
 
 async def cmd_copilot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,18 +230,19 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML, reply_markup=home_keyboard(locale),
         )
         return
-    await show_dashboard(context, chat_id, locale)
+    await show_dashboard(context, chat_id, locale, role=role)
 
 
 # --- page builders ---
 
-async def _send(context, chat_id, text, keyboard=None):
+async def _send(context, chat_id, text, keyboard=None, reply_keyboard=None):
     await context.bot.send_message(
-        chat_id, H.truncate(text), parse_mode=HTML, reply_markup=keyboard
+        chat_id, H.truncate(text), parse_mode=HTML,
+        reply_markup=keyboard if keyboard is not None else reply_keyboard,
     )
 
 
-async def _render(context, chat_id, message_id, text, keyboard=None):
+async def _render(context, chat_id, message_id, text, keyboard=None, reply_keyboard=None):
     """edit-first: when a message_id is known we edit it, else send (B6)."""
     if message_id:
         await edit_message_text_idempotent(
@@ -239,14 +254,16 @@ async def _render(context, chat_id, message_id, text, keyboard=None):
             reply_markup=keyboard,
         )
     else:
-        await _send(context, chat_id, text, keyboard)
+        await _send(context, chat_id, text, keyboard, reply_keyboard=reply_keyboard)
 
 
 def _load_error(detail: str, locale: str) -> str:
     return f"⚠️ {H.escape(t('common.load_error', locale, detail=str(detail)))}"
 
 
-async def show_dashboard(context, chat_id, locale: str, message_id=None):
+async def show_dashboard(
+    context, chat_id, locale: str, message_id=None, role=None, fallback_inline=False,
+):
     """Today's management center (B1). Data is fetched in parallel; any section
     the backend cannot serve is hidden rather than fabricated."""
     api = context.bot_data["api_client"]
@@ -288,12 +305,24 @@ async def show_dashboard(context, chat_id, locale: str, message_id=None):
         vacant_count=vacant_count,
         locale=locale,
     )
-    await _render(context, chat_id, message_id, text, dashboard_keyboard(locale))
+    if message_id:
+        # Telegram does not allow ReplyKeyboardMarkup on editMessageText; the
+        # persistent keyboard stays visible from the last send, so the edited
+        # message carries the minimal inline fallback instead.
+        await _render(context, chat_id, message_id, text, dashboard_keyboard(locale))
+    else:
+        if fallback_inline:
+            # ☰ 更多: the bottom nav is already visible; show the fallback
+            # inline actions (收租/逾期/运营助手/首页) on this message.
+            await _send(context, chat_id, text, keyboard=dashboard_keyboard(locale))
+        else:
+            await _send(context, chat_id, text,
+                        reply_keyboard=reply_keyboard(role) if role else None)
 
 
-async def show_menu(context, chat_id, locale: str, message_id=None):
+async def show_menu(context, chat_id, locale: str, message_id=None, role=None):
     """The menu IS the dashboard now (backward-compatible name)."""
-    await show_dashboard(context, chat_id, locale, message_id=message_id)
+    await show_dashboard(context, chat_id, locale, message_id=message_id, role=role)
 
 
 async def build_properties_page(api, page: int, locale: str):
@@ -497,6 +526,118 @@ async def show_pending(context, chat_id, role, locale: str, message_id=None):
         overdue_rows, confirm_entries, locale,
         can_confirm=has_permission(role, PERMISSION_RENT_CONFIRM),
     )
+    await _render(context, chat_id, message_id, text, keyboard)
+
+
+# --- V1.3 unified to-do page (待办 / Tasks) ---
+
+def _expense_location(expense, units, properties) -> str:
+    """Property · Unit label for an expense card; empty when the expense has
+    no unit (expense_id stays internal)."""
+    if not getattr(expense, "unit_id", None):
+        return ""
+    unit = next((u for u in units if u.id == expense.unit_id), None)
+    if unit is None:
+        return ""
+    prop = next((p for p in properties if p.id == unit.property_id), None)
+    return " · ".join(x for x in ((prop.name if prop else ""), unit.unit_number) if x)
+
+
+async def show_todo(context, chat_id, role, locale: str, message_id=None):
+    """Unified to-do page (V1.3): only what the current user must act on.
+    Owner sees expense approvals, pending income confirmations, overdue rent
+    and their tasks; Secretary sees the tasks the backend scoped to them.
+    Every row carries its action button (action-at-source)."""
+    api = context.bot_data["api_client"]
+    expenses, incomes, overdue, tasks = await asyncio.gather(
+        api.list_expenses(),
+        api.list_incomes(),
+        api.get_overdue_rents(),
+        api.get_operational_tasks(status="PENDING"),
+        return_exceptions=True,
+    )
+    if isinstance(expenses, Exception):
+        expenses = []
+    if isinstance(incomes, Exception):
+        incomes = []
+    if isinstance(overdue, Exception):
+        overdue = []
+    if isinstance(tasks, Exception):
+        tasks = []
+
+    units, properties, leases = [], [], []
+    try:
+        units, properties = await asyncio.gather(api.get_units(), api.get_properties())
+    except PasayApiError:
+        pass
+    try:
+        leases = await api.get_leases()
+    except PasayApiError:
+        pass
+
+    owner_view = role == Role.OWNER
+    expense_rows = []
+    if owner_view:
+        pending_expenses = sorted(
+            (e for e in expenses if (e.status or "").lower() == "pending"),
+            key=lambda e: (e.due_date or e.expense_date, e.id),
+        )
+        expense_rows = [
+            {
+                "id": e.id,
+                "category": e.category,
+                "payee": e.payee,
+                "amount": e.amount,
+                "location": _expense_location(e, units, properties),
+            }
+            for e in pending_expenses
+        ]
+
+    confirm_rows = []
+    if owner_view:
+        by_lease = {l.id: l for l in leases}
+        by_unit = {u.id: u for u in units}
+        by_prop = {p.id: p.name for p in properties}
+        pending_incomes = sorted(
+            (i for i in incomes if i.status == "pending"),
+            key=lambda i: (i.received_date, i.id),
+        )
+        for inc in pending_incomes:
+            lease = by_lease.get(inc.lease_id) if inc.lease_id else None
+            unit = by_unit.get(lease.unit_id) if lease else None
+            where = " · ".join(
+                x for x in (
+                    by_prop.get(unit.property_id, "") if unit else "",
+                    unit.unit_number if unit else "",
+                ) if x
+            )
+            confirm_rows.append({"id": inc.id, "amount": inc.amount, "where": where})
+
+    overdue_rows = []
+    if owner_view:
+        overdue_rows = [
+            {
+                "unit_id": r.unit_id,
+                "lease_id": r.lease_id,
+                "unit": r.unit,
+                "tenant": r.tenant,
+                "total_outstanding": r.total_outstanding,
+                "overdue_days": r.overdue_days,
+            }
+            for r in sorted(overdue, key=lambda x: (-x.overdue_days, -x.total_outstanding))
+        ]
+
+    task_rows = sorted(tasks, key=lambda x: (x.due_at is None, x.due_at or ""))
+    sections = {
+        "expenses": expense_rows,
+        "confirm": confirm_rows,
+        "overdue": overdue_rows,
+        "tasks": task_rows,
+    }
+    text = cards.todo_overview_card(sections, locale)
+    keyboard = todo_keyboard(sections, owner_view=owner_view, locale=locale)
+    # The persistent bottom keyboard stays visible from /start; this message
+    # carries the per-row action buttons (action-at-source).
     await _render(context, chat_id, message_id, text, keyboard)
 
 
