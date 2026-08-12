@@ -236,7 +236,7 @@ def _seed_payment_match_data(client, admin_headers):
         "/api/v1/units",
         json={
             "property_id": prop["id"], "unit_number": "1608", "floor": "16",
-            "size_sqm": "40.00", "monthly_rent": "70000.00", "status": "occupied",
+            "size_sqm": "40.00", "monthly_rent": "70000.00", "status": "vacant",
         },
         headers=admin_headers,
     ).json()
