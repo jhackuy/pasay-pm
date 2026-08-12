@@ -5,7 +5,7 @@ from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.api.deps import admin_only, get_current_user, manager_or_admin
+from app.api.deps import get_current_user, manager_or_admin, owner_subject_only
 from app.database import get_db
 from app.models.financial import Income, IncomeStatus
 from app.models.lease import Lease
@@ -145,7 +145,7 @@ def update_income(
 def confirm_income(
     income_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(owner_subject_only),
 ):
     obj = _get_or_404(db, income_id)
     old = serialize_row(obj)
@@ -188,7 +188,7 @@ def confirm_income(
 def reverse_income(
     income_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(owner_subject_only),
 ):
     obj = _get_or_404(db, income_id)
     old = serialize_row(obj)

@@ -6,7 +6,7 @@ from app.core.security import hash_api_key
 from app.database import get_db
 from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.user import User, UserRole
-from app.services.audit import set_audit_context
+from app.services.audit import current_audit_context, set_audit_context
 from app.services.identity import (
     eligible_human,
     normalize_telegram_user_id,
@@ -16,11 +16,12 @@ from app.services.identity import (
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
-    x_telegram_user_id: str | None = Header(default=None, alias="X-Telegram-User-Id"),
-    db: Session = Depends(get_db),
+def _resolve_current_user(
+    credentials: HTTPAuthorizationCredentials | None,
+    x_telegram_user_id: str | None,
+    db: Session,
 ) -> User:
+    """Resolve one canonical HUMAN subject and bind request provenance."""
     # A failed request must not leave provenance from an earlier request in a
     # recycled async context.
     set_audit_context(db, (None, None, None, None))
@@ -97,6 +98,59 @@ def get_current_user(
             "api",
         ),
     )
+    return user
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    x_telegram_user_id: str | None = Header(default=None, alias="X-Telegram-User-Id"),
+    db: Session = Depends(get_db),
+) -> User:
+    return _resolve_current_user(credentials, x_telegram_user_id, db)
+
+
+def owner_subject_only(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    x_telegram_user_id: str | None = Header(default=None, alias="X-Telegram-User-Id"),
+    db: Session = Depends(get_db),
+) -> User:
+    """Authorize an active canonical HUMAN Owner, failing closed with 403.
+
+    Owner-only transitions deliberately do not authorize the credential owner
+    or SERVICE caller. ``_resolve_current_user`` first resolves the current
+    HUMAN subject (including an exact active Telegram binding for Native Bot
+    calls); this dependency then checks that subject's canonical role and
+    provenance. Authentication failures are intentionally collapsed to 403
+    at this authorization boundary.
+    """
+    try:
+        user = _resolve_current_user(credentials, x_telegram_user_id, db)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Owner authorization required",
+        ) from exc
+
+    subject_principal_id, _, _, _ = current_audit_context(db)
+    subject = (
+        db.get(Principal, subject_principal_id)
+        if subject_principal_id is not None
+        else None
+    )
+    if (
+        user.role != UserRole.admin
+        or subject is None
+        or subject.principal_type != PrincipalType.HUMAN
+        or subject.user_id != user.id
+        or not subject.is_active
+    ):
+        # Do not retain provenance for a denied subject in a request-scoped
+        # session that may be reused by direct tests or non-ASGI callers.
+        set_audit_context(db, (None, None, None, None))
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Owner authorization required",
+        )
     return user
 
 

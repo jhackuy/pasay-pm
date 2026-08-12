@@ -449,50 +449,64 @@ def test_backend_timeout_pending_reconcile(make_app):
     assert env.bot.last_answer()["text"] == "✅ 已入账"
 
 
-# --- F2: dual API keys (manager for writes, admin for reverse) ---
+# --- V1.3 Gate A: one Native Bot caller credential for Owner transitions ---
 
-def test_reverse_uses_admin_key_writes_use_manager_key(make_app):
-    """★ F2: create/confirm go through the manager key; reverse through admin."""
-    env = make_app(api_key="manager-key", admin_api_key="admin-key")
+def test_confirm_and_reverse_use_native_bot_credential_and_owner_subject(make_app):
+    """Confirm/reverse carry one SERVICE caller plus the clicking HUMAN id."""
+    env = make_app(api_key="native-bot-key", admin_api_key="legacy-admin-key")
 
     data = _run_rent_to_confirm(env, user_id=SECRETARY_ID, chat_id=SECRETARY_ID)
     run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "pending"
-    assert env.backend.auth_for("POST", "/incomes") == "Bearer manager-key"
+    assert env.backend.auth_for("POST", "/incomes") == "Bearer native-bot-key"
 
     run_updates(
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, encode("cnf", "inc", "1", nonce=new_nonce(), ts=now_ts()), bot=env.bot)],
     )
     assert env.backend.incomes[0]["status"] == "confirmed"
-    assert env.backend.auth_for("POST", "/incomes/1/confirm") == "Bearer manager-key"
+    assert env.backend.auth_for("POST", "/incomes/1/confirm") == "Bearer native-bot-key"
 
     run_updates(
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts()), update_id=30, bot=env.bot)],
     )
     assert env.backend.incomes[0]["status"] == "reversed"
-    assert env.backend.auth_for("POST", "/incomes/1/reverse") == "Bearer admin-key"
+    assert env.backend.auth_for("POST", "/incomes/1/reverse") == "Bearer native-bot-key"
+
+    financial_calls = [
+        (call, telegram_user_id)
+        for call, telegram_user_id in zip(
+            env.backend.calls, env.backend.telegram_user_calls
+        )
+        if call[0] == "POST" and call[1] in {
+            "/incomes/1/confirm", "/incomes/1/reverse"
+        }
+    ]
+    assert financial_calls == [
+        (("POST", "/incomes/1/confirm", None), str(OWNER_ID)),
+        (("POST", "/incomes/1/reverse", None), str(OWNER_ID)),
+    ]
 
 
-def test_reverse_disabled_without_admin_key(make_app):
-    """★ F2: without PASSAY_ADMIN_API_KEY the reverse button is hidden and a
-    hand-crafted reverse callback is refused without touching the API."""
-    env = make_app(admin_api_key="")
+def test_reverse_does_not_require_legacy_admin_key(make_app):
+    """The Native Bot credential is sufficient caller proof for Owner reverse."""
+    env = make_app(api_key="native-bot-key", admin_api_key="")
     env.backend.add_income(status="confirmed", income_id=1)
     data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
-    assert env.backend.count_calls("POST", "/incomes/1/reverse") == 0
-    assert env.backend.incomes[0]["status"] == "confirmed"
-    assert "未配置" in (env.bot.last_answer()["text"] or "")
+    assert env.backend.count_calls("POST", "/incomes/1/reverse") == 1
+    assert env.backend.incomes[0]["status"] == "reversed"
+    assert env.backend.auth_for("POST", "/incomes/1/reverse") == "Bearer native-bot-key"
 
-    # full OWNER flow renders a success card WITHOUT a reverse button
+    # A full OWNER flow keeps the reverse action available without a second
+    # credential; the backend still validates the bound canonical subject.
     env2 = make_app(admin_api_key="")
     data2 = _run_rent_to_confirm(env2)
     run_updates(env2, [make_callback_update(OWNER_ID, OWNER_ID, data2, bot=env2.bot)])
     kb = env2.bot.edits()[-1]["reply_markup"]
     labels = [b.text for row in kb.inline_keyboard for b in row] if kb else []
-    assert "↩️ 撤销" not in labels
+    assert "↩️ 撤销" in labels
 
 
 # --- F3: crash after write -> restart -> same card retry, no duplicate ---

@@ -57,7 +57,7 @@ from app.services.operations.scheduler import run_scheduler_once
 from app.services.audit import set_audit_context
 
 API = "/api/v1"
-NOW = datetime(2026, 8, 11, 4, 0, 0, tzinfo=timezone.utc)  # 12:00 Asia/Manila
+NOW = datetime(2026, 8, 12, 9, 30, 0, tzinfo=timezone.utc)  # 17:30 Asia/Manila
 
 
 # ---------------------------------------------------------------------------

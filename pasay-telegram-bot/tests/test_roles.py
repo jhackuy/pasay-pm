@@ -39,7 +39,7 @@ def test_agent_permission():
 def test_manager_permission():
     perms = permissions_for_api_role("manager")
     assert PERMISSION_RENT_ENTRY in perms
-    assert PERMISSION_RENT_CONFIRM in perms
+    assert PERMISSION_RENT_CONFIRM not in perms
     assert PERMISSION_REVERSE not in perms
 
 

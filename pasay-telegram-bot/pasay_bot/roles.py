@@ -2,8 +2,9 @@
 
 Phase source of truth: a hard-coded copy of the pre-existing ``roles.json``
 mapping (OWNER / SECRETARY by Telegram user id) so the logic can be unit
-tested. The backend API key is the *real* enforcement point — the bot only
-uses this map to hide/show UI and to refuse writes before they reach the API.
+tested. The backend's canonical HUMAN-subject policy is the *real*
+enforcement point — the bot only uses this map to hide/show UI and to refuse
+writes before they reach the API.
 """
 from __future__ import annotations
 
@@ -29,12 +30,12 @@ PERMISSION_REVERSE = "reverse"
 PERMISSION_OPERATIONS = "operations"  # V1.2 待办中心 (backend enforces per-task)
 
 # Mirrors the backend user_role enum (agent/manager/admin). The backend
-# enforces these against the API key; the bot mirrors them for UI + fast
-# refusal of hand-crafted callbacks.
+# authorizes finance transitions against the resolved HUMAN subject; the bot
+# mirrors that policy for UI + fast refusal of hand-crafted callbacks.
 API_ROLE_PERMISSIONS: dict[str, frozenset[str]] = {
     "agent": frozenset(PERMISSION_READ),
     "manager": frozenset(
-        {*PERMISSION_READ, PERMISSION_RENT_ENTRY, PERMISSION_RENT_CONFIRM, PERMISSION_OPERATIONS}
+        {*PERMISSION_READ, PERMISSION_RENT_ENTRY, PERMISSION_OPERATIONS}
     ),
     "admin": frozenset(
         {

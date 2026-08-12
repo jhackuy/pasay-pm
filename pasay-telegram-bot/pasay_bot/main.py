@@ -96,8 +96,6 @@ def _load(args: argparse.Namespace) -> tuple[Settings, StateStore, PasayApiClien
         if settings.pasay_admin_api_key
         else None
     )
-    if admin_api is None:
-        logger.warning("PASSAY_ADMIN_API_KEY is not configured; reverse is disabled")
     return settings, store, api, admin_api
 
 

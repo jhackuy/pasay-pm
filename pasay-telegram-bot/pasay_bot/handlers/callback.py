@@ -151,12 +151,8 @@ def _remember_default_method(update, context, payload: dict) -> None:
 
 
 def _can_reverse(context, role) -> bool:
-    """Reverse needs OWNER permission AND an admin API key (F2). Without the
-    admin key the button is hidden and hand-crafted callbacks are refused."""
-    return (
-        has_permission(role, PERMISSION_REVERSE)
-        and context.bot_data.get("admin_api_client") is not None
-    )
+    """Reverse is shown only to OWNER; the backend re-authorizes the subject."""
+    return has_permission(role, PERMISSION_REVERSE)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,7 +653,6 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
 
 async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
     api = context.bot_data["api_client"]
-    admin_api = context.bot_data.get("admin_api_client")
     guard = context.bot_data["idempotency"]
     settings = context.bot_data["settings"]
     if _expired(ts, settings):
@@ -666,10 +661,6 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         return
     if not has_permission(role, PERMISSION_REVERSE):
         await _answer(update, t("common.no_permission", locale))
-        return
-    if admin_api is None:
-        logger.warning("PASSAY_ADMIN_API_KEY is not configured; OWNER reverse refused")
-        await _answer(update, t("common.reverse_unavailable", locale))
         return
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
@@ -687,8 +678,10 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("common.processing", locale))
         return
     try:
-        # Reverse is admin-only on the backend -> use the admin-key client.
-        reversed_ = await admin_api.reverse_income(income_id)
+        # Confirm and reverse use the same Native Bot SERVICE credential. The
+        # bound Telegram HUMAN subject, not a second credential, supplies the
+        # Owner authority at the backend boundary.
+        reversed_ = await api.reverse_income(income_id)
         guard.settle(key, reversed_.as_dict(), resource=str(income_id))
         await _render_income_state(update, context, reversed_, role, locale)
         await _answer(update, t("rent.reversed_toast", locale))
