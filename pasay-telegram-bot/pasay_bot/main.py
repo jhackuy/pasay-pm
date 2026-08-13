@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 
 import telegram
 from telegram.ext import (
@@ -41,7 +42,15 @@ def build_application(
     if bot is not None:
         builder = builder.bot(bot)  # tests / custom bot
     else:
-        builder = builder.token(settings.pasay_tg_bot_token or "0:UNSET")
+        timeout = settings.pasay_http_timeout_seconds
+        builder = (
+            builder
+            .token(settings.pasay_tg_bot_token or "0:UNSET")
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
+            .write_timeout(timeout)
+            .pool_timeout(timeout)
+        )
     app = builder.build()
     app.bot_data["api_client"] = api_client
     app.bot_data["admin_api_client"] = admin_api_client
@@ -118,14 +127,27 @@ def main(argv=None) -> int:
         print(f"[pasay-bot] self-check failed: {exc}", file=sys.stderr)
         return 1
 
-    app = build_application(settings, api, store, admin_api_client=admin_api)
-    print("[pasay-bot] starting polling ...")
     try:
         # run_polling() is BLOCKING and manages its OWN event loop; call it at
         # top level (not inside asyncio.run) so its loop isn't shared/closed by
         # an outer runner.
-        app.run_polling()
-        return 0
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            app = build_application(settings, api, store, admin_api_client=admin_api)
+            print("[pasay-bot] starting polling ...")
+            try:
+                app.run_polling()
+                return 0
+            except telegram.error.TimedOut as exc:
+                print(
+                    f"[pasay-bot] polling network timeout "
+                    f"(attempt {attempt}/{max_retries}): {exc}",
+                    file=sys.stderr,
+                )
+                if attempt >= max_retries:
+                    print("[pasay-bot] polling failed after retries", file=sys.stderr)
+                    return 1
+                time.sleep(5)
     except Exception as exc:  # noqa: BLE001 - fail closed
         print(f"[pasay-bot] self-check failed: {exc}", file=sys.stderr)
         return 1
@@ -148,7 +170,17 @@ async def _self_check(settings: Settings) -> None:
     # Standalone lightweight bot so we don't disturb the Application lifecycle
     # that run_polling() manages (using `async with app.bot` would pre-close the
     # bot's event-loop context -> "Cannot close a running event loop").
-    async with telegram.Bot(settings.pasay_tg_bot_token) as selfcheck_bot:
+    from telegram.request import HTTPXRequest
+    timeout = settings.pasay_http_timeout_seconds
+    request = HTTPXRequest(
+        connect_timeout=timeout,
+        read_timeout=timeout,
+        write_timeout=timeout,
+        pool_timeout=timeout,
+    )
+    async with telegram.Bot(
+        settings.pasay_tg_bot_token, request=request
+    ) as selfcheck_bot:
         me = await selfcheck_bot.get_me()
         print(f"[pasay-bot] getMe OK: @{me.username} (id={me.id})")
 
