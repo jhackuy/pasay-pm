@@ -73,6 +73,13 @@ def build_application(
     app.add_handler(CommandHandler("ops", commands.cmd_ops))
     app.add_handler(CommandHandler("todo", commands.cmd_todo))
     app.add_handler(CommandHandler("copilot", commands.cmd_copilot))
+    # SLICE3-UX-PERSISTENT-MENU-002: group new-member onboarding (neutral
+    # welcome only; ReplyKeyboardMarkup is per-chat, so no role menu broadcast).
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS, commands.handle_new_chat_members
+        )
+    )
     app.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversation.handle_message))
     return app

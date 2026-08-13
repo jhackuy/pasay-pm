@@ -346,13 +346,11 @@ def test_owner_zh_short_token_answers_prefixed_unit(make_app):
 def test_owner_zh_full_prefixed_unit_token_and_punctuation(make_app):
     env = make_app()
     add_dev_bay_1608(env)
-    run_updates(env, [
-        make_text_update(OWNER_ID, OWNER_ID, "DEV-BAY-1608 交了没有", bot=env.bot),
-        make_text_update(OWNER_ID, OWNER_ID, "1608. 交了没有",
-                         message_id=2, update_id=2, bot=env.bot),
-    ])
-    for text in env.bot.all_texts():
-        assert "Unit DEV-BAY-1608" in text, text
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "DEV-BAY-1608 交了没有", bot=env.bot)])
+    assert "Unit DEV-BAY-1608" in env.bot.last_send()["text"]
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "1608. 交了没有",
+                                       message_id=2, update_id=2, bot=env.bot)])
+    assert "Unit DEV-BAY-1608" in env.bot.last_send()["text"]
 
 
 def test_owner_zh_short_token_never_answers_other_unit(make_app):

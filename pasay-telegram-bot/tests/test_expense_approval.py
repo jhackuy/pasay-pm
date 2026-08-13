@@ -89,6 +89,8 @@ def test_reply_keyboard_role_specific_labels():
     assert sec_labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
     assert owner.resize_keyboard is True
     assert secretary.resize_keyboard is True
+    assert owner.is_persistent is True
+    assert secretary.is_persistent is True
 
 
 # --- human-readable cards ----------------------------------------------------

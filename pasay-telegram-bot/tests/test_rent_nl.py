@@ -123,10 +123,13 @@ def test_nl_confirm_mutates_card_once(make_app):
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "1608租金收到了", bot=env.bot)])
     data = _match_confirm_data(env)
 
+    # original card edited in place; the confirm mutation sends nothing new
+    sends_before = len(env.bot.sends())
     run_updates(
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, data, message_id=10, update_id=2, bot=env.bot)],
     )
+    assert len(env.bot.sends()) == sends_before
 
     assert env.backend.count_calls("POST", "/incomes") == 1
     income = env.backend.incomes[-1]
@@ -134,8 +137,6 @@ def test_nl_confirm_mutates_card_once(make_app):
     assert income["status"] == "confirmed"
     assert income["description"] == f"rent {date.today().strftime('%Y-%m')}"
 
-    # original card edited in place; no extra success messages
-    assert len(env.bot.sends()) == 1
     last = env.bot.edits()[-1]
     assert last["message_id"] == 10
     assert "租金已入账" in last["text"]

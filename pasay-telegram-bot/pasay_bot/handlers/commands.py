@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime, timedelta
 
-from telegram import Update
+from telegram import Chat, Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import PasayApiError
@@ -62,7 +62,7 @@ TASK_WINDOW_DAYS = 7
 EXPIRING_CONTRACT_DAYS = 30  # BOT-V1-USABLE-001 P0 spec: 30-day contract window
 
 
-def _bind_identity(update, context):
+def _bind_identity(update, context, user_id=None):
     api = context.bot_data["api_client"]
     admin = context.bot_data.get("admin_api_client")
     # Clear first so even a malformed update cannot inherit the previous
@@ -70,11 +70,49 @@ def _bind_identity(update, context):
     api.clear_telegram_user()
     if admin is not None:
         admin.clear_telegram_user()
-    if update.effective_user is None:
-        raise ValueError("Telegram update has no effective_user")
-    api.bind_telegram_user(update.effective_user.id)
+    if user_id is None:
+        if update.effective_user is None:
+            raise ValueError("Telegram update has no effective_user")
+        user_id = update.effective_user.id
+    api.bind_telegram_user(user_id)
     if admin is not None:
-        admin.bind_telegram_user(update.effective_user.id)
+        admin.bind_telegram_user(user_id)
+
+
+# --- SLICE3-UX-PERSISTENT-MENU-002: persistent menu initialization ----------
+# Minimal in-process dedupe (bot_data resets on restart, the allowed scope):
+# each chat gets the persistent Reply Keyboard at most once per process, so
+# normal messages never re-mount it and never spam welcome/menu messages.
+
+
+def _menu_init_chats(context) -> set:
+    return context.bot_data.setdefault("menu_init_chats", set())
+
+
+def _mark_menu_initialized(context, chat_id) -> None:
+    _menu_init_chats(context).add(chat_id)
+
+
+def _is_menu_initialized(context, chat_id) -> bool:
+    return chat_id in _menu_init_chats(context)
+
+
+async def _send_persistent_menu(context, chat_id, role, locale) -> bool:
+    """Re-send the persistent Reply Keyboard once per chat (private chats only,
+    enforced by callers) for identified users. Never depends on backend data
+    and never prompts the user to type /start. Returns True when sent."""
+    if role is None or not has_read_permission(role):
+        return False
+    if _is_menu_initialized(context, chat_id):
+        return False
+    _mark_menu_initialized(context, chat_id)
+    await context.bot.send_message(
+        chat_id,
+        H.escape(t("menu.ready", locale)),
+        parse_mode=HTML,
+        reply_markup=reply_keyboard(role),
+    )
+    return True
 
 
 def _current_month() -> str:
@@ -111,6 +149,39 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _refuse(update, context, role)
         return
     await show_home(context, update.effective_chat.id, role, locale_for(role))
+
+
+async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """SLICE3-UX-PERSISTENT-MENU-002: group new-member onboarding.
+
+    Telegram's ReplyKeyboardMarkup is per-CHAT (never per-member), and the bot
+    has no group->role configuration, so every group is treated as potentially
+    mixed-role and we FAIL CLOSED: no role menu is ever broadcast into a group
+    (an Owner menu must never be pushed to Secretaries/Tenants and vice versa).
+    The existing identity binding + role resolution run per joining member, but
+    the group only receives a neutral welcome; identified members additionally
+    get a private-chat deep-link hint. Unknown identities get no menu and are
+    never told to type /start.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    members = message.new_chat_members if message is not None else None
+    if chat is None or not members or chat.type == Chat.PRIVATE:
+        return
+    hints: list[str] = []
+    for member in members:
+        if member.is_bot:
+            continue  # never greet the bot itself / other bots
+        _bind_identity(update, context, user_id=member.id)
+        role = role_for_telegram_id(member.id)
+        if has_read_permission(role):
+            hints.append(t("group.private_hint", locale_for(role)))
+    lines = [t("group.welcome", "zh")]
+    for hint in dict.fromkeys(hints):  # dedupe when several members join at once
+        lines.append(hint)
+    await context.bot.send_message(
+        chat.id, H.escape("\n".join(lines)), parse_mode=HTML
+    )
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -320,6 +391,10 @@ async def show_dashboard(
         else:
             await _send(context, chat_id, text,
                         reply_keyboard=reply_keyboard(role) if role else None)
+            if role:
+                # The persistent keyboard was just mounted on this message;
+                # remember it so later normal messages don't re-send it.
+                _mark_menu_initialized(context, chat_id)
 
 
 async def show_home(context, chat_id, role, locale: str, message_id=None):

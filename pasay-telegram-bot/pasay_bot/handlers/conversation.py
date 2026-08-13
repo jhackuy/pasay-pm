@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-from telegram import Update
+from telegram import Chat, Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
@@ -79,6 +79,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=HTML, reply_markup=home_keyboard(locale),
             )
         return
+
+    # SLICE3-UX-PERSISTENT-MENU-002: an identified user sending ANY normal
+    # message auto-restores the persistent keyboard when the menu was never
+    # initialized (private chat only; groups fail closed). Never asks for
+    # /start and never depends on backend/dashboard data.
+    if update.effective_chat.type == Chat.PRIVATE:
+        from pasay_bot.handlers.commands import _send_persistent_menu
+
+        await _send_persistent_menu(context, chat_id, role, locale)
 
     conv = store.get_conversation(chat_id, user_id)
     if conv is None:
