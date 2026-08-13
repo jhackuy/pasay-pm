@@ -1,6 +1,6 @@
 # Pasay AI Development Workflow Rules — Canonical
 
-rules_version: 2026-08-13.2
+rules_version: 2026-08-13.3
 canonical_path: /Users/jhackuy/Projects/pasay-pm/AI_WORKFLOW_RULES.md
 authority: 唯一权威规则文件。任何 Windows 副本（例如 D:\AI-Review\pasay-pm\AI_WORKFLOW_RULES.md）只作为 mirror/cache，不作为权威。
 last_updated: 2026-08-13
@@ -459,3 +459,44 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 * deterministic validation
 
 Git 保持可回滚。开发环境优先开发速度 > 流程完整度，但以上安全底线不放松。
+
+---
+
+## 16. 最低流程开发模式（Minimal Process Dev Mode）
+
+生效：2026-08-13。普通产品切片默认按本模式执行；本模式覆盖 §7/§13.5 的默认测试分级与 §4 的默认路由中更重的默认流程。
+
+### 16.1 测试范围：普通 Bot 小功能禁止默认全量
+
+普通 Bot 小功能只跑：
+
+1. 本次新增测试
+2. 与当前改动直接相关的 regression
+3. 必要 smoke
+
+禁止默认运行：Bot 全量 suite、Backend 全量 suite、完整 Gate、Windows 重复测试、历史 Gate 重跑。
+
+例外（才允许扩大范围）：修改 Bot 核心路由/共享公共模块，或 targeted tests 出现异常。
+
+### 16.2 完成后自动继续，禁止停在“等待下一张任务卡”
+
+只要下一产品功能已经明确：PASS → commit → 自动继续下一产品切片。
+
+只有以下情况才停：
+
+* USER_ACTION_REQUIRED
+* MANUAL_APPROVAL_REQUIRED
+* BLOCKED / FAILED
+* TIMEOUT
+* 下一功能优先级确实不明确（NEXT_SLICE_PENDING）
+
+### 16.3 正常开发链固定
+
+```text
+ChatGPT → Fugui/Bridge 传输 → Lily → Max 开发 → targeted tests → commit → 下一任务
+```
+
+* Bridge 只负责传输。
+* Windows/Fugui 不重复测试 Mac 已经 PASS 的内容。
+* 普通开发不同步 Windows、不跑完整 Gate。
+* 不要重新执行历史 Gate、全仓库审计、全量测试或流程检查。
