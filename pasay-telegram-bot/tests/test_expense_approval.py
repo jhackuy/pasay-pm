@@ -84,13 +84,9 @@ def test_reply_keyboard_role_specific_labels():
     secretary = reply_keyboard(Role.SECRETARY)
     owner_labels = [b.text for row in owner.keyboard for b in row]
     sec_labels = [b.text for row in secretary.keyboard for b in row]
-    assert owner_labels == ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
-    assert sec_labels == [
-        "🏠 Properties", "👥 Tenants",
-        "💵 Rent", "✅ Tasks",
-        "🔧 Maintenance", "📋 Records",
-        "⚠️ Overdue",
-    ]
+    # BOT-V1-USABLE-001: one identical 4-button menu for both roles.
+    assert owner_labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
+    assert sec_labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
     assert owner.resize_keyboard is True
     assert secretary.resize_keyboard is True
 

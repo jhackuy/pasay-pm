@@ -6,7 +6,7 @@ handlers can implement the "uncertain write" reconciliation path.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
@@ -523,6 +523,53 @@ class CopilotAsk:
 
 
 @dataclass
+class NlIntentResult:
+    """Structured NL intent from the backend AI fallback lane (P0-5).
+
+    The bot never displays these fields raw; it maps ``intent`` + validated
+    entities into its own deterministic business paths.
+    """
+
+    intent: str = ""
+    message: str = ""
+    unit: str = ""
+    unit_id: Optional[int] = None
+    amount: Optional[Decimal] = None
+    category: str = ""
+    month: str = ""
+    missing: list[str] = field(default_factory=list)
+    options: list[str] = field(default_factory=list)
+    provider: str = ""
+    model: str = "deterministic"
+    fallback: bool = False
+    flags: list[str] = field(default_factory=list)
+    latency_ms: int = 0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "NlIntentResult":
+        try:
+            amount = _to_decimal(d.get("amount")) if d.get("amount") not in (None, "") else None
+        except Exception:
+            amount = None
+        return cls(
+            intent=d.get("intent") or "",
+            message=d.get("message") or "",
+            unit=d.get("unit") or "",
+            unit_id=int(d["unit_id"]) if d.get("unit_id") is not None else None,
+            amount=amount,
+            category=d.get("category") or "",
+            month=d.get("month") or "",
+            missing=list(d.get("missing") or []),
+            options=list(d.get("options") or []),
+            provider=d.get("provider") or "",
+            model=d.get("model") or "deterministic",
+            fallback=bool(d.get("fallback")),
+            flags=list(d.get("flags") or []),
+            latency_ms=int(d.get("latency_ms") or 0),
+        )
+
+
+@dataclass
 class CopilotRecommendCard:
     """Confirmation-card data from POST /operations/copilot/recommend (C2).
     Render-safe: the bot must NOT display the raw proposal_id."""
@@ -784,6 +831,34 @@ class PasayApiClient:
         data = await self._request("GET", f"/expenses/{expense_id}")
         return Expense.from_dict(data)
 
+    async def create_expense(
+        self,
+        *,
+        category: str,
+        amount: Any,
+        expense_date: str,
+        unit_id: Optional[int] = None,
+        payee: str = "",
+        description: Optional[str] = None,
+        status: str = "pending",
+    ) -> Expense:
+        """POST /expenses — BOT-V1-USABLE-001 P0-2. Secretary records PENDING
+        expenses (Owner approval stays the backend's deterministic path);
+        only an admin key may create approved expenses directly."""
+        payload: dict[str, Any] = {
+            "category": category,
+            "amount": str(_to_decimal(amount)),
+            "expense_date": str(expense_date)[:10],
+            "payee": payee or "-",
+            "status": status,
+        }
+        if unit_id is not None:
+            payload["unit_id"] = int(unit_id)
+        if description:
+            payload["description"] = description
+        data = await self._request("POST", "/expenses", json=payload)
+        return Expense.from_dict(data)
+
     async def approve_expense(self, expense_id: int) -> Expense:
         data = await self._request("POST", f"/expenses/{expense_id}/approve")
         return Expense.from_dict(data)
@@ -917,6 +992,16 @@ class PasayApiClient:
             "POST", "/operations/copilot/ask", json={"question": question}, timeout=120.0
         )
         return CopilotAsk.from_dict(data)
+
+    async def parse_nl_intent(self, text: str) -> NlIntentResult:
+        """POST /operations/copilot/nl-parse (BOT-V1-USABLE-001 P0-5, AI
+        fallback). Read-only structured intent parsing; the bot maps the
+        intent to its own deterministic business paths."""
+        data = await self._request(
+            "POST", "/operations/copilot/nl-parse",
+            json={"text": text}, timeout=45.0,
+        )
+        return NlIntentResult.from_dict(data)
 
     async def copilot_recommend(
         self,

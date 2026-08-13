@@ -28,6 +28,7 @@ from pasay_bot.keyboards import (
     dashboard_keyboard,
     error_keyboard,
     home_keyboard,
+    home_summary_keyboard,
     reply_keyboard,
     ops_overview_keyboard,
     ops_section_keyboard,
@@ -58,6 +59,7 @@ HTML = "HTML"
 
 EXPIRING_LEASE_DAYS = 60
 TASK_WINDOW_DAYS = 7
+EXPIRING_CONTRACT_DAYS = 30  # BOT-V1-USABLE-001 P0 spec: 30-day contract window
 
 
 def _bind_identity(update, context):
@@ -108,7 +110,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_read_permission(role):
         await _refuse(update, context, role)
         return
-    await show_dashboard(context, update.effective_chat.id, locale_for(role), role=role)
+    await show_home(context, update.effective_chat.id, role, locale_for(role))
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +320,127 @@ async def show_dashboard(
         else:
             await _send(context, chat_id, text,
                         reply_keyboard=reply_keyboard(role) if role else None)
+
+
+async def show_home(context, chat_id, role, locale: str, message_id=None):
+    """P0 home: operational summary only (no second navigation)."""
+    api = context.bot_data["api_client"]
+    month = _current_month()
+    expenses, incomes, overdue, leases, units, tasks = await asyncio.gather(
+        api.list_expenses(),
+        api.list_incomes(),
+        api.get_overdue_rents(),
+        api.get_leases(),
+        api.get_units(),
+        api.get_operational_tasks(status="PENDING"),
+        return_exceptions=True,
+    )
+    fin = None
+    try:
+        fin = await api.get_financial_summary(month)
+    except PasayApiError:
+        fin = None
+    if fin is None:
+        await _render(context, chat_id, message_id, _load_error("home", locale),
+                      home_summary_keyboard(locale))
+        return
+    expenses_list = [] if isinstance(expenses, Exception) else expenses
+    incomes_list = [] if isinstance(incomes, Exception) else incomes
+    overdue_list = [] if isinstance(overdue, Exception) else overdue
+    leases_list = [] if isinstance(leases, Exception) else leases
+    units_list = [] if isinstance(units, Exception) else units
+    tasks_list = [] if isinstance(tasks, Exception) else tasks
+
+    pending_approvals = sum(
+        1 for e in expenses_list if (e.status or "").lower() == "pending"
+    ) + sum(1 for i in incomes_list if i.status == "pending")
+    unpaid_count = len(overdue_list)
+    today = date.today()
+    expiring_contracts = sum(
+        1
+        for l in leases_list
+        if l.status == "active"
+        and l.end_date >= today
+        and (l.end_date - today).days <= EXPIRING_CONTRACT_DAYS
+    )
+    maintenance_open = sum(
+        1
+        for tk in tasks_list
+        if _is_maintenance_task(tk)
+    )
+    text = cards.home_summary_card(
+        collected=fin.collected_rent,
+        unpaid_count=unpaid_count,
+        pending_approvals=pending_approvals,
+        expiring_contracts=expiring_contracts,
+        maintenance_open=maintenance_open,
+        locale=locale,
+    )
+    if message_id:
+        # Telegram cannot attach a ReplyKeyboardMarkup via editMessageText;
+        # the persistent menu stays visible from the last send, and the
+        # message carries the summary action buttons instead.
+        await _render(context, chat_id, message_id, text, home_summary_keyboard(locale))
+    else:
+        await _send(
+            context, chat_id, text,
+            reply_keyboard=reply_keyboard(role) if role else None,
+        )
+
+
+async def show_expense(context, chat_id, locale: str, message_id=None):
+    """💸 支出 entry page: natural-language first, no form, no /help."""
+    text = (
+        f"<b>{H.escape(t('expense.create_title', locale))}</b>\n\n"
+        f"{H.escape(t('expense.page_hint', locale))}"
+    )
+    await _render(context, chat_id, message_id, text, home_keyboard(locale))
+
+
+async def show_contracts_page(context, chat_id, locale: str, message_id=None,
+                              days: int = EXPIRING_CONTRACT_DAYS):
+    """Home [合同到期] -> real contract list within ``days`` (read-only)."""
+    api = context.bot_data["api_client"]
+    try:
+        leases, units, tenants = await asyncio.gather(
+            api.get_leases(), api.get_units(), api.get_tenants(),
+        )
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      home_summary_keyboard(locale))
+        return
+    by_unit = {u.id: u.unit_number for u in units}
+    by_tenant = {tn.id: tn.full_name for tn in tenants}
+    today = date.today()
+    rows = []
+    for lease in leases:
+        if lease.status != "active" or not lease.end_date:
+            continue
+        remaining = (lease.end_date - today).days
+        if 0 <= remaining <= days:
+            rows.append(
+                {
+                    "unit": by_unit.get(lease.unit_id, ""),
+                    "tenant": by_tenant.get(lease.tenant_id, ""),
+                    "end_date": lease.end_date,
+                }
+            )
+    rows.sort(key=lambda r: r["end_date"])
+    await _render(
+        context, chat_id, message_id,
+        cards.contracts_card(rows, days, locale),
+        home_summary_keyboard(locale),
+    )
+
+
+def _is_maintenance_task(task) -> bool:
+    task_type = str(getattr(task, "task_type", "") or "").upper()
+    title = str(getattr(task, "title", "") or "")
+    return (
+        "MAINTENANCE" in task_type
+        or "维修" in title
+        or "maintenance" in title.lower()
+    )
 
 
 async def show_menu(context, chat_id, locale: str, message_id=None, role=None):
@@ -614,25 +737,56 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
             )
             confirm_rows.append({"id": inc.id, "amount": inc.amount, "where": where})
 
-    overdue_rows = []
-    if owner_view:
-        overdue_rows = [
-            {
-                "unit_id": r.unit_id,
-                "lease_id": r.lease_id,
-                "unit": r.unit,
-                "tenant": r.tenant,
-                "total_outstanding": r.total_outstanding,
-                "overdue_days": r.overdue_days,
-            }
-            for r in sorted(overdue, key=lambda x: (-x.overdue_days, -x.total_outstanding))
-        ]
+    overdue_rows = [
+        {
+            "unit_id": r.unit_id,
+            "lease_id": r.lease_id,
+            "unit": r.unit,
+            "tenant": r.tenant,
+            "total_outstanding": r.total_outstanding,
+            "overdue_days": r.overdue_days,
+        }
+        for r in sorted(overdue, key=lambda x: (-x.overdue_days, -x.total_outstanding))
+    ]
 
-    task_rows = sorted(tasks, key=lambda x: (x.due_at is None, x.due_at or ""))
+    # BOT-V1-USABLE-001 P0-4: 30-day contract expiry + open maintenance are
+    # first-class todo sections (maintenance rows are NOT duplicated into the
+    # generic task list).
+    today = date.today()
+    by_lease = {l.id: l for l in leases}
+    by_unit = {u.id: u for u in units}
+    by_prop = {p.id: p.name for p in properties}
+    try:
+        tenants_list = await api.get_tenants()
+    except PasayApiError:
+        tenants_list = []
+    by_tenant = {tn.id: tn.full_name for tn in tenants_list}
+    contract_rows = []
+    for lease in leases:
+        if lease.status != "active" or not lease.end_date:
+            continue
+        remaining = (lease.end_date - today).days
+        if 0 <= remaining <= EXPIRING_CONTRACT_DAYS:
+            contract_rows.append(
+                {
+                    "unit": by_unit.get(lease.unit_id).unit_number
+                    if by_unit.get(lease.unit_id) else "",
+                    "tenant": by_tenant.get(lease.tenant_id, ""),
+                    "end_date": lease.end_date,
+                }
+            )
+    contract_rows.sort(key=lambda r: r["end_date"])
+    maintenance_rows = [tk for tk in tasks if _is_maintenance_task(tk)]
+    task_rows = sorted(
+        (tk for tk in tasks if not _is_maintenance_task(tk)),
+        key=lambda x: (x.due_at is None, x.due_at or ""),
+    )
     sections = {
         "expenses": expense_rows,
         "confirm": confirm_rows,
         "overdue": overdue_rows,
+        "contracts": contract_rows,
+        "maintenance": maintenance_rows,
         "tasks": task_rows,
     }
     text = cards.todo_overview_card(sections, locale)

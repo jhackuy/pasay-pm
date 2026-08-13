@@ -65,27 +65,20 @@ def _latency(env):
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 房源", "房源概况"),
+        (OWNER_ID, "🏠 首页", "Pasay Property"),
         (OWNER_ID, "✅ 待办", "逾期租金"),
-        (OWNER_ID, "💰 财务", "财务"),
-        (OWNER_ID, "☰ 更多", "本月租金"),
-        (SECRETARY_ID, "🏠 Properties", "Property Overview"),
-        (SECRETARY_ID, "👥 Tenants", "Tenant status"),
-        (SECRETARY_ID, "💵 Rent", "Select unpaid unit"),
-        (SECRETARY_ID, "✅ Tasks", "Nothing to do"),
-        (SECRETARY_ID, "🔧 Maintenance", "Maintenance jobs"),
-        (SECRETARY_ID, "📋 Records", "Finance"),
-        (SECRETARY_ID, "⚠️ Overdue", "Overdue Rent"),
+        (OWNER_ID, "💰 收租", "选择未付款"),
+        (OWNER_ID, "💸 支出", "直接告诉我这笔支出"),
+        (SECRETARY_ID, "🏠 首页", "Pasay Property"),
+        (SECRETARY_ID, "✅ 待办", "Overdue rent"),
+        (SECRETARY_ID, "💰 收租", "Select unpaid unit"),
+        (SECRETARY_ID, "💸 支出", "Just tell me the expense"),
     ],
 )
 def test_fixed_menu_button_exact_routes_without_nl(make_app, user_id, label, marker):
     env = make_app()
     run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
     locale = "zh" if user_id == OWNER_ID else "en"
-    if label in ("👥 Tenants", "🔧 Maintenance"):
-        # local hint routes: sent directly, no backend page load
-        assert marker in env.bot.last_send()["text"]
-        return
     # backend-loading routes: durable "processing" message first, page then
     # rendered onto that same message (message mutation, no junk messages)
     assert t("common.working", locale) in env.bot.last_send()["text"]
@@ -105,40 +98,33 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
     monkeypatch.setattr(nl_bridge, "handle_nl", boom)
     env = make_app()
     for user_id, label, marker in [
-        (OWNER_ID, "🏠 房源", "房源概况"),
+        (OWNER_ID, "🏠 首页", "Pasay Property"),
         (OWNER_ID, "✅ 待办", "逾期租金"),
-        (OWNER_ID, "💰 财务", "财务"),
-        (OWNER_ID, "☰ 更多", "本月租金"),
-        (SECRETARY_ID, "🏠 Properties", "Property Overview"),
-        (SECRETARY_ID, "👥 Tenants", "Tenant status"),
-        (SECRETARY_ID, "💵 Rent", "Select unpaid unit"),
-        (SECRETARY_ID, "✅ Tasks", "Nothing to do"),
-        (SECRETARY_ID, "🔧 Maintenance", "Maintenance jobs"),
-        (SECRETARY_ID, "📋 Records", "Finance"),
-        (SECRETARY_ID, "⚠️ Overdue", "Overdue Rent"),
+        (OWNER_ID, "💰 收租", "选择未付款"),
+        (OWNER_ID, "💸 支出", "直接告诉我这笔支出"),
+        (SECRETARY_ID, "🏠 首页", "Pasay Property"),
+        (SECRETARY_ID, "✅ 待办", "Overdue rent"),
+        (SECRETARY_ID, "💰 收租", "Select unpaid unit"),
+        (SECRETARY_ID, "💸 支出", "Just tell me the expense"),
     ]:
         run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
         locale = "zh" if user_id == OWNER_ID else "en"
-        if label in ("👥 Tenants", "🔧 Maintenance"):
-            assert marker in env.bot.last_send()["text"]
-        else:
-            assert t("common.working", locale) in env.bot.last_send()["text"]
-            assert marker in env.bot.last_edit()["text"]
+        assert t("common.working", locale) in env.bot.last_send()["text"]
+        assert marker in env.bot.last_edit()["text"]
     assert calls == []
 
 
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "\U0001f3e0 \u623f\u6e90", "\u623f\u6e90\u6982\u51b5"),
-        (OWNER_ID, "\u2705 \u5f85\u529e", "\u903e\u671f\u79df\u91d1"),
-        (OWNER_ID, "\U0001f4b0 \u8d22\u52a1", "\u8d22\u52a1"),
-        (OWNER_ID, "\u2630 \u66f4\u591a", "\u672c\u6708\u79df\u91d1"),
-        (SECRETARY_ID, "\U0001f3e0 Properties", "Property Overview"),
-        (SECRETARY_ID, "\U0001f4b5 Rent", "Select unpaid unit"),
-        (SECRETARY_ID, "\u2705 Tasks", "Nothing to do"),
-        (SECRETARY_ID, "\U0001f4cb Records", "Finance"),
-        (SECRETARY_ID, "\u26a0\ufe0f Overdue", "Overdue Rent"),
+        (OWNER_ID, "🏠 首页", "Pasay Property"),
+        (OWNER_ID, "✅ 待办", "逾期租金"),
+        (OWNER_ID, "💰 收租", "选择未付款"),
+        (OWNER_ID, "💸 支出", "直接告诉我这笔支出"),
+        (SECRETARY_ID, "🏠 首页", "Pasay Property"),
+        (SECRETARY_ID, "✅ 待办", "Overdue rent"),
+        (SECRETARY_ID, "💰 收租", "Select unpaid unit"),
+        (SECRETARY_ID, "💸 支出", "Just tell me the expense"),
     ],
 )
 def test_fixed_menu_slow_routes_status_message_is_editable(
@@ -159,18 +145,18 @@ def test_fixed_menu_slow_routes_status_message_is_editable(
     assert edits and marker in edits[-1]["text"]
 
 
-def test_finance_button_live_ux_failure_repro_edits_status_in_place(make_app):
-    """Exact repro of the captured live failure: Owner taps '\U0001f4b0
-    \u8d22\u52a1' and the finance page must be rendered onto the status
-    message (never a stuck '\u23f3 \u5904\u7406\u4e2d\u2026')."""
+def test_rent_button_live_ux_failure_repro_edits_status_in_place(make_app):
+    """Live UX regression (OWNER-UX-FAILURE-LIVE-TRACE-001): the status
+    message is sent without a reply keyboard and the page is rendered onto
+    that same message (never a stuck '处理中…')."""
     env = make_app()
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "\U0001f4b0 \u8d22\u52a1", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 收租", bot=env.bot)])
     status = env.bot.sends()[0]
     assert status["text"] == t("common.working", "zh")
     assert status["reply_markup"] is None
     edit = env.bot.last_edit()
     assert edit["message_id"] == status["message_id"]  # same message mutated
-    assert "\u8d22\u52a1" in edit["text"]
+    assert "选择未付款" in edit["text"]
 
 
 def test_fakebot_mirrors_telegram_reply_keyboard_edit_semantics(make_app):
@@ -401,10 +387,10 @@ def test_callback_latency_recorded(make_app):
 
 def test_menu_button_latency_recorded(make_app):
     env = make_app()
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 房源", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 首页", bot=env.bot)])
     sample = _latency(env).last("menu_button")
     assert sample is not None
-    assert sample["label"] == "properties"
+    assert sample["label"] == "home"
     assert isinstance(sample["elapsed_ms"], (int, float))
 
 

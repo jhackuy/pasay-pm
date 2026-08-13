@@ -1032,6 +1032,161 @@ def expense_detail_card(
     return "\n".join(lines)
 
 
+# --- BOT-V1-USABLE-001 P0-2: expense create flow ---------------------------
+
+def expense_confirm_card(
+    *,
+    unit_number: str,
+    property_name: str,
+    category: str,
+    amount,
+    expense_date: str,
+    locale: str = "zh",
+) -> str:
+    """Secretary/Owner expense confirmation card (P0-2 spec)."""
+    lines = [f"💸 <b>{H.escape(t('expense.confirm_title', locale))}</b>"]
+    where = " · ".join(x for x in (property_name, unit_number) if x)
+    if where:
+        lines.append(f"{H.escape(t('rent.unit', locale))}：{H.escape(where)}")
+    lines.append(f"{H.escape(t('expense.purpose', locale))}：{H.escape(category)}")
+    lines.append(f"{H.escape(t('rent.amount', locale))}：<b>{H.money(amount)}</b>")
+    lines.append(f"{H.escape(t('expense.date', locale))}：{H.escape(expense_date)}")
+    return "\n".join(lines)
+
+
+def expense_submitted_card(
+    *,
+    unit_number: str,
+    property_name: str,
+    category: str,
+    amount,
+    locale: str = "zh",
+) -> str:
+    where = " · ".join(x for x in (property_name, unit_number) if x)
+    lines = [
+        f"<b>{H.escape(t('expense.submitted_title', locale))}</b>",
+        f"{H.escape(where)}" if where else "",
+        f"{H.escape(category)} · <b>{H.money(amount)}</b>",
+        H.escape(t("expense.submitted_next", locale)),
+    ]
+    return "\n".join(x for x in lines if x)
+
+
+# --- BOT-V1-USABLE-001 P0-3: deterministic NL query answers ----------------
+
+def income_summary_card(
+    month: str, *, collected, expected, outstanding, locale: str = "zh",
+) -> str:
+    """'这个月收了多少钱' -> real income data (direct answer, no menu)."""
+    year, _, mm = str(month).partition("-")
+    if locale == "en":
+        label = t("query.income_month", locale, month=f"{year}-{mm}")
+    else:
+        label = t("query.income_month", locale, month=f"{int(mm)}月")
+    return "\n".join(
+        [
+            f"💰 <b>{H.escape(label)}</b>",
+            f"{H.escape(t('query.income_collected', locale))}：<b>{H.money(collected)}</b>",
+            f"{H.escape(t('query.income_expected', locale))}：{H.money(expected)}",
+            f"{H.escape(t('query.income_outstanding', locale))}：{H.money(outstanding)}",
+        ]
+    )
+
+
+def expense_summary_card(
+    month: str, *, total_expense, net_income, locale: str = "zh",
+) -> str:
+    year, _, mm = str(month).partition("-")
+    if locale == "en":
+        label = t("query.expense_month", locale, month=f"{year}-{mm}")
+    else:
+        label = t("query.expense_month", locale, month=f"{int(mm)}月")
+    return "\n".join(
+        [
+            f"💸 <b>{H.escape(label)}</b>",
+            f"{H.escape(t('query.expense_total', locale))}：<b>{H.money(total_expense)}</b>",
+            f"{H.escape(t('query.net_income', locale))}：{H.money(net_income)}",
+        ]
+    )
+
+
+def unit_expense_history_card(
+    unit_number: str, rows: list[dict], locale: str = "zh",
+) -> str:
+    """'1680最近有什么支出' -> recent expenses of one unit (read-only)."""
+    if not rows:
+        return H.escape(t("query.expense_none", locale))
+    blocks = [f"💸 <b>{H.escape(t('query.expense_recent', locale))}</b> · {H.escape(unit_number)}"]
+    for row in rows[:5]:
+        blocks.append(
+            f"{H.escape(row.get('category') or '')} · <b>{H.money(row.get('amount'))}</b>"
+            f" · {H.escape(row.get('status_label') or '')}"
+            f" · {H.format_date(row.get('expense_date'))}"
+        )
+    return "\n\n".join(blocks)
+
+
+def unit_info_card(
+    *,
+    unit_number: str,
+    property_name: str,
+    tenant_name: str = "",
+    monthly_rent=None,
+    end_date=None,
+    locale: str = "zh",
+) -> str:
+    lines = [f"🏢 <b>{H.escape(t('query.unit_info_title', locale))}</b>"]
+    where = " · ".join(x for x in (property_name, unit_number) if x)
+    if where:
+        lines.append(H.escape(where))
+    if tenant_name:
+        lines.append(f"{H.escape(t('query.unit_tenant', locale))}：{H.escape(tenant_name)}")
+    if monthly_rent is not None:
+        lines.append(f"{H.escape(t('query.unit_rent', locale))}：{H.money(monthly_rent)}")
+    if end_date:
+        lines.append(
+            f"{H.escape(t('query.unit_lease_end', locale))}：{H.format_date(end_date)}"
+        )
+    return "\n".join(lines)
+
+
+def contracts_card(rows: list[dict], days: int, locale: str = "zh") -> str:
+    """'有哪些合同快到期' -> real lease end dates within N days."""
+    if not rows:
+        return H.escape(t("query.contracts_none", locale))
+    blocks = [
+        f"📋 <b>{H.escape(t('query.contracts_title', locale))}</b>",
+        H.escape(t("query.contracts_window", locale, days=days)),
+    ]
+    for row in rows[:10]:
+        blocks.append(
+            f"• {H.escape(row.get('unit') or '')} · {H.escape(row.get('tenant') or '')}"
+            f" · {H.format_date(row.get('end_date'))}"
+        )
+    return "\n".join(blocks)
+
+
+def home_summary_card(
+    *,
+    collected,
+    unpaid_count: int,
+    pending_approvals: int,
+    expiring_contracts: int,
+    maintenance_open: int,
+    locale: str = "zh",
+) -> str:
+    """P0 spec home: operational summary only (no second navigation)."""
+    lines = ["<b>Pasay Property</b>"]
+    lines.append(
+        f"{H.escape(t('home.collected', locale))}：<b>{H.money(collected)}</b>"
+    )
+    lines.append(H.escape(t("home.unpaid_count", locale, count=unpaid_count)))
+    lines.append(H.escape(t("home.pending_approvals", locale, count=pending_approvals)))
+    lines.append(H.escape(t("home.expiring_contracts", locale, count=expiring_contracts)))
+    lines.append(H.escape(t("home.maintenance_open", locale, count=maintenance_open)))
+    return "\n".join(lines)
+
+
 def todo_overview_card(sections: dict, locale: str = "zh") -> str:
     """Unified to-do page (V1.3): only what the current user must act on.
     Rows are human-readable; action buttons ride below each row."""
@@ -1070,6 +1225,24 @@ def todo_overview_card(sections: dict, locale: str = "zh") -> str:
             for r in overdue
         ]
         blocks.append(H.escape(t("todo.section_overdue", locale, count=len(overdue))))
+        blocks.append("\n".join(items))
+    contracts = sections.get("contracts") or []
+    if contracts:
+        items = [
+            f"📋 {H.escape(r.get('unit', ''))} · {H.escape(r.get('tenant', ''))}"
+            f" · {H.format_date(r.get('end_date'))}"
+            for r in contracts
+        ]
+        blocks.append(H.escape(t("todo.section_contracts", locale, count=len(contracts))))
+        blocks.append("\n".join(items))
+    maintenance = sections.get("maintenance") or []
+    if maintenance:
+        items = [
+            f"🔧 {H.escape(tk.title or t('ops.task', locale))}"
+            + (f" · {H.escape(_ops_due(tk))}" if getattr(tk, "due_at", None) else "")
+            for tk in maintenance
+        ]
+        blocks.append(H.escape(t("todo.section_maintenance", locale, count=len(maintenance))))
         blocks.append("\n".join(items))
     tasks = sections.get("tasks") or []
     if tasks:

@@ -1,6 +1,6 @@
 # Pasay AI Development Workflow Rules — Canonical
 
-rules_version: 2026-08-13.3
+rules_version: 2026-08-13.4
 canonical_path: /Users/jhackuy/Projects/pasay-pm/AI_WORKFLOW_RULES.md
 authority: 唯一权威规则文件。任何 Windows 副本（例如 D:\AI-Review\pasay-pm\AI_WORKFLOW_RULES.md）只作为 mirror/cache，不作为权威。
 last_updated: 2026-08-13
@@ -500,3 +500,47 @@ ChatGPT → Fugui/Bridge 传输 → Lily → Max 开发 → targeted tests → c
 * Windows/Fugui 不重复测试 Mac 已经 PASS 的内容。
 * 普通开发不同步 Windows、不跑完整 Gate。
 * 不要重新执行历史 Gate、全仓库审计、全量测试或流程检查。
+## 17. 工作流护栏（WF Guardrails，WF-GUARDRAILS-CANONICAL-SYNC-001）
+
+生效：2026-08-13。以下 4 条护栏由确定性程序强制（scripts/wf/wf_guardrails.py + wf006_tests.py），不依赖 prompt 提醒；禁止因护栏任务修改业务 UX 或重构 Telegram Bot。
+
+### 17.1 外部平台真实语义必须进入测试替身
+
+凡真实故障由 Telegram / PostgreSQL / HTTP API / 第三方平台语义导致，修复时必须同步选择以下至少一种方式固化：
+
+- Fake/Stub semantic enforcement（测试替身语义强制）
+- Contract test（契约测试）
+- deterministic integration test（确定性集成测试）
+
+冻结的 Telegram 规则（OWNER-UX-FAILURE-LIVE-TRACE-001）：带非 inline `ReplyKeyboardMarkup` 发送的消息在真实 Telegram 中不可 editMessageText（400 "Message can't be edited"）。FakeBot 必须保留该语义：对这类消息调用 edit_message_text 必须抛 BadRequest；禁止未来为了“让测试通过”删除该语义。
+
+### 17.2 用户可见交互路径禁止静默吞异常
+
+范围仅限 Telegram 用户可见交互路径：fixed menu、inline button、callback、approval/reject、message send/edit、NL routing 最终回复。
+
+异常必须至少做到：1）structured logging；2）用户可见 fallback。禁止 `except: pass` 及等价静默吞异常行为。
+
+确定性检查：扫描 Telegram handler 目录，发现 bare `except` 或 `except ...: pass` 时测试/Gate 失败；合法例外必须显式 whitelist 并写明原因（scripts/wf/wf_guardrails.py 的 SILENT_EXCEPTION_ALLOWLIST）。禁止全仓库无差别重构。
+
+### 17.3 READY_FOR_OWNER_UX_RETEST Gate
+
+READY_FOR_OWNER_UX_RETEST = TARGETED_TEST_PASS AND FAILURE_REGRESSION_PROVEN AND LIVE_VERSION_MATCH AND RUNTIME_HEALTHY
+
+- TARGETED_TEST_PASS：只运行与改动有关的测试，且全部通过（exit 0）。
+- FAILURE_REGRESSION_PROVEN：真实 bug 必须存在能稳定复现旧故障的回归测试或确定性 reproducer。
+- LIVE_VERSION_MATCH：实际运行 Runtime 必须加载目标验收代码（live workspace SHA == target workspace SHA）。
+- RUNTIME_HEALTHY：单一 polling instance、getMe OK、无 409 Conflict、依赖 backend 时 backend health OK。
+
+任一条件不满足：READY_FOR_OWNER_UX_RETEST=NO；禁止通知 Owner 测试。
+
+### 17.4 命令 timeout 强制化
+
+不依赖 prompt 写“记得 timeout”；由 workflow runner / command wrapper 程序化执行 timeout。
+
+- 普通 shell / PowerShell：60 秒
+- git/status/hash/process 检查：60 秒
+- targeted tests：180 秒（任务可显式覆盖）
+- 长任务必须明确声明 timeout（timeout_seconds）
+- LLM worker 沿用现有独立 timeout 策略
+
+超时时必须：1）返回明确 TIMEOUT；2）记录 command；3）记录 elapsed time；4）尽可能终止 child process tree；5）不得无限等待；6）不得自动无限重试。

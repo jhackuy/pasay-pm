@@ -181,7 +181,10 @@ def reject_expense(
     user: User = Depends(admin_only),
 ):
     obj = _get_or_404(db, expense_id)
-    if obj.created_by == user.id:
+    # Owner (admin) is the final authority and may handle an expense they
+    # recorded themselves (the Owner-records-then-approves flow). Only a
+    # manager rejecting their own creation is blocked, mirroring approve.
+    if user.role == "manager" and obj.created_by == user.id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot reject an expense you created"
         )

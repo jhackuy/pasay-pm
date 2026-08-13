@@ -119,7 +119,7 @@ def test_rent_callback(make_app):
 
 
 def test_commands_and_menu(make_app):
-    """★ B1: /start renders the live dashboard, not a static 4-button menu."""
+    """★ B1: /start renders the P0 home summary with real data."""
     env = make_app()
     updates = [
         make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot),
@@ -129,13 +129,9 @@ def test_commands_and_menu(make_app):
     ]
     run_updates(env, updates)
     start_text = env.bot.sends()[0]["text"]
-    assert "Pasay 房产管理" in start_text
-    assert "本月租金" in start_text
-    assert "应收：₱363,000" in start_text
-    assert "已收到：₱190,000" in start_text
-    assert "未收到：<b>₱173,000</b>" in start_text
-    assert "逾期 2 笔" in start_text  # aggregate, no zero-noise
-    assert "今日待处理" in start_text
+    assert "Pasay Property" in start_text
+    assert "本月已收" in start_text
+    assert "未收租：2 套" in start_text
     texts = "".join(env.bot.all_texts())
     assert "2026年8月财务" in texts
     assert "逾期租金 · 2笔" in texts

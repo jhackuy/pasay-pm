@@ -126,6 +126,24 @@ def test_expense_manager_cannot_approve_own_created(client, admin_headers, manag
     assert resp.status_code == 403
 
 
+def test_expense_admin_can_reject_own_created(client, admin_headers):
+    # Owner records an expense themselves, then rejects it -> allowed (the
+    # Owner is the final authority; this is the V1 Owner-records flow).
+    resp = client.post(f"{API}/expenses", json=_expense(), headers=admin_headers)
+    assert resp.status_code == 201
+    expense_id = resp.json()["id"]
+    resp = client.post(f"{API}/expenses/{expense_id}/reject", headers=admin_headers)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
+
+
+def test_expense_manager_cannot_reject_own_created(client, admin_headers, manager_headers):
+    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+    expense_id = resp.json()["id"]
+    resp = client.post(f"{API}/expenses/{expense_id}/reject", headers=manager_headers)
+    assert resp.status_code == 403
+
+
 def test_expense_reject_flow(client, admin_headers, manager_headers):
     resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
     expense_id = resp.json()["id"]

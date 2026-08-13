@@ -49,9 +49,10 @@ from pasay_bot.api_client import (
     PasayApiTimeoutError,
 )
 from pasay_bot.handlers import commands as pages
+from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.keyboards import (
+    ai_choice_keyboard,
     confirm_income_keyboard,
-    menu_keyboard,
     new_nonce,
     now_ts,
     rent_match_keyboard,
@@ -74,6 +75,19 @@ from pasay_bot.roles import (
 
 HTML = "HTML"
 logger = logging.getLogger(__name__)
+
+# BOT-V1-USABLE-001: expense statements run BEFORE the rent statement parser
+# ("付了1680电费3800" is an expense, never a rent payment) and the AI fallback
+# is the last lane for any text the deterministic parsers cannot classify.
+from pasay_bot.handlers.expense_flow import (
+    detect_expense_ambiguity,
+    detect_expense_statement,
+    handle_expense_statement,
+    parse_expense_statement,
+    render_expense_confirm,
+    resolve_unit,
+)
+from pasay_bot.handlers import nl_queries
 
 _RENT_WORDS_CN = ("租金", "房租")
 _RENT_WORD_EN = re.compile(r"\brent\b")
@@ -193,6 +207,10 @@ def is_rent_payment_statement(text: str) -> bool:
     lowered = raw.strip().lower()
     if not lowered:
         return False
+    if detect_expense_statement(raw):
+        # Expense phrases containing payment verbs ("付了1680电费3800") are
+        # expenses; they must never fall into the rent matcher.
+        return False
     if _QUERY_SUFFIX.search(raw):
         return False
     if _correction_values(raw) is not None:
@@ -277,6 +295,24 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.effective_message.text or ""
 
+    # BOT-V1-USABLE-001 P0-2: expense statements first (they share payment
+    # verbs with rent statements but carry a category signal).
+    expense_stmt = parse_expense_statement(text)
+    if expense_stmt is not None:
+        await handle_expense_statement(
+            update, context, expense_stmt, role, locale,
+        )
+        return
+
+    # P0-5 spec: "1680水费" (unit + category only) is genuinely ambiguous ->
+    # offer [记录水费] [查询1680记录] deterministically (no LLM).
+    ambiguity = detect_expense_ambiguity(text)
+    if ambiguity is not None:
+        await _handle_expense_ambiguity(
+            update, context, ambiguity, role, locale,
+        )
+        return
+
     if is_rent_payment_statement(text):
         await _handle_rent_payment_statement(update, context, text, role, locale)
         return
@@ -284,6 +320,22 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = detect_rent_status_query(text)
     if query is not None:
         await _handle_rent_status_query(update, context, query, role, locale)
+        return
+
+    # BOT-V1-USABLE-001 P0-3: income/expense summaries, unit info and
+    # contract-expiry queries answer directly from existing read endpoints.
+    general_query = nl_queries.detect_query(text)
+    if general_query is not None:
+        if not has_read_permission(role):
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("common.no_permission", locale)),
+                parse_mode=HTML,
+            )
+            return
+        await nl_queries.handle_query(
+            context, chat_id, general_query, locale,
+        )
         return
 
     route = route_for_text(text)
@@ -336,12 +388,9 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=pages.reply_keyboard(role),
         )
     else:
-        await context.bot.send_message(
-            chat_id,
-            H.escape(t("common.unknown", locale)),
-            parse_mode=HTML,
-            reply_markup=menu_keyboard(locale),
-        )
+        # BOT-V1-USABLE-001 P0-5: every unmatched ordinary text enters the AI
+        # intent lane — never a /help fallback, never silence.
+        await _handle_ai_fallback(update, context, text, role, locale)
 
 
 async def _handle_rent_status_query(update, context, query, role, locale):
@@ -904,3 +953,227 @@ async def _send_ambiguous(update, context, result, locale):
             f" · {cards.period_label(cand.period, locale)} · {H.money(cand.amount)}"
         )
     await context.bot.send_message(chat_id, "\n".join(lines), parse_mode=HTML)
+
+
+# --- BOT-V1-USABLE-001 P0-5: AI fallback lane (never /help) ----------------
+
+async def _edit_ai_status(context, chat_id, status, locale, text: str, keyboard=None):
+    """Mutate the '理解中…' status message into the real answer (no junk
+    messages); fall back to a new message if the edit fails."""
+    try:
+        await edit_message_text_idempotent(
+            context.bot,
+            chat_id=chat_id,
+            message_id=status.message_id,
+            text=H.truncate(text),
+            parse_mode=HTML,
+            reply_markup=keyboard,
+        )
+    except Exception:  # noqa: BLE001 - fallback must never lose feedback
+        await context.bot.send_message(
+            chat_id, H.truncate(text), parse_mode=HTML,
+            reply_markup=keyboard,
+        )
+
+
+async def _handle_ai_fallback(update, context, text, role, locale):
+    """P0-5: ordinary text the deterministic parsers cannot classify enters
+    the backend's grounded AI intent lane. The structured intent then routes
+    into the existing deterministic business paths only."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    if not has_read_permission(role):
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("common.no_permission", locale)),
+            parse_mode=HTML,
+        )
+        return
+    api = context.bot_data["api_client"]
+    status = await context.bot.send_message(
+        chat_id, H.escape(t("ai.thinking", locale)), parse_mode=HTML
+    )
+    try:
+        result = await api.parse_nl_intent(text)
+    except PasayApiError:
+        await _edit_ai_status(context, chat_id, status, locale, t("ai.unknown", locale))
+        return
+
+    intent = result.intent
+    if intent == "create_income":
+        # AI confirms it is a rent-received statement -> the deterministic
+        # matcher resolves the exact receivable (never AI-selected fields).
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=status.message_id)
+        except Exception:  # noqa: BLE001 - status cleanup must never block UX
+            logger.debug("ai status cleanup failed", exc_info=True)
+        await _handle_rent_payment_statement(
+            update, context, _normalize_correction(text), role, locale,
+        )
+        return
+    if intent == "create_expense":
+        await _handle_ai_expense(
+            update, context, result, status, role, locale,
+        )
+        return
+    if intent in ("query", "ask") and result.unit and result.category:
+        # Weak LLM classifications ("1680水费" -> ask) still map to the
+        # explicit record-vs-query choices instead of a generic answer.
+        await _handle_ai_ambiguous(
+            update, context, result, text, status, role, locale,
+        )
+        return
+    if intent in ("query", "ask"):
+        # Read-only grounded Q&A via the existing copilot service.
+        try:
+            ask = await api.copilot_ask(text)
+        except PasayApiError:
+            await _edit_ai_status(context, chat_id, status, locale, t("ai.unknown", locale))
+            return
+        await _edit_ai_status(
+            context, chat_id, status, locale,
+            cards.copilot_ask_card(ask.answer, fallback=ask.fallback, locale=locale),
+        )
+        return
+    await _handle_ai_ambiguous(
+        update, context, result, text, status, role, locale,
+    )
+
+
+async def _handle_ai_expense(update, context, result, status, role, locale):
+    """AI-parsed expense intent -> deterministic confirmation flow. Missing
+    fields are asked ONE at a time; the bot never guesses amounts/categories."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    store = context.bot_data["store"]
+    unit_id, unit_number, property_name = await resolve_unit(
+        context, result.unit,
+    )
+    if result.unit and unit_id is None:
+        await _edit_ai_status(
+            context, chat_id, status, locale,
+            t("expense.unit_not_found", locale, unit=result.unit),
+        )
+        return
+    payload = {
+        "unit_id": unit_id,
+        "unit_number": unit_number or result.unit or "",
+        "property_name": property_name,
+        "category": result.category or "",
+        "amount": str(result.amount) if result.amount is not None else "",
+        "expense_date": result.month or "",
+        "payee": "",
+        "description": "",
+    }
+    missing = list(result.missing or [])
+    if not payload["category"]:
+        missing.append("category")
+    if not payload["amount"]:
+        missing.append("amount")
+    missing = list(dict.fromkeys(missing))
+    if missing:
+        store.save_conversation(
+            chat_id, user_id, "ai_expense_partial", payload,
+        )
+        if "amount" in missing:
+            ask_text = result.message or t(
+                "ai.ask_amount", locale,
+                unit=payload["unit_number"] or "该房源",
+                category=payload["category"] or "",
+            )
+        elif "category" in missing:
+            ask_text = t("ai.ask_category", locale)
+        else:
+            ask_text = t("ai.ask_unit", locale)
+        await _edit_ai_status(context, chat_id, status, locale, ask_text)
+        return
+    await render_expense_confirm(
+        update, context, payload, role, locale,
+        message_id=status.message_id,
+    )
+
+
+async def _handle_ai_ambiguous(
+    update, context, result, original_text, status, role, locale,
+):
+    """P0-5 ambiguity: 2-3 explicit choices (deterministic taps)."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    store = context.bot_data["store"]
+    if result.unit and result.category:
+        options = [
+            t("ai.choice_record", locale, category=result.category),
+            t("ai.choice_query", locale, unit=result.unit),
+        ]
+        choice_base = "expense"
+    elif result.unit and result.amount is not None:
+        options = [
+            t("ai.choice_income_record", locale, unit=result.unit),
+            t("ai.choice_income_query", locale, unit=result.unit),
+        ]
+        choice_base = "income"
+    else:
+        options = [
+            t("ai.choice_expense", locale),
+            t("ai.choice_general_query", locale),
+            t("ai.choice_ask", locale),
+        ]
+        choice_base = "generic"
+    nonce = new_nonce()
+    ts = now_ts()
+    store.save_conversation(
+        chat_id, user_id, "ai_choice",
+        {
+            "text": original_text,
+            "unit": result.unit,
+            "unit_id": result.unit_id,
+            "category": result.category,
+            "amount": str(result.amount) if result.amount is not None else "",
+            "month": result.month,
+            "choice_base": choice_base,
+            "options": options,
+        },
+        nonce=nonce,
+    )
+    header = result.message or t("ai.want", locale)
+    await _edit_ai_status(
+        context, chat_id, status, locale,
+        header,
+        keyboard=ai_choice_keyboard(nonce, ts, options, locale),
+    )
+
+
+async def _handle_expense_ambiguity(update, context, statement, role, locale):
+    """Deterministic P0-5 ambiguity for '1680水费': two explicit choices."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    store = context.bot_data["store"]
+    unit_id, unit_number, _property_name = await resolve_unit(
+        context, statement.unit_token,
+    )
+    options = [
+        t("ai.choice_record", locale, category=statement.category),
+        t("ai.choice_query", locale, unit=statement.unit_token),
+    ]
+    nonce = new_nonce()
+    ts = now_ts()
+    store.save_conversation(
+        chat_id, user_id, "ai_choice",
+        {
+            "text": "",
+            "unit": statement.unit_token,
+            "unit_id": unit_id,
+            "category": statement.category,
+            "amount": "",
+            "month": "",
+            "choice_base": "expense",
+            "options": options,
+        },
+        nonce=nonce,
+    )
+    await context.bot.send_message(
+        chat_id,
+        H.escape(t("ai.want", locale)),
+        parse_mode=HTML,
+        reply_markup=ai_choice_keyboard(nonce, ts, options, locale),
+    )

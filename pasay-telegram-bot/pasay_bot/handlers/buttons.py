@@ -38,7 +38,9 @@ HTML = "HTML"
 # (editMessageText -> 400 "Message can't be edited"). The status message is
 # therefore sent WITHOUT reply_markup; the persistent keyboard remains pinned
 # client-side because it was previously sent with is_persistent=True.
-_SLOW_ROUTES = frozenset({"properties", "finance", "overdue", "rent", "pending", "more"})
+_SLOW_ROUTES = frozenset(
+    {"home", "properties", "finance", "overdue", "rent", "pending", "expense", "more"}
+)
 
 
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:
@@ -81,7 +83,9 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
             message_id = status.message_id
         else:
             message_id = None
-        if route == "properties":
+        if route == "home":
+            await pages.show_home(context, chat_id, role, locale, message_id=message_id)
+        elif route == "properties":
             await pages.show_properties(
                 context, chat_id, role, locale, page=1, message_id=message_id
             )
@@ -93,6 +97,8 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
             )
         elif route == "rent":
             await pages.show_rent(context, chat_id, locale, message_id=message_id)
+        elif route == "expense":
+            await pages.show_expense(context, chat_id, locale, message_id=message_id)
         elif route == "pending":
             await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
         elif route == "more":

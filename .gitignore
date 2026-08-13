@@ -11,3 +11,10 @@ backups/
 .DS_Store
 # WF-002: runtime task results are local evidence, never committed.
 .ai-control/results/
+
+# WIN-SINGLE-NODE-MIGRATION-001: local runtime/evidence/worktree dirs stay untracked
+.ai-control/
+.runtime/
+pasay-telegram-bot/state/
+worktrees/
+ux/results/

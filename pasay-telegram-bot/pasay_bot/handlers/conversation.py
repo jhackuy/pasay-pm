@@ -42,6 +42,9 @@ MAX_AMOUNT = Decimal("999999999999.99")  # Numeric(14,2)
 _WRITE_STATES = (
     "rent_amount", "rent_date", "rent_method", "rent_confirm",
     "rent_edit", "rent_edit_amount", "rent_edit_date", "rent_edit_method",
+    # BOT-V1-USABLE-001 P0-2: expense create flow.
+    "expense_confirm", "expense_edit_amount", "expense_edit_category",
+    "expense_edit_unit", "ai_expense_partial",
 )
 
 
@@ -91,6 +94,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _enter_amount(update, context, payload, locale, edit_mode=state == "rent_edit_amount")
     elif state in ("rent_date", "rent_edit_date"):
         await _enter_date(update, context, payload, locale, edit_mode=state == "rent_edit_date")
+    elif state == "expense_edit_amount":
+        await _enter_expense_amount(update, context, payload, locale, edit_mode=True)
+    elif state == "expense_edit_category":
+        await _enter_expense_category(update, context, payload, locale)
+    elif state == "expense_edit_unit":
+        await _enter_expense_unit(update, context, payload, locale)
+    elif state == "ai_expense_partial":
+        await _enter_ai_expense_partial(update, context, payload, locale)
     elif state == "ops_snooze_custom":
         await _enter_ops_snooze_custom(update, context, payload, locale)
     elif state == "copilot_ask":
@@ -182,6 +193,171 @@ async def _enter_date(update, context, payload, locale, edit_mode: bool):
         parse_mode=HTML,
         reply_markup=payment_method_keyboard(locale),
     )
+
+
+async def _enter_expense_amount(update, context, payload, locale, edit_mode: bool):
+    """Expense amount follow-up (edit or AI-partial): one number, re-render."""
+    from pasay_bot.handlers.expense_flow import render_expense_confirm
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = (update.effective_message.text or "").strip()
+    try:
+        amount = Decimal(text.replace(",", ""))
+    except InvalidOperation:
+        await context.bot.send_message(
+            chat_id, H.escape(t("expense.amount_invalid", locale)),
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+    if amount <= 0 or amount > MAX_AMOUNT or amount != amount.quantize(Decimal("0.01")):
+        await context.bot.send_message(
+            chat_id, H.escape(t("expense.amount_invalid", locale)),
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+    payload["amount"] = str(amount.quantize(Decimal("0.01")))
+    payload["expense_date"] = payload.get("expense_date") or date.today().isoformat()
+    # Re-render the original confirmation card (edit-first).
+    role = role_for_telegram_id(user_id)
+    message_id = int(payload.get("confirm_message_id") or 0)
+    await render_expense_confirm(
+        update, context, payload, role, locale,
+        message_id=message_id or None,
+    )
+
+
+async def _enter_expense_category(update, context, payload, locale):
+    """Expense category follow-up: canonical label or retry."""
+    from pasay_bot.handlers.expense_flow import normalize_category, render_expense_confirm
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = (update.effective_message.text or "").strip()
+    category = normalize_category(text)
+    if not category:
+        await context.bot.send_message(
+            chat_id, H.escape(t("expense.ask_category", locale)),
+            parse_mode=HTML,
+        )
+        return
+    payload["category"] = category
+    role = role_for_telegram_id(user_id)
+    message_id = int(payload.get("confirm_message_id") or 0)
+    await render_expense_confirm(
+        update, context, payload, role, locale,
+        message_id=message_id or None,
+    )
+
+
+async def _enter_expense_unit(update, context, payload, locale):
+    """Expense unit follow-up: unit number or '无' (not tied to a unit)."""
+    from pasay_bot.handlers.expense_flow import render_expense_confirm, resolve_unit
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = (update.effective_message.text or "").strip()
+    if text.lower() in ("无", "none", "没有", "不填", "-"):
+        payload["unit_id"] = None
+        payload["unit_number"] = ""
+        payload["property_name"] = ""
+    else:
+        unit_id, unit_number, property_name = await resolve_unit(context, text)
+        if unit_id is None:
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("expense.unit_not_found", locale, unit=text)),
+                parse_mode=HTML,
+            )
+            return
+        payload["unit_id"] = unit_id
+        payload["unit_number"] = unit_number
+        payload["property_name"] = property_name
+    role = role_for_telegram_id(user_id)
+    message_id = int(payload.get("confirm_message_id") or 0)
+    await render_expense_confirm(
+        update, context, payload, role, locale,
+        message_id=message_id or None,
+    )
+
+
+async def _enter_ai_expense_partial(update, context, payload, locale):
+    """P0-5 follow-up: the user answered the missing-field question."""
+    from pasay_bot.handlers.expense_flow import (
+        normalize_category,
+        render_expense_confirm,
+        resolve_unit,
+    )
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = (update.effective_message.text or "").strip()
+    missing = list(payload.get("missing") or [])
+    if "amount" in missing or not payload.get("amount"):
+        try:
+            amount = Decimal(text.replace(",", ""))
+        except InvalidOperation:
+            amount = None
+        if amount is None or amount <= 0 or amount > MAX_AMOUNT:
+            await context.bot.send_message(
+                chat_id, H.escape(t("expense.amount_invalid", locale)),
+                parse_mode=HTML,
+            )
+            return
+        payload["amount"] = str(amount.quantize(Decimal("0.01")))
+        missing = [m for m in missing if m != "amount"]
+    elif "category" in missing or not payload.get("category"):
+        category = normalize_category(text)
+        if not category:
+            await context.bot.send_message(
+                chat_id, H.escape(t("ai.ask_category", locale)),
+                parse_mode=HTML,
+            )
+            return
+        payload["category"] = category
+        missing = [m for m in missing if m != "category"]
+    elif "unit" in missing or not payload.get("unit_number"):
+        if text.lower() in ("无", "none", "没有", "-"):
+            payload["unit_id"] = None
+            payload["unit_number"] = ""
+            payload["property_name"] = ""
+        else:
+            unit_id, unit_number, property_name = await resolve_unit(context, text)
+            if unit_id is None:
+                await context.bot.send_message(
+                    chat_id,
+                    H.escape(t("expense.unit_not_found", locale, unit=text)),
+                    parse_mode=HTML,
+                )
+                return
+            payload["unit_id"] = unit_id
+            payload["unit_number"] = unit_number
+            payload["property_name"] = property_name
+        missing = [m for m in missing if m != "unit"]
+
+    if missing:
+        payload["missing"] = missing
+        store = context.bot_data["store"]
+        store.save_conversation(chat_id, user_id, "ai_expense_partial", payload)
+        if "amount" in missing:
+            await context.bot.send_message(
+                chat_id, H.escape(t("expense.ask_amount", locale)),
+                parse_mode=HTML,
+            )
+        elif "category" in missing:
+            await context.bot.send_message(
+                chat_id, H.escape(t("ai.ask_category", locale)),
+                parse_mode=HTML,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id, H.escape(t("ai.ask_unit", locale)),
+                parse_mode=HTML,
+            )
+        return
+    payload.pop("missing", None)
+    role = role_for_telegram_id(user_id)
+    await render_expense_confirm(update, context, payload, role, locale)
 
 
 async def _return_to_confirm(update, context, payload, locale):

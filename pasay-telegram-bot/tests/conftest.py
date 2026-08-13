@@ -216,6 +216,13 @@ class FakeBackend:
         self.copilot_execute_error = None
         self.copilot_execute_response = None     # full CopilotExecuteOut dict
         self.copilot_cancel_error = None
+        self.copilot_ask_payload = {
+            "answer": "本月租金：已收到 ₱190,000，未收 ₱173,000。",
+            "provider": "fake", "model": "fake", "fallback": False,
+        }
+        # BOT-V1-USABLE-001 P0-5: configurable grounded NL intent parse.
+        self.nl_parse_payload: Optional[dict] = None
+        self.nl_parse_status: Optional[int] = None
         self.auth_info = {"id": 7, "username": "ana", "role": "admin", "is_active": True}
         self._copilot_proposal_seq = 100
         self._copilot_execute_task_id = 77
@@ -382,6 +389,19 @@ class FakeBackend:
         # --- V1.3 expense approval ---
         if path == "/expenses" and method == "GET":
             return httpx.Response(200, json=self.expenses)
+        if path == "/expenses" and method == "POST":
+            payload = body or {}
+            exp = self.add_expense(
+                status=payload.get("status", "pending"),
+                category=payload.get("category", "其他"),
+                amount=str(payload.get("amount", "0")),
+                payee=payload.get("payee", "-"),
+                unit_id=payload.get("unit_id"),
+                expense_date=payload.get("expense_date", TODAY),
+                due_date=payload.get("due_date"),
+                description=payload.get("description"),
+            )
+            return httpx.Response(201, json=exp)
         if path.startswith("/expenses/") and path.endswith("/approve") and method == "POST":
             expense = self._get_expense(int(path.split("/")[2]))
             if expense is None:
@@ -419,6 +439,33 @@ class FakeBackend:
                     "provider": "fake",
                     "model": "fake",
                     "fallback": False,
+                },
+            )
+        if path == "/operations/copilot/ask" and method == "POST":
+            return httpx.Response(200, json=self.copilot_ask_payload)
+        if path == "/operations/copilot/nl-parse" and method == "POST":
+            if self.nl_parse_status:
+                return httpx.Response(
+                    self.nl_parse_status,
+                    json={"detail": f"forced {self.nl_parse_status}"},
+                )
+            if self.nl_parse_payload is not None:
+                return httpx.Response(200, json=self.nl_parse_payload)
+            return httpx.Response(
+                200,
+                json={
+                    "intent": "ambiguous",
+                    "message": "",
+                    "unit": "",
+                    "unit_id": None,
+                    "amount": None,
+                    "category": "",
+                    "month": "",
+                    "missing": [],
+                    "options": [],
+                    "provider": "fake",
+                    "model": "fake",
+                    "fallback": True,
                 },
             )
         if path == "/operations/copilot/recommend" and method == "POST":

@@ -47,53 +47,47 @@ def _paid_unit1(env):
 # --- dashboard (B1) ---
 
 def test_start_shows_dashboard(make_app):
-    """★ /start renders the live dashboard with data + the persistent 2x2
-    bottom reply keyboard (V1.3: no more six-grid as primary nav)."""
+    """★ /start renders the P0 home summary with data + the identical 4-button
+    persistent reply keyboard for both roles."""
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     send = env.bot.last_send()
     text = send["text"]
-    assert "<b>🏠 Pasay 房产管理</b>" in text
-    assert "本月租金" in text
-    assert "应收：₱363,000" in text
-    assert "已收到：₱190,000" in text
-    assert "未收到：<b>₱173,000</b>" in text
-    assert "今日待处理" in text
-    assert "逾期 2 笔" in text
-    assert "空置 1 套" in text
+    assert "<b>Pasay Property</b>" in text
+    assert "本月已收" in text
+    assert "未收租：2 套" in text
+    assert "待审批：0 笔" in text
+    assert "30天内到期合同：0" in text
+    assert "未完成维修：0" in text
     kb = send["reply_markup"]
     assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
     assert kb.is_persistent is True
     labels = [b.text for row in kb.keyboard for b in row]
-    assert labels == ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
+    assert labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
 
 
 def test_secretary_start_has_english_persistent_keyboard(make_app):
-    """★ SECRETARY /start mounts the English persistent keyboard covering the
-    high-frequency daily ops entries (no Owner-only confirm/finalize/reverse)."""
+    """★ SECRETARY /start mounts the SAME 4-button persistent keyboard as the
+    Owner (one menu, no structural chaos)."""
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/start", bot=env.bot)])
     send = env.bot.last_send()
+    assert "Pasay Property" in send["text"]
     kb = send["reply_markup"]
     assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
     assert kb.is_persistent is True
     labels = [b.text for row in kb.keyboard for b in row]
-    assert labels == [
-        "🏠 Properties", "👥 Tenants",
-        "💵 Rent", "✅ Tasks",
-        "🔧 Maintenance", "📋 Records",
-        "⚠️ Overdue",
-    ]
+    assert labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
 
 
 def test_more_keyword_opens_fallback_inline_menu(make_app):
-    """★ typing ☰ 更多 / More opens the dashboard with the minimal inline
-    fallback (rent / overdue / copilot / home), not the six-grid."""
+    """★ typing ☰ 更多 (legacy alias) opens the dashboard with the minimal
+    inline fallback (rent / overdue / copilot / home), not a menu detour."""
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "☰ 更多", bot=env.bot)])
-    assert "处理中" in env.bot.last_send()["text"]  # durable first feedback
-    page = env.bot.last_edit()  # dashboard rendered onto the status message
-    kb = page["reply_markup"]
+    send = env.bot.last_send()
+    assert "本月租金" in send["text"]  # dashboard rendered directly
+    kb = send["reply_markup"]
     assert kb.__class__.__name__ == "InlineKeyboardMarkup"
     labels = [b.text for row in kb.inline_keyboard for b in row]
     assert "💵 收租" in labels
@@ -121,29 +115,28 @@ def test_nl_todo_keyword_opens_unified_page(make_app):
 
 
 def test_dashboard_no_tasks(make_app):
-    """★ no overdue/tasks -> positive empty line, no zero-noise."""
+    """★ no overdue/tasks -> home summary shows zero counts (no junk lines)."""
     env = make_app()
     env.backend.overdue = []
     env.backend.tasks = []
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "✅ 今天没有紧急事项" in text
-    assert "逾期 0 笔" not in text
-    assert "待办 0 项" not in text
+    assert "未收租：0 套" in text
+    assert "待审批：0 笔" in text
+    assert "30天内到期合同：0" in text
 
 
 def test_dashboard_with_overdue(make_app):
-    """★ overdue entries surface on the dashboard attention line."""
+    """★ overdue entries surface on the home summary."""
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "今日待处理" in text
-    assert "逾期 2 笔" in text
-    assert "✅ 今天没有紧急事项" not in text
+    assert "未收租：2 套" in text
 
 
 def test_dashboard_zero_values_hidden(make_app):
-    """★ zero/empty values are hidden; only the positive empty-state remains."""
+    """★ zero values render as clean zero counts, never as old dashboard
+    noise or internal terms."""
     env = make_app()
     env.backend.overdue = []
     env.backend.tasks = []
@@ -154,11 +147,10 @@ def test_dashboard_zero_values_hidden(make_app):
     }
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "✅ 今天没有紧急事项" in text
-    assert "逾期 0 笔" not in text
-    assert "待办 0 项" not in text
-    assert "空置 0 套" not in text
-    assert "租约即将到期 0 份" not in text
+    assert "未收租：0 套" in text
+    assert "待审批：0 笔" in text
+    assert "30天内到期合同：0" in text
+    assert "未完成维修：0" in text
 
 
 # --- state-driven buttons (B5) ---
@@ -420,8 +412,9 @@ def test_i18n_zh(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     zh_start = env.bot.last_send()["text"]
-    assert "Pasay 房产管理" in zh_start
-    assert "今天没有紧急事项" not in zh_start  # there IS overdue in fixture
+    assert "Pasay Property" in zh_start
+    assert "本月已收" in zh_start
+    assert "未收租：2 套" in zh_start  # there IS overdue in fixture
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/finance", message_id=2, update_id=2, bot=env.bot)])
     assert "2026年8月财务" in env.bot.last_send()["text"]
     # no English 'No data' / 'Main Menu' leak
@@ -433,9 +426,9 @@ def test_i18n_en(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/start", bot=env.bot)])
     start = env.bot.last_send()["text"]
-    assert "Pasay Property Management" in start
-    assert "This month" in start
-    assert "overdue" in start.lower()
+    assert "Pasay Property" in start
+    assert "Collected this month" in start
+    assert "unpaid rent" in start.lower()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending",
                                        message_id=2, update_id=2, bot=env.bot)])
     assert "Tasks" in env.bot.last_send()["text"]
@@ -466,7 +459,7 @@ def test_pending_aggregates_overdue_and_tasks(make_app):
     assert "逾期租金 · 2笔" in text
     assert "待确认收款 · 1笔" in text
     assert "支出待批准 · 1笔" in text
-    assert "我的任务 · 1项" in text
+    assert "未完成维修 · 1项" in text
     assert "Fix AC in 16B" in text
     kb = env.bot.last_send()["reply_markup"]
     actions = [
@@ -488,5 +481,5 @@ def test_pending_empty_positive(make_app):
     env.backend.tasks = []
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "✅ 暂无待办事项" in text
-    assert "0" not in text.replace("✅ 暂无待办事项", "")
+    assert "✅ 当前没有需要处理的事项。" in text
+    assert "0" not in text.replace("✅ 当前没有需要处理的事项。", "")

@@ -38,6 +38,13 @@ ACTION_RENT_STATUS_SELECT = "rss"
 ACTION_EXPENSE_APPROVE = "exa"
 ACTION_EXPENSE_REJECT = "exr"
 ACTION_EXPENSE_DETAIL = "exd"
+# BOT-V1-USABLE-001 P0-2: expense create flow (submit for approval / edit).
+ACTION_EXPENSE_CREATE = "exc"
+ACTION_EXPENSE_EDIT = "exe"
+# BOT-V1-USABLE-001 P0-5: AI fallback ambiguity choices (deterministic taps).
+ACTION_AI_CHOICE = "aic"
+# BOT-V1-USABLE-001 home summary action buttons.
+ACTION_HOME_NAV = "hnv"
 # V1.2 operations center (待办中心).
 ACTION_OPS_NAV = "opn"
 ACTION_TASK_COMPLETE = "tkc"
@@ -64,31 +71,22 @@ ACTION_COPILOT_ASSIGNEE_PICK = "cap"    # cp_assignee_pick (edit who)
 # NOT natural language: the text-message handler must exact-match them and
 # route deterministically BEFORE any NL/NLU/LLM processing can run.
 FIXED_MENU_ROUTES: dict[str, str] = {
-    # Owner (zh)
-    "🏠 房源": "properties",
+    # BOT-V1-USABLE-001: one identical 4-button persistent menu for both
+    # roles (首页 / 待办 / 收租 / 支出). No second/duplicate main menu.
+    "🏠 首页": "home",
     "✅ 待办": "pending",
-    "💰 财务": "finance",
-    "☰ 更多": "more",
-    # Secretary (en)
-    "🏠 Properties": "properties",
-    "👥 Tenants": "tenants",
-    "💵 Rent": "rent",
-    "✅ Tasks": "pending",
-    "🔧 Maintenance": "maintenance",
-    "📋 Records": "finance",
-    "⚠️ Overdue": "overdue",
+    "💰 收租": "rent",
+    "💸 支出": "expense",
 }
 
 # Row layout for the persistent keyboard (role -> rows of exact labels).
 _OWNER_REPLY_ROWS = [
-    ["🏠 房源", "✅ 待办"],
-    ["💰 财务", "☰ 更多"],
+    ["🏠 首页", "✅ 待办"],
+    ["💰 收租", "💸 支出"],
 ]
 _SECRETARY_REPLY_ROWS = [
-    ["🏠 Properties", "👥 Tenants"],
-    ["💵 Rent", "✅ Tasks"],
-    ["🔧 Maintenance", "📋 Records"],
-    ["⚠️ Overdue"],
+    ["🏠 首页", "✅ 待办"],
+    ["💰 收租", "💸 支出"],
 ]
 
 
@@ -1220,6 +1218,107 @@ def expense_result_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
     )
 
 
+# --- BOT-V1-USABLE-001 P0-2: expense create flow ---------------------------
+
+def expense_confirm_keyboard(
+    nonce: str, ts: int, locale: str = "zh"
+) -> InlineKeyboardMarkup:
+    """Expense confirmation card: [提交审批][修改] + [取消]. ``exc`` creates
+    the PENDING expense (Secretary/OWNER both allowed); approval stays the
+    Owner-only deterministic path."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("expense.submit_approval", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_CREATE, "exp", nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.edit", locale),
+                    callback_data=encode(ACTION_EXPENSE_EDIT, "menu"),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL)
+                ),
+            ],
+        ]
+    )
+
+
+def expense_edit_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Edit picker from an expense confirmation card (deterministic states)."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("expense.edit_amount", locale),
+                    callback_data=encode(ACTION_EXPENSE_EDIT, "amount"),
+                ),
+                InlineKeyboardButton(
+                    t("expense.edit_category", locale),
+                    callback_data=encode(ACTION_EXPENSE_EDIT, "cat"),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("expense.edit_unit", locale),
+                    callback_data=encode(ACTION_EXPENSE_EDIT, "unit"),
+                ),
+                InlineKeyboardButton(
+                    t("expense.edit_back", locale),
+                    callback_data=encode(ACTION_EXPENSE_EDIT, "back"),
+                ),
+            ],
+        ]
+    )
+
+
+def home_summary_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Home summary actions (P0 spec): view unpaid / approvals / expiring
+    contracts / maintenance. These are action buttons, not a second nav."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("home.view_unpaid", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "unpaid"),
+                ),
+                InlineKeyboardButton(
+                    t("home.view_approvals", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "approvals"),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("home.view_contracts", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "contracts"),
+                ),
+                InlineKeyboardButton(
+                    t("home.view_maintenance", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "maintenance"),
+                ),
+            ],
+        ]
+    )
+
+
+def ai_choice_keyboard(
+    nonce: str, ts: int, options: list[str], locale: str = "zh"
+) -> InlineKeyboardMarkup:
+    """BOT-V1-USABLE-001 P0-5: AI ambiguity -> 2-3 explicit deterministic
+    choices. The callback stores nothing free-form; the tap routes through the
+    stored intent payload in the callback handler."""
+    kb = [[InlineKeyboardButton(label, callback_data=encode(
+        ACTION_AI_CHOICE, "ai", str(idx), nonce=nonce, ts=ts
+    ))] for idx, label in enumerate(options[:3])]
+    kb.append([InlineKeyboardButton(t("rent.cancel", locale), callback_data=encode(ACTION_CANCEL))])
+    return InlineKeyboardMarkup(kb)
+
+
 def todo_keyboard(
     sections: dict,
     *,
@@ -1276,6 +1375,22 @@ def todo_keyboard(
             ]
         )
     for task in sections.get("tasks") or []:
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("ops.complete", locale),
+                    callback_data=encode(
+                        ACTION_TASK_COMPLETE, "ops", str(task.id), nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("ops.detail", locale),
+                    callback_data=encode(ACTION_TASK_DETAIL, "ops", str(task.id)),
+                ),
+            ]
+        )
+    for task in sections.get("maintenance") or []:
         nonce, ts = new_nonce(), now_ts()
         kb.append(
             [

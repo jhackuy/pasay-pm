@@ -192,8 +192,10 @@ def test_conversation_expired_falls_back_to_nl(make_app):
         env,
         [make_text_update(OWNER_ID, OWNER_ID, "55000", message_id=5, update_id=5, bot=env.bot)],
     )
-    # expired conversation -> treated as free text -> unknown fallback
-    assert "请用下方按钮" in env.bot.sends()[-1]["text"]
+    # expired conversation -> treated as free text -> AI ambiguity lane with
+    # explicit choices (never a /help fallback)
+    assert "你是想：" in env.bot.last_edit()["text"]
+    assert "/help" not in "".join(env.bot.all_texts())
 
 
 def test_method_invalid_entity_rejected(make_app):

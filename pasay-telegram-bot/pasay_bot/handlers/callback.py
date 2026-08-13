@@ -28,6 +28,7 @@ from pasay_bot.api_client import (
     Income,
 )
 from pasay_bot.handlers import commands as pages
+from pasay_bot.handlers import expense_flow, nl_bridge, nl_queries
 from pasay_bot.handlers.commands import (
     _current_month,
     show_dashboard,
@@ -49,9 +50,13 @@ from pasay_bot.keyboards import (
     ACTION_COPILOT_WHY,
     ACTION_DETAIL,
     ACTION_EDIT,
+    ACTION_AI_CHOICE,
     ACTION_EXPENSE_APPROVE,
+    ACTION_EXPENSE_CREATE,
     ACTION_EXPENSE_DETAIL,
+    ACTION_EXPENSE_EDIT,
     ACTION_EXPENSE_REJECT,
+    ACTION_HOME_NAV,
     ACTION_ISSUE,
     ACTION_METHOD,
     ACTION_NAV,
@@ -82,10 +87,13 @@ from pasay_bot.keyboards import (
     edit_menu_keyboard,
     error_keyboard,
     expense_approval_keyboard,
+    expense_confirm_keyboard,
     expense_detail_keyboard,
+    expense_edit_keyboard,
     expense_result_keyboard,
     expired_keyboard,
     home_keyboard,
+    home_summary_keyboard,
     new_nonce,
     now_ts,
     ops_back_keyboard,
@@ -301,6 +309,14 @@ async def _dispatch_callback(
         await _handle_expense_reject(update, context, entity, nonce, ts, role, locale)
     elif action == ACTION_EXPENSE_DETAIL:
         await _handle_expense_detail(update, context, entity, role, locale)
+    elif action == ACTION_EXPENSE_CREATE:
+        await _handle_expense_create(update, context, nonce, ts, role, locale)
+    elif action == ACTION_EXPENSE_EDIT:
+        await _handle_expense_edit(update, context, entity, role, locale)
+    elif action == ACTION_AI_CHOICE:
+        await _handle_ai_choice(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_HOME_NAV:
+        await _handle_home_nav(update, context, entity, role, locale)
     elif action == ACTION_EDIT:
         await _handle_edit(update, context, entity, role, locale)
     elif action == ACTION_ISSUE:
@@ -1110,6 +1126,197 @@ async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
         parse_mode=HTML,
         reply_markup=kb,
     )
+
+
+# --- BOT-V1-USABLE-001 P0-2: expense create/edit (deterministic) -----------
+
+async def _handle_expense_create(update, context, nonce, ts, role, locale):
+    """[提交审批] tap: create ONE PENDING expense through the existing
+    backend service (idempotency-guarded). Approval stays Owner-only."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    store = context.bot_data["store"]
+    chat_id, user_id = update.effective_chat.id, update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] != "expense_confirm" or conv["nonce"] != nonce:
+        await _answer(update, t("common.expired", locale))
+        return
+    payload = _payload(conv)
+    await _ack_working(update, locale)
+    await expense_flow.submit_expense(update, context, payload, role, locale)
+
+
+async def _handle_expense_edit(update, context, sub, role, locale):
+    """[✏️ 修改] picker + field edits. All free-text follow-ups are handled by
+    the deterministic conversation states (amount/category/unit)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    store = context.bot_data["store"]
+    chat_id, user_id = update.effective_chat.id, update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] != "expense_confirm":
+        await _answer(update, t("common.expired", locale))
+        return
+    payload = _payload(conv)
+    message_id = update.callback_query.message.message_id
+    if sub == "menu":
+        await _edit(
+            update,
+            "✏️ " + H.escape(t("expense.edit", locale)),
+            expense_edit_keyboard(locale),
+        )
+        await _answer(update, "")
+        return
+    if sub == "back":
+        await expense_flow.render_expense_confirm(
+            update, context, payload, role, locale, message_id=message_id,
+        )
+        await _answer(update, "")
+        return
+    state_map = {
+        "amount": ("expense_edit_amount", t("expense.ask_amount", locale)),
+        "cat": ("expense_edit_category", t("expense.ask_category", locale)),
+        "unit": ("expense_edit_unit", t("expense.ask_unit", locale)),
+    }
+    if sub not in state_map:
+        await _answer(update, t("common.invalid", locale))
+        return
+    state, ask_text = state_map[sub]
+    store.save_conversation(chat_id, user_id, state, payload)
+    await _edit(update, H.escape(ask_text), None)
+    await _answer(update, "")
+
+
+async def _handle_ai_choice(update, context, entity, ref, nonce, ts, role, locale):
+    """P0-5 ambiguity choice taps: deterministic routing from the stored
+    intent payload (record / query / ask)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    store = context.bot_data["store"]
+    chat_id, user_id = update.effective_chat.id, update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] != "ai_choice" or conv["nonce"] != nonce:
+        await _answer(update, t("common.expired", locale))
+        return
+    payload = _payload(conv)
+    idx = int(ref)
+    base = payload.get("choice_base") or "generic"
+    options = payload.get("options") or []
+    if idx < 0 or idx >= len(options):
+        await _answer(update, t("common.invalid", locale))
+        return
+    await _ack_working(update, locale)
+    message_id = update.callback_query.message.message_id
+
+    if base == "expense" and idx == 0:
+        partial = {
+            "unit_id": payload.get("unit_id"),
+            "unit_number": payload.get("unit") or "",
+            "property_name": "",
+            "category": payload.get("category") or "",
+            "amount": "",
+            "expense_date": date.today().isoformat(),
+            "payee": "",
+            "description": "",
+            "missing": ["amount"],
+        }
+        store.save_conversation(chat_id, user_id, "ai_expense_partial", partial)
+        await _edit(
+            update,
+            H.escape(t(
+                "ai.ask_amount", locale,
+                unit=partial["unit_number"] or "该房源",
+                category=partial["category"],
+            )),
+            None,
+        )
+        await _answer(update, "")
+        return
+    if base == "expense" and idx == 1:
+        answer = await nl_queries.build_query_answer(
+            context,
+            nl_queries.QueryIntent(
+                kind="unit_expenses", unit_token=payload.get("unit") or "",
+            ),
+            locale,
+        )
+        await _edit(update, H.truncate(answer), None)
+        await _answer(update, "")
+        return
+    if base == "income" and idx == 0:
+        await _edit(update, H.escape(t("ai.thinking", locale)), None)
+        await _answer(update, "")
+        await nl_bridge._handle_rent_payment_statement(
+            update, context, payload.get("text") or "", role, locale,
+        )
+        return
+    if base == "income" and idx == 1:
+        await _edit(update, H.escape(t("ai.thinking", locale)), None)
+        await _answer(update, "")
+        await nl_bridge._handle_rent_status_query(
+            update, context,
+            nl_bridge.RentStatusQuery(kind="unit", unit_token=payload.get("unit") or ""),
+            role, locale,
+        )
+        return
+    # generic: 0 = record expense, 1/2 = query/ask via copilot.
+    if idx == 0:
+        await _edit(
+            update,
+            H.escape(t("expense.page_hint", locale)),
+            home_keyboard(locale),
+        )
+        await _answer(update, "")
+        return
+    question = payload.get("text") or ""
+    api = context.bot_data["api_client"]
+    try:
+        ask = await api.copilot_ask(question)
+    except PasayApiError:
+        await _edit(update, H.escape(t("ai.unknown", locale)), None)
+        await _answer(update, "")
+        return
+    await _edit(
+        update,
+        H.truncate(cards.copilot_ask_card(ask.answer, fallback=ask.fallback, locale=locale)),
+        None,
+    )
+    await _answer(update, "")
+
+
+async def _handle_home_nav(update, context, sub, role, locale):
+    """Home summary action buttons (P0 spec): deterministic page routes."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    await _ack_working(update, locale)
+    message_id = update.callback_query.message.message_id
+    chat_id = update.effective_chat.id
+    if sub == "unpaid":
+        await pages.show_rent(context, chat_id, locale, message_id=message_id)
+    elif sub == "approvals":
+        await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
+    elif sub == "contracts":
+        await pages.show_contracts_page(context, chat_id, locale, message_id=message_id)
+    elif sub == "maintenance":
+        await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
+    else:
+        await _answer(update, t("common.invalid", locale))
 
 
 # --- timeout reconciliation (design §13) ---

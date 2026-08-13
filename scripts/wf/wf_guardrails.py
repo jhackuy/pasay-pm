@@ -147,42 +147,42 @@ def scan_platform_semantics(conftest_path=None):
 # user-facing swallow. New occurrences are FAIL; deleting or moving code without
 # re-reviewing these entries is also FAIL (line numbers are pinned).
 SILENT_EXCEPTION_ALLOWLIST = [
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 144,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 152,
      "kind": "silent_pass",
      "reason": "Telegram accepts exactly one answerCallbackQuery per query id; a "
                "second answer is invalid. Best-effort ack only: the durable "
                "edit/send fallback below still gives the user visible feedback."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 208,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 216,
      "kind": "silent_pass",
      "reason": "Remembering the last payment method is best-effort non-visible "
                "persistence; failure must never block the visible flow."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 253,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 261,
      "kind": "silent_pass",
      "reason": "Safety-net spinner-clear answer after the primary user-visible "
                "feedback already ran; Telegram single-answer semantics make a "
                "second answer best-effort."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 263,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/callback.py", "line": 271,
      "kind": "silent_pass",
      "reason": "Handler-latency instrumentation is telemetry, not user-visible "
                "output; it must never break the UX path."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 381,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 504,
      "kind": "silent_pass",
      "reason": "Property-name enrichment on the overdue page is decorative; the "
                "page still renders with core data and the API error path above "
                "already shows a visible error card."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 571,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 694,
      "kind": "silent_pass",
      "reason": "Dashboard unit/property enrichment is optional; core dashboard "
                "data renders and other backend failures surface visible errors."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 575,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 698,
      "kind": "silent_pass",
      "reason": "Dashboard lease enrichment is optional; core dashboard data "
                "renders."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 778,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/commands.py", "line": 932,
      "kind": "silent_pass",
      "reason": "Unparseable ISO due date falls back to 'no due date' so the task "
                "still renders in the correct ops section instead of breaking."},
-    {"file": "pasay-telegram-bot/pasay_bot/handlers/nl_bridge.py", "line": 401,
+    {"file": "pasay-telegram-bot/pasay_bot/handlers/nl_bridge.py", "line": 440,
      "kind": "silent_pass",
      "reason": "Property-name enrichment in the who-unpaid answer is decorative; "
                "core rows render and the API error path shows a visible error."},

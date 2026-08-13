@@ -40,6 +40,8 @@ from app.schemas.copilot import (
     CopilotAskIn,
     CopilotAskOut,
     CopilotExecuteOut,
+    CopilotNlParseIn,
+    CopilotNlParseOut,
     CopilotProposalActionOut,
     CopilotProposalCard,
     CopilotProposalCreate,
@@ -55,6 +57,7 @@ from app.schemas.copilot import (
 from app.services.audit import record_audit, serialize_row
 from app.services.copilot import ask as copilot_ask_svc
 from app.services.copilot import llm as copilot_llm
+from app.services.copilot import nl_parse as copilot_nl_parse_svc
 from app.services.copilot import today as copilot_today_svc
 from app.services.copilot import today_fast as copilot_today_fast_svc
 from app.services.copilot import why as copilot_why_svc
@@ -750,6 +753,79 @@ def copilot_ask(
         fallback=result.fallback,
         flags=result.flags,
         latency=LatencyOut(**result.latency.to_dict()),
+    )
+
+
+@router.post(
+    "/copilot/nl-parse",
+    response_model=CopilotNlParseOut,
+    status_code=status.HTTP_200_OK,
+)
+def copilot_nl_parse(
+    payload: CopilotNlParseIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """BOT-V1-USABLE-001 P0-5: grounded NL intent parsing for the bot's AI
+    fallback lane.
+
+    The text is grounded to the real catalog (units / tenants / categories /
+    current month) and parsed into a STRUCTURED intent. Nothing is executed
+    or written here; the bot maps the intent to its existing deterministic
+    business paths. Provider-down returns HTTP 200 with ``fallback=True`` and
+    a deterministic classification / clarification — never a fabricated
+    write action. Read-only; the only write is the optional ``copilot_runs``
+    audit row.
+    """
+    provider = payload.provider
+    if provider is not None and provider not in copilot_llm.list_providers():
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"unknown copilot LLM provider {provider!r}; "
+            f"known providers: {', '.join(copilot_llm.list_providers())}",
+        )
+    result = copilot_nl_parse_svc.parse_nl_intent(
+        db, user, payload.text, provider=provider
+    )
+    copilot_svc.log_context_run(
+        db,
+        actor=user,
+        context={
+            "text": payload.text,
+            "nl_parse": {
+                "intent": result.intent,
+                "unit": result.unit,
+                "unit_id": result.unit_id,
+                "amount": str(result.amount) if result.amount is not None else None,
+                "category": result.category,
+                "month": result.month,
+                "missing": result.missing,
+                "options": result.options,
+                "provider": result.provider,
+                "model": result.model,
+                "latency_ms": result.latency_ms,
+                "fallback": result.fallback,
+                "flags": result.flags,
+            },
+        },
+        intent="copilot_nl_parse",
+    )
+    db.commit()
+    return CopilotNlParseOut(
+        intent=result.intent,
+        message=result.message,
+        unit=result.unit,
+        unit_id=result.unit_id,
+        amount=str(result.amount) if result.amount is not None else None,
+        category=result.category,
+        month=result.month,
+        missing=result.missing,
+        options=result.options,
+        provider=result.provider,
+        model=result.model,
+        fallback=result.fallback,
+        flags=result.flags,
+        latency_ms=result.latency_ms,
     )
 
 

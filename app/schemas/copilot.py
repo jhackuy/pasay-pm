@@ -127,6 +127,39 @@ class CopilotAskOut(BaseModel):
     latency: LatencyOut = Field(default_factory=LatencyOut)
 
 
+# --- BOT-V1-USABLE-001 P0-5: grounded NL intent parsing (AI fallback) -------
+
+class CopilotNlParseIn(BaseModel):
+    """Free-text NL input for the bot's AI fallback lane.
+
+    The backend grounds the text to the real catalog and returns a STRUCTURED
+    intent; the bot only executes through its deterministic business paths.
+    """
+
+    text: str = Field(min_length=1, max_length=500)
+    provider: str | None = Field(default=None, max_length=64)
+
+
+class CopilotNlParseOut(BaseModel):
+    """Validated structured intent result. ``amount`` is serialized as string
+    so the bot can render it without float precision loss."""
+
+    intent: str
+    message: str = ""
+    unit: str = ""
+    unit_id: int | None = None
+    amount: str | None = None
+    category: str = ""
+    month: str = ""
+    missing: list[str] = Field(default_factory=list)
+    options: list[str] = Field(default_factory=list)
+    provider: str = ""
+    model: str = "deterministic"
+    fallback: bool = False
+    flags: list[str] = Field(default_factory=list)
+    latency_ms: int = 0
+
+
 # --- V1.2.2 Phase C2 — CONFIRMED-action copilot (recommend + execute) ---
 # Render-safe schemas shared with the bot (mirrored dataclasses in the bot's
 # api_client.py). The bot must never display the raw ``proposal_id``; the
