@@ -12,7 +12,9 @@ from decimal import Decimal
 import httpx
 import pytest
 from datetime import date, timedelta
+from telegram.error import BadRequest
 from telegram import Update
+from telegram import ReplyKeyboardMarkup
 
 TODAY = date.today().isoformat()
 
@@ -40,6 +42,12 @@ class FakeBot:
         self.calls: list[dict] = []
         self.username = "pasay_test_bot"
         self.id = 999
+        self._answered_ids: set[str] = set()
+        # Real Telegram semantics: only messages sent WITHOUT a reply keyboard
+        # (or with an inline keyboard) are editable. Track what the bot sent so
+        # edit_message_text can reject the reply-keyboard case exactly like the
+        # live API does ("Message can't be edited").
+        self._sent_by_id: dict[int, dict] = {}
 
     async def initialize(self):
         pass
@@ -60,10 +68,18 @@ class FakeBot:
                 "reply_markup": reply_markup,
             }
         )
-        return SimpleNamespace(chat_id=chat_id, message_id=len(self.calls), text=text)
+        message_id = len(self.calls)
+        self.calls[-1]["message_id"] = message_id
+        self._sent_by_id[message_id] = {"chat_id": chat_id, "reply_markup": reply_markup}
+        return SimpleNamespace(chat_id=chat_id, message_id=message_id, text=text)
 
     async def edit_message_text(self, text=None, chat_id=None, message_id=None,
                                 parse_mode=None, reply_markup=None, **kw):
+        sent = self._sent_by_id.get(message_id)
+        if sent is not None and isinstance(sent.get("reply_markup"), ReplyKeyboardMarkup):
+            # Mirrors the live Telegram API: a message sent with a non-inline
+            # reply keyboard can not be edited.
+            raise BadRequest("Message can't be edited")
         self.calls.append(
             {
                 "type": "edit_message_text",
@@ -77,6 +93,15 @@ class FakeBot:
         return SimpleNamespace(chat_id=chat_id, message_id=message_id, text=text)
 
     async def answer_callback_query(self, callback_query_id, text=None, show_alert=False, **kw):
+        # Real Telegram accepts exactly ONE answerCallbackQuery per callback
+        # id; a second answer fails with QUERY_ID_INVALID / "query is too old".
+        # Enforcing this in the fake keeps the button paths honest (a second
+        # answer must never be relied on for user-visible feedback).
+        if callback_query_id in self._answered_ids:
+            raise BadRequest(
+                "query is too old and response timeout expired or query ID is invalid"
+            )
+        self._answered_ids.add(callback_query_id)
         self.calls.append(
             {"type": "answer_callback_query", "id": callback_query_id, "text": text}
         )
@@ -172,6 +197,9 @@ class FakeBackend:
         self.timeout_before_write_paths: set[str] = set()
         self.timeout_without_effect_paths: set[str] = set()
         self.fail_status: dict[str, int] = {}
+        # --- button-determinism test knobs ---
+        self.delay_seconds = 0.0       # slow-backend simulation (code-side)
+        self.raise_on_paths: set[str] = set()  # unexpected exception simulation
         # --- V1.2.2 C2 copilot (TODAY / WHY / recommend / confirm / execute) ---
         self.copilot_today_payload = {
             "top_items": [
@@ -265,6 +293,10 @@ class FakeBackend:
         self.auth_calls.append(request.headers.get("authorization") or "")
         self.telegram_user_calls.append(request.headers.get("x-telegram-user-id"))
 
+        if path in self.raise_on_paths:
+            raise RuntimeError(f"forced unexpected error on {method} {path}")
+        if self.delay_seconds:
+            await asyncio.sleep(self.delay_seconds)
         if path in self.fail_status:
             return httpx.Response(self.fail_status[path], json={"detail": f"forced {self.fail_status[path]}"})
         if method == "POST" and path in self.timeout_before_write_paths:

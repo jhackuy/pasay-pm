@@ -26,6 +26,7 @@ from pasay_bot.config import Settings, get_settings
 from pasay_bot.handlers import callback as callback_handlers
 from pasay_bot.handlers import commands, conversation
 from pasay_bot.state.idempotency import IdempotencyGuard
+from pasay_bot.state.latency import LatencyTracker
 from pasay_bot.state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ def build_application(
     app.bot_data["store"] = store
     app.bot_data["settings"] = settings
     app.bot_data["idempotency"] = IdempotencyGuard(store)
+    # Code-side handler latency instrumentation (never an LLM judgment).
+    app.bot_data["latency"] = LatencyTracker()
 
     app.add_handler(CommandHandler("start", commands.cmd_start))
     app.add_handler(CommandHandler("menu", commands.cmd_menu))

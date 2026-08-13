@@ -148,7 +148,8 @@ def test_nl_confirm_mutates_card_once(make_app):
     labels = [b.text for row in kb.inline_keyboard for b in row] if kb else []
     assert "✓ 确认入账" not in labels  # confirmed card must not keep a stale confirm button
     assert "↩️ 撤销" in labels  # reverse stays available for the Owner
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert len(env.bot.answers()) == 1
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
 
 
 def test_nl_confirm_double_click_idempotent(make_app):

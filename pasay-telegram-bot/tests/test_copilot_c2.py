@@ -303,7 +303,8 @@ def test_copilot_followup_confirm_flow(make_app):
     assert "查看任务" in labels and "◀️ 返回今日重点" in labels
     assert "101" not in success["text"] and "proposal_id" not in success["text"]
     assert "EXECUTED" not in success["text"]
-    assert env.bot.last_answer()["text"] == ""
+    # single answer = processing ack; the success card is the durable result
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
 
 
 def test_copilot_snooze_entry_preset_and_execute(make_app):
@@ -448,6 +449,9 @@ def test_copilot_why_suggestions_owner_only_and_forged_confirm_refused(make_app)
     assert "◀️ Back to Today" in labels
 
     forged = encode("cpc", "101", "0", nonce=new_nonce(), ts=now_ts())
-    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, forged, bot=env.bot)])
+    run_updates(
+        env,
+        [make_callback_update(SECRETARY_ID, SECRETARY_ID, forged, update_id=99, bot=env.bot)],
+    )
     answer = env.bot.last_answer()["text"] or ""
     assert "permission" in answer.lower() or "无权限" in answer

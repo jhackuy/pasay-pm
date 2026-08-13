@@ -91,8 +91,9 @@ def test_more_keyword_opens_fallback_inline_menu(make_app):
     fallback (rent / overdue / copilot / home), not the six-grid."""
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "☰ 更多", bot=env.bot)])
-    send = env.bot.last_send()
-    kb = send["reply_markup"]
+    assert "处理中" in env.bot.last_send()["text"]  # durable first feedback
+    page = env.bot.last_edit()  # dashboard rendered onto the status message
+    kb = page["reply_markup"]
     assert kb.__class__.__name__ == "InlineKeyboardMarkup"
     labels = [b.text for row in kb.inline_keyboard for b in row]
     assert "💵 收租" in labels
@@ -111,9 +112,10 @@ def test_nl_todo_keyword_opens_unified_page(make_app):
         due_at=f"{TODAY}T00:00:00+08:00",
     )
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "✅ 待办", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "季度空调保养" in send["text"]
-    kb = send["reply_markup"]
+    assert "处理中" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "季度空调保养" in page["text"]
+    kb = page["reply_markup"]
     assert kb.__class__.__name__ == "InlineKeyboardMarkup"
     assert "✅ 完成" in [b.text for row in kb.inline_keyboard for b in row]
 
@@ -374,7 +376,8 @@ def test_uncertain_payment_state(make_app):
     nonce = decode(data)["nonce"]
     env.guard.acquire(f"ik:cnf:ren:{nonce}", kind="income", resource="")
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=2, bot=env.bot)])
-    assert "请勿重复提交" in (env.bot.last_answer()["text"] or "")
+    # the in-flight state is rendered durably onto the card (no silent drop)
+    assert "请勿重复提交" in (env.bot.last_edit()["text"] or "")
     assert len(env.backend.incomes) == 0
 
 

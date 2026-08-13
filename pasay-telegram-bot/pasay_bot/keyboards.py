@@ -59,6 +59,46 @@ ACTION_COPILOT_RECOMMEND_BACK = "cpr"   # cp_recommend_back (return to TODAY)
 ACTION_COPILOT_SNOOZE_PICK = "csp"      # cp_snooze_pick (edit due preset)
 ACTION_COPILOT_ASSIGNEE_PICK = "cap"    # cp_assignee_pick (edit who)
 
+# --- Fixed bottom Reply Keyboard (single source of truth) -------------------
+# Exact button label -> deterministic route. These labels are UI commands,
+# NOT natural language: the text-message handler must exact-match them and
+# route deterministically BEFORE any NL/NLU/LLM processing can run.
+FIXED_MENU_ROUTES: dict[str, str] = {
+    # Owner (zh)
+    "🏠 房源": "properties",
+    "✅ 待办": "pending",
+    "💰 财务": "finance",
+    "☰ 更多": "more",
+    # Secretary (en)
+    "🏠 Properties": "properties",
+    "👥 Tenants": "tenants",
+    "💵 Rent": "rent",
+    "✅ Tasks": "pending",
+    "🔧 Maintenance": "maintenance",
+    "📋 Records": "finance",
+    "⚠️ Overdue": "overdue",
+}
+
+# Row layout for the persistent keyboard (role -> rows of exact labels).
+_OWNER_REPLY_ROWS = [
+    ["🏠 房源", "✅ 待办"],
+    ["💰 财务", "☰ 更多"],
+]
+_SECRETARY_REPLY_ROWS = [
+    ["🏠 Properties", "👥 Tenants"],
+    ["💵 Rent", "✅ Tasks"],
+    ["🔧 Maintenance", "📋 Records"],
+    ["⚠️ Overdue"],
+]
+
+
+def fixed_menu_route_for(text: str) -> Optional[str]:
+    """Exact-match a fixed bottom-menu button label to its deterministic
+    route. Returns None when the text is NOT a fixed button, so free text
+    still falls through to the conversation/NL path unchanged."""
+    return FIXED_MENU_ROUTES.get((text or "").strip())
+
+
 # ops center section entities (callback entity field).
 OPS_OVERVIEW = "ops"
 OPS_SECTION_OVERDUE = "oov"
@@ -231,22 +271,16 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
     """Persistent bottom navigation (V1.3 + SLICE3-UX-PERSISTENT-MENU-001):
     Owner sees Chinese decision labels, Secretary sees English execution
-    labels. The buttons are plain text and route through nl_bridge like any
-    natural-language input. ``is_persistent=True`` pins the keyboard above the
+    labels. Every label is an exact-match UI command routed deterministically
+    (see ``FIXED_MENU_ROUTES`` / ``fixed_menu_route_for``) and never reaches
+    NL/NLU/LLM processing. ``is_persistent=True`` pins the keyboard above the
     input field across messages (Telegram Bot API >= 4.5 / PTB >= 13.5)."""
-    if role == Role.SECRETARY:
-        rows = [
-            [KeyboardButton("🏠 Properties"), KeyboardButton("👥 Tenants")],
-            [KeyboardButton("💵 Rent"), KeyboardButton("✅ Tasks")],
-            [KeyboardButton("🔧 Maintenance"), KeyboardButton("📋 Records")],
-            [KeyboardButton("⚠️ Overdue")],
-        ]
-    else:
-        rows = [
-            [KeyboardButton("🏠 房源"), KeyboardButton("✅ 待办")],
-            [KeyboardButton("💰 财务"), KeyboardButton("☰ 更多")],
-        ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+    rows = _SECRETARY_REPLY_ROWS if role == Role.SECRETARY else _OWNER_REPLY_ROWS
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label) for label in row] for row in rows],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 def copilot_today_keyboard(

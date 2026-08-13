@@ -51,10 +51,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     user_id = user.id if user else None
-    role = role_for_telegram_id(user_id)
-    locale = locale_for(role)
     store = context.bot_data["store"]
     text = (update.effective_message.text or "").strip()
+
+    # Fixed bottom Reply Keyboard buttons are exact-match UI commands: they
+    # are routed deterministically BEFORE any conversation-state or NL/LLM
+    # processing can run (buttons are never natural language).
+    from pasay_bot.handlers import buttons as button_handlers
+    from pasay_bot.keyboards import fixed_menu_route_for
+    route = fixed_menu_route_for(text)
+    if route is not None:
+        await button_handlers.handle_fixed_menu_button(update, context, route)
+        return
+
+    role = role_for_telegram_id(user_id)
+    locale = locale_for(role)
 
     if text.lower() in ("取消", "cancel", "quit", "exit"):
         conv = store.get_conversation(chat_id, user_id)

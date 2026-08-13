@@ -123,12 +123,53 @@ def _expired(ts, settings) -> bool:
     return (int(time.time()) - int(ts)) > settings.callback_ttl_seconds
 
 
-async def _answer(update: Update, text: str):
+async def _answer(update: Update, text: str, *, durable: bool = False, keyboard=None):
+    """Deliver callback feedback exactly once, in Telegram's real semantics.
+
+    Telegram accepts exactly ONE answerCallbackQuery per callback id, so the
+    first call wins and carries the user-visible toast (and clears the client
+    spinner). Any LATER call fails with QUERY_ID_INVALID; with
+    ``durable=True`` it then edits the tapped message in place instead - a
+    backend error, permission denial, expiry or timeout must never be silent.
+    Success toasts after the result card is rendered stay non-durable on
+    purpose (the card IS the result); durable=False post-ack calls are safe
+    no-ops.
+    """
     cq = update.callback_query
+    if cq is None:
+        return
     try:
         await cq.answer(text)
-    except Exception:
+        return
+    except Exception:  # noqa: BLE001 - already answered / query invalid
         pass
+    if durable and text:
+        user = update.effective_user
+        locale = locale_for(role_for_telegram_id(user.id if user else None))
+        try:
+            await edit_message_text_or_send(
+                update.get_bot(),
+                chat_id=update.effective_chat.id,
+                message_id=cq.message.message_id,
+                text=H.truncate(text),
+                parse_mode=HTML,
+                reply_markup=keyboard if keyboard is not None else home_keyboard(locale),
+            )
+        except Exception:  # noqa: BLE001 - feedback must never raise into the router
+            logger.exception("durable callback feedback failed")
+
+
+async def _ack_working(update: Update, locale: str):
+    """Acknowledge the click with a visible 'processing…' status right before
+    a slow backend operation.
+
+    This is normally the FIRST (and only) answerCallbackQuery for the click:
+    it clears the Telegram client spinner within milliseconds and shows the
+    processing toast at the same time. The final result is then rendered by
+    mutating the tapped message, so the user always sees 处理中 -> result and
+    never "did my tap register?".
+    """
+    await _answer(update, t("common.working", locale))
 
 
 async def _edit(update: Update, text: str, keyboard=None):
@@ -174,6 +215,18 @@ def _can_reverse(context, role) -> bool:
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deterministic inline-button router (buttons are UI commands, never NL).
+
+    Order: bind identity -> decode -> local role/locale -> route. The first
+    handler feedback (permission/expiry/invalid toast, or the 'processing'
+    ack before a slow backend call) is the single Telegram answer for this
+    click, so the client spinner clears within milliseconds. Post-ack errors
+    are rendered durably onto the tapped message (message mutation), never
+    silent. The whole dispatch is fail-closed: ANY unexpected exception still
+    yields a human-visible reply, and every handled action is timed by the
+    code-side latency tracker (never by an LLM).
+    """
+    started = time.monotonic()
     pages._bind_identity(update, context)
     cq = update.callback_query
     parsed = decode(cq.data)
@@ -181,15 +234,48 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _answer(update, t("common.invalid"))
         return
     action = parsed["action"]
+    user = update.effective_user
+    user_id = user.id if user else None
+    role = role_for_telegram_id(user_id)
+    locale = locale_for(role)
+    outcome, detail = "ok", ""
+    try:
+        await _dispatch_callback(update, context, parsed, role, locale)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never silent
+        logger.exception("callback action=%s data=%r failed", action, cq.data)
+        outcome, detail = "error", str(exc)
+        await _answer(update, t("common.unexpected", locale), durable=True)
+    finally:
+        # Safety net: if a handler path produced no answer and no durable
+        # edit, clear the client spinner anyway (never leave "waiting").
+        try:
+            await cq.answer("")
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        tracker = context.bot_data.get("latency")
+        if tracker is not None:
+            try:
+                tracker.record(
+                    "callback", action,
+                    (time.monotonic() - started) * 1000,
+                    outcome=outcome, detail=detail,
+                )
+            except Exception:  # noqa: BLE001 - instrumentation never breaks UX
+                pass
+
+
+async def _dispatch_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed: dict,
+    role,
+    locale: str,
+):
+    action = parsed["action"]
     entity = parsed["entity"]
     ref = parsed["ref"]
     nonce = parsed["nonce"]
     ts = parsed["ts"]
-    user = update.effective_user
-    user_id = user.id if user else None
-    chat_id = update.effective_chat.id if update.effective_chat else user_id
-    role = role_for_telegram_id(user_id)
-    locale = locale_for(role)
 
     if action == ACTION_NAV:
         await _handle_nav(update, context, entity, role, locale)
@@ -250,6 +336,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == ACTION_COPILOT_ASSIGNEE_PICK:
         await _handle_copilot_assignee_pick(update, context, entity, ref, nonce, ts, role, locale)
     else:
+        logger.warning("unknown callback action=%r data=%r", action, update.callback_query.data)
         await _answer(update, t("common.invalid", locale))
 
 
@@ -257,9 +344,9 @@ async def _handle_nav(update, context, entity, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    # B11: acknowledge immediately so Telegram never keeps the spinner up
-    # while dashboard data loads.
-    await _answer(update, "")
+    # B11: the entry-level ack already removed the spinner; show a durable
+    # "processing" status while the page data loads from the backend.
+    await _ack_working(update, locale)
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
     if entity == "properties":
@@ -286,7 +373,7 @@ async def _handle_page(update, context, entity, ref, role, locale):
         page = 1
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
-    await _answer(update, "")
+    await _ack_working(update, locale)
     if entity == "prop":
         await pages.show_properties(context, chat_id, None, locale, page=page, message_id=message_id)
     elif entity == "ovd":
@@ -303,11 +390,11 @@ async def _handle_rent(update, context, entity, ref, role, locale):
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
     if entity == "prop" and ref.isdigit():
-        await _answer(update, "")
+        await _ack_working(update, locale)
         await pages.show_rent_units(context, chat_id, message_id, int(ref), locale)
         return
     if entity == "unit" and ref.isdigit():
-        await _answer(update, "")
+        await _ack_working(update, locale)
         unit_id = int(ref)
         can_rent = has_permission(role, PERMISSION_RENT_ENTRY)
         await pages.show_unit_page(
@@ -331,7 +418,6 @@ async def _handle_rent_status_select(update, context, ref, nonce, ts, role, loca
     re-taps are idempotent through the shared IdempotencyGuard; expired or
     foreign selectors get the friendly expired copy, never a stack trace or
     internal state."""
-    await _answer(update, "")
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
@@ -384,7 +470,7 @@ async def _begin_rent_entry(update, context, unit_id: int, role, locale):
     store = context.bot_data["store"]
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    await _answer(update, "")
+    await _ack_working(update, locale)
     try:
         unit, properties, leases, incomes = await asyncio.gather(
             api.get_unit(unit_id),
@@ -490,7 +576,6 @@ async def _handle_edit(update, context, sub, role, locale):
         await _answer(update, t("common.expired", locale))
         await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
-    await _answer(update, "")
     if sub == "menu":
         store.save_conversation(chat_id, user_id, "rent_edit", payload)
         await _edit(update, H.escape(t("rent.edit_title", locale)), edit_menu_keyboard(locale))
@@ -549,17 +634,18 @@ async def _handle_issue(update, context, ref, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     api = context.bot_data["api_client"]
+    await _ack_working(update, locale)
     try:
         income = await api.get_income(int(ref))
     except PasayApiError:
-        await _answer(update, t("rent.issue_error", locale))
+        await _answer(update, t("rent.issue_error", locale), durable=True)
         return
     if income.status == "pending":
-        await _answer(update, t("rent.issue_pending", locale))
+        await _answer(update, t("rent.issue_pending", locale), durable=True)
     elif income.status == "confirmed":
-        await _answer(update, t("rent.issue_confirmed", locale))
+        await _answer(update, t("rent.issue_confirmed", locale), durable=True)
     else:
-        await _answer(update, t("rent.issue_error", locale))
+        await _answer(update, t("rent.issue_error", locale), durable=True)
 
 
 async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
@@ -589,6 +675,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
         return
     payload = _payload(conv)
     can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)
+    await _ack_working(update, locale)
 
     # Idempotency: done/in_flight replay without touching the API, so a second
     # click after a successful write never re-writes.
@@ -600,7 +687,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
         await _answer(update, t("rent.processed_toast", locale))
         return
     if status == "in_flight":
-        await _answer(update, t("common.processing", locale))
+        await _answer(update, t("common.processing", locale), durable=True)
         return
 
     income = None
@@ -684,7 +771,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
             await _answer(update, t("rent.processed_toast", locale))
         else:
             guard.fail(key)
-            await _answer(update, t("common.error", locale, detail="conflict"))
+            await _answer(update, t("common.error", locale, detail="conflict"), durable=True)
     except PasayApiTimeoutError:
         if income is not None:
             await _reconcile_after_timeout(
@@ -696,7 +783,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
             )
     except PasayApiPermissionError:
         guard.fail(key, resource=str(income.id) if income else None)
-        await _answer(update, t("common.no_permission", locale))
+        await _answer(update, t("common.no_permission", locale), durable=True)
     except PasayApiError as exc:
         guard.fail(key, resource=str(income.id) if income else None)
         await _answer(update, t("common.error", locale, detail=exc.detail))
@@ -723,6 +810,7 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     income_id = int(ref)
+    await _ack_working(update, locale)
     key = f"ik:cnf:inc:{income_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="income", resource=str(income_id))
     if status == "done":
@@ -732,7 +820,7 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("rent.processed_toast", locale))
         return
     if status == "in_flight":
-        await _answer(update, t("common.processing", locale))
+        await _answer(update, t("common.processing", locale), durable=True)
         return
 
     try:
@@ -752,7 +840,7 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
         )
     except PasayApiPermissionError:
         guard.fail(key, resource=str(income_id))
-        await _answer(update, t("common.no_permission", locale))
+        await _answer(update, t("common.no_permission", locale), durable=True)
     except PasayApiError as exc:
         guard.fail(key, resource=str(income_id))
         await _answer(update, t("common.error", locale, detail=exc.detail))
@@ -775,6 +863,7 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     income_id = int(ref)
+    await _ack_working(update, locale)
     key = f"ik:rv:{income_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="income", resource=str(income_id))
     if status == "done":
@@ -784,7 +873,7 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("rent.processed_toast", locale))
         return
     if status == "in_flight":
-        await _answer(update, t("common.processing", locale))
+        await _answer(update, t("common.processing", locale), durable=True)
         return
     try:
         # Confirm and reverse use the same Native Bot SERVICE credential. The
@@ -808,10 +897,10 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         )
     except PasayApiPermissionError:
         guard.fail(key)
-        await _answer(update, t("common.no_permission", locale))
+        await _answer(update, t("common.no_permission", locale), durable=True)
     except PasayApiError as exc:
         guard.fail(key)
-        await _answer(update, t("common.error", locale, detail=exc.detail))
+        await _answer(update, t("common.error", locale, detail=exc.detail), durable=True)
 
 
 async def _handle_cancel(update, context, locale):
@@ -838,7 +927,7 @@ async def _handle_detail(update, context, entity, ref, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    await _answer(update, "")
+    await _ack_working(update, locale)
     if entity == "unit" and ref.isdigit():
         await pages.show_unit_page(
             context,
@@ -909,7 +998,6 @@ async def _handle_expense_action(
     """Approve/reject core (V1.3): answer first (no loading spinner), Owner
     only, idempotency-guarded, original message mutated to the result card.
     Backend errors never destroy the original card."""
-    await _answer(update, "")
     if role != Role.OWNER:
         await _answer(update, t("expense.owner_only", locale))
         return
@@ -919,6 +1007,9 @@ async def _handle_expense_action(
     settings = context.bot_data["settings"]
     if _expired(ts, settings):
         await _answer(update, t("common.expired", locale))
+        # Make the expiry visible on the card too: a fleeting toast alone is
+        # easy to miss and reads as "tap did nothing".
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
     expense_id = int(expense_id_raw)
     api = context.bot_data["api_client"]
@@ -934,13 +1025,14 @@ async def _handle_expense_action(
         await _render_expense_state(update, context, expense, locale)
         return
     if status == "in_flight":
-        await _answer(update, t("common.processing", locale))
+        await _answer(update, t("common.processing", locale), durable=True)
         return
+    await _ack_working(update, locale)
     try:
         current = await api.get_expense(expense_id)
     except PasayApiError as exc:
         guard.fail(key, resource=str(expense_id))
-        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}")
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
         return
     if (current.status or "").lower() != "pending":
         guard.settle(key, current.as_dict(), resource=str(expense_id))
@@ -967,13 +1059,13 @@ async def _handle_expense_action(
         await _render_expense_state(update, context, current, locale)
     except PasayApiTimeoutError:
         guard.fail(key, resource=str(expense_id))
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
     except PasayApiPermissionError:
         guard.fail(key, resource=str(expense_id))
-        await _answer(update, t("common.no_permission", locale))
+        await _answer(update, t("common.no_permission", locale), durable=True)
     except PasayApiError as exc:
         guard.fail(key, resource=str(expense_id))
-        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}")
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
 
 
 async def _handle_expense_approve(update, context, expense_id_raw, nonce, ts, role, locale):
@@ -991,7 +1083,6 @@ async def _handle_expense_reject(update, context, expense_id_raw, nonce, ts, rol
 async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
     """[📎 查看凭证/详情]: human-readable detail. Approve/reject stay on the
     card while the expense is still pending AND the user is the Owner."""
-    await _answer(update, "")
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
@@ -999,10 +1090,11 @@ async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     api = context.bot_data["api_client"]
+    await _ack_working(update, locale)
     try:
         expense = await api.get_expense(int(expense_id_raw))
     except PasayApiError as exc:
-        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}")
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
         return
     location = await _expense_location(update, context, expense)
     text = cards.expense_detail_card(expense, locale, location=location)
@@ -1035,7 +1127,7 @@ async def _reconcile_after_timeout(
         current = await api.get_income(income_id)
     except PasayApiError:
         guard.fail(key)
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
         return
     if current.status in ("confirmed", "reversed"):
         guard.settle(key, current.as_dict(), resource=str(income_id))
@@ -1047,7 +1139,7 @@ async def _reconcile_after_timeout(
         await _answer(update, t("common.timeout_pending", locale))
     else:
         guard.fail(key, resource=str(income_id))
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
 
 
 async def _reconcile_create_after_timeout(
@@ -1069,11 +1161,11 @@ async def _reconcile_create_after_timeout(
         )
     except PasayApiError:
         guard.fail(key)
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
         return
     if matched is None:
         guard.fail(key)
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
         return
     can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)
     if matched.status == "pending" and can_confirm:
@@ -1100,7 +1192,7 @@ async def _reconcile_income_after_timeout(
         current = await api.get_income(income_id)
     except PasayApiError:
         guard.fail(key)
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
         return
     if current.status in ("confirmed", "reversed"):
         guard.settle(key, current.as_dict(), resource=str(income_id))
@@ -1108,12 +1200,12 @@ async def _reconcile_income_after_timeout(
         if reverse and current.status == "confirmed":
             # Reverse timed out and the income is still confirmed: the reversal
             # did NOT land. Never tell the user it was processed (F7).
-            await _answer(update, t("rent.reverse_failed_toast", locale))
+            await _answer(update, t("rent.reverse_failed_toast", locale), durable=True)
         else:
             await _answer(update, t("rent.processed_toast", locale))
     else:
         guard.fail(key, resource=str(income_id))
-        await _answer(update, t("common.timeout", locale))
+        await _answer(update, t("common.timeout", locale), durable=True)
 
 
 # --- result rendering ---
@@ -1260,6 +1352,7 @@ async def _handle_ops_nav(update, context, entity, role, locale):
         await _answer(update, t("common.no_permission", locale))
         return
     cq = update.callback_query
+    await _ack_working(update, locale)
     if entity == OPS_OVERVIEW:
         await show_operations_center(
             context, update.effective_chat.id, locale, message_id=cq.message.message_id
@@ -1268,7 +1361,6 @@ async def _handle_ops_nav(update, context, entity, role, locale):
         await show_operations_section(
             context, update.effective_chat.id, cq.message.message_id, entity, locale
         )
-    await _answer(update, "")
 
 
 async def _handle_task_complete(update, context, ref, role, locale):
@@ -1280,13 +1372,14 @@ async def _handle_task_complete(update, context, ref, role, locale):
         return
     task_id = int(ref)
     api = context.bot_data["api_client"]
+    await _ack_working(update, locale)
     try:
         task = await api.complete_operational_task(task_id)
     except PasayApiPermissionError:
-        await _answer(update, t("ops.no_permission", locale))
+        await _answer(update, t("ops.no_permission", locale), durable=True)
         return
     except PasayApiError as exc:
-        await _answer(update, f"⚠️ {H.escape(exc.detail)}")
+        await _answer(update, f"⚠️ {H.escape(exc.detail)}", durable=True)
         return
     text = t(
         "ops.completed_card", locale,
@@ -1338,13 +1431,14 @@ async def _handle_task_snooze_pick(update, context, entity, ref, role, locale):
     if preset is None:
         await _answer(update, t("common.invalid", locale))
         return
+    await _ack_working(update, locale)
     try:
         task = await api.snooze_operational_task(task_id, preset=preset)
     except PasayApiPermissionError:
-        await _answer(update, t("ops.no_permission", locale))
+        await _answer(update, t("ops.no_permission", locale), durable=True)
         return
     except PasayApiError as exc:
-        await _answer(update, f"⚠️ {H.escape(exc.detail)}")
+        await _answer(update, f"⚠️ {H.escape(exc.detail)}", durable=True)
         return
     until = str(task.snoozed_until or "")[:16].replace("T", " ")
     text = t(
@@ -1364,15 +1458,16 @@ async def _handle_task_detail(update, context, ref, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     api = context.bot_data["api_client"]
+    await _ack_working(update, locale)
     try:
         task, properties = await asyncio.gather(
             api.get_operational_task(int(ref)), api.get_properties()
         )
     except PasayApiPermissionError:
-        await _answer(update, t("ops.no_permission", locale))
+        await _answer(update, t("ops.no_permission", locale), durable=True)
         return
     except PasayApiError as exc:
-        await _answer(update, f"⚠️ {H.escape(exc.detail)}")
+        await _answer(update, f"⚠️ {H.escape(exc.detail)}", durable=True)
         return
     text = cards.operational_task_detail_card(task, properties, locale)
     await _edit(update, text, task_action_keyboard(task.id, locale))
@@ -1385,7 +1480,7 @@ async def _handle_copilot_nav(update, context, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    await _answer(update, "")
+    await _ack_working(update, locale)
     await pages.show_copilot(context, update.effective_chat.id, locale,
                              message_id=update.callback_query.message.message_id)
 
@@ -1398,7 +1493,7 @@ async def _handle_copilot_why(update, context, entity, role, locale):
     if not entity.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
-    await _answer(update, "")
+    await _ack_working(update, locale)
     await pages.show_copilot_why(
         context, update.effective_chat.id,
         update.callback_query.message.message_id, int(entity), locale,
@@ -1534,6 +1629,7 @@ async def _re_recommend(update, context, payload: dict, overrides: dict, locale:
     unchanged); nothing executes here."""
     api = context.bot_data["api_client"]
     intent = payload.get("intent")
+    await _ack_working(update, locale)
     try:
         if intent == "snooze":
             rec = await api.copilot_recommend(
@@ -1586,6 +1682,7 @@ async def _handle_copilot_suggest(update, context, entity, ref, nonce, ts, role,
         await _answer(update, t("common.invalid", locale))
         return
     api = context.bot_data["api_client"]
+    await _ack_working(update, locale)
     try:
         today = await api.copilot_today()
     except PasayApiError as exc:
@@ -1672,8 +1769,9 @@ async def _handle_copilot_confirm(update, context, entity, ref, nonce, ts, role,
         await _answer(update, t("copilot.executed_already", locale))
         return
     if status == "in_flight":
-        await _answer(update, t("common.processing", locale))
+        await _answer(update, t("common.processing", locale), durable=True)
         return
+    await _ack_working(update, locale)
     payload = _copilot_conv(update, context) or {}
     assignee_name = str(payload.get("assignee_name") or "")
     try:
@@ -1726,8 +1824,9 @@ async def _handle_copilot_decline(update, context, entity, ref, nonce, ts, role,
         await _answer(update, "")
         return
     if status == "in_flight":
-        await _answer(update, t("common.processing", locale))
+        await _answer(update, t("common.processing", locale), durable=True)
         return
+    await _ack_working(update, locale)
     try:
         await api.copilot_cancel(proposal_id)
     except PasayApiError as exc:
@@ -1759,7 +1858,6 @@ async def _handle_copilot_edit(update, context, entity, ref, nonce, ts, role, lo
         await _answer(update, t("common.expired", locale))
         await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
-    await _answer(update, "")
     if entity == "menu":
         await _edit(
             update, H.escape(t("copilot.edit_title", locale)),
@@ -1797,7 +1895,6 @@ async def _handle_copilot_snooze_pick(update, context, entity, ref, nonce, ts, r
         await _answer(update, t("common.expired", locale))
         await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
-    await _answer(update, "")
     preset = _COPILOT_DUE_PRESET_MAP.get(entity)
     if preset is None:
         await _answer(update, t("common.invalid", locale))
@@ -1826,9 +1923,9 @@ async def _handle_copilot_assignee_pick(update, context, entity, ref, nonce, ts,
         await _answer(update, t("common.expired", locale))
         await _edit(update, t("common.expired", locale), expired_keyboard(locale))
         return
-    await _answer(update, "")
     api = context.bot_data["api_client"]
     if entity == "me":
+        await _ack_working(update, locale)
         try:
             me = await api.get_me()
         except PasayApiError as exc:

@@ -85,7 +85,12 @@ def test_reply_keyboard_role_specific_labels():
     owner_labels = [b.text for row in owner.keyboard for b in row]
     sec_labels = [b.text for row in secretary.keyboard for b in row]
     assert owner_labels == ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
-    assert sec_labels == ["🏠 Properties", "✅ Tasks", "💰 Finance", "☰ More"]
+    assert sec_labels == [
+        "🏠 Properties", "👥 Tenants",
+        "💵 Rent", "✅ Tasks",
+        "🔧 Maintenance", "📋 Records",
+        "⚠️ Overdue",
+    ]
     assert owner.resize_keyboard is True
     assert secretary.resize_keyboard is True
 
@@ -205,7 +210,7 @@ def test_already_processed_never_writes_again(make_app):
     assert env.backend._get_expense(5)["status"] == "rejected"
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, _expense_data(), update_id=4, bot=env.bot)])
     assert env.backend.count_calls("POST", "/expenses/5/approve") == 0
-    assert env.bot.last_answer()["text"] == "✅ 这笔支出已处理过了。"
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
     assert "❌ <b>已拒绝</b>" in env.bot.last_edit()["text"]
 
 
@@ -224,7 +229,7 @@ def test_unauthorized_secretary_refused_card_unchanged(make_app):
     assert env.backend.count_calls("POST", "/expenses/5/approve") == 0
     assert env.backend._get_expense(5)["status"] == "pending"
     assert len(env.bot.edits()) == 0  # original card unchanged
-    assert len(env.bot.calls) == before + 2  # only the two answers, no edit
+    assert len(env.bot.calls) == before + 1  # single answer, no edit
 
 
 def test_backend_error_keeps_original_card(make_app):
@@ -234,8 +239,10 @@ def test_backend_error_keeps_original_card(make_app):
     _seed_pending_expense(env)
     env.backend.fail_status["/expenses/5/approve"] = 500
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, _expense_data(), bot=env.bot)])
-    assert env.bot.edits() == []  # original card untouched
-    assert env.bot.last_answer()["text"] != ""
+    # one processing answer + durable error ON the card (never silent)
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
+    assert "forced 500" in env.bot.last_edit()["text"]
+    assert len(env.bot.sends()) == 0
     assert env.backend._get_expense(5)["status"] == "pending"
 
 

@@ -167,7 +167,9 @@ def test_rent_confirm(make_app):
     assert inc["status"] == "confirmed"
     assert inc["amount"] == "55000.00"
     assert inc["description"] == f"rent {date.today().strftime('%Y-%m')}"
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    # single answer = processing ack; the done card is the durable result
+    assert len(env.bot.answers()) == 1
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
     assert "收租成功" in env.bot.edits()[-1]["text"]
     assert "编号" not in env.bot.edits()[-1]["text"]  # no income_id on the user-facing card
     kb = env.bot.edits()[-1]["reply_markup"]
@@ -187,7 +189,8 @@ def test_secretary_records_pending_not_confirmed(make_app):
     inc = env.backend.incomes[0]
     assert inc["status"] == "pending"
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
-    assert env.bot.last_answer()["text"] == "📝 Recorded, pending"
+    assert len(env.bot.answers()) == 1
+    assert "Processing" in (env.bot.last_answer()["text"] or "")
     assert "Recorded, pending" in env.bot.edits()[-1]["text"]
 
 
@@ -239,7 +242,9 @@ def test_duplicate_rent_callback(make_app):
     assert len(env.backend.incomes) == 1
     assert env.backend.count_calls("POST", "/incomes") == 1
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
-    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert len(env.bot.answers()) == 3  # setup click + 2 confirm clicks
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_double_confirm(make_app):
@@ -258,7 +263,9 @@ def test_double_confirm(make_app):
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
     assert len(env.backend.incomes) == 1
     assert env.backend.incomes[0]["status"] == "confirmed"
-    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert len(env.bot.answers()) == 2  # two confirm clicks on the same data
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_double_confirm_backend_409_path(make_app):
@@ -270,7 +277,8 @@ def test_double_confirm_backend_409_path(make_app):
     data = encode("cnf", "inc", "1", nonce=new_nonce(), ts=now_ts())
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
-    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert len(env.bot.answers()) == 1
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
     assert "收租成功" in env.bot.edits()[-1]["text"]
     assert "编号" not in env.bot.edits()[-1]["text"]
     kb = env.bot.edits()[-1]["reply_markup"]
@@ -303,7 +311,8 @@ def test_reverse_owner_only(make_app):
     data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "reversed"
-    assert env.bot.last_answer()["text"] == "↩️ 已撤销"
+    assert len(env.bot.answers()) == 1
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
     assert "已撤销" in env.bot.edits()[-1]["text"]
 
 
@@ -341,7 +350,8 @@ def test_permission_bypass(make_app):
         [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=30, bot=env2.bot)],
     )
     assert env2.backend.incomes[0]["status"] == "pending"
-    assert "无权限" in (env2.bot.last_answer()["text"] or "")
+    # backend 403 arrives after the processing ack -> durable on the card
+    assert "无权限" in (env2.bot.last_edit()["text"] or "")
 
 
 # --- timeout reconciliation (design §13) ---
@@ -355,16 +365,18 @@ def test_backend_timeout_before_write(make_app):
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
     assert len(env.backend.incomes) == 0
     assert env.backend.count_calls("POST", "/incomes") == 1
-    answer = env.bot.last_answer()["text"] or ""
-    assert "网络超时" in answer
-    assert "请重试" in answer or "不确定" in answer
+    assert len(env.bot.answers()) == 2  # setup click + timed-out confirm click
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
+    edit = env.bot.last_edit()["text"] or ""
+    assert "网络超时" in edit
+    assert "请重试" in edit or "不确定" in edit
 
     # retry same card -> allowed (failed state) and completes
     env.backend.timeout_before_write_paths.clear()
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
     assert len(env.backend.incomes) == 1
     assert env.backend.incomes[0]["status"] == "confirmed"
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_backend_timeout_after_write(make_app):
@@ -381,8 +393,8 @@ def test_backend_timeout_after_write(make_app):
     assert env.backend.count_calls("POST", "/incomes") == 1
     assert env.backend.count_calls("GET", "/incomes") >= 1  # reconciled via list
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
-    answer = env.bot.last_answer()["text"] or ""
-    assert answer == "✅ 已入账"
+    assert len(env.bot.answers()) == 2  # setup click + confirm click
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
     assert "没有修改" not in "".join(env.bot.all_texts())
     assert "收租成功" in env.bot.edits()[-1]["text"]
 
@@ -391,7 +403,9 @@ def test_backend_timeout_after_write(make_app):
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
     assert len(env.backend.incomes) == 1
     assert len(env.backend.calls) == before
-    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert len(env.bot.answers()) == 3
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_create_timeout_after_write_no_duplicate(make_app):
@@ -411,7 +425,9 @@ def test_create_timeout_after_write_no_duplicate(make_app):
     assert len(env.backend.incomes) == 1  # never a second income
     assert env.backend.count_calls("POST", "/incomes") == 1
     assert len(env.backend.calls) == before
-    assert env.bot.last_answer()["text"] == "✅ 已处理"
+    assert len(env.bot.answers()) == 3  # setup click + two confirm clicks
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_new_card_re_records_same_period_reuses_pending(make_app):
@@ -434,7 +450,7 @@ def test_new_card_re_records_same_period_reuses_pending(make_app):
     assert len(env.backend.incomes) == 1  # reused, not duplicated
     assert env.backend.count_calls("POST", "/incomes") == 1
     assert env.backend.incomes[0]["status"] == "confirmed"
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_backend_timeout_pending_reconcile(make_app):
@@ -446,8 +462,8 @@ def test_backend_timeout_pending_reconcile(make_app):
 
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=10, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "pending"
-    answer = env.bot.last_answer()["text"] or ""
-    assert "已登记待确认" in answer or "网络超时" in answer
+    edit = env.bot.last_edit()["text"] or ""
+    assert "待确认" in edit or "网络超时" in edit
     assert "收租成功" not in "".join(env.bot.all_texts())
 
     # retry is allowed, resumes the existing pending income, and completes
@@ -455,7 +471,7 @@ def test_backend_timeout_pending_reconcile(make_app):
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, update_id=11, bot=env.bot)])
     assert len(env.backend.incomes) == 1  # no second income created
     assert env.backend.incomes[0]["status"] == "confirmed"
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 # --- V1.3 Gate A: one Native Bot caller credential for Owner transitions ---
@@ -548,7 +564,7 @@ def test_crash_after_write_restart_no_duplicate(make_app, tmp_path):
     assert len(env2.backend.incomes) == 1
     assert env2.backend.incomes[0]["status"] == "confirmed"
     assert env2.backend.count_calls("POST", "/incomes") == 0  # never re-created
-    assert env2.bot.last_answer()["text"] == "✅ 已入账"
+    assert "收租成功" in env2.bot.edits()[-1]["text"]
 
 
 # --- F4: read paths are permission-gated ---
@@ -607,7 +623,7 @@ def test_owner_confirms_secretary_pending_via_pending_command(make_app):
     )
     assert env.backend.incomes[0]["status"] == "confirmed"
     assert env.backend.count_calls("POST", "/incomes/1/confirm") == 1
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert "收租成功" in env.bot.edits()[-1]["text"]
 
 
 def test_secretary_pending_list_has_no_confirm_buttons(make_app):
@@ -660,6 +676,6 @@ def test_reverse_timeout_reconcile_still_confirmed_toast(make_app):
     data = encode("rv", "inc", "1", nonce=new_nonce(), ts=now_ts())
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "confirmed"
-    answer = env.bot.last_answer()["text"] or ""
-    assert "未撤销" in answer
-    assert "已处理" not in answer
+    edit = env.bot.last_edit()["text"] or ""
+    assert "未撤销" in edit
+    assert "已处理" not in edit

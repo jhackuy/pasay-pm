@@ -162,7 +162,8 @@ def test_owner_confirm_mutates_card_to_terminal_state(make_app):
     labels = _keyboard_labels(last)
     assert "确认入账" not in labels
     assert "↩️ 撤销" in labels
-    assert env.bot.last_answer()["text"] == "✅ 已入账"
+    assert len(env.bot.answers()) == 1
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
 
 
 def test_owner_confirm_double_click_idempotent(make_app):
@@ -298,9 +299,9 @@ def test_issue_button_is_read_only_status_hint(make_app):
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, issue, message_id=10, update_id=2, bot=env.bot)],
     )
-    assert env.bot.last_answer()["text"] == "这笔租金仍待确认，请直接描述问题。"
+    # post-ack tip is rendered durably onto the card (never a silent drop)
+    assert "这笔租金仍待确认，请直接描述问题。" in env.bot.last_edit()["text"]
     assert env.backend.count_calls("POST", "/incomes") == 1
-    assert env.bot.edits() == []
     assert income["status"] == "pending"
 
     data = _owner_confirm_data(env)
@@ -312,7 +313,7 @@ def test_issue_button_is_read_only_status_hint(make_app):
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, issue, message_id=10, update_id=4, bot=env.bot)],
     )
-    assert env.bot.last_answer()["text"] == "这笔租金已入账；如需调整请联系秘书。"
+    assert "这笔租金已入账；如需调整请联系秘书。" in env.bot.last_edit()["text"]
 
 
 def test_issue_button_owner_only(make_app):

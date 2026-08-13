@@ -132,7 +132,7 @@ def test_ops_complete_edits_message(make_app):
     assert "待付款支出 #5" in edit["text"]
     task = env.backend._ops_task("/operations/tasks/7")
     assert task["status"] == "COMPLETED"
-    assert env.bot.last_answer()["text"] == "✅ 已完成"
+    assert "处理中" in (env.bot.last_answer()["text"] or "")
 
 
 def test_ops_snooze_preset_calls_backend_and_edits(make_app):
@@ -222,7 +222,8 @@ def test_forged_callback_backend_403_refused(make_app):
     env.backend.ops_forbidden_task_ids.add(5)
     data = encode(ACTION_TASK_COMPLETE, "ops", "5", nonce="abcdef01", ts=1700000000)
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, data, bot=env.bot)])
-    assert env.bot.last_answer()["text"] == "⚠️ 无权操作该任务"
+    # backend 403 arrives after the processing ack -> durable on the card
+    assert "无权操作该任务" in env.bot.last_edit()["text"]
     task = env.backend._ops_task("/operations/tasks/5")
     assert task["status"] == "PENDING", "forbidden task must stay pending"
 

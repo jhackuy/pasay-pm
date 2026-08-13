@@ -50,9 +50,10 @@ def test_secretary_reply_keyboard_structure():
 def test_secretary_properties_button_routes_to_properties_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "🏠 Properties", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "Property Overview" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "Processing" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "Property Overview" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 def test_secretary_tenants_button_routes_to_guidance(make_app):
@@ -66,17 +67,19 @@ def test_secretary_tenants_button_routes_to_guidance(make_app):
 def test_secretary_rent_button_routes_to_rent_collect_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "💵 Rent", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "Select unpaid unit" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "Processing" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "Select unpaid unit" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 def test_secretary_tasks_button_routes_to_todo_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "✅ Tasks", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "Nothing to do" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "Processing" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "Nothing to do" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 def test_secretary_maintenance_button_routes_to_guidance(make_app):
@@ -90,17 +93,19 @@ def test_secretary_maintenance_button_routes_to_guidance(make_app):
 def test_secretary_records_button_routes_to_finance_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "📋 Records", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "Finance" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "Processing" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "Finance" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 def test_secretary_overdue_button_routes_to_overdue_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "⚠️ Overdue", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "Overdue Rent" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "Processing" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "Overdue Rent" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 # --- Owner (Chinese) buttons -------------------------------------------------
@@ -108,17 +113,19 @@ def test_secretary_overdue_button_routes_to_overdue_page(make_app):
 def test_owner_properties_button_routes_to_properties_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 房源", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "房源概况" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "处理中" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "房源概况" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 def test_owner_finance_button_routes_to_finance_page(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 财务", bot=env.bot)])
-    send = env.bot.last_send()
-    assert "财务" in send["text"]
-    assert _markup_name(send) == "InlineKeyboardMarkup"
+    assert "处理中" in env.bot.last_send()["text"]
+    page = env.bot.last_edit()
+    assert "财务" in page["text"]
+    assert _markup_name(page) == "InlineKeyboardMarkup"
 
 
 # --- RBAC is not bypassed by menu buttons ------------------------------------
