@@ -240,21 +240,33 @@ def rent_status_card(
     return "\n".join(lines)
 
 
-def tenant_candidates_card(candidates: list[dict], locale: str = "zh") -> str:
-    """Multiple tenants matched (read-only candidate list, no auto-select)."""
-    blocks = [f"👥 <b>{H.escape(t('rent_status.multiple', locale))}</b>"]
-    for c in candidates:
-        unit_label = (
-            f"{H.escape(c.get('property_name') or '')} · Unit {H.escape(c.get('unit_number') or '')}"
-            if c.get("property_name")
-            else f"Unit {H.escape(c.get('unit_number') or '')}"
-        )
-        line = (
-            f"{H.escape(c.get('tenant_name') or '')} · {unit_label}："
-            f"{_rent_status_line(locale, bool(c.get('paid')), c.get('outstanding'), int(c.get('overdue_days') or 0), int(c.get('overdue_months') or 0))}"
-        )
-        blocks.append(line)
-    return "\n\n".join(blocks)
+def rent_status_selector_card(candidates: list[dict], locale: str = "zh") -> str:
+    """Multi-match selector heading (V1.3 Slice 2, Entry D).
+
+    The candidate rows are inline buttons (property · unit · tenant) built by
+    ``rent_status_candidates_keyboard``, so the text carries only the shared
+    heading — the same information as the old text-only candidates list, with
+    every row now a tappable choice. Never auto-selects, never writes."""
+    return f"👥 <b>{H.escape(t('rent_status.multiple', locale))}</b>"
+
+
+def rent_status_card_for_candidate(candidate: dict, locale: str = "zh") -> str:
+    """Render the exact single-hit status card for one selector candidate.
+
+    Shared by the single-match NL answer and the read-only selector tap so a
+    chosen candidate is byte-identical to asking about it directly."""
+    return rent_status_card(
+        locale=locale,
+        unit_number=str(candidate.get("unit_number") or ""),
+        property_name=str(candidate.get("property_name") or ""),
+        tenant_name=str(candidate.get("tenant_name") or ""),
+        monthly_rent=candidate.get("monthly_rent"),
+        paid=bool(candidate.get("paid")),
+        outstanding=candidate.get("outstanding"),
+        overdue_days=int(candidate.get("overdue_days") or 0),
+        overdue_months=int(candidate.get("overdue_months") or 0),
+        month=str(candidate.get("month") or ""),
+    )
 
 
 def unpaid_list_card(

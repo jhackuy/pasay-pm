@@ -18,19 +18,21 @@ from pasay_bot.handlers.nl_bridge import (
 
 def add_unit_1608(env, with_overdue=False):
     """Unit 1608 with Jan–Jul confirmed; the current month is left open."""
+    env.backend.tenants.append({
+        "id": 88, "full_name": "John Dela Cruz", "phone": None,
+        "email": None, "is_active": True,
+    })
     env.backend.units.append({
         "id": 100, "property_id": 2, "unit_number": "1608", "floor": "16",
         "size_sqm": "40.00", "monthly_rent": "70000.00",
         "status": "occupied", "is_active": True,
     })
     env.backend.leases.append({
-        "id": 100, "unit_id": 100, "tenant_id": 2, "start_date": "2026-01-01",
+        "id": 100, "unit_id": 100, "tenant_id": 88, "start_date": "2026-01-01",
         "end_date": "2026-12-31", "accounting_start_date": None,
         "monthly_rent": "70000.00", "deposit": "140000.00",
         "status": "active", "due_day": 5, "notes": None,
     })
-    # Make the canonical "John" tenant for the 1608 lease.
-    env.backend.tenants[1]["full_name"] = "John Dela Cruz"
     for m in range(1, 8):
         env.backend.add_income(
             status="confirmed", lease_id=100, amount="70000.00",
@@ -98,8 +100,8 @@ def add_prefixed_unit(env, unit_number, unit_id, property_id, tenant_id, rent,
 
 def add_dev_bay_1608(env):
     """Unit 1608 in the prefixed 'DEV-BAY-1608' style used by the dev seed."""
-    env.backend.tenants[1]["full_name"] = "John Dela Cruz"
-    add_prefixed_unit(env, "DEV-BAY-1608", 130, 2, 2, "70000.00")
+    add_prefixed_unit(env, "DEV-BAY-1608", 130, 2, 88, "70000.00",
+                      tenant_name="John Dela Cruz")
 
 
 def set_who_unpaid_rows(env):
@@ -272,12 +274,24 @@ def test_tenant_ambiguous_lists_candidates_read_only(make_app):
     add_unit_1608(env)
     add_second_john(env)
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "John 交了吗", bot=env.bot)])
-    text = env.bot.last_send()["text"]
+    send = env.bot.last_send()
+    text = send["text"]
     assert "找到多个匹配项" in text
-    assert "John Dela Cruz" in text and "John Smith" in text
-    assert "Unit 1608" in text and "Unit 1708" in text
-    # read-only: never a select/confirm action, zero writes
-    assert env.bot.last_send()["reply_markup"] is None
+    kb = send["reply_markup"].inline_keyboard
+    labels = [btn.text for row in kb for btn in row]
+    assert len(labels) == 2
+    assert any(
+        "Bayshore & Tower" in lbl and "1608" in lbl and "John Dela Cruz" in lbl
+        for lbl in labels
+    )
+    assert any(
+        "Pasay Premier Residences" in lbl and "1708" in lbl and "John Smith" in lbl
+        for lbl in labels
+    )
+    # read-only selector: callback is the pick action, never a confirm action,
+    # and zero writes happen.
+    callbacks = "".join(btn.callback_data for row in kb for btn in row)
+    assert "rss" in callbacks and "cnf" not in callbacks
     assert env.backend.count_calls("POST", "/incomes") == 0
 
 
@@ -361,18 +375,22 @@ def test_unit_9999_no_match_friendly(make_app):
 
 def test_owner_zh_unit_ambiguous_lists_candidates(make_app):
     """A shared suffix ('1805') across two prefixed units is ambiguous: list
-    read-only candidates (unit + tenant), never auto-select, never write."""
+    read-only candidate buttons (property · unit · tenant), never auto-select,
+    never write."""
     env = make_app()
-    env.backend.tenants[1]["full_name"] = "John Dela Cruz"
-    add_prefixed_unit(env, "DEV-BAY-1805", 130, 2, 2, "70000.00")
+    add_prefixed_unit(env, "DEV-BAY-1805", 130, 2, 88, "70000.00",
+                      tenant_name="John Dela Cruz")
     add_prefixed_unit(env, "DEV-SOL-1805", 140, 1, 9, "48000.00",
                       tenant_name="Paolo Cruz")
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "1805 交了没有", bot=env.bot)])
-    text = env.bot.last_send()["text"]
+    send = env.bot.last_send()
+    text = send["text"]
     assert "找到多个匹配项" in text
-    assert "Unit DEV-BAY-1805" in text and "Unit DEV-SOL-1805" in text
-    assert "John Dela Cruz" in text and "Paolo Cruz" in text
-    assert env.bot.last_send()["reply_markup"] is None
+    kb = send["reply_markup"].inline_keyboard
+    labels = [btn.text for row in kb for btn in row]
+    assert len(labels) == 2
+    assert any("DEV-BAY-1805" in lbl and "John Dela Cruz" in lbl for lbl in labels)
+    assert any("DEV-SOL-1805" in lbl and "Paolo Cruz" in lbl for lbl in labels)
     assert env.backend.count_calls("POST", "/incomes") == 0
 
 
@@ -380,8 +398,8 @@ def test_tenant_name_match_stays_word_boundary(make_app):
     """SLICE2-RENT-003FIX: 'John' must not hit an unrelated 'DEV Paolo Cruz'
     tenant; the single exact name match answers its own unit only."""
     env = make_app()
-    env.backend.tenants[1]["full_name"] = "John Dela Cruz"
-    add_prefixed_unit(env, "DEV-BAY-1608", 130, 2, 2, "70000.00")
+    add_prefixed_unit(env, "DEV-BAY-1608", 130, 2, 88, "70000.00",
+                      tenant_name="John Dela Cruz")
     add_prefixed_unit(env, "DEV-SOL-1805", 140, 1, 9, "48000.00",
                       tenant_name="DEV Paolo Cruz")
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "John 交了吗", bot=env.bot)])

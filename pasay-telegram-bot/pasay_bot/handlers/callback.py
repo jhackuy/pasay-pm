@@ -58,6 +58,7 @@ from pasay_bot.keyboards import (
     ACTION_PAGE,
     ACTION_RENT,
     ACTION_REVERSE,
+    ACTION_RENT_STATUS_SELECT,
     ACTION_TASK_COMPLETE,
     ACTION_TASK_DETAIL,
     ACTION_TASK_SNOOZE,
@@ -195,6 +196,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_confirm(update, context, entity, ref, nonce, ts, role, locale)
     elif action == ACTION_REVERSE:
         await _handle_reverse(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_RENT_STATUS_SELECT:
+        await _handle_rent_status_select(update, context, ref, nonce, ts, role, locale)
     elif action == ACTION_CANCEL:
         await _handle_cancel(update, context, locale)
     elif action == ACTION_DETAIL:
@@ -311,6 +314,58 @@ async def _handle_rent(update, context, entity, ref, role, locale):
         await _begin_rent_entry(update, context, int(ref), role, locale)
         return
     await _answer(update, t("common.invalid", locale))
+
+
+async def _handle_rent_status_select(update, context, ref, nonce, ts, role, locale):
+    """V1.3 Slice 2, Entry D: tap one read-only multi-match candidate.
+
+    Renders ONLY the stored candidate's status card (byte-identical to a
+    single hit) onto the tapped message. Zero API calls and zero writes;
+    re-taps are idempotent through the shared IdempotencyGuard; expired or
+    foreign selectors get the friendly expired copy, never a stack trace or
+    internal state."""
+    await _answer(update, "")
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit() or not nonce:
+        await _answer(update, t("common.invalid", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    store = context.bot_data["store"]
+    guard = context.bot_data["idempotency"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    payload = store.get_rent_status_selector(nonce, chat_id, user_id)
+    if not payload:
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    index = int(ref)
+    if index < 1 or index > len(payload):
+        await _answer(update, t("common.invalid", locale))
+        return
+    key = f"ik:rss:{nonce}:{index}"
+    status = guard.acquire(key, kind="rent_status", resource=str(index))
+    candidate = payload[index - 1]
+    text = H.truncate(cards.rent_status_card_for_candidate(candidate, locale))
+    if status == "done":
+        result = guard.result(key) or {}
+        if isinstance(result, dict) and result.get("text"):
+            text = result["text"]
+        await _edit(update, text)
+        await _answer(update, t("rent_status.selected_toast", locale))
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale))
+        return
+    await _edit(update, text)
+    guard.settle(key, {"text": text, "index": index}, resource=str(index))
+    await _answer(update, t("rent_status.selected_toast", locale))
 
 
 async def _begin_rent_entry(update, context, unit_id: int, role, locale):

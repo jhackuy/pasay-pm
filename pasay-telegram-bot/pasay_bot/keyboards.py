@@ -32,6 +32,8 @@ ACTION_DETAIL = "det"
 ACTION_EDIT = "ed"
 # V1.3 Slice 2 (Entry B, Secretary register): read-only "有问题" status hint.
 ACTION_ISSUE = "iss"
+# V1.3 Slice 2 (Entry D, rent status selector): multi-match candidate pick.
+ACTION_RENT_STATUS_SELECT = "rss"
 # V1.3 Slice 1: expense approval (exa = approve, exr = reject, exd = detail).
 ACTION_EXPENSE_APPROVE = "exa"
 ACTION_EXPENSE_REJECT = "exr"
@@ -165,6 +167,39 @@ def property_pagination_keyboard(page: int, total_pages: int, locale: str = "zh"
 
 def overdue_pagination_keyboard(page: int, total_pages: int, locale: str = "zh"):
     return _pagination_keyboard(ACTION_PAGE, "ovd", page, total_pages, locale)
+
+
+def rent_status_candidates_keyboard(
+    candidates: list[dict],
+    locale: str = "zh",
+    nonce: str = "",
+    ts: Optional[int] = None,
+) -> InlineKeyboardMarkup:
+    """Multi-match selector (V1.3 Slice 2, Entry D): one read-only inline
+    button per candidate, labelled ``property · unit · tenant``. The callback
+    carries only the 1-based row index + per-card nonce; the handler resolves
+    the row from the stored selector state, so no internal id ever travels in
+    callback_data or the label."""
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i, c in enumerate(candidates, start=1):
+        parts = [
+            str(c.get("property_name") or "").strip(),
+            str(c.get("unit_number") or "").strip(),
+            str(c.get("tenant_name") or "").strip(),
+        ]
+        label = " · ".join(p for p in parts if p)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=encode(
+                        ACTION_RENT_STATUS_SELECT, "sel", str(i),
+                        nonce=nonce, ts=ts,
+                    ),
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
 
 
 def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:

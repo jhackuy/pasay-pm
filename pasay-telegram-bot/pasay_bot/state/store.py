@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS user_defaults (
   payment_method TEXT NOT NULL DEFAULT 'Bank',
   updated_at     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rent_status_selectors (
+  nonce        TEXT PRIMARY KEY,
+  chat_id      TEXT NOT NULL,
+  user_id      TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL
+);
 """
 
 DEFAULT_CONVERSATION_TTL = 900        # 15 minutes
@@ -178,6 +186,74 @@ class StateStore:
                 (str(chat_id), str(user_id)),
             )
             self._conn.commit()
+
+    # --- read-only rent status selectors (V1.3 Slice 2, Entry D) ------------
+    # Each multi-match candidate card stores its candidate rows under a
+    # per-card nonce so clicking a button only ever re-renders that card's own
+    # candidates (a newer query in the same chat cannot hijack an older card).
+    # The payload is the JSON-safe candidate list; internal ids are never
+    # stored here (the rows are display-only fields).
+    def save_rent_status_selector(
+        self,
+        nonce: Any,
+        chat_id: Any,
+        user_id: Any,
+        payload: list,
+        ttl_seconds: int = DEFAULT_CONVERSATION_TTL,
+    ) -> None:
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO rent_status_selectors
+                  (nonce, chat_id, user_id, payload_json, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(nonce) DO UPDATE SET
+                  chat_id=excluded.chat_id, user_id=excluded.user_id,
+                  payload_json=excluded.payload_json, created_at=excluded.created_at,
+                  expires_at=excluded.expires_at
+                """,
+                (
+                    str(nonce),
+                    str(chat_id),
+                    str(user_id),
+                    json.dumps(payload, ensure_ascii=False),
+                    str(now),
+                    str(now + ttl_seconds),
+                ),
+            )
+            self._conn.commit()
+
+    def get_rent_status_selector(
+        self, nonce: Any, chat_id: Any, user_id: Any
+    ) -> Optional[list]:
+        """Return the candidate rows only when the nonce exists, is owned by
+        this chat+user, and is still inside its TTL; otherwise drop the row
+        and return None (caller shows the friendly expired copy)."""
+        now = int(time.time())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM rent_status_selectors WHERE nonce=?",
+                (str(nonce),),
+            ).fetchone()
+            if row is None:
+                return None
+            if (
+                str(row["chat_id"]) != str(chat_id)
+                or str(row["user_id"]) != str(user_id)
+                or int(row["expires_at"]) < now
+            ):
+                self._conn.execute(
+                    "DELETE FROM rent_status_selectors WHERE nonce=?",
+                    (str(nonce),),
+                )
+                self._conn.commit()
+                return None
+            try:
+                payload = json.loads(row["payload_json"] or "[]")
+            except json.JSONDecodeError:
+                payload = None
+            return payload if isinstance(payload, list) else None
 
     # --- idempotency keys ---
     def get_idempotency(self, key: str) -> Optional[dict]:

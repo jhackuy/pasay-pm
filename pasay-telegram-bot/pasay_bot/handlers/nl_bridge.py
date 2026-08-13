@@ -41,6 +41,7 @@ from pasay_bot.keyboards import (
     new_nonce,
     now_ts,
     rent_match_keyboard,
+    rent_status_candidates_keyboard,
     secretary_registered_keyboard,
 )
 from pasay_bot.render import html as H
@@ -253,9 +254,15 @@ async def _handle_rent_status_query(update, context, query, role, locale):
         if query.kind == "who_unpaid":
             await _answer_who_unpaid(context, chat_id, locale)
         elif query.kind == "unit":
-            await _answer_unit_status(context, chat_id, query.unit_token, locale)
+            await _answer_unit_status(
+                context, chat_id, query.unit_token, locale,
+                user_id=update.effective_user.id if update.effective_user else None,
+            )
         else:
-            await _answer_tenant_status(context, chat_id, query.tenant_token, locale)
+            await _answer_tenant_status(
+                context, chat_id, query.tenant_token, locale,
+                user_id=update.effective_user.id if update.effective_user else None,
+            )
     except PasayApiError:
         # Never leak HTTP status / error codes / DB terms to the user.
         await context.bot.send_message(
@@ -364,38 +371,54 @@ def _status_candidates(
     return candidates
 
 
-async def _send_status_answer(context, chat_id, candidates, locale):
-    """One match -> the single status card; several -> read-only candidates
-    (never auto-selects, never writes)."""
+def _selector_candidate(c: dict) -> dict:
+    """JSON-safe display-only candidate row for the selector store.
+
+    Only the fields shown on a status card are kept — no lease_id / unit_id /
+    tenant_id / income_id ever leaves the API layer."""
+    return {
+        "tenant_name": str(c.get("tenant_name") or ""),
+        "unit_number": str(c.get("unit_number") or ""),
+        "property_name": str(c.get("property_name") or ""),
+        "monthly_rent": str(c.get("monthly_rent") or "0"),
+        "paid": bool(c.get("paid")),
+        "outstanding": str(c.get("outstanding") or "0"),
+        "overdue_days": int(c.get("overdue_days") or 0),
+        "overdue_months": int(c.get("overdue_months") or 0),
+        "month": str(c.get("month") or ""),
+    }
+
+
+async def _send_status_answer(context, chat_id, candidates, locale, user_id=None):
+    """One match -> the single status card; several -> read-only selector
+    buttons (one inline button per candidate, resolved by the tap handler;
+    never auto-selects, never writes)."""
     if len(candidates) == 1:
-        c = candidates[0]
+        c = _selector_candidate(candidates[0])
         await context.bot.send_message(
             chat_id,
-            H.truncate(
-                cards.rent_status_card(
-                    locale=locale,
-                    unit_number=c["unit_number"],
-                    property_name=c["property_name"],
-                    tenant_name=c["tenant_name"],
-                    monthly_rent=c["monthly_rent"],
-                    paid=c["paid"],
-                    outstanding=c["outstanding"],
-                    overdue_days=c["overdue_days"],
-                    overdue_months=c["overdue_months"],
-                    month=c["month"],
-                )
-            ),
+            H.truncate(cards.rent_status_card_for_candidate(c, locale)),
             parse_mode=HTML,
         )
         return
+    payload = [_selector_candidate(c) for c in candidates]
+    nonce = new_nonce()
+    ts = now_ts()
+    if user_id is not None:
+        context.bot_data["store"].save_rent_status_selector(
+            nonce, chat_id, user_id, payload
+        )
     await context.bot.send_message(
         chat_id,
-        H.truncate(cards.tenant_candidates_card(candidates, locale)),
+        H.truncate(cards.rent_status_selector_card(candidates, locale)),
         parse_mode=HTML,
+        reply_markup=rent_status_candidates_keyboard(
+            candidates, locale, nonce=nonce, ts=ts
+        ),
     )
 
 
-async def _answer_unit_status(context, chat_id, unit_token, locale):
+async def _answer_unit_status(context, chat_id, unit_token, locale, user_id=None):
     """'1608 交了没有 / 还欠多少' — normalized unit-number match (punctuation
     tolerant, "1608" resolves "DEV-BAY-1608"), then a paid/unpaid + owed +
     overdue answer from the existing read endpoints. Multiple unit hits
@@ -428,10 +451,10 @@ async def _answer_unit_status(context, chat_id, unit_token, locale):
             parse_mode=HTML,
         )
         return
-    await _send_status_answer(context, chat_id, candidates, locale)
+    await _send_status_answer(context, chat_id, candidates, locale, user_id=user_id)
 
 
-async def _answer_tenant_status(context, chat_id, tenant_token, locale):
+async def _answer_tenant_status(context, chat_id, tenant_token, locale, user_id=None):
     """'John 交了吗 / did John pay?' — match tenant full/first name on active
     leases; multiple hits render a read-only candidate list (no auto-select)."""
     api = context.bot_data["api_client"]
@@ -467,7 +490,7 @@ async def _answer_tenant_status(context, chat_id, tenant_token, locale):
             parse_mode=HTML,
         )
         return
-    await _send_status_answer(context, chat_id, candidates, locale)
+    await _send_status_answer(context, chat_id, candidates, locale, user_id=user_id)
 
 
 async def _handle_rent_payment_statement(update, context, text, role, locale):
