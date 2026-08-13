@@ -182,11 +182,14 @@ def _rent_status_line(
     outstanding=None,
     overdue_days: int = 0,
     overdue_months: int = 0,
+    partial: bool = False,
 ) -> str:
     """One human status line: paid, or unpaid + owed + overdue (days, else
     periods). Internal enum/DB values are never rendered."""
     if paid:
-        return H.escape(t("rent_status.paid", locale))
+        return H.escape(t("rent_status.paid_full", locale))
+    if partial:
+        return H.escape(t("rent_status.partial", locale))
     parts = [H.escape(t("rent_status.unpaid", locale))]
     if outstanding is not None and _dec(outstanding) > 0:
         parts.append(
@@ -215,6 +218,9 @@ def rent_status_card(
     overdue_days: int = 0,
     overdue_months: int = 0,
     month: str = "",
+    paid_amount=None,
+    due_amount=None,
+    remaining=None,
 ) -> str:
     """Single unit / tenant rent status answer (V1.3 Slice 2, Entry C).
 
@@ -234,9 +240,29 @@ def rent_status_card(
             f"{H.escape(t('unit.monthly_rent', locale))}：{H.money(monthly_rent)}"
         )
     period = period_label(month, locale) if month else str(month)
-    lines.append(
-        f"📅 {period}：{_rent_status_line(locale, paid, outstanding, overdue_days, overdue_months)}"
+    partial = (
+        not paid
+        and _dec(paid_amount or 0) > 0
+        and _dec(remaining or 0) > 0
     )
+    status_line = _rent_status_line(
+        locale, paid, outstanding, overdue_days, overdue_months, partial
+    )
+    lines.append(
+        f"📅 {period}：{status_line}"
+    )
+    if due_amount is not None:
+        lines.append(
+            H.escape(t("rent_status.due_line", locale, amount=H.money(due_amount)))
+        )
+    if paid_amount is not None:
+        lines.append(
+            H.escape(t("rent_status.paid_line", locale, amount=H.money(paid_amount)))
+        )
+    if remaining is not None and _dec(remaining) > 0:
+        lines.append(
+            H.escape(t("rent_status.remain_line", locale, amount=H.money(remaining)))
+        )
     return "\n".join(lines)
 
 
@@ -266,6 +292,9 @@ def rent_status_card_for_candidate(candidate: dict, locale: str = "zh") -> str:
         overdue_days=int(candidate.get("overdue_days") or 0),
         overdue_months=int(candidate.get("overdue_months") or 0),
         month=str(candidate.get("month") or ""),
+        paid_amount=candidate.get("paid_amount"),
+        due_amount=candidate.get("due_amount"),
+        remaining=candidate.get("remaining") or candidate.get("outstanding"),
     )
 
 
@@ -369,6 +398,27 @@ def rent_match_card(
     can_confirm: bool = True,
 ) -> str:
     """Entry B confirm card: exact payment found, action-at-source."""
+    partial = (
+        _dec(candidate.paid_amount or 0) > 0
+        or _dec(candidate.amount) < _dec(candidate.due_amount)
+    )
+    if partial:
+        paid_total = _dec(candidate.paid_amount) + _dec(candidate.amount)
+        lines = [
+            f"<b>{H.escape(t('rent.match_partial_title', locale))}</b>",
+            f"{H.escape(candidate.property_name)} {H.escape(candidate.unit_number)}"
+            f" · {period_label(candidate.period, locale)}",
+            f"{H.escape(t('rent.match_partial_due', locale))}：{H.money(candidate.due_amount)}",
+            f"{H.escape(t('rent.match_partial_received', locale))}：{H.money(candidate.amount)}",
+            f"{H.escape(t('rent.match_partial_paid_total', locale))}：{H.money(paid_total)}",
+            f"{H.escape(t('rent.match_partial_remaining', locale))}：{H.money(candidate.remaining_balance)}",
+            "",
+            H.escape(t("rent.match_unique", locale)),
+            H.escape(t("rent.match_no_duplicate", locale)),
+        ]
+        if not can_confirm:
+            lines.append(H.escape(t("rent.owner_only_confirm", locale)))
+        return "\n".join(lines)
     lines = [
         f"💵 <b>{H.escape(t('rent.match_found_title', locale))}</b>",
         f"{H.escape(candidate.property_name)} {H.escape(candidate.unit_number)}"
@@ -383,6 +433,56 @@ def rent_match_card(
     if not can_confirm:
         lines.append(H.escape(t("rent.owner_only_confirm", locale)))
     return "\n".join(lines)
+
+
+def rent_match_partial_success_card(
+    unit_number: str,
+    amount,
+    due_amount,
+    paid_amount,
+    remaining_balance,
+    locale: str = "zh",
+) -> str:
+    """SLICE2-RENT-005 payment-recorded card: due / cumulative paid / remaining.
+    A settled month adds the paid-in-full line. No internal ids or state."""
+    paid_total = _dec(paid_amount) + _dec(amount)
+    text = t(
+        "rent.match_partial_success",
+        locale,
+        unit=H.escape(unit_number),
+        amount=H.money(amount),
+        due=H.money(due_amount),
+        paid=H.money(paid_total),
+        remaining=H.money(remaining_balance),
+    )
+    if _dec(remaining_balance) <= 0:
+        text += "\n" + H.escape(t("rent.match_paid_off", locale))
+    return text
+
+
+def rent_overpayment_card(candidate: RentMatchCandidate, locale: str = "zh") -> str:
+    """Overpayment guard (SLICE2-RENT-005): explain, never book, never show
+    raw amounts as ids/enums."""
+    return "\n".join(
+        [
+            f"<b>{H.escape(t('rent.overpayment_title', locale))}</b>",
+            t(
+                "rent.overpayment_text",
+                locale,
+                property=H.escape(candidate.property_name),
+                unit=H.escape(candidate.unit_number),
+                month=period_label(candidate.period, locale),
+                due=H.money(candidate.due_amount),
+                paid=H.money(candidate.paid_amount),
+                remaining=H.money(candidate.remaining_balance),
+                amount=H.money(candidate.amount),
+            ),
+        ]
+    )
+
+
+def rent_invalid_amount_card(locale: str = "zh") -> str:
+    return H.escape(t("rent.invalid_amount", locale))
 
 
 def rent_match_success_card(
@@ -436,6 +536,27 @@ def secretary_registered_card(
 ) -> str:
     """Owner confirmation card after the Secretary registers a rent payment
     (V1.3 Slice 2). Human text only: no income_id / internal state."""
+    partial = (
+        _dec(candidate.paid_amount or 0) > 0
+        or _dec(candidate.amount) < _dec(candidate.due_amount)
+    )
+    if partial:
+        paid_total = _dec(candidate.paid_amount) + _dec(candidate.amount)
+        lines = [
+            f"📋 <b>{H.escape(t('rent.secretary_registered_title', locale))}</b>",
+            H.escape(t("rent.match_partial_title", locale)),
+            "",
+            f"{H.escape(candidate.property_name)} {H.escape(candidate.unit_number)}"
+            f" · {period_label(candidate.period, locale)}",
+            f"{H.escape(t('rent.match_partial_due', locale))}：{H.money(candidate.due_amount)}",
+            f"{H.escape(t('rent.match_partial_received', locale))}：{H.money(candidate.amount)}",
+            f"{H.escape(t('rent.match_partial_paid_total', locale))}：{H.money(paid_total)}",
+            f"{H.escape(t('rent.match_partial_remaining', locale))}：{H.money(candidate.remaining_balance)}",
+            f"{H.escape(t('rent.registered_by', locale))}：Secretary",
+            "",
+            H.escape(t("rent.match_unique", locale)),
+        ]
+        return "\n".join(lines)
     lines = [
         f"📋 <b>{H.escape(t('rent.secretary_registered_title', locale))}</b>",
         "",
@@ -467,6 +588,20 @@ def secretary_matched_reply(candidate: RentMatchCandidate, locale: str = "en") -
 def secretary_terminal_card(payload: dict, income: Income, locale: str = "zh") -> str:
     """Terminal state of the Owner's confirmation card after confirm: no
     confirm button remains; balance + registrar keep the entry human."""
+    due = _dec(payload.get("due_amount") or 0)
+    if due > 0 and _dec(income.amount) < due:
+        text = rent_match_partial_success_card(
+            payload.get("unit_number", ""),
+            income.amount,
+            due,
+            payload.get("paid_amount") or 0,
+            payload.get("remaining_balance") or 0,
+            locale,
+        )
+        return text + "\n" + (
+            H.escape(t("rent.registered_by", locale))
+            + "：" + H.escape(payload.get("registrar", "Secretary"))
+        )
     return t(
         "rent.secretary_terminal",
         locale,

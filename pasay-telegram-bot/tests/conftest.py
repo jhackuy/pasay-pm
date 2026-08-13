@@ -194,13 +194,15 @@ class FakeBackend:
 
     def add_income(self, status="pending", lease_id=1, amount="55000.00",
                    received_date="2026-08-10", payment_method="Bank",
-                   description="rent 2026-08", income_id=None):
+                   description="rent 2026-08", income_id=None,
+                   idempotency_key=None):
         inc = {
             "id": income_id or self._next_income_id,
             "lease_id": lease_id,
-            "amount": amount,
+            "amount": f"{Decimal(str(amount)):.2f}",
             "received_date": received_date,
             "payment_method": payment_method,
+            "idempotency_key": idempotency_key,
             "status": status,
             "description": description,
             "confirmed_by": None,
@@ -299,6 +301,7 @@ class FakeBackend:
                 received_date=payload.get("received_date", "2026-08-10"),
                 payment_method=payload.get("payment_method"),
                 description=payload.get("description"),
+                idempotency_key=payload.get("idempotency_key"),
             )
             if path in self.timeout_after_write_paths:
                 raise httpx.ReadTimeout("simulated response timeout after create")
@@ -491,6 +494,10 @@ class FakeBackend:
             val = int(m.replace(",", ""))
             if val >= 10000 and amount is None:
                 amount = str(val)
+        invalid = bool(
+            re.search(r"(?<!\d)[-−]\s*\d[\d,]*", text)
+            or re.search(r"(?<!\d)0(?:\.0+)?(?!\d)", text)
+        )
         lease = None
         if unit:
             lease = next(
@@ -498,7 +505,22 @@ class FakeBackend:
                 None,
             )
         if lease is None:
+            if invalid:
+                return {
+                    "received_date": TODAY,
+                    "candidates": [self._match_candidate(
+                        {"unit_number": ""}, {"id": 0, "monthly_rent": "0.00"}, "",
+                        "invalid_amount", "high", 0, amount="0.00",
+                    )],
+                }
             return {"received_date": TODAY, "candidates": []}
+        if invalid:
+            return {
+                "received_date": TODAY,
+                "candidates": [self._match_candidate(
+                    unit, lease, "", "invalid_amount", "high", 0, amount="0.00",
+                )],
+            }
         start = date.fromisoformat(lease["start_date"])
         today_m = TODAY[:7]
         periods = []
@@ -508,7 +530,9 @@ class FakeBackend:
             m += 1
             if m > 12:
                 m, y = 1, y + 1
-        covered, pending = set(), set()
+        paid = {}
+        pending = set()
+        rent = Decimal(str(lease["monthly_rent"]))
         for inc in self.incomes:
             if inc["lease_id"] != lease["id"]:
                 continue
@@ -517,10 +541,64 @@ class FakeBackend:
             if month not in periods:
                 continue
             if inc["status"] == "confirmed":
-                covered.add(month)
+                paid[month] = paid.get(month, Decimal("0")) + Decimal(str(inc["amount"]))
             elif inc["status"] == "pending":
                 pending.add(month)
-        open_p = [p for p in periods if p not in covered and p not in pending]
+        open_p = [p for p in periods if paid.get(p, Decimal("0")) < rent and p not in pending]
+        if amount:
+            want = Decimal(amount)
+            # Same statement while a pending row exists -> confirm that row.
+            for inc in reversed(self.incomes):
+                if inc["lease_id"] != lease["id"] or inc["status"] != "pending":
+                    continue
+                desc = inc.get("description") or ""
+                month = desc.split()[-1] if "rent " in desc else (inc.get("received_date") or "")[:7]
+                if Decimal(str(inc["amount"])) == want:
+                    return {
+                        "received_date": TODAY,
+                        "candidates": [
+                            self._match_candidate(
+                                unit, lease, month, "pending", "high", 0,
+                                income_id=inc["id"], income_status="pending",
+                            )
+                        ],
+                    }
+            if not open_p:
+                # Fully settled month: same confirmed amount = already booked.
+                for inc in reversed(self.incomes):
+                    if inc["lease_id"] != lease["id"] or inc["status"] != "confirmed":
+                        continue
+                    desc = inc.get("description") or ""
+                    month = desc.split()[-1] if "rent " in desc else (inc.get("received_date") or "")[:7]
+                    if Decimal(str(inc["amount"])) == want:
+                        return {
+                            "received_date": TODAY,
+                            "candidates": [
+                                self._match_candidate(
+                                    unit, lease, month, "duplicate", "high", 0,
+                                    income_id=inc["id"], income_status="confirmed",
+                                )
+                            ],
+                        }
+                return {"received_date": TODAY, "candidates": []}
+            # Overpayment guard: never suggest booking past the receivable.
+            if want > rent - paid.get(open_p[0], Decimal("0")):
+                return {
+                    "received_date": TODAY,
+                    "candidates": [
+                        self._match_candidate(
+                            unit, lease, open_p[0], "overpayment", "high", 0,
+                            amount=amount,
+                        )
+                    ],
+                }
+            cand = self._match_candidate(
+                unit, lease, open_p[0], "open",
+                "high" if len(open_p) == 1 else "low",
+                len(open_p),
+                amount=amount,
+            )
+            return {"received_date": TODAY, "candidates": [cand]}
         if open_p:
             cand = self._match_candidate(
                 unit, lease, open_p[0], "open",
@@ -556,31 +634,57 @@ class FakeBackend:
         return {"received_date": TODAY, "candidates": []}
 
     def _match_candidate(self, unit, lease, period, kind, confidence, open_count,
-                         income_id=None, income_status=None):
+                         income_id=None, income_status=None, amount=None):
         prop = next(
-            (p for p in self.properties if p["id"] == unit["property_id"]),
+            (p for p in self.properties if p["id"] == unit.get("property_id")),
             {"name": ""},
-        )
+        ) if unit else {"name": ""}
         tenant = next(
-            (t for t in self.tenants if t["id"] == lease["tenant_id"]),
+            (t for t in self.tenants if t["id"] == lease.get("tenant_id")),
             {"full_name": ""},
-        )
+        ) if lease else {"full_name": ""}
         rent = Decimal(str(lease["monthly_rent"]))
+        if amount is not None:
+            rent = Decimal(amount)
+        paid = Decimal("0")
+        if period and lease.get("id"):
+            for inc in self.incomes:
+                if inc["lease_id"] != lease["id"] or inc["status"] != "confirmed":
+                    continue
+                desc = inc.get("description") or ""
+                month = desc.split()[-1] if "rent " in desc else (inc.get("received_date") or "")[:7]
+                if month == period:
+                    paid += Decimal(str(inc["amount"]))
+        due = Decimal(str(lease["monthly_rent"]))
+        remaining = max(due - paid, Decimal("0"))
+        if kind == "overpayment":
+            remaining_balance = str(remaining)
+        elif kind == "open":
+            amt = Decimal(amount) if amount is not None else remaining
+            remaining_balance = str(
+                max(remaining - amt, Decimal("0")) + max(open_count - 1, 0) * due
+            )
+        elif kind == "pending":
+            remaining_balance = str(max(remaining - Decimal(amount), Decimal("0"))) if amount else "0.00"
+        else:
+            remaining_balance = str(remaining)
         return {
             "kind": kind,
             "confidence": confidence,
-            "lease_id": lease["id"],
-            "unit_id": unit["id"],
-            "unit_number": unit["unit_number"],
-            "property_id": unit["property_id"],
+            "lease_id": lease.get("id") if lease else 0,
+            "unit_id": unit.get("id") if unit else 0,
+            "unit_number": unit.get("unit_number", "") if unit else "",
+            "property_id": unit.get("property_id") if unit else 0,
             "property_name": prop["name"],
-            "tenant_id": lease["tenant_id"],
+            "tenant_id": lease.get("tenant_id") if lease else 0,
             "tenant_name": tenant["full_name"],
             "period": period,
             "due_date": None,
-            "amount": str(rent),
+            "amount": f"{rent:.2f}",
             "open_count": open_count,
-            "remaining_balance": str(rent * max(open_count - 1, 0)) if open_count else "0.00",
+            "due_amount": f"{due:.2f}",
+            "paid_amount": f"{paid:.2f}",
+            "remaining_balance": f"{Decimal(remaining_balance):.2f}",
             "income_id": income_id,
             "income_status": income_status,
         }

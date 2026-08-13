@@ -1,11 +1,12 @@
-"""Shared rent-period / coverage math (mirrors /reports/overdue-rents)."""
+"""Shared rent-period / coverage / balance math (mirrors /reports/overdue-rents)."""
 from __future__ import annotations
 
 import calendar
 import re
 from datetime import date
+from decimal import Decimal
 
-from app.models.financial import Income
+from app.models.financial import Income, IncomeStatus
 from app.models.lease import Lease
 
 _PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
@@ -73,3 +74,32 @@ def covered_periods(
         if month in receivable:
             covered.add(month)
     return covered
+
+
+def confirmed_paid_by_period(
+    lease_periods_list: list[tuple[str, date]],
+    incomes: list[Income],
+) -> dict[str, Decimal]:
+    """Total confirmed income amount per rent period (SLICE2-RENT-005).
+
+    One period can now be paid by several partial payments, so the amount
+    matters, not just "is there a confirmed income". The period attribution
+    reuses the exact coverage rule (description period, else received month)
+    so a partial payment never silently covers a different month.
+    """
+    receivable = {month for month, _ in lease_periods_list}
+    paid: dict[str, Decimal] = {}
+    for income in incomes:
+        if income.status != IncomeStatus.confirmed:
+            continue
+        month = month_from_description(income.description)
+        if month is None:
+            month = income.received_date.strftime("%Y-%m")
+        if month in receivable:
+            paid[month] = paid.get(month, Decimal("0")) + income.amount
+    return paid
+
+
+def period_remaining(due_amount: Decimal, paid_amount: Decimal) -> Decimal:
+    """Remaining receivable for one period; never negative (balance safety)."""
+    return max(due_amount - paid_amount, Decimal("0.00"))

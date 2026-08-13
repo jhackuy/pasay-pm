@@ -32,6 +32,8 @@ class PaymentMatchCandidate(BaseModel):
     due_date: date | None = None
     amount: Decimal
     open_count: int = 0
+    due_amount: Decimal = Decimal("0.00")
+    paid_amount: Decimal = Decimal("0.00")
     remaining_balance: Decimal = Decimal("0.00")
     income_id: int | None = None
     income_status: str | None = None

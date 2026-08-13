@@ -13,6 +13,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from datetime import date
+from decimal import Decimal
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -144,6 +145,12 @@ async def _edit(update: Update, text: str, keyboard=None):
 
 def _payload(conv: dict) -> dict:
     return conv.get("payload") or {}
+
+
+def _dec(value) -> Decimal:
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value or 0))
 
 
 def _load_error(detail: str, locale: str) -> str:
@@ -628,6 +635,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
             amount=payload.get("amount"),
             received_date=payload.get("received_date"),
             payment_method=payload.get("method"),
+            idempotency_key=key,
         )
         if matched is not None:
             income = matched
@@ -1057,6 +1065,7 @@ async def _reconcile_create_after_timeout(
             amount=payload.get("amount"),
             received_date=payload.get("received_date"),
             payment_method=payload.get("method"),
+            idempotency_key=key,
         )
     except PasayApiError:
         guard.fail(key)
@@ -1121,7 +1130,25 @@ async def _render_done_card(update, context, income, payload, role, locale):
     if income.status == "pending":
         await _render_pending_card(update, context, income, payload, role, locale)
         return
-    if payload.get("flow") == "nl":
+    due = _dec(payload.get("due_amount") or 0)
+    partial = due > 0 and _dec(income.amount) < due
+    if partial:
+        # SLICE2-RENT-005: partial payment success shows due / cumulative paid
+        # / remaining (and paid-in-full once the month is settled).
+        text = cards.rent_match_partial_success_card(
+            payload.get("unit_number", ""),
+            income.amount,
+            due,
+            payload.get("paid_amount") or 0,
+            payload.get("remaining_balance") or 0,
+            locale,
+        )
+        if payload.get("flow") == "secretary_register":
+            text += "\n" + (
+                H.escape(t("rent.registered_by", locale))
+                + "：" + H.escape(payload.get("registrar", "Secretary"))
+            )
+    elif payload.get("flow") == "nl":
         # Entry B exact-payment success: period + remaining balance instead of
         # the legacy success card (no income_id / raw state on screen).
         text = cards.rent_match_success_card(

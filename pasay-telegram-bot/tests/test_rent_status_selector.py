@@ -255,7 +255,8 @@ def test_selector_never_exposes_internal_ids(make_app):
     assert payload is not None and len(payload) == 2
     allowed = {
         "tenant_name", "unit_number", "property_name", "monthly_rent",
-        "paid", "outstanding", "overdue_days", "overdue_months", "month",
+        "paid", "paid_amount", "due_amount", "outstanding", "remaining",
+        "overdue_days", "overdue_months", "month",
     }
     for row in payload:
         assert set(row.keys()) <= allowed, row

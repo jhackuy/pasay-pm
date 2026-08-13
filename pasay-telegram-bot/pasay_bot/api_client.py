@@ -137,6 +137,7 @@ class Income:
     amount: Decimal = Decimal("0")
     received_date: date = date.today()
     payment_method: Optional[str] = None
+    idempotency_key: Optional[str] = None
     status: str = "pending"
     description: Optional[str] = None
     confirmed_by: Optional[int] = None
@@ -150,6 +151,7 @@ class Income:
             amount=_to_decimal(d.get("amount")),
             received_date=_to_date(d.get("received_date")) or date.today(),
             payment_method=d.get("payment_method"),
+            idempotency_key=d.get("idempotency_key"),
             status=d.get("status") or "pending",
             description=d.get("description"),
             confirmed_by=d.get("confirmed_by"),
@@ -163,6 +165,7 @@ class Income:
             "amount": str(self.amount),
             "received_date": self.received_date.isoformat(),
             "payment_method": self.payment_method,
+            "idempotency_key": self.idempotency_key,
             "status": self.status,
             "description": self.description,
             "confirmed_by": self.confirmed_by,
@@ -191,6 +194,8 @@ class RentMatchCandidate:
     due_date: Optional[date] = None
     amount: Decimal = Decimal("0")
     open_count: int = 0
+    due_amount: Decimal = Decimal("0")
+    paid_amount: Decimal = Decimal("0")
     remaining_balance: Decimal = Decimal("0")
     income_id: Optional[int] = None
     income_status: Optional[str] = None
@@ -211,6 +216,8 @@ class RentMatchCandidate:
             due_date=_to_date(d.get("due_date")),
             amount=_to_decimal(d.get("amount")),
             open_count=int(d.get("open_count") or 0),
+            due_amount=_to_decimal(d.get("due_amount")),
+            paid_amount=_to_decimal(d.get("paid_amount")),
             remaining_balance=_to_decimal(d.get("remaining_balance")),
             income_id=int(d["income_id"]) if d.get("income_id") is not None else None,
             income_status=d.get("income_status"),
@@ -792,15 +799,25 @@ class PasayApiClient:
         amount: Any,
         received_date: str,
         payment_method: str,
+        idempotency_key: Optional[str] = None,
     ) -> Optional[Income]:
         """Reconcile an uncertain create: return the first income matching the
         exact create payload (lease_id, received_date, amount, method). Used to
         reuse a write that may have landed during a timeout / crash instead of
-        creating a second income (F1/F3)."""
+        creating a second income (F1/F3).
+
+        SLICE2-RENT-005: when ``idempotency_key`` is given, matching is STRICT
+        on that key (the true replay identity of the same request). The shape
+        fallback only reuses still-PENDING rows: a CONFIRMED row with the same
+        shape but a different key is a different (genuine second partial)
+        payment, never this request's replay."""
         want_amount = _to_decimal(amount)
         want_date = str(received_date)[:10]
         for inc in await self.list_incomes():
-            if (
+            if idempotency_key is not None:
+                if (inc.idempotency_key or "") == idempotency_key:
+                    return inc
+            if inc.status == "pending" and (
                 inc.lease_id == lease_id
                 and inc.amount == want_amount
                 and inc.received_date.isoformat() == want_date

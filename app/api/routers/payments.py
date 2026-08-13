@@ -41,6 +41,8 @@ def match_rent_payment(
                 "due_date": cand.due_date,
                 "amount": str(cand.amount),
                 "open_count": cand.open_count,
+                "due_amount": str(cand.due_amount),
+                "paid_amount": str(cand.paid_amount),
                 "remaining_balance": str(cand.remaining_balance),
                 "income_id": cand.income_id,
                 "income_status": cand.income_status,

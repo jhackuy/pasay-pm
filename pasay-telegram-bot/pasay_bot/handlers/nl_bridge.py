@@ -15,6 +15,13 @@ V1.3 Slice 2 (Entry C): read-only rent status queries ("这个月谁还没交",
 and BEFORE the button routes, then answered deterministically from the
 existing read endpoints (units/leases/tenants/incomes/overdue/properties).
 No write path is ever reached for these queries.
+
+SLICE2-RENT-005: partial payments ("1608 付了 40000", "1608 又付了 30000")
+flow through the same statement -> matcher -> confirm chain; the matcher now
+returns the period receivable (due_amount), the confirmed total before this
+payment (paid_amount) and the balance remaining after it, and guards
+overpayments (never book, explain instead). Status queries additionally
+answer "交了多少 / 交清了吗" with the same read-only data.
 """
 from __future__ import annotations
 
@@ -63,9 +70,11 @@ logger = logging.getLogger(__name__)
 
 _RENT_WORDS_CN = ("租金", "房租")
 _RENT_WORD_EN = re.compile(r"\brent\b")
-_RECEIVE_VERBS_CN = ("收到", "到了", "到账", "已收", "入账", "收款")
+_RECEIVE_VERBS_CN = ("收到", "到了", "到账", "已收", "入账", "收款", "付了", "支付")
 _RECEIVE_VERB_EN = re.compile(r"\b(received|paid)\b")
 _AMOUNT_IN_TEXT = re.compile(r"\d[\d,]{4,}")
+_AMOUNT_ZERO = re.compile(r"(?<!\d)0(?:\.0+)?(?!\d)")
+_AMOUNT_NEGATIVE = re.compile(r"(?<!\d)[-−]\s*\d[\d,]*")
 _QUERY_SUFFIX = re.compile(r"(吗|么|？|\?|没有|没)\s*$")
 
 # --- V1.3 Slice 2 (Entry C): read-only rent status queries ------------------
@@ -90,10 +99,13 @@ _QUERY_VERB_CN = (
     "交了没有", "交了没", "交了吗", "交了么", "交没交", "有没有交",
     "还欠多少", "欠多少", "欠多少钱", "没交吗", "没交钱吗", "交钱了吗",
     "付了吗", "付了没有", "还没交", "没交租", "没交租金", "交了钱吗",
+    "交了多少", "付了多少", "交清了吗", "交清没有", "付清了吗", "付清没有",
 )
 _QUERY_VERB_EN = re.compile(
     r"\b(?:has|hasn't|has not|hasnt|did|didn't|did not|didnt|does)\b.{0,24}\b(?:paid|pay)\b"
     r"|\bhow\s+much\b.{0,24}\bowe[sd]?\b"
+    r"|\bhow\s+much\b.{0,24}\b(?:paid|pay)\b"
+    r"|\bpaid\s+in\s+full\b"
     r"|\bowe[sd]?\b.{0,24}\?",
     re.IGNORECASE,
 )
@@ -163,7 +175,14 @@ def is_rent_payment_statement(text: str) -> bool:
     has_verb = any(v in raw for v in _RECEIVE_VERBS_CN) or bool(_RECEIVE_VERB_EN.search(lowered))
     if has_rent_word and has_verb:
         return True
-    return has_verb and bool(_AMOUNT_IN_TEXT.search(lowered))
+    # A payment verb with a number (including an explicit zero or negative
+    # amount) is a statement; the backend matcher then rejects invalid amounts
+    # with a friendly message instead of booking anything.
+    return has_verb and bool(
+        _AMOUNT_IN_TEXT.search(lowered)
+        or _AMOUNT_ZERO.search(lowered)
+        or _AMOUNT_NEGATIVE.search(lowered)
+    )
 
 
 def route_for_text(text: str):
@@ -329,6 +348,22 @@ def _unit_number_matches(token: str, unit_number: str) -> bool:
     return False
 
 
+def _period_paid(incomes, lease_id: int, month: str) -> Decimal:
+    """Confirmed income total for one rent period (mirrors the backend's
+    ``confirmed_paid_by_period`` attribution: description period first,
+    received-date month as fallback). Read-only."""
+    total = Decimal("0")
+    for inc in incomes:
+        if inc.lease_id != lease_id or inc.status != "confirmed":
+            continue
+        if month in (inc.description or ""):
+            total += inc.amount
+            continue
+        if inc.received_date and inc.received_date.strftime("%Y-%m") == month:
+            total += inc.amount
+    return total
+
+
 def _status_candidates(
     units, leases, tenants, incomes, overdue, properties, *, unit_ids=None, tenant_ids=None
 ):
@@ -349,7 +384,10 @@ def _status_candidates(
         if unit is None or tenant is None:
             continue
         prop = next((p for p in properties if p.id == unit.property_id), None)
-        paid = pages._period_covered(incomes, lease.id, month)
+        due_amount = lease.monthly_rent
+        paid_amount = _period_paid(incomes, lease.id, month)
+        remaining = max(due_amount - paid_amount, Decimal("0"))
+        paid_full = paid_amount >= due_amount
         ovd = next((r for r in overdue if r.lease_id == lease.id), None)
         candidates.append(
             {
@@ -357,12 +395,11 @@ def _status_candidates(
                 "unit_number": unit.unit_number,
                 "property_name": prop.name if prop else "",
                 "monthly_rent": lease.monthly_rent,
-                "paid": paid,
-                "outstanding": (
-                    ovd.total_outstanding
-                    if ovd
-                    else (Decimal("0") if paid else lease.monthly_rent)
-                ),
+                "paid": paid_full,
+                "paid_amount": paid_amount,
+                "due_amount": due_amount,
+                "outstanding": remaining,
+                "remaining": remaining,
                 "overdue_days": ovd.overdue_days if ovd else 0,
                 "overdue_months": ovd.overdue_months if ovd else 0,
                 "month": month,
@@ -382,7 +419,10 @@ def _selector_candidate(c: dict) -> dict:
         "property_name": str(c.get("property_name") or ""),
         "monthly_rent": str(c.get("monthly_rent") or "0"),
         "paid": bool(c.get("paid")),
+        "paid_amount": str(c.get("paid_amount") or "0"),
+        "due_amount": str(c.get("due_amount") or "0"),
         "outstanding": str(c.get("outstanding") or "0"),
+        "remaining": str(c.get("remaining") or c.get("outstanding") or "0"),
         "overdue_days": int(c.get("overdue_days") or 0),
         "overdue_months": int(c.get("overdue_months") or 0),
         "month": str(c.get("month") or ""),
@@ -530,6 +570,18 @@ async def _handle_rent_payment_statement(update, context, text, role, locale):
             chat_id, cards.rent_already_booked_card(best, locale), parse_mode=HTML
         )
         return
+    if best.kind == "overpayment":
+        # Cumulative payments would exceed this period's receivable: explain
+        # and stop. Prepayment / next-month offset is a future slice.
+        await context.bot.send_message(
+            chat_id, cards.rent_overpayment_card(best, locale), parse_mode=HTML
+        )
+        return
+    if best.kind == "invalid_amount":
+        await context.bot.send_message(
+            chat_id, cards.rent_invalid_amount_card(locale), parse_mode=HTML
+        )
+        return
     if best.kind == "pending":
         if role == Role.SECRETARY:
             # Same payment already reported and waiting for the Owner: never
@@ -575,10 +627,20 @@ async def _register_pending_for_owner(update, context, candidate, result, role, 
     period = candidate.period or str(result.received_date)[:7]
     received = result.received_date.isoformat()
     method = store.get_user_default_method(user_id)
+    remaining_before = max(
+        Decimal(candidate.due_amount) - Decimal(candidate.paid_amount),
+        Decimal("0"),
+    )
     # Deterministic business-fact key: identical duplicate reports (and
     # Telegram redeliveries) share one backend idempotency_key, so a race can
-    # never produce a second pending income.
-    key = f"ik:sec:{candidate.lease_id}:{period}:{received}:{candidate.amount}"
+    # never produce a second pending income. The remaining balance before the
+    # payment is part of the key so two genuine partials of the same amount
+    # (e.g. 30k when 60k then 30k remain) still get separate records, while a
+    # replay against the same balance reuses the first record.
+    key = (
+        f"ik:sec:{candidate.lease_id}:{period}:{received}:"
+        f"{candidate.amount}:{remaining_before}"
+    )
     status = guard.acquire(key, kind="income", resource="")
     if status in ("done", "in_flight"):
         # Replay / concurrent duplicate: no second pending row, and the Owner
@@ -617,6 +679,7 @@ async def _register_pending_for_owner(update, context, candidate, result, role, 
             amount=candidate.amount,
             received_date=received,
             payment_method=method,
+            idempotency_key=key,
         )
         if current is not None:
             income = current
@@ -668,6 +731,8 @@ async def _register_pending_for_owner(update, context, candidate, result, role, 
         "received_date": received,
         "flow": "secretary_register",
         "registrar": "Secretary",
+        "due_amount": str(candidate.due_amount),
+        "paid_amount": str(candidate.paid_amount),
         "remaining_balance": str(candidate.remaining_balance),
     }
     store.save_conversation(
@@ -699,6 +764,8 @@ async def _render_match_confirm(update, context, candidate, result, role, locale
         "method": store.get_user_default_method(user_id),
         "flow": "nl",
         "open_count": candidate.open_count,
+        "due_amount": str(candidate.due_amount),
+        "paid_amount": str(candidate.paid_amount),
         "remaining_balance": str(candidate.remaining_balance),
     }
     can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)

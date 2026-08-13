@@ -1,8 +1,10 @@
-"""V1.3 Slice 2 — Entry B rent-payment matcher (exact payment).
+"""V1.3 Slice 2 — Entry B rent-payment matcher (partial payment).
 
 The core (text parsing + confidence grading) is pure and runs without a
 database; the API-level test at the bottom exercises the real endpoint and
 therefore needs the PostgreSQL test DB like the rest of the backend suite.
+SLICE2-RENT-005 adds partial-amount matching, cumulative balance math,
+overpayment protection and invalid-amount rejection.
 """
 from datetime import date
 from decimal import Decimal
@@ -11,7 +13,11 @@ from app.models.financial import Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
 from app.models.property import Property, Unit
 from app.models.tenant import Tenant
-from app.services.operations.rent_math import covered_periods, lease_periods
+from app.services.operations.rent_math import (
+    confirmed_paid_by_period,
+    lease_periods,
+    period_remaining,
+)
 from app.services.payment_match import (
     LeaseCtx,
     MatchConfidence,
@@ -59,7 +65,7 @@ def _ctx(incomes=None, **kw):
     ctx = LeaseCtx(
         lease=lease, unit=unit, property=prop, tenant=ten,
         periods=periods,
-        covered=covered_periods(lease, periods, confirmed),
+        paid_by_period=confirmed_paid_by_period(periods, confirmed),
         incomes=incomes,
     )
     for income in [i for i in incomes if i.status == IncomeStatus.pending]:
@@ -77,9 +83,10 @@ def _inc(period, status, amount="70000.00", received="2026-08-10", income_id=1):
     )
 
 
-def _paid_jan_jul():
+def _paid_jan_jul(amount="70000.00"):
     return [
-        _inc(f"2026-{m:02d}", IncomeStatus.confirmed, received=f"2026-{m:02d}-10", income_id=m)
+        _inc(f"2026-{m:02d}", IncomeStatus.confirmed, amount=amount,
+             received=f"2026-{m:02d}-10", income_id=m)
         for m in range(1, 8)
     ]
 
@@ -229,9 +236,110 @@ def test_two_open_months_ambiguous_low():
     assert result.best.remaining_balance == Decimal("70000.00")
 
 
-def test_amount_mismatch_no_candidate():
+def test_partial_amount_opens_partial_candidate():
+    """SLICE2-RENT-005: a below-rent amount is a valid partial payment, not a
+    mismatch. Candidate carries due / paid / remaining-after for the bot."""
     result = match_from_leases([_ctx(_paid_jan_jul())], "1608的60000到了", today=TODAY)
-    assert result.candidates == []
+    best = result.best
+    assert best is not None
+    assert best.kind == MatchKind.OPEN
+    assert best.amount == Decimal("60000.00")
+    assert best.due_amount == Decimal("70000.00")
+    assert best.paid_amount == Decimal("0.00")
+    assert best.remaining_balance == Decimal("10000.00")
+    assert best.confidence == MatchConfidence.HIGH
+
+
+def test_partial_cumulative_accumulates_and_settles():
+    """40k -> 30k -> 30k on a 100k bill: paid_amount grows and the final
+    payment leaves remaining 0 (paid off)."""
+    ctx = _ctx(_paid_jan_jul(amount="100000.00"), rent="100000.00")
+    partials = [
+        ("1608 付了 40000", Decimal("40000.00"), Decimal("0.00"), Decimal("60000.00")),
+        ("1608 又付了 30000", Decimal("30000.00"), Decimal("40000.00"), Decimal("30000.00")),
+        ("1608 又付了 30000", Decimal("30000.00"), Decimal("70000.00"), Decimal("0.00")),
+    ]
+    for text, want_amount, want_paid, want_remaining in partials:
+        result = match_from_leases([ctx], text, today=TODAY)
+        best = result.best
+        assert best.kind == MatchKind.OPEN
+        assert best.amount == want_amount
+        assert best.paid_amount == want_paid
+        assert best.remaining_balance == want_remaining
+        assert best.due_amount == Decimal("100000.00")
+        ctx.paid_by_period["2026-08"] = ctx.paid_by_period.get("2026-08", Decimal("0")) + want_amount
+
+
+def test_partial_pending_same_amount_confirms_existing():
+    """Re-reporting a partial that is still pending must surface that pending
+    record (confirm it) instead of creating a second one."""
+    incomes = _paid_jan_jul() + [
+        _inc("2026-08", IncomeStatus.pending, amount="40000.00", received="2026-08-11", income_id=77)
+    ]
+    result = match_from_leases([_ctx(incomes)], "1608 付了 40000", today=TODAY)
+    best = result.best
+    assert best.kind == MatchKind.PENDING
+    assert best.income_id == 77
+    assert best.amount == Decimal("40000.00")
+
+
+def test_partial_same_amount_twice_is_two_payments_until_settled():
+    """Two genuine 30k partials are both allowed while 30k remains; after the
+    period is settled, re-reporting the same amount is a duplicate."""
+    ctx = _ctx(_paid_jan_jul(amount="100000.00"), rent="100000.00")
+    result = match_from_leases([ctx], "1608 付了 30000", today=TODAY)
+    assert result.best.kind == MatchKind.OPEN
+    assert result.best.remaining_balance == Decimal("70000.00")
+    ctx.incomes.append(_inc("2026-08", IncomeStatus.confirmed, amount="30000.00", income_id=81))
+    ctx.paid_by_period["2026-08"] = Decimal("30000.00")
+    result = match_from_leases([ctx], "1608 付了 30000", today=TODAY)
+    assert result.best.kind == MatchKind.OPEN
+    assert result.best.remaining_balance == Decimal("40000.00")
+    ctx.incomes.append(_inc("2026-08", IncomeStatus.confirmed, amount="30000.00", income_id=82))
+    ctx.incomes.append(_inc("2026-08", IncomeStatus.confirmed, amount="40000.00", income_id=83))
+    ctx.paid_by_period["2026-08"] = Decimal("100000.00")  # settled
+    result = match_from_leases([ctx], "1608 付了 30000", today=TODAY)
+    assert result.best.kind == MatchKind.DUPLICATE
+
+
+def test_overpayment_is_blocked_not_booked():
+    """A payment bigger than the remaining balance is an overpayment candidate
+    (explain, never suggest confirmation)."""
+    incomes = _paid_jan_jul() + [
+        _inc("2026-08", IncomeStatus.confirmed, amount="40000.00", received="2026-08-10", income_id=51),
+    ]
+    result = match_from_leases([_ctx(incomes)], "1608 付了 50000", today=TODAY)
+    best = result.best
+    assert best is not None
+    assert best.kind == MatchKind.OVERPAYMENT
+    assert best.amount == Decimal("50000.00")
+    assert best.paid_amount == Decimal("40000.00")
+    assert best.due_amount == Decimal("70000.00")
+    assert best.remaining_balance == Decimal("30000.00")
+
+
+def test_invalid_zero_amount_rejected():
+    for text in ("1608 付了 0", "1608 付了 0.00", "1608 付了 -5000"):
+        result = match_from_leases([_ctx(_paid_jan_jul())], text, today=TODAY)
+        best = result.best
+        assert best is not None and best.kind == MatchKind.INVALID_AMOUNT, text
+
+
+def test_no_amount_statement_on_partially_paid_period_settles_remaining():
+    """A statement without an amount is interpreted as settling the remaining
+    balance of the matched period (40k paid of 100k -> 60k remaining)."""
+    ctx = _ctx(_paid_jan_jul(amount="100000.00"), rent="100000.00")
+    ctx.paid_by_period["2026-08"] = Decimal("40000.00")
+    result = match_from_leases([ctx], "1608 租金收到了", today=TODAY)
+    best = result.best
+    assert best.kind == MatchKind.OPEN
+    assert best.amount == Decimal("60000.00")
+    assert best.remaining_balance == Decimal("0.00")
+
+
+def test_period_remaining_never_negative():
+    assert period_remaining(Decimal("100000.00"), Decimal("120000.00")) == Decimal("0.00")
+    assert period_remaining(Decimal("100000.00"), Decimal("70000.00")) == Decimal("30000.00")
 
 
 def test_no_hints_ambiguous_across_leases():
