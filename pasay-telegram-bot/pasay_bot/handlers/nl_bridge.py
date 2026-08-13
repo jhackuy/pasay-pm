@@ -9,11 +9,21 @@ V1.3 Slice 2 (Entry B): rent-payment statements ("1608租金收到了",
 routes and resolved by the backend matcher into an action-at-source confirm
 card. The matcher is read-only; confirmation reuses the existing Income
 create + Owner-only confirm chain.
+
+V1.3 Slice 2 (Entry C): read-only rent status queries ("这个月谁还没交",
+"1608 交了没有", "John 交了吗") are recognized AFTER the statement detector
+and BEFORE the button routes, then answered deterministically from the
+existing read endpoints (units/leases/tenants/incomes/overdue/properties).
+No write path is ever reached for these queries.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -56,6 +66,71 @@ _RECEIVE_VERBS_CN = ("收到", "到了", "到账", "已收", "入账", "收款")
 _RECEIVE_VERB_EN = re.compile(r"\b(received|paid)\b")
 _AMOUNT_IN_TEXT = re.compile(r"\d[\d,]{4,}")
 _QUERY_SUFFIX = re.compile(r"(吗|么|？|\?|没有|没)\s*$")
+
+# --- V1.3 Slice 2 (Entry C): read-only rent status queries ------------------
+_WHO_UNPAID_CN = (
+    "这个月谁还没交", "谁还没交", "谁没交", "还没交房租", "没交房租",
+    "谁还没交租", "谁没交租", "还没交租金", "没交租金", "未交房租", "未交租金",
+)
+_WHO_UNPAID_EN = re.compile(
+    r"\bwho\s+(?:hasn't|has not|hasnt)\s+paid\b"
+    r"|\bwho\s+(?:didn't|did not|didnt)\s+pay\b"
+    r"|\bunpaid\s+this\s+month\b",
+    re.IGNORECASE,
+)
+_UNIT_TOKEN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]?\d{1,4}[A-Za-z]?)(?![A-Za-z0-9])")
+_NAME_TOKEN = re.compile(r"\b([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?)\b")
+_QUERY_VERB_CN = (
+    "交了没有", "交了没", "交了吗", "交了么", "交没交", "有没有交",
+    "还欠多少", "欠多少", "欠多少钱", "没交吗", "没交钱吗", "交钱了吗",
+    "付了吗", "付了没有", "还没交", "没交租", "没交租金", "交了钱吗",
+)
+_QUERY_VERB_EN = re.compile(
+    r"\b(?:has|hasn't|has not|hasnt|did|didn't|did not|didnt|does)\b.{0,24}\b(?:paid|pay)\b"
+    r"|\bhow\s+much\b.{0,24}\bowe[sd]?\b"
+    r"|\bowe[sd]?\b.{0,24}\?",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class RentStatusQuery:
+    """Deterministic read-only rent status NL query (V1.3 Slice 2, Entry C).
+
+    ``kind`` is one of who_unpaid / unit / tenant; unit/tenant carry the token
+    to resolve exactly against the API data (never auto-selected here)."""
+
+    kind: str
+    unit_token: str = ""
+    tenant_token: str = ""
+
+
+def detect_rent_status_query(text: str) -> Optional[RentStatusQuery]:
+    """Deterministic detector for the three read-only rent status queries.
+
+    Runs AFTER ``is_rent_payment_statement`` (so statements never reach it)
+    and BEFORE ``route_for_text`` (so queries never fall into page routes or
+    the "unknown" reply). No LLM, no writes.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if any(w in raw for w in _WHO_UNPAID_CN) or _WHO_UNPAID_EN.search(raw):
+        return RentStatusQuery(kind="who_unpaid")
+    lowered = raw.lower()
+    has_verb = any(v in raw for v in _QUERY_VERB_CN) or bool(
+        _QUERY_VERB_EN.search(lowered)
+    )
+    if not has_verb:
+        return None
+    unit_m = _UNIT_TOKEN.search(raw)
+    if unit_m:
+        return RentStatusQuery(kind="unit", unit_token=unit_m.group(1))
+    name_m = _NAME_TOKEN.search(raw)
+    if name_m:
+        return RentStatusQuery(kind="tenant", tenant_token=name_m.group(1))
+    return None
+
 
 _ROUTES = [
     (("房源", "property", "properties"), "properties"),
@@ -109,6 +184,11 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_rent_payment_statement(update, context, text, role, locale)
         return
 
+    query = detect_rent_status_query(text)
+    if query is not None:
+        await _handle_rent_status_query(update, context, query, role, locale)
+        return
+
     route = route_for_text(text)
     if route in ("properties", "finance", "overdue", "rent", "pending", "menu", "more"):
         if not has_read_permission(role):
@@ -148,6 +228,225 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML,
             reply_markup=menu_keyboard(locale),
         )
+
+
+async def _handle_rent_status_query(update, context, query, role, locale):
+    """V1.3 Slice 2, Entry C: read-only rent status answers.
+
+    All branches first require ``has_read_permission`` (OWNER/SECRETARY);
+    unknown users are refused with the shared no-permission copy. Only GET
+    endpoints are called — there is no create/confirm/reverse/register path."""
+    chat_id = update.effective_chat.id
+    if not has_read_permission(role):
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("common.no_permission", locale)),
+            parse_mode=HTML,
+        )
+        return
+    try:
+        if query.kind == "who_unpaid":
+            await _answer_who_unpaid(context, chat_id, locale)
+        elif query.kind == "unit":
+            await _answer_unit_status(context, chat_id, query.unit_token, locale)
+        else:
+            await _answer_tenant_status(context, chat_id, query.tenant_token, locale)
+    except PasayApiError:
+        # Never leak HTTP status / error codes / DB terms to the user.
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.error", locale)),
+            parse_mode=HTML,
+        )
+        return
+
+
+async def _answer_who_unpaid(context, chat_id, locale):
+    """'这个月谁还没交' / 'who hasn't paid this month?' — the overdue rows
+    whose current period is still outstanding (reuses /reports/overdue-rents,
+    the same source as the overdue page and the finance warning)."""
+    api = context.bot_data["api_client"]
+    rows = await api.get_overdue_rents()
+    prop_by_unit: dict[int, str] = {}
+    try:
+        units, properties = await asyncio.gather(
+            api.get_units(), api.get_properties()
+        )
+        by_pid = {p.id: p.name for p in properties}
+        prop_by_unit = {
+            u.id: by_pid[u.property_id]
+            for u in units
+            if u.property_id in by_pid
+        }
+    except PasayApiError:
+        pass  # property names are a nice-to-have, same as the overdue page
+    month = pages._current_month()
+    unpaid = [
+        r
+        for r in rows
+        if any(
+            str(p.get("month", "")) == month
+            for p in (r.overdue_periods or [])
+        )
+    ]
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(cards.unpaid_list_card(unpaid, month, locale, prop_by_unit)),
+        parse_mode=HTML,
+    )
+
+
+async def _answer_unit_status(context, chat_id, unit_token, locale):
+    """'1608 交了没有 / 还欠多少' — exact unit-number match, then a
+    paid/unpaid + owed + overdue answer from the existing read endpoints."""
+    api = context.bot_data["api_client"]
+    units, leases, tenants, incomes, overdue, properties = await asyncio.gather(
+        api.get_units(),
+        api.get_leases(),
+        api.get_tenants(),
+        api.list_incomes(),
+        api.get_overdue_rents(),
+        api.get_properties(),
+    )
+    unit = next(
+        (u for u in units if u.unit_number.lower() == unit_token.lower()), None
+    )
+    if unit is None:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.no_unit", locale, unit=unit_token)),
+            parse_mode=HTML,
+        )
+        return
+    lease = next(
+        (l for l in leases if l.unit_id == unit.id and l.status == "active"), None
+    )
+    if lease is None:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.no_active_lease", locale)),
+            parse_mode=HTML,
+        )
+        return
+    month = pages._current_month()
+    paid = pages._period_covered(incomes, lease.id, month)
+    ovd = next((r for r in overdue if r.lease_id == lease.id), None)
+    outstanding = (
+        ovd.total_outstanding
+        if ovd
+        else (Decimal("0") if paid else lease.monthly_rent)
+    )
+    tenant = next((tn for tn in tenants if tn.id == lease.tenant_id), None)
+    prop = next((p for p in properties if p.id == unit.property_id), None)
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(
+            cards.rent_status_card(
+                locale=locale,
+                unit_number=unit.unit_number,
+                property_name=prop.name if prop else "",
+                tenant_name=tenant.full_name if tenant else "",
+                monthly_rent=lease.monthly_rent,
+                paid=paid,
+                outstanding=outstanding,
+                overdue_days=ovd.overdue_days if ovd else 0,
+                overdue_months=ovd.overdue_months if ovd else 0,
+                month=month,
+            )
+        ),
+        parse_mode=HTML,
+    )
+
+
+async def _answer_tenant_status(context, chat_id, tenant_token, locale):
+    """'John 交了吗 / did John pay?' — match tenant full/first name on active
+    leases; multiple hits render a read-only candidate list (no auto-select)."""
+    api = context.bot_data["api_client"]
+    units, leases, tenants, incomes, overdue, properties = await asyncio.gather(
+        api.get_units(),
+        api.get_leases(),
+        api.get_tenants(),
+        api.list_incomes(),
+        api.get_overdue_rents(),
+        api.get_properties(),
+    )
+    token = tenant_token.lower()
+    matched = [
+        tn
+        for tn in tenants
+        if re.search(rf"\b{re.escape(token)}\b", tn.full_name.lower())
+    ]
+    if not matched:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.no_tenant", locale, name=tenant_token)),
+            parse_mode=HTML,
+        )
+        return
+    month = pages._current_month()
+    candidates: list[dict] = []
+    for tn in matched:
+        for lease in (
+            l for l in leases if l.tenant_id == tn.id and l.status == "active"
+        ):
+            unit = next((u for u in units if u.id == lease.unit_id), None)
+            prop = (
+                next((p for p in properties if p.id == unit.property_id), None)
+                if unit
+                else None
+            )
+            paid = pages._period_covered(incomes, lease.id, month)
+            ovd = next((r for r in overdue if r.lease_id == lease.id), None)
+            candidates.append(
+                {
+                    "tenant_name": tn.full_name,
+                    "unit_number": unit.unit_number if unit else "",
+                    "property_name": prop.name if prop else "",
+                    "monthly_rent": lease.monthly_rent,
+                    "paid": paid,
+                    "outstanding": (
+                        ovd.total_outstanding
+                        if ovd
+                        else (Decimal("0") if paid else lease.monthly_rent)
+                    ),
+                    "overdue_days": ovd.overdue_days if ovd else 0,
+                    "overdue_months": ovd.overdue_months if ovd else 0,
+                    "month": month,
+                }
+            )
+    if not candidates:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.no_active_lease_tenant", locale)),
+            parse_mode=HTML,
+        )
+        return
+    if len(candidates) == 1:
+        c = candidates[0]
+        await context.bot.send_message(
+            chat_id,
+            H.truncate(
+                cards.rent_status_card(
+                    locale=locale,
+                    unit_number=c["unit_number"],
+                    property_name=c["property_name"],
+                    tenant_name=c["tenant_name"],
+                    monthly_rent=c["monthly_rent"],
+                    paid=c["paid"],
+                    outstanding=c["outstanding"],
+                    overdue_days=c["overdue_days"],
+                    overdue_months=c["overdue_months"],
+                    month=c["month"],
+                )
+            ),
+            parse_mode=HTML,
+        )
+        return
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(cards.tenant_candidates_card(candidates, locale)),
+        parse_mode=HTML,
+    )
 
 
 async def _handle_rent_payment_statement(update, context, text, role, locale):

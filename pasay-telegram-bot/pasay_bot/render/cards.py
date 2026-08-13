@@ -176,6 +176,114 @@ def overdue_list(
     return "\n\n".join(blocks)
 
 
+def _rent_status_line(
+    locale: str,
+    paid: bool,
+    outstanding=None,
+    overdue_days: int = 0,
+    overdue_months: int = 0,
+) -> str:
+    """One human status line: paid, or unpaid + owed + overdue (days, else
+    periods). Internal enum/DB values are never rendered."""
+    if paid:
+        return H.escape(t("rent_status.paid", locale))
+    parts = [H.escape(t("rent_status.unpaid", locale))]
+    if outstanding is not None and _dec(outstanding) > 0:
+        parts.append(
+            H.escape(t("rent_status.owes", locale, amount=H.money(outstanding)))
+        )
+    if overdue_days > 0:
+        parts.append(
+            H.escape(t("rent_status.overdue_days", locale, days=overdue_days))
+        )
+    elif overdue_months > 0:
+        parts.append(
+            H.escape(t("rent_status.overdue_periods", locale, count=overdue_months))
+        )
+    return " · ".join(parts)
+
+
+def rent_status_card(
+    *,
+    locale: str = "zh",
+    unit_number: str = "",
+    property_name: str = "",
+    tenant_name: str = "",
+    monthly_rent=None,
+    paid: bool = False,
+    outstanding=None,
+    overdue_days: int = 0,
+    overdue_months: int = 0,
+    month: str = "",
+) -> str:
+    """Single unit / tenant rent status answer (V1.3 Slice 2, Entry C).
+
+    Answers "1608 交了没有 / John 交了吗" style queries: unit + tenant +
+    monthly rent + this month's paid/unpaid state (with owed amount and
+    overdue days/periods when unpaid). Read-only text; no buttons."""
+    unit_label = (
+        f"{H.escape(property_name)} · Unit {H.escape(unit_number)}"
+        if property_name
+        else f"Unit {H.escape(unit_number)}"
+    )
+    lines = [f"🏢 <b>{unit_label}</b>"]
+    if tenant_name:
+        lines.append(f"{H.escape(t('overdue.tenant', locale))}：{H.escape(tenant_name)}")
+    if monthly_rent is not None:
+        lines.append(
+            f"{H.escape(t('unit.monthly_rent', locale))}：{H.money(monthly_rent)}"
+        )
+    period = period_label(month, locale) if month else str(month)
+    lines.append(
+        f"📅 {period}：{_rent_status_line(locale, paid, outstanding, overdue_days, overdue_months)}"
+    )
+    return "\n".join(lines)
+
+
+def tenant_candidates_card(candidates: list[dict], locale: str = "zh") -> str:
+    """Multiple tenants matched (read-only candidate list, no auto-select)."""
+    blocks = [f"👥 <b>{H.escape(t('rent_status.multiple', locale))}</b>"]
+    for c in candidates:
+        unit_label = (
+            f"{H.escape(c.get('property_name') or '')} · Unit {H.escape(c.get('unit_number') or '')}"
+            if c.get("property_name")
+            else f"Unit {H.escape(c.get('unit_number') or '')}"
+        )
+        line = (
+            f"{H.escape(c.get('tenant_name') or '')} · {unit_label}："
+            f"{_rent_status_line(locale, bool(c.get('paid')), c.get('outstanding'), int(c.get('overdue_days') or 0), int(c.get('overdue_months') or 0))}"
+        )
+        blocks.append(line)
+    return "\n\n".join(blocks)
+
+
+def unpaid_list_card(
+    rows: list[OverdueRent],
+    month: str = "",
+    locale: str = "zh",
+    property_by_unit: Optional[dict[int, str]] = None,
+    max_rows: int = 20,
+) -> str:
+    """Who hasn't paid this month (reuses the overdue row rendering). Single
+    page; the card truncates at Telegram's 4096-UTF-16 limit and notes any
+    rows hidden beyond ``max_rows``."""
+    if not rows:
+        return f"🎉 <b>{H.escape(t('rent.collect_all_paid', locale))}</b>"
+    rows = sorted(rows, key=lambda r: (-r.overdue_days, r.unit))
+    period = period_label(month, locale) if month else str(month)
+    blocks = [
+        f"⚠️ <b>{H.escape(t('rent_status.unpaid_title', locale, period=period, count=len(rows)))}</b>"
+    ]
+    prop_names = property_by_unit or {}
+    for row in rows[:max_rows]:
+        blocks.append(overdue_block(row, prop_names.get(row.unit_id, ""), locale))
+    if len(rows) > max_rows:
+        blocks.append(
+            H.escape(t("rent_status.more", locale, count=len(rows) - max_rows))
+        )
+    return "\n\n".join(blocks)
+
+
 def unit_status_label(status: str, locale: str = "zh") -> str:
     if status == "occupied":
         return t("unit.status_occupied", locale)
