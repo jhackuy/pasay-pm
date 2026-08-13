@@ -9,3 +9,5 @@ backups/
 *.dump
 *.dump.gz
 .DS_Store
+# WF-002: runtime task results are local evidence, never committed.
+.ai-control/results/
