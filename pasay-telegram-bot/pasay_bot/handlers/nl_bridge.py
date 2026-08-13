@@ -22,6 +22,13 @@ returns the period receivable (due_amount), the confirmed total before this
 payment (paid_amount) and the balance remaining after it, and guards
 overpayments (never book, explain instead). Status queries additionally
 answer "交了多少 / 交清了吗" with the same read-only data.
+
+SLICE2-RENT-006 (correction): Owner/Secretary correction statements
+("不是 1608，是 1708" / "not 1608, it's 1708" / "608 应是 1708") are
+recognized as rent-payment statements (never "unknown"), and the negated
+value is normalized to the corrected one before the matcher is called, so
+the confirm card / pending path always shows the corrected unit (1708, not
+1608). Status queries reuse the same normalization for their unit token.
 """
 from __future__ import annotations
 
@@ -77,6 +84,18 @@ _AMOUNT_ZERO = re.compile(r"(?<!\d)0(?:\.0+)?(?!\d)")
 _AMOUNT_NEGATIVE = re.compile(r"(?<!\d)[-−]\s*\d[\d,]*")
 _QUERY_SUFFIX = re.compile(r"(吗|么|？|\?|没有|没)\s*$")
 
+# --- SLICE2-RENT-006: correction statements --------------------------------
+# "不是 1608，是 1708" / "是 1708 不是 1608" / "not 1608, it's 1708" /
+# "it's 1708 not 1608". Tokens must look like unit ids / amounts (>=2 chars
+# and at least one digit) so month words or single digits never misfire.
+_CORRECTION_RE = re.compile(
+    r"不是\s*(?P<neg1>[A-Za-z0-9][A-Za-z0-9._-]*)\s*[,，]?\s*是\s*(?P<pos1>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"|是\s*(?P<pos2>[A-Za-z0-9][A-Za-z0-9._-]*)\s*[,，]?\s*不是\s*(?P<neg2>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"|\bnot\s+(?P<neg3>[A-Za-z0-9][A-Za-z0-9._-]*)\s*,?\s+(?:it'?s|it is|is)\s+(?P<pos3>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"|\b(?:it'?s|it is|is)\s+(?P<pos4>[A-Za-z0-9][A-Za-z0-9._-]*)\s*,?\s+not\s+(?P<neg4>[A-Za-z0-9][A-Za-z0-9._-]*)",
+    re.IGNORECASE,
+)
+
 # --- V1.3 Slice 2 (Entry C): read-only rent status queries ------------------
 _WHO_UNPAID_CN = (
     "这个月谁还没交", "谁还没交", "谁没交", "还没交房租", "没交房租",
@@ -130,7 +149,7 @@ def detect_rent_status_query(text: str) -> Optional[RentStatusQuery]:
     and BEFORE ``route_for_text`` (so queries never fall into page routes or
     the "unknown" reply). No LLM, no writes.
     """
-    raw = (text or "").strip()
+    raw = _normalize_correction((text or "").strip())
     if not raw:
         return None
     if any(w in raw for w in _WHO_UNPAID_CN) or _WHO_UNPAID_EN.search(raw):
@@ -171,6 +190,10 @@ def is_rent_payment_statement(text: str) -> bool:
         return False
     if _QUERY_SUFFIX.search(raw):
         return False
+    if _correction_values(raw) is not None:
+        # "不是 1608，是 1708" / "not 1608, it's 1708": a correction to a rent
+        # report is a statement, never an unknown menu word.
+        return True
     has_rent_word = any(w in raw for w in _RENT_WORDS_CN) or bool(_RENT_WORD_EN.search(lowered))
     has_verb = any(v in raw for v in _RECEIVE_VERBS_CN) or bool(_RECEIVE_VERB_EN.search(lowered))
     if has_rent_word and has_verb:
@@ -183,6 +206,50 @@ def is_rent_payment_statement(text: str) -> bool:
         or _AMOUNT_ZERO.search(lowered)
         or _AMOUNT_NEGATIVE.search(lowered)
     )
+
+
+def _correction_values(text: str) -> Optional[tuple[str, str]]:
+    """Return (negated, corrected) value pair from a correction phrase, or
+    None when the text carries no usable correction. Only unit/amount-like
+    tokens (>=2 chars with at least one digit) qualify, so plain month words
+    or single digits never get rewritten."""
+    match = _CORRECTION_RE.search(text or "")
+    if not match:
+        return None
+    neg = next(
+        (match.group(k) for k in ("neg1", "neg2", "neg3", "neg4") if match.group(k)),
+        None,
+    )
+    pos = next(
+        (match.group(k) for k in ("pos1", "pos2", "pos3", "pos4") if match.group(k)),
+        None,
+    )
+    if not neg or not pos:
+        return None
+    if (
+        len(neg) < 2 or len(pos) < 2
+        or not any(c.isdigit() for c in neg)
+        or not any(c.isdigit() for c in pos)
+    ):
+        return None
+    return neg, pos
+
+
+def _normalize_correction(text: str) -> str:
+    """Rewrite a correction phrase so the negated value becomes the corrected
+    one ("不是 1608，是 1708" -> "不是 1708，是 1708"). The backend matcher and
+    the status-query unit token then only ever see the corrected value (1708,
+    never the negated 1608). Non-correction text is returned unchanged."""
+    raw = text or ""
+    match = _CORRECTION_RE.search(raw)
+    if not match:
+        return raw
+    neg, pos = _correction_values(raw) or (None, None)
+    if neg is None or pos is None or neg == pos:
+        return raw
+    segment = match.group(0)
+    fixed = re.sub(re.escape(neg), pos, segment, count=1)
+    return raw[:match.start()] + fixed + raw[match.end():]
 
 
 def route_for_text(text: str):
@@ -545,7 +612,7 @@ async def _handle_rent_payment_statement(update, context, text, role, locale):
     api = context.bot_data["api_client"]
     chat_id = update.effective_chat.id
     try:
-        result = await api.match_rent_payment(text)
+        result = await api.match_rent_payment(_normalize_correction(text))
     except PasayApiError:
         await context.bot.send_message(
             chat_id, H.escape(t("rent.match_error", locale)), parse_mode=HTML
