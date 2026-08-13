@@ -25,13 +25,10 @@ from conftest import (
 
 GROUP_CHAT_ID = -1001234567890
 
-OWNER_LABELS = ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
-SECRETARY_LABELS = [
-    "🏠 Properties", "👥 Tenants",
-    "💵 Rent", "✅ Tasks",
-    "🔧 Maintenance", "📋 Records",
-    "⚠️ Overdue",
-]
+# WIN-SINGLE-NODE-MIGRATION-001 / BOT-V1-USABLE-001: Windows baseline uses one
+# identical 4-button persistent menu for both roles (home/todo/rent/expense).
+OWNER_LABELS = ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
+SECRETARY_LABELS = OWNER_LABELS
 
 FORBIDDEN_PROMPTS = (
     "请输入 /start", "请输入/start", "type /start", "send /start",
@@ -110,7 +107,8 @@ def test_start_still_works_regression(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     send = env.bot.last_send()
-    assert "Pasay 房产管理" in send["text"]
+    # BOT-V1 home is the live summary card (not the SLICE3 dashboard title).
+    assert "Pasay Property" in send["text"]
     assert _labels(send["reply_markup"]) == OWNER_LABELS
     assert send["reply_markup"].is_persistent is True
     _assert_no_start_prompt("\n".join(env.bot.all_texts()))
@@ -130,7 +128,7 @@ def test_identified_user_any_message_restores_menu(make_app):
     _assert_no_start_prompt("\n".join(env.bot.all_texts()))
 
 
-def test_secretary_any_message_restores_english_menu(make_app):
+def test_secretary_any_message_restores_menu(make_app):
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "hi", bot=env.bot)])
     reply_sends = _reply_sends(env)
@@ -199,9 +197,9 @@ def test_message_menu_init_independent_of_dashboard_failure(make_app):
     assert any("获取数据失败" in (s["text"] or "") for s in env.bot.sends())
 
 
-# --- Owner / Secretary menus never cross -------------------------------------
+# --- Owner / Secretary share the BOT-V1 menu --------------------------------
 
-def test_owner_and_secretary_menus_never_cross(make_app):
+def test_owner_and_secretary_share_bot_v1_menu(make_app):
     env = make_app()
     run_updates(
         env,
@@ -216,8 +214,9 @@ def test_owner_and_secretary_menus_never_cross(make_app):
     assert len(reply_sends) == 2
     assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
     assert _labels(reply_sends[1]["reply_markup"]) == SECRETARY_LABELS
-    assert "房源" not in reply_sends[1]["text"]      # Owner labels not in Secretary message
-    assert "Properties" not in reply_sends[0]["text"]  # Secretary labels not in Owner message
+    # Identical BOT-V1 menu: neither message contains legacy SLICE3 labels.
+    assert "房源" not in reply_sends[1]["text"]
+    assert "Properties" not in reply_sends[0]["text"]
 
 
 # --- group new-member onboarding (fail-closed) -------------------------------

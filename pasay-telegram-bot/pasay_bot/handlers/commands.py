@@ -418,6 +418,10 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
     if fin is None:
         await _render(context, chat_id, message_id, _load_error("home", locale),
                       home_summary_keyboard(locale))
+        if role and message_id is None:
+            # SLICE3-UX-PERSISTENT-MENU-002: the persistent keyboard must not
+            # depend on backend/dashboard success (private chat only).
+            await _send_persistent_menu(context, chat_id, role, locale)
         return
     expenses_list = [] if isinstance(expenses, Exception) else expenses
     incomes_list = [] if isinstance(incomes, Exception) else incomes
@@ -461,6 +465,10 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
             context, chat_id, text,
             reply_keyboard=reply_keyboard(role) if role else None,
         )
+        if role:
+            # The persistent keyboard was just mounted on this message;
+            # remember it so later normal messages don't re-send it.
+            _mark_menu_initialized(context, chat_id)
 
 
 async def show_expense(context, chat_id, locale: str, message_id=None):
