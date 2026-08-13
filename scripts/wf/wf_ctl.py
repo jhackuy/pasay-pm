@@ -10,6 +10,7 @@ Usage:
   python scripts/wf/wf_ctl.py mirror-sync
   python scripts/wf/wf_ctl.py bootstrap-canonical [--src PATH]
   python scripts/wf/wf_ctl.py tests
+  python scripts/wf/wf_ctl.py bridge-route --task-json '{...}'
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import tempfile
 
 import wf_lib as wf
 import wf_ops
+import bridge_router
 
 
 def cmd_preflight(args):
@@ -393,6 +395,15 @@ def cmd_route(args):
     return 0
 
 
+def cmd_bridge_route(args):
+    """BRIDGE-ROUTER-001: deterministic route -> full RouteResult (add-only;
+    does not change the existing wf_ops 'route' command behavior)."""
+    task = json.loads(args.task_json)
+    result = bridge_router.route_task(task)
+    print(json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+    return 0
+
+
 def cmd_metrics(args):
     task = json.loads(args.task_json)
     metrics = wf_ops.record_metrics(
@@ -480,6 +491,7 @@ def build_parser():
     sp = sub.add_parser("tests"); sp.set_defaults(fn=cmd_tests)
     sp = sub.add_parser("verify"); sp.set_defaults(fn=cmd_verify)
     sp = sub.add_parser("route"); sp.add_argument("--task-json", required=True); sp.set_defaults(fn=cmd_route)
+    sp = sub.add_parser("bridge-route"); sp.add_argument("--task-json", required=True); sp.set_defaults(fn=cmd_bridge_route)
     sp = sub.add_parser("metrics"); sp.add_argument("--task-json", required=True); sp.add_argument("--route", default="UNKNOWN"); sp.add_argument("--result", default="UNKNOWN"); sp.add_argument("--max-sessions", type=int, default=0); sp.add_argument("--lily-sessions", type=int, default=0); sp.add_argument("--fugui-llm-calls", type=int, default=0); sp.add_argument("--max-attempts", type=int, default=None); sp.add_argument("--human-interventions", type=int, default=0); sp.add_argument("--test-runs", type=int, default=0); sp.add_argument("--test-failures", type=int, default=0); sp.set_defaults(fn=cmd_metrics)
     sp = sub.add_parser("test-level"); sp.add_argument("--task-json", required=True); sp.add_argument("--l2-risk", action="store_true"); sp.set_defaults(fn=cmd_test_level)
     sp = sub.add_parser("reduce-log"); sp.add_argument("--raw", required=True); sp.add_argument("--task-id", required=True); sp.add_argument("--command"); sp.add_argument("--exit-code", type=int, default=None); sp.set_defaults(fn=cmd_reduce_log)
