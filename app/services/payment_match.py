@@ -128,10 +128,25 @@ class MatchResult:
 
 
 def _unit_matches(token: str, unit_number: str) -> bool:
-    # Trailing sentence punctuation ("1608.") must not hide the unit hint.
+    """Normalized unit-number match.
+
+    Trailing sentence punctuation ("1608.") must not hide the unit hint.
+    Suffix matches require a non-digit boundary so a short token like "608"
+    never over-matches unit "1608" / "DEV-BAY-1608" (and "20" never matches
+    "1020"), while "1608" still resolves the prefixed building-unit style
+    ("DEV-BAY-1608") used by the dev data.
+    """
     t = (token or "").lower().strip().rstrip(".,;:!?")
     u = (unit_number or "").lower().strip()
-    return bool(u) and (t == u or u.endswith(t) or t.endswith(u))
+    if not u or not t:
+        return False
+    if t == u:
+        return True
+    if u.endswith(t) and not u[len(u) - len(t) - 1].isdigit():
+        return True
+    if t.endswith(u) and not t[len(t) - len(u) - 1].isdigit():
+        return True
+    return False
 
 
 def _parse_unit_hints(text: str, unit_numbers: Iterable[str]) -> list[str]:

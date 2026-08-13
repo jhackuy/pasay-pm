@@ -16,6 +16,7 @@ from app.services.payment_match import (
     LeaseCtx,
     MatchConfidence,
     MatchKind,
+    _unit_matches,
     match_from_leases,
     parse_hints,
 )
@@ -90,6 +91,28 @@ def test_parse_unit_phrase():
     assert hints.unit_hints == ["1608"]
     assert hints.amounts == []
     assert hints.received_date == TODAY
+
+
+def test_unit_match_rejects_digit_suffix_overmatch():
+    """SLICE2-RENT-003FIX: '608' must not over-match '1608' / 'DEV-BAY-1608'
+    and '20' must not match '1020', while '1608' still resolves the prefixed
+    dev style and exact ids/punctuation still match."""
+    assert not _unit_matches("608", "1608")
+    assert not _unit_matches("608", "DEV-BAY-1608")
+    assert not _unit_matches("8", "1608")
+    assert not _unit_matches("20", "1020")
+    assert _unit_matches("1608", "DEV-BAY-1608")
+    assert _unit_matches("1608.", "DEV-BAY-1608")
+    assert _unit_matches("DEV-BAY-1608", "DEV-BAY-1608")
+    assert _unit_matches("20", "20")
+
+
+def test_parse_unit_hint_rejects_digit_suffix_overmatch():
+    """The unit hint parser must not resolve '608租金收到了' to unit 1608 /
+    DEV-BAY-1608, and must still resolve '1608' against the prefixed style."""
+    assert parse_hints("608租金收到了", ["1608", "DEV-BAY-1608"], TODAY).unit_hints == []
+    assert parse_hints("1608租金收到了", ["DEV-BAY-1608"], TODAY).unit_hints == ["1608"]
+    assert parse_hints("20租金收到了", ["1020", "20"], TODAY).unit_hints == ["20"]
 
 
 def test_english_sentence_with_trailing_period():

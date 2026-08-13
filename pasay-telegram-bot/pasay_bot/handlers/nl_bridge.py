@@ -78,7 +78,12 @@ _WHO_UNPAID_EN = re.compile(
     r"|\bunpaid\s+this\s+month\b",
     re.IGNORECASE,
 )
-_UNIT_TOKEN = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]?\d{1,4}[A-Za-z]?)(?![A-Za-z0-9])")
+_UNIT_TOKEN = re.compile(
+    r"(?<![A-Za-z0-9-])("
+    r"(?:[A-Za-z]+-)+[A-Za-z]*\d{1,4}[A-Za-z]?"  # prefixed ids: DEV-BAY-1608
+    r"|[A-Za-z]?\d{1,4}[A-Za-z]?"                 # plain ids: 1608 / 16B / 2C
+    r")(?![A-Za-z0-9-])"
+)
 _NAME_TOKEN = re.compile(r"\b([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?)\b")
 _QUERY_VERB_CN = (
     "交了没有", "交了没", "交了吗", "交了么", "交没交", "有没有交",
@@ -296,9 +301,105 @@ async def _answer_who_unpaid(context, chat_id, locale):
     )
 
 
+def _unit_number_matches(token: str, unit_number: str) -> bool:
+    """Normalized unit-number match (mirrors payment_match._unit_matches).
+
+    Trailing sentence punctuation ("1608?") must not hide the unit hint.
+    Suffix matches require a non-digit boundary so "608" never answers
+    "1608" / "DEV-BAY-1608", while "1608" still resolves the prefixed
+    building-unit style (DEV-BAY-1608) used by the dev data.
+    """
+    t = (token or "").lower().strip().rstrip(".,;:!?")
+    u = (unit_number or "").lower().strip()
+    if not u or not t:
+        return False
+    if t == u:
+        return True
+    if u.endswith(t) and not u[len(u) - len(t) - 1].isdigit():
+        return True
+    if t.endswith(u) and not t[len(t) - len(u) - 1].isdigit():
+        return True
+    return False
+
+
+def _status_candidates(
+    units, leases, tenants, incomes, overdue, properties, *, unit_ids=None, tenant_ids=None
+):
+    """Read-only rent status candidates for the matched units or tenants
+    (shared by the unit and tenant NL answer paths). One entry per active
+    lease; never selects or writes anything."""
+    month = pages._current_month()
+    candidates: list[dict] = []
+    for lease in leases:
+        if lease.status != "active":
+            continue
+        if unit_ids is not None and lease.unit_id not in unit_ids:
+            continue
+        if tenant_ids is not None and lease.tenant_id not in tenant_ids:
+            continue
+        unit = next((u for u in units if u.id == lease.unit_id), None)
+        tenant = next((tn for tn in tenants if tn.id == lease.tenant_id), None)
+        if unit is None or tenant is None:
+            continue
+        prop = next((p for p in properties if p.id == unit.property_id), None)
+        paid = pages._period_covered(incomes, lease.id, month)
+        ovd = next((r for r in overdue if r.lease_id == lease.id), None)
+        candidates.append(
+            {
+                "tenant_name": tenant.full_name,
+                "unit_number": unit.unit_number,
+                "property_name": prop.name if prop else "",
+                "monthly_rent": lease.monthly_rent,
+                "paid": paid,
+                "outstanding": (
+                    ovd.total_outstanding
+                    if ovd
+                    else (Decimal("0") if paid else lease.monthly_rent)
+                ),
+                "overdue_days": ovd.overdue_days if ovd else 0,
+                "overdue_months": ovd.overdue_months if ovd else 0,
+                "month": month,
+            }
+        )
+    return candidates
+
+
+async def _send_status_answer(context, chat_id, candidates, locale):
+    """One match -> the single status card; several -> read-only candidates
+    (never auto-selects, never writes)."""
+    if len(candidates) == 1:
+        c = candidates[0]
+        await context.bot.send_message(
+            chat_id,
+            H.truncate(
+                cards.rent_status_card(
+                    locale=locale,
+                    unit_number=c["unit_number"],
+                    property_name=c["property_name"],
+                    tenant_name=c["tenant_name"],
+                    monthly_rent=c["monthly_rent"],
+                    paid=c["paid"],
+                    outstanding=c["outstanding"],
+                    overdue_days=c["overdue_days"],
+                    overdue_months=c["overdue_months"],
+                    month=c["month"],
+                )
+            ),
+            parse_mode=HTML,
+        )
+        return
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(cards.tenant_candidates_card(candidates, locale)),
+        parse_mode=HTML,
+    )
+
+
 async def _answer_unit_status(context, chat_id, unit_token, locale):
-    """'1608 交了没有 / 还欠多少' — exact unit-number match, then a
-    paid/unpaid + owed + overdue answer from the existing read endpoints."""
+    """'1608 交了没有 / 还欠多少' — normalized unit-number match (punctuation
+    tolerant, "1608" resolves "DEV-BAY-1608"), then a paid/unpaid + owed +
+    overdue answer from the existing read endpoints. Multiple unit hits
+    render the read-only candidates card instead of guessing."""
     api = context.bot_data["api_client"]
     units, leases, tenants, incomes, overdue, properties = await asyncio.gather(
         api.get_units(),
@@ -308,54 +409,26 @@ async def _answer_unit_status(context, chat_id, unit_token, locale):
         api.get_overdue_rents(),
         api.get_properties(),
     )
-    unit = next(
-        (u for u in units if u.unit_number.lower() == unit_token.lower()), None
-    )
-    if unit is None:
+    matched = [u for u in units if _unit_number_matches(unit_token, u.unit_number)]
+    if not matched:
         await context.bot.send_message(
             chat_id,
             H.escape(t("rent_status.no_unit", locale, unit=unit_token)),
             parse_mode=HTML,
         )
         return
-    lease = next(
-        (l for l in leases if l.unit_id == unit.id and l.status == "active"), None
+    candidates = _status_candidates(
+        units, leases, tenants, incomes, overdue, properties,
+        unit_ids={u.id for u in matched},
     )
-    if lease is None:
+    if not candidates:
         await context.bot.send_message(
             chat_id,
             H.escape(t("rent_status.no_active_lease", locale)),
             parse_mode=HTML,
         )
         return
-    month = pages._current_month()
-    paid = pages._period_covered(incomes, lease.id, month)
-    ovd = next((r for r in overdue if r.lease_id == lease.id), None)
-    outstanding = (
-        ovd.total_outstanding
-        if ovd
-        else (Decimal("0") if paid else lease.monthly_rent)
-    )
-    tenant = next((tn for tn in tenants if tn.id == lease.tenant_id), None)
-    prop = next((p for p in properties if p.id == unit.property_id), None)
-    await context.bot.send_message(
-        chat_id,
-        H.truncate(
-            cards.rent_status_card(
-                locale=locale,
-                unit_number=unit.unit_number,
-                property_name=prop.name if prop else "",
-                tenant_name=tenant.full_name if tenant else "",
-                monthly_rent=lease.monthly_rent,
-                paid=paid,
-                outstanding=outstanding,
-                overdue_days=ovd.overdue_days if ovd else 0,
-                overdue_months=ovd.overdue_months if ovd else 0,
-                month=month,
-            )
-        ),
-        parse_mode=HTML,
-    )
+    await _send_status_answer(context, chat_id, candidates, locale)
 
 
 async def _answer_tenant_status(context, chat_id, tenant_token, locale):
@@ -383,37 +456,10 @@ async def _answer_tenant_status(context, chat_id, tenant_token, locale):
             parse_mode=HTML,
         )
         return
-    month = pages._current_month()
-    candidates: list[dict] = []
-    for tn in matched:
-        for lease in (
-            l for l in leases if l.tenant_id == tn.id and l.status == "active"
-        ):
-            unit = next((u for u in units if u.id == lease.unit_id), None)
-            prop = (
-                next((p for p in properties if p.id == unit.property_id), None)
-                if unit
-                else None
-            )
-            paid = pages._period_covered(incomes, lease.id, month)
-            ovd = next((r for r in overdue if r.lease_id == lease.id), None)
-            candidates.append(
-                {
-                    "tenant_name": tn.full_name,
-                    "unit_number": unit.unit_number if unit else "",
-                    "property_name": prop.name if prop else "",
-                    "monthly_rent": lease.monthly_rent,
-                    "paid": paid,
-                    "outstanding": (
-                        ovd.total_outstanding
-                        if ovd
-                        else (Decimal("0") if paid else lease.monthly_rent)
-                    ),
-                    "overdue_days": ovd.overdue_days if ovd else 0,
-                    "overdue_months": ovd.overdue_months if ovd else 0,
-                    "month": month,
-                }
-            )
+    candidates = _status_candidates(
+        units, leases, tenants, incomes, overdue, properties,
+        tenant_ids={tn.id for tn in matched},
+    )
     if not candidates:
         await context.bot.send_message(
             chat_id,
@@ -421,32 +467,7 @@ async def _answer_tenant_status(context, chat_id, tenant_token, locale):
             parse_mode=HTML,
         )
         return
-    if len(candidates) == 1:
-        c = candidates[0]
-        await context.bot.send_message(
-            chat_id,
-            H.truncate(
-                cards.rent_status_card(
-                    locale=locale,
-                    unit_number=c["unit_number"],
-                    property_name=c["property_name"],
-                    tenant_name=c["tenant_name"],
-                    monthly_rent=c["monthly_rent"],
-                    paid=c["paid"],
-                    outstanding=c["outstanding"],
-                    overdue_days=c["overdue_days"],
-                    overdue_months=c["overdue_months"],
-                    month=c["month"],
-                )
-            ),
-            parse_mode=HTML,
-        )
-        return
-    await context.bot.send_message(
-        chat_id,
-        H.truncate(cards.tenant_candidates_card(candidates, locale)),
-        parse_mode=HTML,
-    )
+    await _send_status_answer(context, chat_id, candidates, locale)
 
 
 async def _handle_rent_payment_statement(update, context, text, role, locale):
