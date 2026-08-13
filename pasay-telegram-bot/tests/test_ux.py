@@ -63,19 +63,27 @@ def test_start_shows_dashboard(make_app):
     assert "空置 1 套" in text
     kb = send["reply_markup"]
     assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
+    assert kb.is_persistent is True
     labels = [b.text for row in kb.keyboard for b in row]
     assert labels == ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
 
 
 def test_secretary_start_has_english_persistent_keyboard(make_app):
-    """★ SECRETARY /start mounts the English 2x2 persistent keyboard."""
+    """★ SECRETARY /start mounts the English persistent keyboard covering the
+    high-frequency daily ops entries (no Owner-only confirm/finalize/reverse)."""
     env = make_app()
     run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/start", bot=env.bot)])
     send = env.bot.last_send()
     kb = send["reply_markup"]
     assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
+    assert kb.is_persistent is True
     labels = [b.text for row in kb.keyboard for b in row]
-    assert labels == ["🏠 Properties", "✅ Tasks", "💰 Finance", "☰ More"]
+    assert labels == [
+        "🏠 Properties", "👥 Tenants",
+        "💵 Rent", "✅ Tasks",
+        "🔧 Maintenance", "📋 Records",
+        "⚠️ Overdue",
+    ]
 
 
 def test_more_keyword_opens_fallback_inline_menu(make_app):

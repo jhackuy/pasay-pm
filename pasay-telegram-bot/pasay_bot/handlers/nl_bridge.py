@@ -171,13 +171,18 @@ def detect_rent_status_query(text: str) -> Optional[RentStatusQuery]:
 
 _ROUTES = [
     (("房源", "property", "properties"), "properties"),
-    (("财务", "finance", "summary", "收支", "报表"), "finance"),
+    (("财务", "finance", "summary", "收支", "报表", "record", "records"), "finance"),
     (("逾期", "overdue", "欠租", "overdue rent"), "overdue"),
     (("收租", "rent", "登记"), "rent"),
     (("待处理", "pending", "待办", "todo", "tasks", "待确认"), "pending"),
     (("更多", "more"), "more"),
     (("菜单", "menu", "主菜单", "home", "start"), "menu"),
     (("帮助", "help", "帮助"), "help"),
+    # SLICE3-UX-PERSISTENT-MENU-001: Secretary fixed-menu entries without a
+    # dedicated page handler get friendly guidance to existing capabilities
+    # (tenant status NL queries / to-do center), never a silent no-op.
+    (("租客", "tenant", "tenants"), "tenants"),
+    (("维修", "maintenance"), "maintenance"),
 ]
 
 
@@ -282,7 +287,10 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     route = route_for_text(text)
-    if route in ("properties", "finance", "overdue", "rent", "pending", "menu", "more"):
+    if route in (
+        "properties", "finance", "overdue", "rent", "pending", "menu", "more",
+        "tenants", "maintenance",
+    ):
         if not has_read_permission(role):
             await context.bot.send_message(
                 chat_id,
@@ -310,6 +318,20 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id,
             f"📖 <b>{H.escape(t('help.title', locale))}</b>\n\n{H.escape(t('help.text', locale))}",
+            parse_mode=HTML,
+            reply_markup=pages.reply_keyboard(role),
+        )
+    elif route == "tenants":
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("menu.tenants_hint", locale)),
+            parse_mode=HTML,
+            reply_markup=pages.reply_keyboard(role),
+        )
+    elif route == "maintenance":
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("menu.maintenance_hint", locale)),
             parse_mode=HTML,
             reply_markup=pages.reply_keyboard(role),
         )

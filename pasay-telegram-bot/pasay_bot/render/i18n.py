@@ -6,6 +6,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "zh": {
         'menu.title': '主菜单',
         'menu.hint': '请选择功能：',
+        'menu.tenants_hint': '👥 租客查询：直接输入租客姓名即可查询交租状态（例如“John 交了吗”“这个月谁还没交”）。\n也可查看 🏠 房源 或 ⚠️ 逾期。',
+        'menu.maintenance_hint': '🔧 维修事项统一在 ✅ 待办（待办中心）里处理。\n也可直接问运营助手（/copilot），例如“这个月维修费多少？”。',
         'nav.properties': '🏘 房源',
         'nav.finance': '📊 财务',
         'nav.overdue': '⚠️ 逾期',
@@ -318,6 +320,8 @@ STRINGS: dict[str, dict[str, str]] = {
     "en": {
         'menu.title': 'Main Menu',
         'menu.hint': 'Choose an option:',
+        'menu.tenants_hint': '👥 Tenant status: type a tenant name directly (e.g. “has John paid?” or “who hasn’t paid this month?”).\nYou can also check 🏠 Properties or ⚠️ Overdue.',
+        'menu.maintenance_hint': '🔧 Maintenance jobs are handled in ✅ Tasks (to-do center).\nYou can also ask the assistant (/copilot), e.g. “maintenance cost this month?”',
         'nav.properties': '🏘 Properties',
         'nav.finance': '📊 Finance',
         'nav.overdue': '⚠️ Overdue',
@@ -449,7 +453,7 @@ STRINGS: dict[str, dict[str, str]] = {
         'ops.property': 'Property',
         'ops.tenant': 'Tenant',
         'help.title': 'Help',
-        'help.text': 'Use the buttons below for daily tasks:\n🏠 Properties · ✅ Tasks · 💰 Finance\nMore actions live under ☰ More.\n\nCommands: /start /help.',
+        'help.text': 'Use the buttons below for daily tasks:\n🏠 Properties · 👥 Tenants · 💵 Rent · ✅ Tasks\n🔧 Maintenance · 📋 Records · ⚠️ Overdue\n\nCommands: /start /help.',
         'properties.title': 'Property Overview',
         'properties.total': 'Total',
         'properties.occupied': 'Occupied',

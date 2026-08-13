@@ -229,20 +229,24 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
-    """Persistent bottom navigation (V1.3): Owner sees Chinese decision labels,
-    Secretary sees English execution labels. The buttons are plain text and
-    route through nl_bridge like any natural-language input."""
+    """Persistent bottom navigation (V1.3 + SLICE3-UX-PERSISTENT-MENU-001):
+    Owner sees Chinese decision labels, Secretary sees English execution
+    labels. The buttons are plain text and route through nl_bridge like any
+    natural-language input. ``is_persistent=True`` pins the keyboard above the
+    input field across messages (Telegram Bot API >= 4.5 / PTB >= 13.5)."""
     if role == Role.SECRETARY:
         rows = [
-            [KeyboardButton("🏠 Properties"), KeyboardButton("✅ Tasks")],
-            [KeyboardButton("💰 Finance"), KeyboardButton("☰ More")],
+            [KeyboardButton("🏠 Properties"), KeyboardButton("👥 Tenants")],
+            [KeyboardButton("💵 Rent"), KeyboardButton("✅ Tasks")],
+            [KeyboardButton("🔧 Maintenance"), KeyboardButton("📋 Records")],
+            [KeyboardButton("⚠️ Overdue")],
         ]
     else:
         rows = [
             [KeyboardButton("🏠 房源"), KeyboardButton("✅ 待办")],
             [KeyboardButton("💰 财务"), KeyboardButton("☰ 更多")],
         ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 
 def copilot_today_keyboard(
