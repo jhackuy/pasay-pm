@@ -22,6 +22,7 @@ import sys
 import tempfile
 
 import wf_lib as wf
+import wf_ops
 
 
 def cmd_preflight(args):
@@ -381,7 +382,88 @@ def cmd_verify(args):
     }
     wf.write_json(os.path.join(wf.RESULTS_DIR, "WF-001", "wf001_result.json"), result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if tests.get("overall") == "PASS" and not unexpected else 1
+    return 0 if (tests.get("overall") == "PASS" and not unexpected
+                 and result.get("all_mirrors_match") is True) else 1
+
+
+def cmd_route(args):
+    task = json.loads(args.task_json)
+    route, reason = wf_ops.route_task(task)
+    print(json.dumps({"route": route, "route_reason": reason}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_metrics(args):
+    task = json.loads(args.task_json)
+    metrics = wf_ops.record_metrics(
+        task, args.route, result=args.result, max_sessions=args.max_sessions,
+        lily_sessions=args.lily_sessions, fugui_llm_calls=args.fugui_llm_calls,
+        max_attempts=args.max_attempts, human_interventions=args.human_interventions,
+        test_runs=args.test_runs, test_failures=args.test_failures)
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_test_level(args):
+    task = json.loads(args.task_json)
+    level, reason = wf_ops.select_test_level(task, l2_cross_module_risk=args.l2_risk)
+    print(json.dumps({"test_level": level, "reason": reason}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_reduce_log(args):
+    raw = wf.read_file(args.raw)
+    if raw is None:
+        print("ERROR: raw log file missing")
+        return 2
+    res = wf_ops.reduce_log(raw, args.task_id, command=args.command, exit_code=args.exit_code)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_human_gate(args):
+    task = json.loads(args.task_json)
+    steps = args.steps.split(";") if args.steps else None
+    note = wf_ops.human_test_notification(task, steps=steps)
+    print(json.dumps({"owner_notification": note is not None,
+                      "message": note}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_lock(args):
+    if args.action == "acquire":
+        verdict, rec = wf_ops.acquire_task_lock(args.task, args.session, args.pid, args.worktree)
+        print(json.dumps({"verdict": verdict, "lock": rec}, ensure_ascii=False, indent=2))
+        return 0 if verdict == "ALLOWED" else 1
+    if args.action == "release":
+        rec = wf_ops.release_task_lock(args.task, args.session)
+        print(json.dumps({"released": rec is not None, "lock": rec}, ensure_ascii=False, indent=2))
+        return 0
+    print(json.dumps(wf_ops.task_locks(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_state(args):
+    if args.action == "next":
+        res = wf_ops.set_state(args.task, args.to, expected_from=args.frm)
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if res["verdict"] == "ALLOWED" else 1
+    print(json.dumps(wf_ops.task_states(), ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_safety_scan(args):
+    violations = wf_ops.safety_scan()
+    print(json.dumps({"violations": violations, "count": len(violations)},
+                     ensure_ascii=False, indent=2))
+    return 0 if not violations else 1
+
+
+def cmd_selftest(args):
+    res = wf_ops.workflow_selftest()
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+    ok = not res.get("safety_scan") and res.get("rules_preflight") == "RULES_PREFLIGHT_OK"
+    return 0 if ok else 1
 
 
 def build_parser():
@@ -397,6 +479,15 @@ def build_parser():
     sp = sub.add_parser("bootstrap-canonical"); sp.add_argument("--src"); sp.set_defaults(fn=cmd_bootstrap_canonical)
     sp = sub.add_parser("tests"); sp.set_defaults(fn=cmd_tests)
     sp = sub.add_parser("verify"); sp.set_defaults(fn=cmd_verify)
+    sp = sub.add_parser("route"); sp.add_argument("--task-json", required=True); sp.set_defaults(fn=cmd_route)
+    sp = sub.add_parser("metrics"); sp.add_argument("--task-json", required=True); sp.add_argument("--route", default="UNKNOWN"); sp.add_argument("--result", default="UNKNOWN"); sp.add_argument("--max-sessions", type=int, default=0); sp.add_argument("--lily-sessions", type=int, default=0); sp.add_argument("--fugui-llm-calls", type=int, default=0); sp.add_argument("--max-attempts", type=int, default=None); sp.add_argument("--human-interventions", type=int, default=0); sp.add_argument("--test-runs", type=int, default=0); sp.add_argument("--test-failures", type=int, default=0); sp.set_defaults(fn=cmd_metrics)
+    sp = sub.add_parser("test-level"); sp.add_argument("--task-json", required=True); sp.add_argument("--l2-risk", action="store_true"); sp.set_defaults(fn=cmd_test_level)
+    sp = sub.add_parser("reduce-log"); sp.add_argument("--raw", required=True); sp.add_argument("--task-id", required=True); sp.add_argument("--command"); sp.add_argument("--exit-code", type=int, default=None); sp.set_defaults(fn=cmd_reduce_log)
+    sp = sub.add_parser("human-gate"); sp.add_argument("--task-json", required=True); sp.add_argument("--steps"); sp.set_defaults(fn=cmd_human_gate)
+    sp = sub.add_parser("lock"); sp.add_argument("action", choices=["acquire", "release", "list"]); sp.add_argument("--task"); sp.add_argument("--session"); sp.add_argument("--pid"); sp.add_argument("--worktree"); sp.set_defaults(fn=cmd_lock)
+    sp = sub.add_parser("state"); sp.add_argument("action", choices=["next", "list"]); sp.add_argument("--task"); sp.add_argument("--to"); sp.add_argument("--frm"); sp.set_defaults(fn=cmd_state)
+    sp = sub.add_parser("safety-scan"); sp.set_defaults(fn=cmd_safety_scan)
+    sp = sub.add_parser("selftest"); sp.set_defaults(fn=cmd_selftest)
     return p
 
 

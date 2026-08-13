@@ -18,7 +18,9 @@ $ProtectedFiles = @(
     'AI_WORKFLOW_RULES.md',
     'scripts/wf/wf_lib.py',
     'scripts/wf/wf_ctl.py',
-    'scripts/wf/sync-pasay.ps1'
+    'scripts/wf/sync-pasay.ps1',
+    'scripts/wf/wf_ops.py',
+    'scripts/wf/wf003_tests.py'
 )
 
 function Invoke-MacGit([string]$Arguments) {

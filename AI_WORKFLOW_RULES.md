@@ -1,6 +1,6 @@
 # Pasay AI Development Workflow Rules — Canonical
 
-rules_version: 2026-08-13.1
+rules_version: 2026-08-13.2
 canonical_path: /Users/jhackuy/Projects/pasay-pm/AI_WORKFLOW_RULES.md
 authority: 唯一权威规则文件。任何 Windows 副本（例如 D:\AI-Review\pasay-pm\AI_WORKFLOW_RULES.md）只作为 mirror/cache，不作为权威。
 last_updated: 2026-08-13
@@ -327,7 +327,71 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 
 ---
 
-## 13. 产品 UX 最高法则
+## 13. 程序化路由、升级阈值与成本控制（WF-003）
+
+### 13.1 Task Router（默认不经过 Lily）
+
+每个任务至少包含：task_id、task_type、risk_level、objective、allowed_paths、acceptance_criteria、requires_human_test、requires_supervisor、max_retry、test_level。
+
+程序化路由结果由程序产生：
+
+* `PROGRAMMATIC`：脚本/CLI/SQL/测试可完成 → 不启动 LLM
+* `MAX`：普通代码修改默认只启动 Max
+* `LILY`：仅当以下任一条件成立（禁止“任务比较复杂”这类模糊理由）：
+  * requires_supervisor=true
+  * 跨多个高风险模块且规则明确要求
+  * Max 达到 max_retry
+  * Max 返回 NEEDS_SUPERVISOR
+  * 出现无法自动解决的架构冲突
+  * 长时间/多阶段自治任务明确要求 supervisor
+
+### 13.2 Single Max Session Per Task + Retry Limit
+
+* 一个 task 默认只允许一个 active Max session。
+* 默认 `max_retry=2`：第一次失败允许基于失败证据修复；第二次仍失败 → `NEEDS_SUPERVISOR`，停止烧 Token，之后才允许 Lily 介入。
+* 禁止：Max 无限重试、失败一次立刻启动 Lily、同时启动 Max + Lily 重复分析。
+
+### 13.3 Escalation Only On Evidence
+
+升级必须有证据：失败轮数、exit code、测试失败清单、架构冲突记录。LLM 不得自行生成 task status。
+
+### 13.4 Structured Logs（日志压缩程序化）
+
+* 原始日志保存到磁盘（`.ai-control/results/<task_id>/logs/raw.log`）。
+* 给 LLM 的内容只包含：command、exit_code、failed_test_names、ERROR/FAILED、traceback 相关片段、最后相关行、affected files/modules，并设置最大长度。
+* 日志仍过大 → 进一步截断并提供 raw_log_path，LLM 按需读取指定片段。
+* 原则：“日志存在磁盘，不存在 Prompt 里。”
+
+### 13.5 Test Levels（程序化分级）
+
+* L1 = targeted tests；L2 = module regression；L3 = full suite。
+* 普通修改默认 L1 → PASS → L2。
+* 仅以下情况自动进入 L3：merge/release gate、migration、identity/auth/RBAC、financial write path、shared core infrastructure、明确指定 full regression、L2 结果显示跨模块风险。
+* pytest 是否通过由 exit code + structured result 决定，不让 LLM 判断。
+
+### 13.6 Human Test Minimalism
+
+* requires_human_test=false → 禁止通知 Owner。
+* true → 只生成最小化操作说明（固定格式：需要你完成 1 个测试 → 步骤 → 完成后只回复 正常 / 异常截图）。
+* 测试完成后记录 human_test_result=PASS/FAIL，然后自动恢复机器工作流。
+
+### 13.7 Task Lock（去重与并发保护）
+
+* 同 task_id 已 RUNNING 时再次 dispatch → `BLOCKED_DUPLICATE_TASK`，不启动第二个 worker。
+* 不同 task 可并发，但必须不同 worktree、不同 session、不同 task_id；禁止共享可写工作目录。
+
+### 13.8 Metrics（真实成本记录）
+
+* 每个任务自动记录到 `.ai-control/results/<task_id>/metrics.json`：task_id、route、fugui_llm_calls、max_sessions、lily_sessions、max_attempts、start/end_time、duration_seconds、human_interventions、test_runs、test_failures、result。
+* provider 能取得 token usage 才记录 input/output/total_tokens；否则记录 UNKNOWN。禁止猜测 token 数量。
+
+### 13.9 状态机
+
+统一状态：CREATED → PREFLIGHT → RUNNING → TESTING → HUMAN_TEST_REQUIRED → REVIEW_READY → DONE；异常状态 BLOCKED_RULES_MISMATCH / BLOCKED_SCOPE_VIOLATION / BLOCKED_DUPLICATE_TASK / NEEDS_SUPERVISOR / FAILED。状态转换由程序决定，非法跳转 → BLOCKED_ILLEGAL_TRANSITION。
+
+---
+
+## 14. 产品 UX 最高法则
 
 ### 最高原则
 
@@ -374,7 +438,7 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 
 ---
 
-## 14. 安全底线（本任务与所有后续任务）
+## 15. 安全底线（本任务与所有后续任务）
 
 禁止：
 
