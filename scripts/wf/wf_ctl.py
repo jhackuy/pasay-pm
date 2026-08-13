@@ -25,6 +25,7 @@ import tempfile
 import wf_lib as wf
 import wf_ops
 import bridge_router
+import wf_guardrails
 
 
 def cmd_preflight(args):
@@ -477,6 +478,44 @@ def cmd_selftest(args):
     return 0 if ok else 1
 
 
+def cmd_guardrails(args):
+    """WF-006 static guardrail scan (G1 platform semantics + G2 no silent UI
+    exceptions). Fails closed on any violation."""
+    report = wf_guardrails.guardrail_report()
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    ok = (report["GUARDRAIL_PLATFORM_SEMANTICS"] == "PASS"
+          and report["GUARDRAIL_NO_SILENT_UI_EXCEPTION"] == "PASS")
+    return 0 if ok else 1
+
+
+def cmd_owner_ux_gate(args):
+    """WF-006 G3: READY_FOR_OWNER_UX_RETEST gate (deterministic)."""
+    task = json.loads(args.task_json)
+    result = wf_guardrails.owner_ux_gate(task)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["READY_FOR_OWNER_UX_RETEST"] == "YES" else 1
+
+
+def cmd_timed_run(args):
+    """WF-006 G4: run one command with a hard timeout; TIMEOUT is explicit and
+    the child process tree is terminated. No automatic retry."""
+    record = wf.run_timed(
+        args.command,
+        timeout=args.timeout,
+        shell=True,
+        record_path=os.path.join(wf.RESULTS_DIR, "WF-006", "timed_runs.jsonl"),
+    )
+    print(json.dumps(record, ensure_ascii=False, indent=2))
+    return 0 if record["status"] == "OK" else 2
+
+
+def cmd_guardrails_tests(args):
+    """Run the WF-006 guardrail acceptance tests (standalone, writes
+    .ai-control/results/WF-006/tests.json)."""
+    import wf006_tests
+    return wf006_tests.main()
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="WF-001 workflow control")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -500,6 +539,10 @@ def build_parser():
     sp = sub.add_parser("state"); sp.add_argument("action", choices=["next", "list"]); sp.add_argument("--task"); sp.add_argument("--to"); sp.add_argument("--frm"); sp.set_defaults(fn=cmd_state)
     sp = sub.add_parser("safety-scan"); sp.set_defaults(fn=cmd_safety_scan)
     sp = sub.add_parser("selftest"); sp.set_defaults(fn=cmd_selftest)
+    sp = sub.add_parser("guardrails"); sp.set_defaults(fn=cmd_guardrails)
+    sp = sub.add_parser("owner-ux-gate"); sp.add_argument("--task-json", required=True); sp.set_defaults(fn=cmd_owner_ux_gate)
+    sp = sub.add_parser("timed-run"); sp.add_argument("--command", required=True); sp.add_argument("--timeout", type=int, required=True); sp.set_defaults(fn=cmd_timed_run)
+    sp = sub.add_parser("guardrails-tests"); sp.set_defaults(fn=cmd_guardrails_tests)
     return p
 
 

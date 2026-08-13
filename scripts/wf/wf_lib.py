@@ -11,9 +11,11 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CANONICAL_HOST = "macmini"
@@ -25,23 +27,122 @@ RESULTS_DIR = os.path.join(REPO, ".ai-control", "results")
 SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
 _CANONICAL_CACHE = {}
 
+DEFAULT_SH_TIMEOUT = 60  # WF guardrail G4: git/status/hash/process checks 60s.
+TIMEOUT_STATUS = "TIMEOUT"
+
 
 def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
-def sh(cmd, cwd=None, timeout=90):
+def _record_run(record_path, record) -> None:
+    """Append one JSONL timeout/command record (runtime-only, never committed)."""
+    if not record_path:
+        return
+    os.makedirs(os.path.dirname(record_path), exist_ok=True)
+    with open(record_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _kill_process_tree(proc) -> None:
+    """Best-effort child-process-tree termination (Windows taskkill /T, POSIX
+    process group). Never raises; the caller reaps the process afterwards."""
     try:
-        r = subprocess.run(
-            cmd,
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True,
+                timeout=20,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:  # pragma: no cover - best effort
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def run_timed(command, timeout, cwd=None, shell=False, record_path=None):
+    """Programmatic command wrapper with hard timeout enforcement (G4).
+
+    Returns a structured record. On timeout: status=TIMEOUT, elapsed recorded,
+    the child process tree is terminated, and no automatic retry happens.
+    `timeout` is required so every workflow command carries an explicit bound.
+    """
+    start = time.monotonic()
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        proc = subprocess.Popen(
+            command,
             cwd=cwd,
-            capture_output=True,
+            shell=shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
+            creationflags=creationflags,
+            start_new_session=(os.name != "nt"),
         )
-        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as exc:  # pragma: no cover - defensive
+        record = {
+            "status": "FAILED_TO_START",
+            "command": command,
+            "timeout": timeout,
+            "elapsed": round(time.monotonic() - start, 3),
+            "returncode": None,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        _record_run(record_path, record)
+        return record
+
+    base = {"command": command, "timeout": timeout, "pid": proc.pid,
+            "started_at": now_iso()}
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        record = {
+            "status": "OK",
+            "elapsed": round(time.monotonic() - start, 3),
+            "returncode": proc.returncode,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            **base,
+        }
+        _record_run(record_path, record)
+        return record
+    except subprocess.TimeoutExpired:
+        elapsed = round(time.monotonic() - start, 3)
+        _kill_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except Exception:  # pragma: no cover - best effort
+            stdout, stderr = "", ""
+        record = {
+            "status": TIMEOUT_STATUS,
+            "elapsed": elapsed,
+            "returncode": proc.returncode,
+            "stdout": stdout or "",
+            "stderr": stderr or "",
+            "terminated": True,
+            **base,
+        }
+        _record_run(record_path, record)
+        return record
+
+
+def sh(cmd, cwd=None, timeout=DEFAULT_SH_TIMEOUT):
+    try:
+        rec = run_timed(cmd, timeout=timeout, cwd=cwd)
+        if rec["status"] == TIMEOUT_STATUS:
+            return -1, "TIMEOUT command=%s elapsed=%ss" % (
+                rec["command"], rec["elapsed"])
+        if rec["status"] != "OK":
+            return -1, (rec.get("stderr") or rec.get("stdout") or rec["status"])
+        return rec["returncode"], (rec["stdout"] or "") + (rec["stderr"] or "")
     except Exception as exc:  # pragma: no cover - defensive
         return -1, str(exc)
 
@@ -248,6 +349,30 @@ def save_sessions(records) -> None:
 
 
 def pid_alive(pid) -> bool:
+    if os.name == "nt":
+        # Windows os.kill(pid, 0) is unreliable (EINVAL for processes outside
+        # the current session/elevation). Use OpenProcess + GetExitCodeProcess:
+        # deterministic, read-only, no kill semantics.
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            SYNCHRONIZE = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+                False,
+                int(pid),
+            )
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                    handle, ctypes.byref(code))
+                return bool(ok) and code.value == 259  # STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:  # pragma: no cover - defensive
+            return False
     try:
         os.kill(int(pid), 0)
         return True

@@ -13,7 +13,11 @@ Hard rules under test:
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+from telegram import ReplyKeyboardMarkup
+from telegram.error import BadRequest
 
 from conftest import (
     OWNER_ID,
@@ -167,6 +171,35 @@ def test_finance_button_live_ux_failure_repro_edits_status_in_place(make_app):
     edit = env.bot.last_edit()
     assert edit["message_id"] == status["message_id"]  # same message mutated
     assert "\u8d22\u52a1" in edit["text"]
+
+
+def test_fakebot_mirrors_telegram_reply_keyboard_edit_semantics(make_app):
+    """G1 semantic guardrail (OWNER-UX-FAILURE-LIVE-TRACE-001): FakeBot must
+    mirror real Telegram - a message sent with a non-inline ReplyKeyboardMarkup
+    is NOT editable (400 'Message can't be edited'), while a plain message is.
+    Deleting this semantic to 'make tests pass' must fail the guardrail scan."""
+    env = make_app()
+
+    async def _probe():
+        kb_sent = await env.bot.send_message(
+            1, "status", reply_markup=ReplyKeyboardMarkup([["x"]])
+        )
+        try:
+            await env.bot.edit_message_text(
+                "edit", chat_id=1, message_id=kb_sent.message_id
+            )
+            kb_outcome = "editable"
+        except BadRequest as exc:
+            kb_outcome = str(exc)
+        plain_sent = await env.bot.send_message(1, "status")
+        await env.bot.edit_message_text(
+            "edit", chat_id=1, message_id=plain_sent.message_id
+        )
+        return kb_outcome, "edited"
+
+    kb_outcome, plain_outcome = asyncio.run(_probe())
+    assert kb_outcome == "Message can't be edited"
+    assert plain_outcome == "edited"
 
 
 def test_free_text_still_reaches_nl_bridge(make_app, monkeypatch):
