@@ -85,9 +85,17 @@ def test_reply_keyboard_role_specific_labels():
     owner_labels = [b.text for row in owner.keyboard for b in row]
     sec_labels = [b.text for row in secretary.keyboard for b in row]
     assert owner_labels == ["🏠 房源", "✅ 待办", "💰 财务", "☰ 更多"]
-    assert sec_labels == ["🏠 Properties", "✅ Tasks", "💰 Finance", "☰ More"]
+    # SLICE3-UX-PERSISTENT-MENU-001 baseline: Secretary English 7-key layout.
+    assert sec_labels == [
+        "🏠 Properties", "👥 Tenants",
+        "💵 Rent", "✅ Tasks",
+        "🔧 Maintenance", "📋 Records",
+        "⚠️ Overdue",
+    ]
     assert owner.resize_keyboard is True
     assert secretary.resize_keyboard is True
+    assert owner.is_persistent is True
+    assert secretary.is_persistent is True
 
 
 # --- human-readable cards ----------------------------------------------------

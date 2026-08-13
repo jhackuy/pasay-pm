@@ -6,8 +6,13 @@ STRINGS: dict[str, dict[str, str]] = {
     "zh": {
         'menu.title': '主菜单',
         'menu.hint': '请选择功能：',
+        # SLICE3-UX-PERSISTENT-MENU-002: auto-restored persistent menu.
+        'menu.ready': '✅ 菜单已就绪，点下方按钮即可使用。',
         'menu.tenants_hint': '👥 租客查询：直接输入租客姓名即可查询交租状态（例如“John 交了吗”“这个月谁还没交”）。\n也可查看 🏠 房源 或 ⚠️ 逾期。',
         'menu.maintenance_hint': '🔧 维修事项统一在 ✅ 待办（待办中心）里处理。\n也可直接问运营助手（/copilot），例如“这个月维修费多少？”。',
+        # SLICE3-UX-PERSISTENT-MENU-002: group new-member neutral welcome.
+        'group.welcome': '🎉 欢迎加入 Pasay 群组！',
+        'group.private_hint': '如需使用功能菜单，请在私聊中打开本机器人并点击 Start 按钮（无需手动输入命令）。',
         'nav.properties': '🏘 房源',
         'nav.finance': '📊 财务',
         'nav.overdue': '⚠️ 逾期',
@@ -320,8 +325,13 @@ STRINGS: dict[str, dict[str, str]] = {
     "en": {
         'menu.title': 'Main Menu',
         'menu.hint': 'Choose an option:',
+        # SLICE3-UX-PERSISTENT-MENU-002: auto-restored persistent menu.
+        'menu.ready': '✅ Menu is ready — tap the buttons below.',
         'menu.tenants_hint': '👥 Tenant status: type a tenant name directly (e.g. “has John paid?” or “who hasn’t paid this month?”).\nYou can also check 🏠 Properties or ⚠️ Overdue.',
         'menu.maintenance_hint': '🔧 Maintenance jobs are handled in ✅ Tasks (to-do center).\nYou can also ask the assistant (/copilot), e.g. “maintenance cost this month?”',
+        # SLICE3-UX-PERSISTENT-MENU-002: group new-member neutral welcome.
+        'group.welcome': '🎉 Welcome to the Pasay group!',
+        'group.private_hint': 'To use the menu, open this bot in a private chat and tap the Start button (no need to type a command).',
         'nav.properties': '🏘 Properties',
         'nav.finance': '📊 Finance',
         'nav.overdue': '⚠️ Overdue',
