@@ -57,7 +57,11 @@ from app.services.operations.scheduler import run_scheduler_once
 from app.services.audit import set_audit_context
 
 API = "/api/v1"
-NOW = datetime(2026, 8, 12, 9, 30, 0, tzinfo=timezone.utc)  # 17:30 Asia/Manila
+# Anchored to the real clock at import so due_at=NOW+1d is always in the
+# future and expires_at=NOW-1min is always in the past regardless of when
+# the suite runs (the fixed dates previously went stale and failed with
+# "due_at must be in the future").
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 # ---------------------------------------------------------------------------

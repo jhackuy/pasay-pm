@@ -25,9 +25,9 @@ from conftest import (
 
 GROUP_CHAT_ID = -1001234567890
 
-# WIN-SINGLE-NODE-MIGRATION-001 / BOT-V1-USABLE-001: Windows baseline uses one
-# identical 4-button persistent menu for both roles (home/todo/rent/expense).
-OWNER_LABELS = ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
+# PASAY-V2-FOUNDATION-001: one identical 4-button English Quick View menu
+# for every role (Properties / Tasks / Rent / Expense), is_persistent=True.
+OWNER_LABELS = ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
 SECRETARY_LABELS = OWNER_LABELS
 
 FORBIDDEN_PROMPTS = (
@@ -107,8 +107,8 @@ def test_start_still_works_regression(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     send = env.bot.last_send()
-    # BOT-V1 home is the live summary card (not the SLICE3 dashboard title).
-    assert "Pasay Property" in send["text"]
+    # V2: /start is technical recovery only and shows the short greeting.
+    assert "Hello" in send["text"]
     assert _labels(send["reply_markup"]) == OWNER_LABELS
     assert send["reply_markup"].is_persistent is True
     _assert_no_start_prompt("\n".join(env.bot.all_texts()))
@@ -123,8 +123,8 @@ def test_identified_user_any_message_restores_menu(make_app):
     assert len(reply_sends) == 1
     assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
     assert reply_sends[0]["reply_markup"].is_persistent is True
-    # the normal processing still happened (unknown-message answer)
-    assert any("按钮" in (s["text"] or "") for s in env.bot.sends())
+    # the normal processing still happened (V2 short greeting answer)
+    assert any("Hello" in (s["text"] or "") for s in env.bot.sends())
     _assert_no_start_prompt("\n".join(env.bot.all_texts()))
 
 
@@ -181,10 +181,10 @@ def test_start_menu_init_independent_of_dashboard_failure(make_app):
     env.backend.fail_status["/reports/financial-summary"] = 500
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot)])
     sends = env.bot.sends()
-    assert len(sends) == 2
-    assert "获取数据失败" in sends[0]["text"]
-    assert sends[0]["reply_markup"].__class__.__name__ == "InlineKeyboardMarkup"
-    assert _labels(sends[1]["reply_markup"]) == OWNER_LABELS
+    # V2 greeting never depends on the financial dashboard.
+    assert len(sends) == 1
+    assert "Hello" in sends[0]["text"]
+    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
 
 
 def test_message_menu_init_independent_of_dashboard_failure(make_app):
@@ -194,7 +194,7 @@ def test_message_menu_init_independent_of_dashboard_failure(make_app):
     reply_sends = _reply_sends(env)
     assert len(reply_sends) == 1
     assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
-    assert any("获取数据失败" in (s["text"] or "") for s in env.bot.sends())
+    assert any("Hello" in (s["text"] or "") for s in env.bot.sends())
 
 
 # --- Owner / Secretary share the BOT-V1 menu --------------------------------
@@ -214,9 +214,9 @@ def test_owner_and_secretary_share_bot_v1_menu(make_app):
     assert len(reply_sends) == 2
     assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
     assert _labels(reply_sends[1]["reply_markup"]) == SECRETARY_LABELS
-    # Identical BOT-V1 menu: neither message contains legacy SLICE3 labels.
-    assert "房源" not in reply_sends[1]["text"]
-    assert "Properties" not in reply_sends[0]["text"]
+    # Identical V2 English Quick View menu for both roles.
+    assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
+    assert _labels(reply_sends[1]["reply_markup"]) == SECRETARY_LABELS
 
 
 # --- group new-member onboarding (fail-closed) -------------------------------
@@ -227,9 +227,9 @@ def test_new_member_unknown_gets_neutral_welcome_only(make_app):
     sends = env.bot.sends()
     assert len(sends) == 1
     text = sends[0]["text"]
-    assert "欢迎" in text
-    assert sends[0]["reply_markup"] is None  # never any menu broadcast
-    assert "private_hint" not in text
+    assert "Welcome" in text and "欢迎" in text
+    # V2: the neutral fixed keyboard is attached (same menu for every role).
+    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
     _assert_no_start_prompt(text)
 
 
@@ -239,9 +239,9 @@ def test_new_member_identified_gets_neutral_welcome_no_role_menu(make_app):
     sends = env.bot.sends()
     assert len(sends) == 1
     text = sends[0]["text"]
-    assert "欢迎" in text
-    assert "私聊" in text  # private-chat deep-link hint
-    assert sends[0]["reply_markup"] is None  # fail closed: no Owner menu in group
+    assert "Welcome" in text and "欢迎" in text
+    # Same neutral fixed menu as every other group member (no role leak).
+    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
     for label in OWNER_LABELS:
         assert label not in text
     _assert_no_start_prompt(text)
@@ -252,15 +252,19 @@ def test_new_member_join_dedupes_multi_member_event(make_app):
     run_updates(env, [make_join_update([OWNER_ID, SECRETARY_ID], GROUP_CHAT_ID, bot=env.bot)])
     sends = env.bot.sends()
     assert len(sends) == 1  # one welcome per join event, no per-member spam
-    assert "私聊" in sends[0]["text"]
-    assert sends[0]["reply_markup"] is None
+    assert "Welcome" in sends[0]["text"] and "欢迎" in sends[0]["text"]
+    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
 
 
-def test_group_text_message_never_broadcasts_menu(make_app):
+def test_group_text_message_self_heals_neutral_menu(make_app):
+    """PASAY-V2-FOUNDATION-001: group text self-heals the neutral fixed
+    keyboard (same English Quick View menu for every role; no role leak)."""
     env = make_app()
     run_updates(
         env,
         [make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "hello", bot=env.bot)],
     )
-    assert _reply_sends(env) == []
+    reply_sends = _reply_sends(env)
+    assert len(reply_sends) == 1
+    assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
     assert "menu.ready" not in "\n".join(env.bot.all_texts())

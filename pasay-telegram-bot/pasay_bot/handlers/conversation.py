@@ -32,7 +32,7 @@ from pasay_bot.roles import (
     PERMISSION_OPERATIONS,
     PERMISSION_RENT_CONFIRM,
     has_permission,
-    locale_for,
+    locale_for_chat,
     role_for_telegram_id,
 )
 
@@ -57,6 +57,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store = context.bot_data["store"]
     text = (update.effective_message.text or "").strip()
 
+    # PASAY-V2-FOUNDATION-001: remember groups so the daily digest + next_check
+    # reminders have a delivery target (never spam; groups only).
+    if update.effective_chat.type in ("group", "supergroup"):
+        store.remember_group(chat_id, title=(update.effective_chat.title or ""))
+
     # Fixed bottom Reply Keyboard buttons are exact-match UI commands: they
     # are routed deterministically BEFORE any conversation-state or NL/LLM
     # processing can run (buttons are never natural language).
@@ -68,7 +73,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     role = role_for_telegram_id(user_id)
-    locale = locale_for(role)
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
 
     if text.lower() in ("取消", "cancel", "quit", "exit"):
         conv = store.get_conversation(chat_id, user_id)

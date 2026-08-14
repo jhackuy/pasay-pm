@@ -42,7 +42,9 @@ def _find_button(kb, label):
 
 
 def _open_ops(env):
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/ops", bot=env.bot)])
+    # PASAY-V2-FOUNDATION-001: /ops is pruned; the "tasks"/"todo" text keyword
+    # still opens the unified Tasks page through the deterministic NL route.
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "tasks", bot=env.bot)])
     return env.bot.last_send()
 
 
@@ -62,7 +64,7 @@ def test_dashboard_uses_persistent_todo_nav(make_app):
     kb = env.bot.last_send()["reply_markup"]
     assert kb.__class__.__name__ == "ReplyKeyboardMarkup"
     labels = [b.text for row in kb.keyboard for b in row]
-    assert "✅ 待办" in labels
+    assert "✅ Tasks" in labels
     assert "📋 待办中心" not in labels  # no longer a primary nav entry
 
 
@@ -232,7 +234,7 @@ def test_secretary_can_view_ops(make_app):
     """SECRETARY (manager-level) can open the task center."""
     env = make_app()
     env.backend.add_ops_task(task_id=1, due_at=f"{TODAY}T00:00:00+08:00")
-    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/ops", bot=env.bot)])
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "tasks", bot=env.bot)])
     send = env.bot.last_send()
-    # V1.3: /ops opens the unified Tasks page; SECRETARY locale is English.
+    # V1.3: the tasks keyword opens the unified Tasks page; SECRETARY locale is English.
     assert "<b>✅ Tasks</b>" in send["text"]

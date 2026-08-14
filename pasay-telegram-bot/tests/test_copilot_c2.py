@@ -65,8 +65,16 @@ def _expected_due(iso: str) -> str:
 
 def _open_followup_confirm(env):
     """TODAY -> [1 为什么?] -> WHY -> [📞 安排秘书跟进] -> confirmation card."""
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/copilot", bot=env.bot)])
-    today = env.bot.last_send()
+    # PASAY-V2-FOUNDATION-001: /copilot is pruned; open TODAY via the
+    # dashboard "更多" fallback's 🤖 运营助手 nav button.
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "更多", bot=env.bot)])
+    dashboard = env.bot.last_send()
+    copilot_btn = _find_button(dashboard["reply_markup"], "🤖 运营助手")
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, copilot_btn.callback_data, bot=env.bot)],
+    )
+    today = env.bot.last_edit()
     why_btn = _find_button(today["reply_markup"], "1 为什么?")
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, why_btn.callback_data, bot=env.bot)])
     follow = _find_button(env.bot.last_edit()["reply_markup"], "📞 安排秘书跟进")
@@ -310,8 +318,14 @@ def test_copilot_followup_confirm_flow(make_app):
 def test_copilot_snooze_entry_preset_and_execute(make_app):
     env = make_app()
     backend = env.backend
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/copilot", bot=env.bot)])
-    today = env.bot.last_send()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "更多", bot=env.bot)])
+    dashboard = env.bot.last_send()
+    copilot_btn = _find_button(dashboard["reply_markup"], "🤖 运营助手")
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, copilot_btn.callback_data, bot=env.bot)],
+    )
+    today = env.bot.last_edit()
     why_btn = _find_button(today["reply_markup"], "2 为什么?")  # task item
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, why_btn.callback_data, bot=env.bot)])
     snooze = _find_button(env.bot.last_edit()["reply_markup"], "⏰ 明天再提醒")
@@ -440,8 +454,14 @@ def test_copilot_notify_retry_409_human_card(make_app):
 
 def test_copilot_why_suggestions_owner_only_and_forged_confirm_refused(make_app):
     env = make_app()
-    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/copilot", bot=env.bot)])
-    today = env.bot.last_send()
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "更多", bot=env.bot)])
+    dashboard = env.bot.last_send()
+    copilot_btn = _find_button(dashboard["reply_markup"], "🤖 Operations Assistant")
+    run_updates(
+        env,
+        [make_callback_update(SECRETARY_ID, SECRETARY_ID, copilot_btn.callback_data, bot=env.bot)],
+    )
+    today = env.bot.last_edit()
     why_btn = today["reply_markup"].inline_keyboard[0][0]  # secretary locale: "1 Why?"
     run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, why_btn.callback_data, bot=env.bot)])
     labels = _button_labels(env.bot.last_edit()["reply_markup"])

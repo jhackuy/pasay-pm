@@ -43,6 +43,10 @@ class AuditAction(str, Enum):
     copilot_proposal_executed = "copilot_proposal_executed"
     copilot_proposal_execution_rejected = "copilot_proposal_execution_rejected"
     task_reassigned = "task_reassigned"
+    # PASAY-V2-FOUNDATION-001 (appended only).
+    task_updated = "task_updated"
+    task_completed_via_approval = "task_completed_via_approval"
+    task_completed_via_rejection = "task_completed_via_rejection"
 
 
 class AuditLog(AuditMixin, Base):

@@ -119,19 +119,18 @@ def test_rent_callback(make_app):
 
 
 def test_commands_and_menu(make_app):
-    """★ B1: /start renders the P0 home summary with real data."""
+    """★ B1: /start is the short greeting; text keywords still route to the
+    deterministic read pages (finance / overdue / properties)."""
     env = make_app()
     updates = [
         make_text_update(OWNER_ID, OWNER_ID, "/start", bot=env.bot),
-        make_text_update(OWNER_ID, OWNER_ID, "/finance", message_id=2, update_id=2, bot=env.bot),
-        make_text_update(OWNER_ID, OWNER_ID, "/overdue", message_id=3, update_id=3, bot=env.bot),
-        make_text_update(OWNER_ID, OWNER_ID, "/properties", message_id=4, update_id=4, bot=env.bot),
+        make_text_update(OWNER_ID, OWNER_ID, "finance", message_id=2, update_id=2, bot=env.bot),
+        make_text_update(OWNER_ID, OWNER_ID, "overdue", message_id=3, update_id=3, bot=env.bot),
+        make_text_update(OWNER_ID, OWNER_ID, "properties", message_id=4, update_id=4, bot=env.bot),
     ]
     run_updates(env, updates)
     start_text = env.bot.sends()[0]["text"]
-    assert "Pasay Property" in start_text
-    assert "本月已收" in start_text
-    assert "未收租：2 套" in start_text
+    assert "Hello" in start_text
     texts = "".join(env.bot.all_texts())
     assert "2026年8月财务" in texts
     assert "逾期租金 · 2笔" in texts
@@ -140,7 +139,7 @@ def test_commands_and_menu(make_app):
 
 def test_overdue_escape_and_action_buttons(make_app):
     env = make_app()
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/overdue", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "overdue", bot=env.bot)])
     text = env.bot.last_send()["text"]
     # tenant name with HTML-ish content must be escaped
     assert "Maria &lt;Admin&gt;" in text
@@ -566,9 +565,9 @@ def test_crash_after_write_restart_no_duplicate(make_app, tmp_path):
 # --- F4: read paths are permission-gated ---
 
 def test_unknown_user_read_refused(make_app):
-    """★ F4: unknown users cannot read /finance (command or nav callback)."""
+    """★ F4: unknown users cannot read finance (text route or nav callback)."""
     env = make_app()
-    run_updates(env, [make_text_update(UNKNOWN_ID, UNKNOWN_ID, "/finance", bot=env.bot)])
+    run_updates(env, [make_text_update(UNKNOWN_ID, UNKNOWN_ID, "finance", bot=env.bot)])
     assert env.backend.count_calls("GET", "/reports/financial-summary") == 0
     assert "无权限" in "".join(env.bot.all_texts())
 
@@ -584,7 +583,7 @@ def test_owner_and_secretary_can_read(make_app):
     """★ F4: OWNER and SECRETARY keep read access (zh for OWNER, en for SECRETARY)."""
     for user_id, marker in ((OWNER_ID, "财务"), (SECRETARY_ID, "Finance")):
         env = make_app()
-        run_updates(env, [make_text_update(user_id, user_id, "/finance", bot=env.bot)])
+        run_updates(env, [make_text_update(user_id, user_id, "finance", bot=env.bot)])
         assert env.backend.count_calls("GET", "/reports/financial-summary") == 1
         assert marker in "".join(env.bot.all_texts())
 
@@ -592,13 +591,13 @@ def test_owner_and_secretary_can_read(make_app):
 # --- F5: OWNER confirms SECRETARY-recorded pending via /pending ---
 
 def test_owner_confirms_secretary_pending_via_pending_command(make_app):
-    """★ F5: SECRETARY records pending; OWNER confirms it from /pending."""
+    """★ F5: SECRETARY records pending; OWNER confirms it from the pending page."""
     env = make_app()
     data = _run_rent_to_confirm(env, user_id=SECRETARY_ID, chat_id=SECRETARY_ID)
     run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, data, bot=env.bot)])
     assert env.backend.incomes[0]["status"] == "pending"
 
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/pending", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "pending", bot=env.bot)])
     send = env.bot.last_send()
     assert "待确认收款" in send["text"]
     kb = send["reply_markup"]
@@ -627,7 +626,7 @@ def test_secretary_pending_list_has_no_confirm_buttons(make_app):
     Owner's decision rows (pending income etc.) never appear with confirm."""
     env = make_app()
     env.backend.add_income(status="pending", income_id=1)
-    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "/pending", bot=env.bot)])
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "pending", bot=env.bot)])
     send = env.bot.last_send()
     assert "Tasks" in send["text"]  # SECRETARY locale is en (✅ Tasks title)
     assert "Pending income" not in send["text"]  # not her decision

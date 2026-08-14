@@ -116,7 +116,7 @@ from pasay_bot.roles import (
     Role,
     has_permission,
     has_read_permission,
-    locale_for,
+    locale_for_chat,
     role_for_telegram_id,
 )
 
@@ -153,7 +153,10 @@ async def _answer(update: Update, text: str, *, durable: bool = False, keyboard=
         pass
     if durable and text:
         user = update.effective_user
-        locale = locale_for(role_for_telegram_id(user.id if user else None))
+        locale = locale_for_chat(
+            update.effective_chat.type if update.effective_chat else None,
+            role_for_telegram_id(user.id if user else None),
+        )
         try:
             await edit_message_text_or_send(
                 update.get_bot(),
@@ -245,7 +248,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id if user else None
     role = role_for_telegram_id(user_id)
-    locale = locale_for(role)
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
     outcome, detail = "ok", ""
     try:
         await _dispatch_callback(update, context, parsed, role, locale)

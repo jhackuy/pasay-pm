@@ -101,6 +101,21 @@ def locale_for(role: Optional[Role]) -> str:
     return ROLE_LOCALES.get(role, "zh")
 
 
+GROUP_CHAT_TYPES = frozenset({"group", "supergroup"})
+
+
+def locale_for_chat(chat_type: Optional[str], role: Optional[Role]) -> str:
+    """PASAY-V2-FOUNDATION-001 locale resolver.
+
+    Groups/supergroups are always bilingual (English + 中文) because the fixed
+    menu is shared by every member; private chats keep the role locale
+    (Secretary English only, Owner Chinese-first).
+    """
+    if chat_type in GROUP_CHAT_TYPES:
+        return "bi"
+    return locale_for(role)
+
+
 def permissions_for_api_role(api_role: Optional[str]) -> frozenset[str]:
     """Permission set that the backend would grant for a given API-key role."""
     if api_role is None:

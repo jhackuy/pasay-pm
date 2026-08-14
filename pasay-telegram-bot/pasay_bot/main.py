@@ -61,18 +61,13 @@ def build_application(
     # Code-side handler latency instrumentation (never an LLM judgment).
     app.bot_data["latency"] = LatencyTracker()
 
+    # PASAY-V2-FOUNDATION-001: only rescue commands remain on the slash menu.
+    # Business commands (/rent, /expense, /properties, /tasks, /help, ...)
+    # are handled by the fixed keyboard / normal chat instead — users never
+    # need to know /start.
     app.add_handler(CommandHandler("start", commands.cmd_start))
-    app.add_handler(CommandHandler("menu", commands.cmd_menu))
     app.add_handler(CommandHandler("help", commands.cmd_help))
-    app.add_handler(CommandHandler("properties", commands.cmd_properties))
-    app.add_handler(CommandHandler("finance", commands.cmd_finance))
-    app.add_handler(CommandHandler("overdue", commands.cmd_overdue))
-    app.add_handler(CommandHandler("rent", commands.cmd_rent))
-    app.add_handler(CommandHandler("pending", commands.cmd_pending))
     app.add_handler(CommandHandler("cancel", commands.cmd_cancel))
-    app.add_handler(CommandHandler("ops", commands.cmd_ops))
-    app.add_handler(CommandHandler("todo", commands.cmd_todo))
-    app.add_handler(CommandHandler("copilot", commands.cmd_copilot))
     # SLICE3-UX-PERSISTENT-MENU-002: group new-member onboarding (neutral
     # welcome only; ReplyKeyboardMarkup is per-chat, so no role menu broadcast).
     app.add_handler(
@@ -80,8 +75,38 @@ def build_application(
             filters.StatusUpdate.NEW_CHAT_MEMBERS, commands.handle_new_chat_members
         )
     )
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.ALL, commands.handle_media_message
+        )
+    )
     app.add_handler(CallbackQueryHandler(callback_handlers.handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, conversation.handle_message))
+
+    # PASAY-V2-FOUNDATION-001: daily digest + next_check reminders live in
+    # pasay_bot/jobs.py (Subagent C). The seam below keeps the wiring
+    # decoupled so the app stays runnable while the module lands in parallel.
+    try:
+        from pasay_bot import jobs
+
+        jobs.register_jobs(app, api_client, store, settings)
+    except Exception as exc:  # noqa: BLE001 - wiring must never block startup
+        logger.warning("jobs.register_jobs failed: %s", exc)
+
+    async def _set_rescue_command_menu(app_):
+        """Advertise ONLY the rescue commands in the BotFather menu."""
+        try:
+            await app_.bot.set_my_commands(
+                [
+                    ("start", "Start (recovery)"),
+                    ("help", "Help"),
+                    ("cancel", "Cancel"),
+                ]
+            )
+        except Exception as exc:  # noqa: BLE001 - cosmetic, never fatal
+            logger.warning("set_my_commands failed: %s", exc)
+
+    app.post_init = _set_rescue_command_menu
     return app
 
 

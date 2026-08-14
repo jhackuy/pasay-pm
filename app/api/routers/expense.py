@@ -7,10 +7,16 @@ from sqlalchemy.orm import Session
 from app.api.deps import admin_only, get_current_user, manager_or_admin
 from app.database import get_db
 from app.models.financial import Expense, ExpenseStatus
+from app.models.operations import (
+    OperationalTask,
+    OperationalTaskStatus,
+    OperationalTaskType,
+)
 from app.models.property import Unit
 from app.models.user import User
 from app.schemas.financial import ExpenseCreate, ExpenseRead, ExpenseUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.operations.redelivery import suppress_pending_redeliveries
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
@@ -45,6 +51,53 @@ def _guard_edit(obj: Expense, updates: dict) -> None:
                 status.HTTP_409_CONFLICT,
                 "Cannot change the amount of an approved/paid expense; reject or reverse first",
             )
+
+
+def _complete_linked_approval_task(
+    db: Session,
+    expense: Expense,
+    *,
+    actor_id: int,
+    reason: str,
+) -> None:
+    """PASAY-V2-FOUNDATION-001: closing an expense approval also closes the
+    linked APPROVAL_PENDING operational task atomically in the same
+    transaction (single source of truth; the bot never does this itself)."""
+    now = datetime.now(timezone.utc)
+    task = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.source_type == "expense",
+            OperationalTask.source_id == expense.id,
+            OperationalTask.task_type == OperationalTaskType.APPROVAL_PENDING,
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .first()
+    )
+    if task is None:
+        return
+    old = serialize_row(task)
+    task.status = OperationalTaskStatus.COMPLETED
+    task.completed_at = now
+    task.completed_by = actor_id
+    task.reminder_generation = task.reminder_generation + 1
+    task.updated_by = actor_id
+    db.flush()
+    record_audit(
+        db,
+        table_name="operational_tasks",
+        record_id=task.id,
+        action=f"task_completed_via_{reason}",
+        actor_id=actor_id,
+        changed_fields={"status": [old.get("status"), "COMPLETED"]},
+        old_value=old,
+        new_value=serialize_row(task),
+    )
+    suppress_pending_redeliveries(
+        db, task.id, actor_id=actor_id, reason=f"expense_{reason}", now=now
+    )
 
 
 @router.get("", response_model=list[ExpenseRead])
@@ -155,6 +208,9 @@ def approve_expense(
     )
     if result.rowcount == 1:
         db.refresh(obj)
+        _complete_linked_approval_task(
+            db, obj, actor_id=user.id, reason="approval"
+        )
         record_audit(
             db,
             table_name="expenses",
@@ -201,6 +257,9 @@ def reject_expense(
     )
     if result.rowcount == 1:
         db.refresh(obj)
+        _complete_linked_approval_task(
+            db, obj, actor_id=user.id, reason="rejection"
+        )
         record_audit(
             db,
             table_name="expenses",

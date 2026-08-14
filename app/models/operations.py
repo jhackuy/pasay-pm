@@ -43,6 +43,7 @@ class OperationalTaskType(str, Enum):
 
 class OperationalTaskStatus(str, Enum):
     PENDING = "PENDING"
+    IN_PROGRESS = "IN_PROGRESS"
     COMPLETED = "COMPLETED"
     CANCELLED = "CANCELLED"
 
@@ -79,7 +80,7 @@ class OperationalTask(AuditMixin, Base):
             name="ck_operational_tasks_task_type",
         ),
         CheckConstraint(
-            "status IN ('PENDING','COMPLETED','CANCELLED')",
+            "status IN ('PENDING','IN_PROGRESS','COMPLETED','CANCELLED')",
             name="ck_operational_tasks_status",
         ),
         CheckConstraint(
@@ -126,6 +127,16 @@ class OperationalTask(AuditMixin, Base):
     reminder_generation: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    # PASAY-V2-FOUNDATION-001: V2 task core fields (next action / next check /
+    # context / completion condition / source event). All nullable so existing
+    # scheduler-generated tasks and row insert paths remain back-compatible.
+    next_action: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    next_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    context: Mapped[str | None] = mapped_column(Text, nullable=True)
+    completion_condition: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    source_event: Mapped[str | None] = mapped_column(String(500), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -2,8 +2,9 @@
 
 The persistent Reply Keyboard is a set of UI commands, not natural language.
 ``handle_fixed_menu_button`` exact-matches a route produced by
-``keyboards.fixed_menu_route_for`` and dispatches straight to the same
-deterministic page builders the commands use. It is called from
+``keyboards.fixed_menu_route_for`` and dispatches straight to the
+deterministic Quick View page builders (V2) or the legacy pages for old
+aliases. It is called from
 ``conversation.handle_message`` BEFORE any NL/NLU/LLM path can run.
 """
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pasay_bot.render import html as H
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
     has_read_permission,
-    locale_for,
+    locale_for_chat,
     role_for_telegram_id,
 )
 
@@ -39,8 +40,13 @@ HTML = "HTML"
 # therefore sent WITHOUT reply_markup; the persistent keyboard remains pinned
 # client-side because it was previously sent with is_persistent=True.
 _SLOW_ROUTES = frozenset(
-    {"home", "properties", "finance", "overdue", "rent", "pending", "expense", "more"}
+    {"home", "finance", "overdue", "pending", "more"}
 )
+
+# PASAY-V2-FOUNDATION-001: the four fixed buttons are fast deterministic
+# Quick Views (single backend read, target < 1s) — they render directly and
+# never show the processing stub.
+_QUICK_ROUTES = frozenset({"properties", "tasks", "rent", "expense"})
 
 
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:
@@ -57,7 +63,9 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
     started = time.monotonic()
     user = update.effective_user
     role = role_for_telegram_id(user.id if user else None)
-    locale = locale_for(role)
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
     chat_id = update.effective_chat.id if update.effective_chat else (user.id if user else None)
     if chat_id is None:
         _track(context, route, (time.monotonic() - started) * 1000, outcome="no_chat")
@@ -83,22 +91,24 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
             message_id = status.message_id
         else:
             message_id = None
-        if route == "home":
+        if route in _QUICK_ROUTES:
+            # Fast deterministic Quick View: single reply, no stub message.
+            if route == "properties":
+                await pages.show_quick_properties(context, chat_id, role, locale)
+            elif route == "tasks":
+                await pages.show_quick_tasks(context, chat_id, role, locale)
+            elif route == "rent":
+                await pages.show_quick_rent(context, chat_id, role, locale)
+            else:  # expense
+                await pages.show_quick_expense(context, chat_id, role, locale)
+        elif route == "home":
             await pages.show_home(context, chat_id, role, locale, message_id=message_id)
-        elif route == "properties":
-            await pages.show_properties(
-                context, chat_id, role, locale, page=1, message_id=message_id
-            )
         elif route == "finance":
             await pages.show_finance(context, chat_id, locale, message_id=message_id)
         elif route == "overdue":
             await pages.show_overdue(
                 context, chat_id, locale, page=1, message_id=message_id
             )
-        elif route == "rent":
-            await pages.show_rent(context, chat_id, locale, message_id=message_id)
-        elif route == "expense":
-            await pages.show_expense(context, chat_id, locale, message_id=message_id)
         elif route == "pending":
             await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
         elif route == "more":

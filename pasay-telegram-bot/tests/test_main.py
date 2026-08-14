@@ -22,4 +22,5 @@ def test_build_application_registers_handlers(make_app):
             name = type(h).__name__
             if name == "CommandHandler":
                 commands.extend(h.commands)
-    assert {"start", "menu", "help", "properties", "finance", "overdue", "rent", "cancel"} <= set(commands)
+    # PASAY-V2-FOUNDATION-001: only rescue commands remain registered.
+    assert {"start", "help", "cancel"} <= set(commands)

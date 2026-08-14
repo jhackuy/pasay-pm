@@ -609,6 +609,11 @@ def test_unknown_provider_and_missing_key(monkeypatch):
         llm.get_llm_client("not-a-provider")
     monkeypatch.setenv("COPILOT_LLM_API_KEY", "")
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    # The deployment .env may set per-provider keys; the missing-key path
+    # must be tested with every key source cleared.
+    monkeypatch.delenv("COPILOT_LLM_DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("COPILOT_LLM_DEEPSEEK_PRO_API_KEY", raising=False)
+    monkeypatch.delenv("COPILOT_LLM_DEEPSEEK_CHAT_API_KEY", raising=False)
     config = llm.provider_config("deepseek")
     assert config.api_key == ""
     with pytest.raises(LLMProviderError, match="no API key"):

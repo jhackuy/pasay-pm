@@ -45,9 +45,23 @@ CREATE TABLE IF NOT EXISTS rent_status_selectors (
   created_at   TEXT NOT NULL,
   expires_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS v2_context (
+  chat_id      TEXT NOT NULL,
+  user_id      TEXT NOT NULL,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  updated_at   TEXT NOT NULL,
+  expires_at   TEXT NOT NULL,
+  PRIMARY KEY (chat_id, user_id)
+);
+CREATE TABLE IF NOT EXISTS known_groups (
+  chat_id      TEXT PRIMARY KEY,
+  title        TEXT NOT NULL DEFAULT '',
+  first_seen   TEXT NOT NULL
+);
 """
 
 DEFAULT_CONVERSATION_TTL = 900        # 15 minutes
+DEFAULT_V2_CONTEXT_TTL = 3600         # 60 minutes (short-term conversation)
 DEFAULT_IDEMPOTENCY_TTL = 7 * 86400   # 7 days (longer than card TTL)
 DEFAULT_IN_FLIGHT_TTL = 120           # in_flight stale window (crash recovery)
 
@@ -186,6 +200,98 @@ class StateStore:
                 (str(chat_id), str(user_id)),
             )
             self._conn.commit()
+
+    # --- PASAY-V2-FOUNDATION-001: short-term conversation context -----------
+    # (chat_id, user_id) -> {task_ref, property_ref, intent, ...} so follow-up
+    # messages ("coming tomorrow") attach to the active event without re-asking
+    # which property. TTL is 60 minutes; context never holds secrets.
+    def save_v2_context(
+        self,
+        chat_id: Any,
+        user_id: Any,
+        payload: Optional[dict] = None,
+        ttl_seconds: int = DEFAULT_V2_CONTEXT_TTL,
+    ) -> None:
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO v2_context
+                  (chat_id, user_id, payload_json, updated_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                  payload_json=excluded.payload_json,
+                  updated_at=excluded.updated_at,
+                  expires_at=excluded.expires_at
+                """,
+                (
+                    str(chat_id),
+                    str(user_id),
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    str(now),
+                    str(now + ttl_seconds),
+                ),
+            )
+            self._conn.commit()
+
+    def get_v2_context(self, chat_id: Any, user_id: Any) -> Optional[dict]:
+        now = int(time.time())
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM v2_context WHERE chat_id=? AND user_id=?",
+                (str(chat_id), str(user_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            if int(row["expires_at"]) < now:
+                self._conn.execute(
+                    "DELETE FROM v2_context WHERE chat_id=? AND user_id=?",
+                    (str(chat_id), str(user_id)),
+                )
+                self._conn.commit()
+                return None
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            return {
+                "payload": payload,
+                "updated_at": row["updated_at"],
+                "expires_at": row["expires_at"],
+            }
+
+    def clear_v2_context(self, chat_id: Any, user_id: Any) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM v2_context WHERE chat_id=? AND user_id=?",
+                (str(chat_id), str(user_id)),
+            )
+            self._conn.commit()
+
+    # --- PASAY-V2-FOUNDATION-001: known group registry (daily digest) --------
+    def remember_group(self, chat_id: Any, title: str = "") -> None:
+        now = int(time.time())
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO known_groups (chat_id, title, first_seen)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title
+                """,
+                (str(chat_id), title, str(now)),
+            )
+            self._conn.commit()
+
+    def list_known_groups(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chat_id, title, first_seen FROM known_groups ORDER BY first_seen"
+            ).fetchall()
+            return [
+                {"chat_id": row["chat_id"], "title": row["title"] or "",
+                 "first_seen": row["first_seen"]}
+                for row in rows
+            ]
 
     # --- read-only rent status selectors (V1.3 Slice 2, Entry D) ------------
     # Each multi-match candidate card stores its candidate rows under a

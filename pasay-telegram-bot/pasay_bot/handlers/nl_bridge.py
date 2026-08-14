@@ -35,7 +35,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -69,6 +71,7 @@ from pasay_bot.roles import (
     has_permission,
     has_read_permission,
     locale_for,
+    locale_for_chat,
     role_for_telegram_id,
     telegram_id_for_role,
 )
@@ -128,6 +131,78 @@ _UNIT_TOKEN = re.compile(
     r")(?![A-Za-z0-9-])"
 )
 _NAME_TOKEN = re.compile(r"\b([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?)\b")
+
+# --- PASAY-V2-FOUNDATION-001: conversation -> Task (repair/maintenance) -----
+# "1680 aircon leaking" / "aircon leaking again" / "ac not cold" create an
+# AC_MAINTENANCE task; follow-ups ("technician coming tomorrow", "coming
+# tomorrow") attach to the short-term context; "finished"/"done" advance it.
+_MAINTENANCE_CN = (
+    "\u7a7a\u8c03", "\u51b7\u6c14", "\u7ef4\u4fee", "\u5b89\u88c5",
+    "\u6f0f\u6c34", "\u7535\u8def", "\u95e8\u9501", "\u7535\u6247", "\u9a6c\u6876",
+)
+_MAINTENANCE_EN = re.compile(
+    r"\b(aircon|ac\b|air\s*conditioner|leak|plumb|electric|repair|fix|broken|not\s+cold|maintenance)\b",
+    re.IGNORECASE,
+)
+_PROGRESS_CN = (
+    "\u660e\u5929", "\u4e0b\u5468", "\u660e\u5929\u6765", "\u5df2\u7ecf\u7ea6\u4e86",
+    "\u9884\u7ea6", "\u6392\u5728", "\u4eca\u5929\u6765", "\u5230\u4e86",
+    "\u6b63\u5728\u5904\u7406", "\u5904\u7406\u4e2d",
+)
+_PROGRESS_EN = re.compile(
+    r"\b(tomorrow|today|next\s+week|scheduled|scheduling|coming|on\s+the\s+way|arrived|arriving|started|in\s+progress|fixing|working\s+on)\b",
+    re.IGNORECASE,
+)
+_COMPLETE_CN = (
+    "\u5b8c\u6210", "\u641e\u5b9a", "\u4fee\u597d", "\u4fee\u5b8c",
+    "\u7ed3\u675f", "\u505a\u5b8c",
+)
+_COMPLETE_EN = re.compile(r"\b(finished|done|completed|fixed|working now|all good|resolved)\b", re.IGNORECASE)
+_CORRECTION_TASK_CN = re.compile(
+    r"\u4e0d\u662f\s*([0-9A-Za-z-]+)\s*[\uff0c,]\s*\u662f\s*([0-9A-Za-z-]+)"
+)
+_CORRECTION_TASK_EN = re.compile(r"\bnot\s+([0-9A-Za-z-]+)\s*,?\s+(?:it'?s|is)\s+([0-9A-Za-z-]+)", re.IGNORECASE)
+_GREETING_RE = re.compile(r"^\s*(hi|hello|hey|yo|你好|您好|嗨)\b[!.\s]*$", re.IGNORECASE)
+
+
+def detect_repair_statement(text: str) -> Optional[str]:
+    """Return the unit token when the text creates/mentions a repair event."""
+    raw = text or ""
+    if not raw.strip():
+        return None
+    lowered = raw.lower()
+    if detect_expense_statement(raw) or is_rent_payment_statement(raw):
+        return None  # financial lanes keep their existing priority
+    has_issue = any(w in raw for w in _MAINTENANCE_CN) or bool(
+        _MAINTENANCE_EN.search(lowered)
+    )
+    if not has_issue:
+        return None
+    match = _UNIT_TOKEN.search(raw)
+    return match.group(1) if match else None
+
+
+def detect_task_progress(text: str) -> bool:
+    raw = text or ""
+    lowered = raw.lower()
+    return any(w in raw for w in _PROGRESS_CN) or bool(_PROGRESS_EN.search(lowered))
+
+
+def detect_task_completion(text: str) -> bool:
+    raw = text or ""
+    lowered = raw.lower()
+    return any(w in raw for w in _COMPLETE_CN) or bool(_COMPLETE_EN.search(lowered))
+
+
+def detect_task_correction(text: str) -> Optional[tuple[str, str]]:
+    """(old_unit, corrected_unit) from "涓嶆槸1680锛屾槸1805" / "not 1680, it's 1805"."""
+    m = _CORRECTION_TASK_CN.search(text or "") or _CORRECTION_TASK_EN.search(text or "")
+    if not m:
+        return None
+    old, new = m.group(1), m.group(2)
+    if not old or not new or old == new:
+        return None
+    return old, new
 _QUERY_VERB_CN = (
     "交了没有", "交了没", "交了吗", "交了么", "交没交", "有没有交",
     "还欠多少", "欠多少", "欠多少钱", "没交吗", "没交钱吗", "交钱了吗",
@@ -291,9 +366,39 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pages._bind_identity(update, context)
     user = update.effective_user
     role = role_for_telegram_id(user.id if user else None)
-    locale = locale_for(role)
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
     chat_id = update.effective_chat.id
     text = update.effective_message.text or ""
+
+    # PASAY-V2-FOUNDATION-001: plain "hello"/"hi"/"你好" is a SHORT greeting
+    # (never the old full Portfolio Summary / dashboard).
+    if _GREETING_RE.match(text.strip()):
+        if not has_read_permission(role):
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("common.no_permission", locale)),
+                parse_mode=HTML,
+            )
+            return
+        await _v2_reply(
+            update, context,
+            cards.greeting_card(locale, reminder_count=0),
+            role, locale,
+        )
+        return
+
+    # PASAY-V2-FOUNDATION-001: correction to a live task context first
+    # ("不是1680，是1805" fixes the association without re-asking).
+    correction = detect_task_correction(text)
+    if correction is not None:
+        old_unit, new_unit = correction
+        fixed = await _handle_task_correction(
+            update, context, old_unit, new_unit, role, locale,
+        )
+        if fixed:
+            return
 
     # BOT-V1-USABLE-001 P0-2: expense statements first (they share payment
     # verbs with rent statements but carry a category signal).
@@ -338,6 +443,12 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # PASAY-V2-FOUNDATION-001: conversation -> Task (deterministic, before
+    # page routes and the AI fallback; financial lanes above keep priority).
+    task_handled = await _handle_v2_task_event(update, context, text, role, locale)
+    if task_handled:
+        return
+
     route = route_for_text(text)
     if route in (
         "properties", "finance", "overdue", "rent", "pending", "menu", "more",
@@ -365,7 +476,9 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context, chat_id, locale, role=role, fallback_inline=True
         )
     elif route == "menu":
-        await pages.show_menu(context, chat_id, locale, role=role)
+        # PASAY-V2-FOUNDATION-001: "menu"/"home"/"start" words open the short
+        # greeting (never the old full dashboard).
+        await pages.show_greeting(context, chat_id, role, locale)
     elif route == "help":
         await context.bot.send_message(
             chat_id,
@@ -391,6 +504,205 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # BOT-V1-USABLE-001 P0-5: every unmatched ordinary text enters the AI
         # intent lane — never a /help fallback, never silence.
         await _handle_ai_fallback(update, context, text, role, locale)
+
+
+async def _v2_reply(update, context, text: str, role, locale: str):
+    """Send one V2 reply carrying the fixed keyboard (self-healing reuse)."""
+    from pasay_bot.handlers.commands import _is_menu_initialized, reply_keyboard
+    chat_id = update.effective_chat.id
+    try:
+        keyboard = (
+            reply_keyboard(role)
+            if role and not _is_menu_initialized(context, chat_id)
+            else None
+        )
+        await context.bot.send_message(
+            chat_id,
+            H.escape(text),
+            parse_mode=HTML,
+            reply_markup=keyboard,
+        )
+    except Exception:  # noqa: BLE001 - never let keyboard mounting break UX
+        await context.bot.send_message(chat_id, H.escape(text), parse_mode=HTML)
+
+
+def _v2_task_card_text(event: str, task: dict, locale: str) -> str:
+    """task_event_card from Subagent B, with a defensive inline fallback."""
+    try:
+        return cards.task_event_card(event, task, locale)
+    except Exception:  # noqa: BLE001 - integration seam must never crash UX
+        status = str(task.get("status") or "").upper()
+        emoji = "\U0001f534" if status == "PENDING" else ("\U0001f7e1" if status == "IN_PROGRESS" else "\u2705")
+        unit = task.get("property_code") or task.get("unit_code") or ""
+        title = task.get("title") or ""
+        lines = [f"{emoji} {unit} \u00b7 {title}".strip(" \u00b7")]
+        if task.get("next_action"):
+            lines.append("Next: " + str(task["next_action"]))
+        return "\n".join(lines)
+
+
+async def _handle_v2_task_event(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, role, locale: str,
+) -> bool:
+    """Deterministic conversation -> Task: create repair task, apply progress,
+    complete, or correct the association. Returns True when handled."""
+    if not has_read_permission(role):
+        return False
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    store = context.bot_data["store"]
+    api = context.bot_data["api_client"]
+    ctx = store.get_v2_context(chat_id, user_id)
+    payload = dict(ctx["payload"]) if ctx else {}
+    task_ref = payload.get("task_ref")
+    unit_token = payload.get("unit_token")
+
+    completion = detect_task_completion(text)
+    progress = detect_task_progress(text)
+    repair_unit = detect_repair_statement(text)
+
+    # Completion of the active task in context.
+    if completion and task_ref:
+        try:
+            task = await api.update_operational_task(
+                int(task_ref), status="COMPLETED",
+            )
+        except PasayApiError:
+            return False  # let the AI lane produce a friendly fallback
+        store.clear_v2_context(chat_id, user_id)
+        await _v2_reply(
+            update, context,
+            _v2_task_card_text(
+                "completed",
+                task.as_dict() if hasattr(task, "as_dict") else task.__dict__,
+                locale,
+            ),
+            role, locale,
+        )
+        return True
+
+    # Progress update attaches to the active task (never re-asks property).
+    if progress and task_ref:
+        next_check = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        next_action = _progress_next_action(text, unit_token)
+        try:
+            task = await api.update_operational_task(
+                int(task_ref),
+                status="IN_PROGRESS",
+                next_action=next_action,
+                next_check_at=next_check,
+                context=text,
+            )
+        except PasayApiError:
+            return False
+        store.save_v2_context(
+            chat_id, user_id,
+            {"task_ref": task_ref, "unit_token": unit_token, "intent": "repair"},
+        )
+        await _v2_reply(
+            update, context,
+            _v2_task_card_text(
+                "updated",
+                task.as_dict() if hasattr(task, "as_dict") else task.__dict__,
+                locale,
+            ),
+            role, locale,
+        )
+        return True
+
+    # New repair event -> create AC_MAINTENANCE task.
+    if repair_unit is not None:
+        unit_id, unit_number, property_name = await resolve_unit(context, repair_unit)
+        if unit_id is None:
+            return False  # unresolved unit -> normal lanes/AI fallback
+        if "air" in text.lower() or "\u7a7a\u8c03" in text:
+            title = f"{unit_number} \u00b7 Aircon repair"
+        else:
+            title = f"{unit_number} \u00b7 Maintenance"
+        try:
+            task = await api.create_operational_task(
+                task_type="AC_MAINTENANCE",
+                title=title,
+                property_id=unit_id,
+                description=text,
+                context=text,
+                source_event=text,
+                completion_condition="Repair confirmed done",
+                dedupe_key=f"conversation:{unit_number.lower()}:{int(time.time()) // 3600}",
+            )
+        except PasayApiError:
+            return False
+        store.save_v2_context(
+            chat_id, user_id,
+            {
+                "task_ref": task.id,
+                "unit_token": unit_number,
+                "intent": "repair",
+                "property_id": unit_id,
+            },
+        )
+        await _v2_reply(
+            update, context,
+            _v2_task_card_text(
+                "created",
+                task.as_dict() if hasattr(task, "as_dict") else task.__dict__,
+                locale,
+            ),
+            role, locale,
+        )
+        return True
+
+    return False
+
+
+def _progress_next_action(text: str, unit_token: Optional[str]) -> str:
+    """Human next-action line from a progress message (short, actionable)."""
+    lowered = (text or "").lower()
+    if "tomorrow" in lowered or "\u660e\u5929" in text:
+        return "Confirm repair completion tomorrow"
+    if "today" in lowered or "\u4eca\u5929" in text:
+        return "Confirm repair completion today"
+    return "Confirm repair completion"
+
+
+async def _handle_task_correction(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    old_unit: str, new_unit: str, role, locale: str,
+) -> bool:
+    """V2 correction: fix the property association of the active draft/task
+    in context. Confirmed financial data is NEVER touched here (existing
+    reverse/audit rules own that path)."""
+    if not has_read_permission(role):
+        return False
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    store = context.bot_data["store"]
+    api = context.bot_data["api_client"]
+    ctx = store.get_v2_context(chat_id, user_id)
+    payload = dict(ctx["payload"]) if ctx else {}
+    task_ref = payload.get("task_ref")
+    if task_ref is None:
+        return False
+    unit_id, unit_number, _property_name = await resolve_unit(context, new_unit)
+    if unit_id is None:
+        return False
+    try:
+        await api.update_operational_task(
+            int(task_ref),
+            context=f"Corrected {old_unit} -> {new_unit}",
+        )
+    except PasayApiError:
+        return False
+    store.save_v2_context(
+        chat_id, user_id,
+        {"task_ref": task_ref, "unit_token": unit_number, "intent": "repair"},
+    )
+    await _v2_reply(
+        update, context,
+        f"\u2705 {new_unit} / \u5df2\u4fee\u6b63\u4e3a {new_unit}",
+        role, locale,
+    )
+    return True
 
 
 async def _handle_rent_status_query(update, context, query, role, locale):

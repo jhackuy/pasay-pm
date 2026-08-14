@@ -1,4 +1,4 @@
-"""Pydantic schemas for the /operations router (V1.2)."""
+"""Pydantic schemas for the /operations router (V1.2 + V2 Foundation)."""
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -18,16 +18,24 @@ class OperationalTaskRead(AuditFields):
     title: str
     description: str | None = None
     property_id: int | None = None
+    # PASAY-V2-FOUNDATION-001: derived display unit code ("1680", or
+    # "BAY-1680" / "SOL-1680" only when duplicate unit codes exist).
+    property_code: str | None = None
     tenant_id: int | None = None
     lease_id: int | None = None
     source_type: str
     source_id: int | None = None
+    source_event: str | None = None
     assigned_user_id: int | None = None
     priority: OperationalTaskPriority
     status: OperationalTaskStatus
     due_at: datetime
     remind_at: datetime | None = None
     snoozed_until: datetime | None = None
+    next_action: str | None = None
+    next_check_at: datetime | None = None
+    context: str | None = None
+    completion_condition: str | None = None
     completed_at: datetime | None = None
     completed_by: int | None = None
     dedupe_key: str | None = None
@@ -37,6 +45,37 @@ class OperationalTaskRead(AuditFields):
 class TaskSnoozeIn(BaseModel):
     until: datetime | None = None
     preset: str | None = Field(default=None, max_length=32)
+
+
+class TaskUpdateIn(BaseModel):
+    """PASAY-V2-FOUNDATION-001: partial V2 task update (conversation-driven)."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    status: OperationalTaskStatus | None = None
+    due_at: datetime | None = None
+    next_action: str | None = Field(default=None, max_length=300)
+    next_check_at: datetime | None = None
+    context: str | None = None
+    completion_condition: str | None = Field(default=None, max_length=300)
+
+
+class TaskCreateIn(BaseModel):
+    """PASAY-V2-FOUNDATION-001: create a task from a conversation event."""
+
+    task_type: OperationalTaskType
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = None
+    property_id: int | None = None
+    priority: OperationalTaskPriority = OperationalTaskPriority.medium
+    status: OperationalTaskStatus | None = None
+    due_at: datetime | None = None
+    next_action: str | None = Field(default=None, max_length=300)
+    next_check_at: datetime | None = None
+    context: str | None = None
+    completion_condition: str | None = Field(default=None, max_length=300)
+    source_event: str | None = Field(default=None, max_length=500)
+    assigned_user_id: int | None = None
+    dedupe_key: str | None = Field(default=None, max_length=255)
 
 
 class TaskActionOut(BaseModel):

@@ -84,9 +84,9 @@ def test_reply_keyboard_role_specific_labels():
     secretary = reply_keyboard(Role.SECRETARY)
     owner_labels = [b.text for row in owner.keyboard for b in row]
     sec_labels = [b.text for row in secretary.keyboard for b in row]
-    # BOT-V1-USABLE-001: one identical 4-button menu for both roles.
-    assert owner_labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
-    assert sec_labels == ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
+    # PASAY-V2-FOUNDATION-001: one identical 4-button English Quick View menu.
+    assert owner_labels == ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
+    assert sec_labels == ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
     assert owner.resize_keyboard is True
     assert secretary.resize_keyboard is True
     assert owner.is_persistent is True
@@ -287,7 +287,7 @@ def test_todo_page_human_readable_no_internal_enums(make_app):
         task_id=1, title="待批准支出 · 维修", task_type="APPROVAL_PENDING",
         due_at="2026-08-10T00:00:00+08:00",
     )
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/todo", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "todo", bot=env.bot)])
     text = env.bot.last_send()["text"]
     assert "支出待批准 · 1笔" in text
     assert "待批准支出 · 维修" in text
@@ -323,14 +323,14 @@ def test_todo_page_detail_button_label_depends_on_receipt(make_app):
     receipt attached and 查看详情 without one."""
     env = make_app()
     _seed_pending_expense(env, receipt=True)
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/todo", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "todo", bot=env.bot)])
     labels = [b.text for b in _buttons(env.bot.last_send()["reply_markup"])]
     assert "📎 查看凭证" in labels
     assert "查看详情" not in labels
 
     env = make_app()
     _seed_pending_expense(env, receipt=False)
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "/todo", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "todo", bot=env.bot)])
     labels = [b.text for b in _buttons(env.bot.last_send()["reply_markup"])]
     assert "查看详情" in labels
     assert "📎 查看凭证" not in labels

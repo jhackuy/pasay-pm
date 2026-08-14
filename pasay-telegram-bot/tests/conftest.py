@@ -190,6 +190,18 @@ class FakeBackend:
              "outstanding": "24000.00", "days_overdue": 40},
         ]
         self.overdue: Optional[list] = None
+        # --- PASAY-V2-FOUNDATION-001: quick views / digest / task create+patch ---
+        self.quick_tasks: list[dict] = []
+        self.quick_properties: list[dict] = []
+        self.quick_rent: dict = {"overdue": [], "outstanding_total": "0.00"}
+        self.quick_expense: dict = {
+            "month_total": "0.00",
+            "pending_approval_count": 0,
+            "pending_approval_amount": "0.00",
+            "unresolved_expense_tasks": [],
+        }
+        self.digest: dict = {"pending": [], "in_progress": [], "recently_completed": []}
+        self._next_v2_task_id = 1000
         # --- V1.3 Slice 2: Entry B rent-payment matcher ---
         self.rent_match_response: Optional[dict] = None
         self.tasks: list[dict] = []
@@ -602,6 +614,92 @@ class FakeBackend:
                 return httpx.Response(422, json={"detail": "preset must be one of ..."})
             return httpx.Response(200, json={"task": task, "detail": "Task snoozed"})
 
+        # --- PASAY-V2-FOUNDATION-001: quick views / digest / task write ---
+        if path == "/operations/quick/tasks" and method == "GET":
+            return httpx.Response(200, json=self.quick_tasks)
+        if path == "/operations/quick/properties" and method == "GET":
+            return httpx.Response(200, json=self.quick_properties)
+        if path == "/operations/quick/rent" and method == "GET":
+            return httpx.Response(200, json=self.quick_rent)
+        if path == "/operations/quick/expense" and method == "GET":
+            return httpx.Response(200, json=self.quick_expense)
+        if path == "/operations/digest" and method == "GET":
+            return httpx.Response(200, json=self.digest)
+        if path == "/operations/tasks" and method == "POST":
+            payload = body or {}
+            self._next_v2_task_id += 1
+            row = {
+                "id": self._next_v2_task_id,
+                "task_type": payload.get("task_type", "AC_MAINTENANCE"),
+                "title": payload.get("title", ""),
+                "description": payload.get("description"),
+                "property_id": payload.get("property_id"),
+                "property_code": None,
+                "tenant_id": None,
+                "lease_id": None,
+                "source_type": "conversation",
+                "source_id": None,
+                "source_event": payload.get("source_event"),
+                "assigned_user_id": payload.get("assigned_user_id"),
+                "priority": payload.get("priority", "medium"),
+                "status": payload.get("status", "PENDING"),
+                "due_at": payload.get("due_at") or "2026-08-21T00:00:00+08:00",
+                "remind_at": None,
+                "snoozed_until": None,
+                "next_action": payload.get("next_action"),
+                "next_check_at": payload.get("next_check_at"),
+                "context": payload.get("context"),
+                "completion_condition": payload.get("completion_condition"),
+                "completed_at": None,
+                "completed_by": None,
+                "dedupe_key": payload.get("dedupe_key"),
+                "details": {},
+            }
+            existing = next(
+                (t for t in self.operational_tasks if t.get("dedupe_key") == payload.get("dedupe_key")),
+                None,
+            )
+            if existing is not None:
+                return httpx.Response(201, json={"task": existing, "detail": "Task already exists"})
+            self.operational_tasks.append(row)
+            self.quick_tasks.append(row)
+            return httpx.Response(201, json={"task": row, "detail": "Task created"})
+        if path.startswith("/operations/tasks/") and method == "PATCH":
+            task = self._ops_task(path)
+            if task is None:
+                return httpx.Response(404, json={"detail": "Operational task not found"})
+            payload = body or {}
+            want_status = payload.get("status")
+            if want_status == "IN_PROGRESS" and not (
+                payload.get("next_action") or task.get("next_action")
+            ) and not (payload.get("next_check_at") or task.get("next_check_at")):
+                return httpx.Response(
+                    422, json={"detail": "IN_PROGRESS requires next_action and next_check_at"}
+                )
+            for key in ("title", "status", "due_at", "next_action", "next_check_at",
+                        "context", "completion_condition"):
+                if key in payload:
+                    task[key] = payload[key]
+            if want_status == "COMPLETED":
+                task["completed_at"] = "2026-08-20T10:00:00Z"
+                task["completed_by"] = 1
+            self.quick_tasks = [
+                t for t in self.quick_tasks if t.get("id") != task.get("id")
+            ]
+            self.quick_tasks.append(
+                {
+                    "id": task["id"],
+                    "task_type": task.get("task_type"),
+                    "title": task.get("title"),
+                    "status": task.get("status"),
+                    "property_code": task.get("property_code"),
+                    "due_at": task.get("due_at"),
+                    "next_action": task.get("next_action"),
+                    "next_check_at": task.get("next_check_at"),
+                }
+            )
+            return httpx.Response(200, json={"task": task, "detail": "Task updated"})
+
         return httpx.Response(404, json={"detail": f"no route {method} {path}"})
 
     # --- V1.3 Slice 2: Entry B matcher (deterministic fake over fake data) ---
@@ -929,29 +1027,48 @@ class FakeBackend:
     # --- V1.2 ops helpers ---
     def add_ops_task(self, task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
                      status="PENDING", due_at=None, snoozed_until=None, property_id=1,
-                     details=None, assigned_user_id=None):
+                     details=None, assigned_user_id=None, next_action=None,
+                     next_check_at=None, property_code=None):
         row = {
             "id": task_id,
             "task_type": task_type,
             "title": title,
             "description": None,
             "property_id": property_id,
+            "property_code": property_code,
             "tenant_id": None,
             "lease_id": None,
             "source_type": "recurring_rule",
             "source_id": 1,
+            "source_event": None,
             "assigned_user_id": assigned_user_id,
             "priority": "medium",
             "status": status,
             "due_at": due_at or "2026-08-10T00:00:00+08:00",
             "remind_at": None,
             "snoozed_until": snoozed_until,
+            "next_action": next_action,
+            "next_check_at": next_check_at,
+            "context": None,
+            "completion_condition": None,
             "completed_at": None,
             "completed_by": None,
             "dedupe_key": f"recurring:1:2026-Q3",
             "details": details or {"amount": "12000.00", "period": "2026-Q3"},
         }
         self.operational_tasks.append(row)
+        self.quick_tasks.append(
+            {
+                "id": task_id,
+                "task_type": task_type,
+                "title": title,
+                "status": status,
+                "property_code": property_code,
+                "due_at": row["due_at"],
+                "next_action": next_action,
+                "next_check_at": next_check_at,
+            }
+        )
         return row
 
     def _ops_task(self, path):

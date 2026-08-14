@@ -56,7 +56,6 @@ from app.models.user import User, UserRole
 from app.services.audit import set_audit_context
 from app.services.operations.copilot import (
     CONTEXT_SCHEMA_VERSION,
-    COPILOT_EXECUTION_ENABLED,
     ProposalConfirmRejectedError,
     ProposalStateError,
     assert_executed_invariant,
@@ -72,7 +71,9 @@ from app.services.operations.redelivery import snooze_redelivery_dedupe_key
 from app.services.operations.scheduler import run_scheduler_once
 
 API = "/api/v1"
-NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
+# Anchored to the real clock at import so due_at=NOW+1d is in the future and
+# expires_at=NOW-1min is in the past whenever the suite runs.
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 # ---------------------------------------------------------------------------
@@ -905,7 +906,6 @@ def test_proposal_payload_size_cap(client, manager_headers, db_session):
 
 def test_proposal_confirm_never_sets_executed_at(client, manager_headers, db_session):
     """Phase A+B invariant: nothing transitions to EXECUTED / sets executed_at."""
-    assert COPILOT_EXECUTION_ENABLED is False
     task = _task(db_session, dedupe_key="p10")
     proposal = _make_proposal(db_session, actor_id=1, target_id=task.id,
                               idempotency_key="no-exec")

@@ -30,14 +30,11 @@ def test_fixed_menu_buttons_send_real_sender_id_not_chat_or_fallback(make_app):
     Telegram user id (never the group chat id, never a fixed Owner fallback)
     and the deterministic page renders (backend 200 in the fake).
 
-    ``expense`` is a pure UI entry page (NL-first, no form, no backend fetch),
-    so it must make zero backend calls - hence it can never 401 on this path.
+    PASAY-V2-FOUNDATION-001: every fixed button is a deterministic Quick
+    View that makes exactly ONE backend read with the sender's identity.
     """
     env = make_app()
-    data_labels = [
-        label for label, route in FIXED_MENU_ROUTES.items() if route != "expense"
-    ]
-    for label in data_labels:
+    for label in FIXED_MENU_ROUTES:
         for user_id in (OWNER_ID, SECRETARY_ID):
             run_updates(
                 env, [make_text_update(user_id, GROUP_CHAT_ID, label, bot=env.bot)]
@@ -50,14 +47,6 @@ def test_fixed_menu_buttons_send_real_sender_id_not_chat_or_fallback(make_app):
             assert str(GROUP_CHAT_ID) not in headers
             assert str(OWNER_ID) not in headers or user_id == OWNER_ID
             env.backend.telegram_user_calls.clear()
-
-    # expense entry page: deterministic UI only, no backend fetch.
-    expense_label = next(
-        label for label, route in FIXED_MENU_ROUTES.items() if route == "expense"
-    )
-    env.backend.telegram_user_calls.clear()
-    run_updates(env, [make_text_update(OWNER_ID, GROUP_CHAT_ID, expense_label, bot=env.bot)])
-    assert env.backend.telegram_user_calls == []
 
 
 def test_no_fixed_owner_telegram_id_fallback_in_bot_chain():

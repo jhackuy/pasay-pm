@@ -403,15 +403,21 @@ class OperationalTask:
     title: str = ""
     description: Optional[str] = None
     property_id: Optional[int] = None
+    property_code: Optional[str] = None
     tenant_id: Optional[int] = None
     lease_id: Optional[int] = None
     source_type: str = ""
     source_id: Optional[int] = None
+    source_event: Optional[str] = None
     assigned_user_id: Optional[int] = None
     priority: str = "medium"
     status: str = "PENDING"
     due_at: Optional[str] = None
     snoozed_until: Optional[str] = None
+    next_action: Optional[str] = None
+    next_check_at: Optional[str] = None
+    context: Optional[str] = None
+    completion_condition: Optional[str] = None
     completed_at: Optional[str] = None
     details: Optional[dict] = None
 
@@ -423,15 +429,21 @@ class OperationalTask:
             title=d.get("title") or "",
             description=d.get("description"),
             property_id=int(d["property_id"]) if d.get("property_id") is not None else None,
+            property_code=d.get("property_code"),
             tenant_id=int(d["tenant_id"]) if d.get("tenant_id") is not None else None,
             lease_id=int(d["lease_id"]) if d.get("lease_id") is not None else None,
             source_type=d.get("source_type") or "",
             source_id=int(d["source_id"]) if d.get("source_id") is not None else None,
+            source_event=d.get("source_event"),
             assigned_user_id=int(d["assigned_user_id"]) if d.get("assigned_user_id") is not None else None,
             priority=d.get("priority") or "medium",
             status=d.get("status") or "PENDING",
             due_at=d.get("due_at"),
             snoozed_until=d.get("snoozed_until"),
+            next_action=d.get("next_action"),
+            next_check_at=d.get("next_check_at"),
+            context=d.get("context"),
+            completion_condition=d.get("completion_condition"),
             completed_at=d.get("completed_at"),
             details=d.get("details") or {},
         )
@@ -951,6 +963,114 @@ class PasayApiClient:
     async def cancel_operational_task(self, task_id: int) -> OperationalTask:
         data = await self._request("POST", f"/operations/tasks/{task_id}/cancel")
         return OperationalTask.from_dict(data["task"])
+
+    # --- PASAY-V2-FOUNDATION-001: conversation-driven task create/update ---
+    async def create_operational_task(
+        self,
+        *,
+        task_type: str,
+        title: str,
+        property_id: Optional[int] = None,
+        description: Optional[str] = None,
+        priority: str = "medium",
+        status: Optional[str] = None,
+        due_at: Optional[str] = None,
+        next_action: Optional[str] = None,
+        next_check_at: Optional[str] = None,
+        context: Optional[str] = None,
+        completion_condition: Optional[str] = None,
+        source_event: Optional[str] = None,
+        assigned_user_id: Optional[int] = None,
+        dedupe_key: Optional[str] = None,
+    ) -> OperationalTask:
+        """POST /operations/tasks: create a task from a conversation event."""
+        body: dict[str, Any] = {
+            "task_type": task_type,
+            "title": title,
+            "priority": priority,
+        }
+        if property_id is not None:
+            body["property_id"] = property_id
+        if description is not None:
+            body["description"] = description
+        if status is not None:
+            body["status"] = status
+        if due_at is not None:
+            body["due_at"] = due_at
+        if next_action is not None:
+            body["next_action"] = next_action
+        if next_check_at is not None:
+            body["next_check_at"] = next_check_at
+        if context is not None:
+            body["context"] = context
+        if completion_condition is not None:
+            body["completion_condition"] = completion_condition
+        if source_event is not None:
+            body["source_event"] = source_event
+        if assigned_user_id is not None:
+            body["assigned_user_id"] = assigned_user_id
+        if dedupe_key is not None:
+            body["dedupe_key"] = dedupe_key
+        data = await self._request("POST", "/operations/tasks", json=body, timeout=15.0)
+        return OperationalTask.from_dict(data["task"])
+
+    async def update_operational_task(
+        self,
+        task_id: int,
+        *,
+        title: Optional[str] = None,
+        status: Optional[str] = None,
+        due_at: Optional[str] = None,
+        next_action: Optional[str] = None,
+        next_check_at: Optional[str] = None,
+        context: Optional[str] = None,
+        completion_condition: Optional[str] = None,
+    ) -> OperationalTask:
+        """PATCH /operations/tasks/{id}: conversation-driven partial update."""
+        body: dict[str, Any] = {}
+        if title is not None:
+            body["title"] = title
+        if status is not None:
+            body["status"] = status
+        if due_at is not None:
+            body["due_at"] = due_at
+        if next_action is not None:
+            body["next_action"] = next_action
+        if next_check_at is not None:
+            body["next_check_at"] = next_check_at
+        if context is not None:
+            body["context"] = context
+        if completion_condition is not None:
+            body["completion_condition"] = completion_condition
+        data = await self._request(
+            "PATCH", f"/operations/tasks/{task_id}", json=body, timeout=15.0
+        )
+        return OperationalTask.from_dict(data["task"])
+
+    async def get_quick_tasks(self) -> list[dict]:
+        """GET /operations/quick/tasks: deterministic active-task quick view."""
+        data = await self._request("GET", "/operations/quick/tasks")
+        return data if isinstance(data, list) else []
+
+    async def get_quick_properties(self) -> list[dict]:
+        """GET /operations/quick/properties: deterministic property status."""
+        data = await self._request("GET", "/operations/quick/properties")
+        return data if isinstance(data, list) else []
+
+    async def get_quick_rent(self) -> dict:
+        """GET /operations/quick/rent: overdue + outstanding."""
+        data = await self._request("GET", "/operations/quick/rent")
+        return data or {}
+
+    async def get_quick_expense(self) -> dict:
+        """GET /operations/quick/expense: month total + pending approval."""
+        data = await self._request("GET", "/operations/quick/expense")
+        return data or {}
+
+    async def get_digest(self) -> dict:
+        """GET /operations/digest: daily Active Tasks Digest."""
+        data = await self._request("GET", "/operations/digest")
+        return data or {}
 
     async def get_operations_summary(self) -> dict:
         data = await self._request("GET", "/operations/summary")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import logging
 import re
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -55,11 +56,14 @@ from pasay_bot.roles import (
     Role,
     has_permission,
     has_read_permission,
+    locale_for_chat,
     locale_for,
     role_for_telegram_id,
 )
 
 HTML = "HTML"
+
+logger = logging.getLogger(__name__)
 
 EXPIRING_LEASE_DAYS = 60
 TASK_WINDOW_DAYS = 7
@@ -199,45 +203,47 @@ def _last_income_for_lease(incomes, lease_id: int):
 # --- commands ---
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PASAY-V2-FOUNDATION-001: /start is a technical recovery command only —
+    never part of the normal user path. It shows the short V2 greeting (not
+    the full dashboard) and mounts the fixed Quick View keyboard."""
     _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
     if not has_read_permission(role):
         await _refuse(update, context, role)
         return
-    await show_home(context, update.effective_chat.id, role, locale_for(role))
+    chat_id = update.effective_chat.id
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
+    await show_greeting(context, chat_id, role, locale)
 
 
 async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """SLICE3-UX-PERSISTENT-MENU-002: group new-member onboarding.
+    """PASAY-V2-FOUNDATION-001: keyboard self-healing when the bot is added
+    to a group (and a friendly bilingual welcome when anyone joins).
 
-    Telegram's ReplyKeyboardMarkup is per-CHAT (never per-member), and the bot
-    has no group->role configuration, so every group is treated as potentially
-    mixed-role and we FAIL CLOSED: no role menu is ever broadcast into a group
-    (an Owner menu must never be pushed to Secretaries/Tenants and vice versa).
-    The existing identity binding + role resolution run per joining member, but
-    the group only receives a neutral welcome; identified members additionally
-    get a private-chat deep-link hint. Unknown identities get no menu and are
-    never told to type /start.
-    """
+    The V2 fixed menu is identical for every role (4 English Quick View
+    buttons), so attaching the neutral fixed keyboard in a group can never
+    leak an Owner/Secretary menu. Users are never told to type /start."""
     message = update.effective_message
     chat = update.effective_chat
     members = message.new_chat_members if message is not None else None
     if chat is None or not members or chat.type == Chat.PRIVATE:
         return
-    hints: list[str] = []
-    for member in members:
-        if member.is_bot:
-            continue  # never greet the bot itself / other bots
-        _bind_identity(update, context, user_id=member.id)
-        role = role_for_telegram_id(member.id)
-        if has_read_permission(role):
-            hints.append(t("group.private_hint", locale_for(role)))
-    lines = [t("group.welcome", "zh")]
-    for hint in dict.fromkeys(hints):  # dedupe when several members join at once
-        lines.append(hint)
+    context.bot_data["store"].remember_group(chat.id, title=(chat.title or ""))
+    lines = [
+        t("v2.welcome", "en"),
+        t("v2.welcome", "zh"),
+        t("v2.help", "en"),
+        t("v2.help", "zh"),
+    ]
     await context.bot.send_message(
-        chat.id, H.escape("\n".join(lines)), parse_mode=HTML
+        chat.id,
+        H.escape("\n".join(lines)),
+        parse_mode=HTML,
+        reply_markup=None if _is_menu_initialized(context, chat.id) else reply_keyboard(Role.OWNER),
     )
+    _mark_menu_initialized(context, chat.id)
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,7 +253,9 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _bind_identity(update, context)
     role = role_for_telegram_id(update.effective_user.id if update.effective_user else None)
-    locale = locale_for(role)
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
     text = (
         f"📖 <b>{H.escape(t('help.title', locale))}</b>\n\n"
         f"{H.escape(t('help.text', locale))}"
@@ -525,6 +533,127 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
             # The persistent keyboard was just mounted on this message;
             # remember it so later normal messages don't re-send it.
             _mark_menu_initialized(context, chat_id)
+
+
+async def show_greeting(context, chat_id, role, locale: str, message_id=None):
+    """PASAY-V2-FOUNDATION-001: short greeting — 👋 + one action line + at
+    most one reminder-count line. Never the full dashboard."""
+    api = context.bot_data["api_client"]
+    reminder_count = 0
+    try:
+        digest = await api.get_digest()
+        reminder_count = len((digest or {}).get("pending") or []) + len(
+            (digest or {}).get("in_progress") or []
+        )
+    except Exception as exc:  # noqa: BLE001 - greeting must never depend on backend
+        logger.warning("greeting digest unavailable: %s", exc)
+        reminder_count = 0
+    text = cards.greeting_card(locale, reminder_count=reminder_count)
+    keyboard = (
+        reply_keyboard(role)
+        if role and not _is_menu_initialized(context, chat_id)
+        else None
+    )
+    await _render(
+        context, chat_id, message_id, text, reply_keyboard=keyboard,
+    )
+    if role:
+        _mark_menu_initialized(context, chat_id)
+
+
+async def _quick_view(
+    context, chat_id, role, locale: str, message_id,
+    fetcher, card_fn, error_key: str,
+):
+    """Shared deterministic Quick View path: one backend read + one card.
+    Never calls an LLM. The reply carries the persistent keyboard so the
+    fixed menu is self-healing without extra messages."""
+    api = context.bot_data["api_client"]
+    try:
+        data = await fetcher(api)
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    except Exception as exc:  # noqa: BLE001 - user-visible fallback
+        logger.warning("quick view %s failed: %s", error_key, exc)
+        await _render(context, chat_id, message_id, _load_error(error_key, locale),
+                      error_keyboard("home", locale))
+        return
+    text = card_fn(data, locale)
+    await _render(
+        context, chat_id, message_id, text,
+        reply_keyboard=reply_keyboard(role) if role else None,
+    )
+    if role:
+        _mark_menu_initialized(context, chat_id)
+
+
+async def show_quick_properties(context, chat_id, role, locale: str, message_id=None):
+    """🏠 Properties Quick View (deterministic, no LLM)."""
+    await _quick_view(
+        context, chat_id, role, locale, message_id,
+        lambda api: api.get_quick_properties(),
+        cards.properties_quick_card,
+        "properties",
+    )
+
+
+async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None):
+    """✅ Tasks Quick View (deterministic, no LLM)."""
+    await _quick_view(
+        context, chat_id, role, locale, message_id,
+        lambda api: api.get_quick_tasks(),
+        cards.tasks_quick_card,
+        "tasks",
+    )
+
+
+async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
+    """💰 Rent Quick View (deterministic, no LLM)."""
+    await _quick_view(
+        context, chat_id, role, locale, message_id,
+        lambda api: api.get_quick_rent(),
+        cards.rent_quick_card,
+        "rent",
+    )
+
+
+async def show_quick_expense(context, chat_id, role, locale: str, message_id=None):
+    """💸 Expense Quick View (deterministic, no LLM)."""
+    await _quick_view(
+        context, chat_id, role, locale, message_id,
+        lambda api: api.get_quick_expense(),
+        cards.expense_quick_card,
+        "expense",
+    )
+
+
+async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """PASAY-V2-FOUNDATION-001: photo/document receipt ack.
+
+    Media is accepted immediately (background processing happens later) and
+    the reply carries the persistent keyboard — one message, no junk."""
+    user = update.effective_user
+    role = role_for_telegram_id(user.id if user else None)
+    chat_id = update.effective_chat.id if update.effective_chat else (user.id if user else None)
+    if chat_id is None or not has_read_permission(role):
+        return
+    _bind_identity(update, context)
+    if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
+        context.bot_data["store"].remember_group(
+            chat_id, title=(update.effective_chat.title or "")
+        )
+    locale = locale_for_chat(
+        update.effective_chat.type if update.effective_chat else None, role
+    )
+    await context.bot.send_message(
+        chat_id,
+        H.escape(t("v2.media_received", locale)),
+        parse_mode=HTML,
+        reply_markup=reply_keyboard(role),
+    )
+    _mark_menu_initialized(context, chat_id)
 
 
 async def show_expense(context, chat_id, locale: str, message_id=None):

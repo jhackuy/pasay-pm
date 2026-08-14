@@ -1454,3 +1454,260 @@ def copilot_replayed_card(locale: str = "zh") -> str:
 def copilot_notify_retry_card(locale: str = "zh") -> str:
     """Task created but the secretary notification is retrying."""
     return H.escape(t("copilot.notify_retry", locale))
+
+
+# --- PASAY-V2-FOUNDATION-001: Quick Views / bilingual cards -----------------
+# All V2 cards are deterministic (never call an LLM). Group mode renders
+# every visible line English + 中文; private chats use the role language.
+
+_V2_STATUS_EMOJI = {
+    "overdue_rent": "🔴",
+    "lease_expiring": "🟡",
+    "paid": "🟢",
+    "rent_paid": "🟢",
+    "vacant": "⚪",
+    "normal": "🔵",
+}
+
+
+def _bi_line(locale: str, en: str, zh: str) -> str:
+    """One visible business line: English + 中文 in group mode; single
+    language otherwise. Callers escape HTML before passing fragments in."""
+    if locale == "bi":
+        return f"{en}\n{zh}"
+    return en if locale == "en" else zh
+
+
+def _bi_header(locale: str, en: str, zh: str) -> str:
+    """Compact one-line bilingual header, e.g. 'Pending / 未完成'."""
+    if locale == "bi":
+        return f"{en} / {zh}"
+    return en if locale == "en" else zh
+
+
+def _v2_section(status_key: str, locale: str, emoji: str) -> str:
+    header = _bi_header(locale, t(status_key, "en"), t(status_key, "zh"))
+    return f"{emoji} <b>{H.escape(header)}</b>"
+
+
+def _v2_property_label(row: dict, locale: str) -> tuple[str, str]:
+    """(emoji, rendered line) for one property quick-view row."""
+    status = str(row.get("status") or "normal").lower()
+    unit = H.escape(str(row.get("unit_code") or row.get("property_code") or ""))
+    amount = H.money(row.get("amount")) if row.get("amount") is not None else ""
+    days = row.get("days")
+    if days is None:
+        days = row.get("due_days")
+    if status == "overdue_rent":
+        en = t("v2.status.overdue_rent", "en", amount=amount)
+        zh = t("v2.status.overdue_rent", "zh", amount=amount)
+    elif status == "lease_expiring":
+        en = t("v2.status.lease_expiring", "en", days=days or 0)
+        zh = t("v2.status.lease_expiring", "zh", days=days or 0)
+    elif status in ("paid", "rent_paid"):
+        en, zh = t("v2.status.rent_paid", "en"), t("v2.status.rent_paid", "zh")
+    elif status == "vacant":
+        en, zh = t("v2.status.vacant", "en"), t("v2.status.vacant", "zh")
+    else:
+        en, zh = t("v2.status.normal", "en"), t("v2.status.normal", "zh")
+    emoji = _V2_STATUS_EMOJI.get(status, "🔵")
+    line = _bi_line(locale, f"{unit} · {en}" if unit else en,
+                    f"{unit} · {zh}" if unit else zh)
+    return emoji, line
+
+
+def _v2_task_line(task: dict, locale: str, emoji: str) -> str:
+    """One active-task row: unit · title · due/overdue · next action."""
+    unit = H.escape(str(task.get("property_code") or task.get("unit_code") or ""))
+    title = H.escape(str(task.get("title") or t("ops.task", locale)))
+    en_parts: list[str] = []
+    zh_parts: list[str] = []
+    if unit:
+        en_parts.append(unit)
+        zh_parts.append(unit)
+    en_parts.append(title)
+    zh_parts.append(title)
+    overdue_days = task.get("overdue_days")
+    due_days = task.get("due_in_days")
+    if overdue_days is not None:
+        en_parts.append(t("v2.overdue_days", "en", days=overdue_days))
+        zh_parts.append(t("v2.overdue_days", "zh", days=overdue_days))
+    elif due_days is not None:
+        en_parts.append(t("v2.due_in_days", "en", days=due_days))
+        zh_parts.append(t("v2.due_in_days", "zh", days=due_days))
+    elif task.get("due_at"):
+        date_str = H.format_date(task.get("due_at"))
+        en_parts.append(date_str)
+        zh_parts.append(date_str)
+    en_line = " · ".join(p for p in en_parts if p)
+    zh_line = " · ".join(p for p in zh_parts if p)
+    next_action = task.get("next_action")
+    if next_action:
+        en_line += "\n" + t("v2.next", "en", next=H.escape(str(next_action)))
+        zh_line += "\n" + t("v2.next", "zh", next=H.escape(str(next_action)))
+    return f"{emoji} {_bi_line(locale, en_line, zh_line)}"
+
+
+def _v2_title(locale: str, key: str, emoji: str) -> str:
+    return f"{emoji} <b>{H.escape(_bi_header(locale, t(key, 'en'), t(key, 'zh')))}</b>"
+
+
+def properties_quick_card(data, locale: str = "bi") -> str:
+    """🏠 Properties quick view: one line per unit, abnormal first."""
+    rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
+    blocks = [_v2_title(locale, "v2.properties_title", "🏠")]
+    if not rows:
+        blocks.append(H.escape(t("v2.empty", locale)))
+        return "\n".join(blocks)
+    for row in rows:
+        emoji, line = _v2_property_label(row, locale)
+        blocks.append(f"{emoji} {line}")
+    return "\n\n".join(blocks)
+
+
+def tasks_quick_card(data, locale: str = "bi") -> str:
+    """✅ Tasks quick view: active tasks grouped by status."""
+    tasks = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
+    pending = [t_ for t_ in tasks if str(t_.get("status") or "").upper() == "PENDING"]
+    in_progress = [
+        t_ for t_ in tasks
+        if str(t_.get("status") or "").upper() in ("IN_PROGRESS", "IN PROGRESS")
+    ]
+    other = [t_ for t_ in tasks if t_ not in pending and t_ not in in_progress]
+    blocks = [_v2_title(locale, "v2.tasks_title", "✅")]
+    if not tasks:
+        blocks.append(H.escape(t("v2.empty", locale)))
+        return "\n".join(blocks)
+    if pending:
+        blocks.append(_v2_section("v2.status.pending", locale, "🔴"))
+        blocks.extend(_v2_task_line(t_, locale, "🔴") for t_ in pending)
+    if in_progress:
+        blocks.append(_v2_section("v2.status.in_progress", locale, "🟡"))
+        blocks.extend(_v2_task_line(t_, locale, "🟡") for t_ in in_progress)
+    for t_ in other:
+        blocks.append(_v2_task_line(t_, locale, "📋"))
+    return "\n\n".join(blocks)
+
+
+def rent_quick_card(data, locale: str = "bi") -> str:
+    """💰 Rent quick view: overdue units + outstanding total."""
+    data = data or {}
+    overdue = data.get("overdue") or []
+    outstanding = data.get("outstanding_total")
+    blocks = [_v2_title(locale, "v2.rent_title", "💰")]
+    if not overdue:
+        blocks.append(H.escape(t("v2.rent_no_overdue", locale)))
+    else:
+        blocks.append(_v2_section("v2.rent_overdue_section", locale, "🔴"))
+        for row in overdue:
+            unit = H.escape(str(row.get("unit") or row.get("unit_code") or ""))
+            amount = H.money(row.get("amount"))
+            days = row.get("overdue_days")
+            if days is None:
+                days = row.get("days")
+            en = f"{unit} · {amount} · " + t("v2.overdue_days", "en", days=days or 0)
+            zh = f"{unit} · {amount} · " + t("v2.overdue_days", "zh", days=days or 0)
+            blocks.append("🔴 " + _bi_line(locale, en, zh))
+    if outstanding is not None:
+        blocks.append(
+            H.escape(t("v2.outstanding_total", locale, amount=H.money(outstanding)))
+        )
+    return "\n\n".join(blocks)
+
+
+def expense_quick_card(data, locale: str = "bi") -> str:
+    """💸 Expense quick view: month total + pending approval + unresolved."""
+    data = data or {}
+    month_total = data.get("month_total")
+    if month_total is None:
+        month_total = data.get("current_month_total")
+    pending_count = data.get("pending_approval_count")
+    pending_amount = data.get("pending_approval_amount")
+    unresolved = data.get("unresolved_expense_tasks") or []
+    blocks = [_v2_title(locale, "v2.expense_title", "💸")]
+    if month_total is not None:
+        blocks.append(
+            H.escape(t("v2.expense_month_total", locale, amount=H.money(month_total)))
+        )
+    if pending_count:
+        blocks.append(
+            H.escape(
+                t(
+                    "v2.expense_pending_approval",
+                    locale,
+                    count=pending_count,
+                    amount=H.money(pending_amount or 0),
+                )
+            )
+        )
+    if unresolved:
+        blocks.append(
+            H.escape(t("v2.expense_unresolved", locale, count=len(unresolved)))
+        )
+        for task in unresolved[:5]:
+            blocks.append(_v2_task_line(task, locale, "💸"))
+    else:
+        blocks.append(H.escape(t("v2.expense_no_unresolved", locale)))
+    return "\n\n".join(blocks)
+
+
+def active_tasks_digest_card(data, locale: str = "bi") -> str:
+    """Daily Active Tasks Digest: pending / in progress / recently completed."""
+    data = data or {}
+    pending = data.get("pending") or []
+    in_progress = data.get("in_progress") or []
+    recently = data.get("recently_completed") or []
+    blocks = [_v2_title(locale, "v2.digest_title", "📋")]
+    if pending:
+        blocks.append(_v2_section("v2.status.pending", locale, "🔴"))
+        blocks.extend(_v2_task_line(t_, locale, "🔴") for t_ in pending)
+    if in_progress:
+        blocks.append(_v2_section("v2.status.in_progress", locale, "🟡"))
+        blocks.extend(_v2_task_line(t_, locale, "🟡") for t_ in in_progress)
+    if recently:
+        blocks.append(_v2_section("v2.status.completed", locale, "✅"))
+        blocks.extend(_v2_task_line(t_, locale, "✅") for t_ in recently)
+    if not (pending or in_progress or recently):
+        blocks.append(H.escape(t("v2.empty", locale)))
+    return "\n\n".join(blocks)
+
+
+def greeting_card(locale: str = "zh", reminder_count: int = 0) -> str:
+    """V2 greeting: short, actionable, at most one reminder-count line.
+    Never the full dashboard/portfolio summary."""
+    blocks = ["👋 <b>Hello / 你好</b>"]
+    blocks.append(H.escape(t("v2.greeting", locale)))
+    if reminder_count > 0:
+        blocks.append(H.escape(t("v2.greeting_reminders", locale, count=reminder_count)))
+    return "\n".join(blocks)
+
+
+def task_event_card(event: str, task: dict, locale: str = "zh") -> str:
+    """Conversation-driven task feedback: created / updated / completed.
+    Short, bilingual in groups, and always shows the next action when known."""
+    status = str(task.get("status") or "").upper()
+    if status == "PENDING":
+        emoji = "🔴"
+    elif status in ("IN_PROGRESS", "IN PROGRESS"):
+        emoji = "🟡"
+    else:
+        emoji = "✅"
+    event_key = {
+        "created": "v2.event.created",
+        "updated": "v2.event.updated",
+        "completed": "v2.event.completed",
+    }.get(str(event).lower(), "v2.event.updated")
+    header = _bi_line(locale, t(event_key, "en"), t(event_key, "zh"))
+    lines = [f"{emoji} <b>{H.escape(header)}</b>"]
+    unit = H.escape(str(task.get("property_code") or task.get("unit_code") or ""))
+    title = H.escape(str(task.get("title") or ""))
+    where = f"{unit} · {title}" if unit else title
+    if where:
+        lines.append(where)
+    next_action = task.get("next_action")
+    if next_action:
+        lines.append(t("v2.next", locale, next=H.escape(str(next_action))))
+    next_check = task.get("next_check_at")
+    if next_check:
+        lines.append(t("v2.check_at", locale, date=H.format_date(next_check)))
+    return "\n".join(lines)

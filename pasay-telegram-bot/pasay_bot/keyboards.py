@@ -70,9 +70,20 @@ ACTION_COPILOT_ASSIGNEE_PICK = "cap"    # cp_assignee_pick (edit who)
 # Exact button label -> deterministic route. These labels are UI commands,
 # NOT natural language: the text-message handler must exact-match them and
 # route deterministically BEFORE any NL/NLU/LLM processing can run.
+#
+# PASAY-V2-FOUNDATION-001: V2 menu is 4 simple-English Quick View buttons
+# shared by every role. They are direct views, never a feature navigation.
 FIXED_MENU_ROUTES: dict[str, str] = {
-    # BOT-V1-USABLE-001: one identical 4-button persistent menu for both
-    # roles (首页 / 待办 / 收租 / 支出). No second/duplicate main menu.
+    "🏠 Properties": "properties",
+    "✅ Tasks": "tasks",
+    "💰 Rent": "rent",
+    "💸 Expense": "expense",
+}
+
+# V2 legacy aliases: old Chinese labels still route deterministically so
+# keyboards already pinned on clients keep working after deploy. They are
+# never part of the visible V2 menu.
+LEGACY_MENU_ROUTES: dict[str, str] = {
     "🏠 首页": "home",
     "✅ 待办": "pending",
     "💰 收租": "rent",
@@ -80,21 +91,24 @@ FIXED_MENU_ROUTES: dict[str, str] = {
 }
 
 # Row layout for the persistent keyboard (role -> rows of exact labels).
-_OWNER_REPLY_ROWS = [
-    ["🏠 首页", "✅ 待办"],
-    ["💰 收租", "💸 支出"],
-]
-_SECRETARY_REPLY_ROWS = [
-    ["🏠 首页", "✅ 待办"],
-    ["💰 收租", "💸 支出"],
+_FIXED_REPLY_ROWS = [
+    ["🏠 Properties", "✅ Tasks"],
+    ["💰 Rent", "💸 Expense"],
 ]
 
 
 def fixed_menu_route_for(text: str) -> Optional[str]:
     """Exact-match a fixed bottom-menu button label to its deterministic
     route. Returns None when the text is NOT a fixed button, so free text
-    still falls through to the conversation/NL path unchanged."""
-    return FIXED_MENU_ROUTES.get((text or "").strip())
+    still falls through to the conversation/NL path unchanged.
+
+    V2: the English labels are primary; legacy Chinese labels keep working as
+    aliases for already-pinned keyboards (never shown in the V2 menu)."""
+    normalized = (text or "").strip()
+    route = FIXED_MENU_ROUTES.get(normalized)
+    if route is not None:
+        return route
+    return LEGACY_MENU_ROUTES.get(normalized)
 
 
 # ops center section entities (callback entity field).
@@ -267,15 +281,14 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
-    """Persistent bottom navigation (V1.3 + SLICE3-UX-PERSISTENT-MENU-001):
-    Owner sees Chinese decision labels, Secretary sees English execution
-    labels. Every label is an exact-match UI command routed deterministically
-    (see ``FIXED_MENU_ROUTES`` / ``fixed_menu_route_for``) and never reaches
-    NL/NLU/LLM processing. ``is_persistent=True`` pins the keyboard above the
-    input field across messages (Telegram Bot API >= 4.5 / PTB >= 13.5)."""
-    rows = _SECRETARY_REPLY_ROWS if role == Role.SECRETARY else _OWNER_REPLY_ROWS
+    """Persistent bottom navigation (PASAY-V2-FOUNDATION-001): one identical
+    4-button English Quick View menu for every role (Properties / Tasks /
+    Rent / Expense). Every label is an exact-match UI command routed
+    deterministically (see ``FIXED_MENU_ROUTES`` / ``fixed_menu_route_for``)
+    and never reaches NL/NLU/LLM processing. ``is_persistent=True`` pins the
+    keyboard above the input field across messages."""
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(label) for label in row] for row in rows],
+        [[KeyboardButton(label) for label in row] for row in _FIXED_REPLY_ROWS],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -1146,22 +1159,75 @@ def ops_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 # --- V1.3 Slice 1: expense approval action cards ---------------------------
 
+def _compact_peso(value) -> str:
+    """'₱3,500' or '₱3.5K' for large amounts (approval button label only)."""
+    from decimal import Decimal as _D, InvalidOperation
+
+    try:
+        d = _D(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        d = _D("0")
+    if abs(d) >= _D("10000"):
+        return _compact_k(d)
+    return H.money(d)
+
+
+def _compact_k(value) -> str:
+    """'₱3.5K' compact form (>= ₱1,000), else normal peso formatting."""
+    from decimal import Decimal as _D, InvalidOperation
+
+    try:
+        d = _D(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        d = _D("0")
+    if abs(d) >= _D("1000"):
+        scaled = f"{abs(d) / _D('1000'):.1f}".rstrip("0").rstrip(".")
+        return f"₱{scaled}K"
+    return H.money(d)
+
+
+def _approve_button_label(locale: str = "zh", amount=None, unit=None) -> str:
+    """PASAY-V2-FOUNDATION-001: approval button carries the value.
+
+    'Approve ₱3,500' or 'Approve 1680 · ₱3.5K' when an amount is known;
+    otherwise falls back to the plain locale label (back-compat for callers
+    that do not know the amount yet)."""
+    if amount is None:
+        return t("expense.approve", locale)
+    if unit:
+        return f"Approve {unit} · {_compact_k(amount)}"
+    return f"Approve {_compact_peso(amount)}"
+
+
+def _reject_button_label(locale: str = "zh", amount=None) -> str:
+    """V2: the reject action stays plain English next to the amount-aware
+    approve button; falls back to the locale label when no amount is known."""
+    if amount is not None:
+        return "Reject"
+    return t("expense.reject", locale)
+
+
 def expense_approval_keyboard(
-    expense_id: int, locale: str = "zh", has_receipt: bool = False
+    expense_id: int, locale: str = "zh", has_receipt: bool = False,
+    amount=None, unit=None,
 ) -> InlineKeyboardMarkup:
-    """Expense approval card: [✅ 批准][❌ 拒绝] + secondary [查看凭证/详情]."""
+    """Expense approval card: [Approve ₱3,500][Reject] + secondary buttons.
+
+    V2: the approve button carries the amount (and unit when known) so the
+    Owner decides with the value in front of them, e.g. ``Approve 1680 ·
+    ₱3.5K``."""
     nonce, ts = new_nonce(), now_ts()
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    t("expense.approve", locale),
+                    _approve_button_label(locale, amount=amount, unit=unit),
                     callback_data=encode(
                         ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
                     ),
                 ),
                 InlineKeyboardButton(
-                    t("expense.reject", locale),
+                    _reject_button_label(locale, amount=amount),
                     callback_data=encode(
                         ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
                     ),
@@ -1184,6 +1250,7 @@ def expense_approval_keyboard(
 
 def expense_detail_keyboard(
     expense_id: int, *, still_pending: bool = False, locale: str = "zh",
+    amount=None, unit=None,
 ) -> InlineKeyboardMarkup:
     """Detail card buttons: keep approve/reject while the expense is still
     pending (the handler re-checks the backend state before rendering)."""
@@ -1193,13 +1260,13 @@ def expense_detail_keyboard(
         kb.append(
             [
                 InlineKeyboardButton(
-                    t("expense.approve", locale),
+                    _approve_button_label(locale, amount=amount, unit=unit),
                     callback_data=encode(
                         ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
                     ),
                 ),
                 InlineKeyboardButton(
-                    t("expense.reject", locale),
+                    _reject_button_label(locale, amount=amount),
                     callback_data=encode(
                         ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
                     ),
@@ -1339,13 +1406,17 @@ def todo_keyboard(
         kb.append(
             [
                 InlineKeyboardButton(
-                    t("expense.approve", locale),
+                    _approve_button_label(
+                        locale,
+                        amount=row.get("amount"),
+                        unit=row.get("unit"),
+                    ),
                     callback_data=encode(
                         ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
                     ),
                 ),
                 InlineKeyboardButton(
-                    t("expense.reject", locale),
+                    _reject_button_label(locale, amount=row.get("amount")),
                     callback_data=encode(
                         ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
                     ),

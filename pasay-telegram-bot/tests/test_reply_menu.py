@@ -1,8 +1,9 @@
-"""BOT-V1-USABLE-001: persistent Reply Keyboard menu tests.
+"""PASAY-V2-FOUNDATION-001: persistent Reply Keyboard menu tests.
 
-Both roles share ONE identical 4-button persistent menu (首页 / 待办 / 收租 /
-支出). Each fixed button exact-matches to a deterministic page BEFORE any
-NL/AI path; unknown users cannot reach a page through a menu button.
+Both roles share ONE identical 4-button English Quick View menu (Properties /
+Tasks / Rent / Expense). Each fixed button exact-matches to a deterministic
+Quick View BEFORE any NL/AI path; unknown users cannot reach a page through a
+menu button.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ def _markup_name(send):
     return kb.__class__.__name__ if kb is not None else None
 
 
-EXPECTED_LABELS = ["🏠 首页", "✅ 待办", "💰 收租", "💸 支出"]
+EXPECTED_LABELS = ["\U0001f3e0 Properties", "\u2705 Tasks", "\U0001f4b0 Rent", "\U0001f4b8 Expense"]
 
 
 # --- keyboard structure: identical for both roles --------------------------
@@ -45,65 +46,61 @@ def test_secretary_reply_keyboard_structure():
         assert forbidden not in joined
 
 
-# --- button -> deterministic page reuse (both roles) ------------------------
-
-def _home_marker(text):
-    return "Pasay Property" in text
-
+# --- button -> deterministic Quick View (both roles) ------------------------
 
 @pytest.mark.parametrize(
-    "user_id", [OWNER_ID, SECRETARY_ID],
+    ("user_id", "marker"),
+    [(OWNER_ID, "\u623f\u6e90"), (SECRETARY_ID, "Properties")],
 )
-def test_home_button_routes_to_summary(make_app, user_id):
+def test_properties_button_routes_to_quick_view(make_app, user_id, marker):
     env = make_app()
-    run_updates(env, [make_text_update(user_id, user_id, "🏠 首页", bot=env.bot)])
-    assert "处理中" in env.bot.last_send()["text"] or "Processing" in env.bot.last_send()["text"]
-    page = env.bot.last_edit()
-    assert _home_marker(page["text"])
-    assert _markup_name(page) == "InlineKeyboardMarkup"
+    run_updates(env, [make_text_update(user_id, user_id, "\U0001f3e0 Properties", bot=env.bot)])
+    send = env.bot.last_send()
+    assert marker in send["text"]
+    assert _markup_name(send) == "ReplyKeyboardMarkup"
 
 
 @pytest.mark.parametrize(
     ("user_id", "marker"),
-    [(OWNER_ID, "逾期租金"), (SECRETARY_ID, "Overdue rent")],
+    [(OWNER_ID, "\u5f85\u529e"), (SECRETARY_ID, "Tasks")],
 )
-def test_todo_button_routes_to_unified_todo(make_app, user_id, marker):
+def test_tasks_button_routes_to_quick_view(make_app, user_id, marker):
     env = make_app()
-    run_updates(env, [make_text_update(user_id, user_id, "✅ 待办", bot=env.bot)])
-    page = env.bot.last_edit()
-    assert marker in page["text"]
-    assert _markup_name(page) == "InlineKeyboardMarkup"
+    run_updates(env, [make_text_update(user_id, user_id, "\u2705 Tasks", bot=env.bot)])
+    send = env.bot.last_send()
+    assert marker in send["text"]
+    assert _markup_name(send) == "ReplyKeyboardMarkup"
 
 
 @pytest.mark.parametrize(
     ("user_id", "marker"),
-    [(OWNER_ID, "选择未付款"), (SECRETARY_ID, "Select unpaid unit")],
+    [(OWNER_ID, "\u79df\u91d1"), (SECRETARY_ID, "Rent")],
 )
-def test_rent_button_routes_to_collect_page(make_app, user_id, marker):
+def test_rent_button_routes_to_quick_view(make_app, user_id, marker):
     env = make_app()
-    run_updates(env, [make_text_update(user_id, user_id, "💰 收租", bot=env.bot)])
-    page = env.bot.last_edit()
-    assert marker in page["text"]
-    assert _markup_name(page) == "InlineKeyboardMarkup"
+    run_updates(env, [make_text_update(user_id, user_id, "\U0001f4b0 Rent", bot=env.bot)])
+    send = env.bot.last_send()
+    assert marker in send["text"]
+    assert _markup_name(send) == "ReplyKeyboardMarkup"
 
 
 @pytest.mark.parametrize(
     ("user_id", "marker"),
-    [(OWNER_ID, "直接告诉我这笔支出"), (SECRETARY_ID, "Just tell me the expense")],
+    [(OWNER_ID, "\u652f\u51fa"), (SECRETARY_ID, "Expense")],
 )
-def test_expense_button_routes_to_expense_page(make_app, user_id, marker):
+def test_expense_button_routes_to_quick_view(make_app, user_id, marker):
     env = make_app()
-    run_updates(env, [make_text_update(user_id, user_id, "💸 支出", bot=env.bot)])
-    page = env.bot.last_edit()
-    assert marker in page["text"]
-    assert _markup_name(page) == "InlineKeyboardMarkup"
+    run_updates(env, [make_text_update(user_id, user_id, "\U0001f4b8 Expense", bot=env.bot)])
+    send = env.bot.last_send()
+    assert marker in send["text"]
+    assert _markup_name(send) == "ReplyKeyboardMarkup"
 
 
 # --- RBAC is not bypassed by menu buttons -----------------------------------
 
 def test_unknown_user_menu_button_cannot_reach_page(make_app):
     env = make_app()
-    run_updates(env, [make_text_update(UNKNOWN_ID, UNKNOWN_ID, "✅ 待办", bot=env.bot)])
+    run_updates(env, [make_text_update(UNKNOWN_ID, UNKNOWN_ID, "\u2705 Tasks", bot=env.bot)])
     send = env.bot.last_send()
-    assert "权限" in send["text"] or "permission" in send["text"]
-    assert "逾期租金" not in send["text"]
+    assert "\u6743\u9650" in send["text"] or "permission" in send["text"]
+    assert "Tasks" not in send["text"]

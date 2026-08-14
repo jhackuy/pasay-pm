@@ -65,24 +65,23 @@ def _latency(env):
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 首页", "Pasay Property"),
-        (OWNER_ID, "✅ 待办", "逾期租金"),
-        (OWNER_ID, "💰 收租", "选择未付款"),
-        (OWNER_ID, "💸 支出", "直接告诉我这笔支出"),
-        (SECRETARY_ID, "🏠 首页", "Pasay Property"),
-        (SECRETARY_ID, "✅ 待办", "Overdue rent"),
-        (SECRETARY_ID, "💰 收租", "Select unpaid unit"),
-        (SECRETARY_ID, "💸 支出", "Just tell me the expense"),
+        (OWNER_ID, "🏠 Properties", "房源"),
+        (OWNER_ID, "✅ Tasks", "待办"),
+        (OWNER_ID, "💰 Rent", "租金"),
+        (OWNER_ID, "💸 Expense", "支出"),
+        (SECRETARY_ID, "🏠 Properties", "Properties"),
+        (SECRETARY_ID, "✅ Tasks", "Tasks"),
+        (SECRETARY_ID, "💰 Rent", "Rent"),
+        (SECRETARY_ID, "💸 Expense", "Expense"),
     ],
 )
 def test_fixed_menu_button_exact_routes_without_nl(make_app, user_id, label, marker):
     env = make_app()
     run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
-    locale = "zh" if user_id == OWNER_ID else "en"
-    # backend-loading routes: durable "processing" message first, page then
-    # rendered onto that same message (message mutation, no junk messages)
-    assert t("common.working", locale) in env.bot.last_send()["text"]
-    assert marker in env.bot.last_edit()["text"]
+    # V2 Quick Views: ONE deterministic reply (no stub message, no LLM).
+    send = env.bot.last_send()
+    assert marker in send["text"]
+    assert send["reply_markup"] is not None
 
 
 def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
@@ -98,65 +97,54 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
     monkeypatch.setattr(nl_bridge, "handle_nl", boom)
     env = make_app()
     for user_id, label, marker in [
-        (OWNER_ID, "🏠 首页", "Pasay Property"),
-        (OWNER_ID, "✅ 待办", "逾期租金"),
-        (OWNER_ID, "💰 收租", "选择未付款"),
-        (OWNER_ID, "💸 支出", "直接告诉我这笔支出"),
-        (SECRETARY_ID, "🏠 首页", "Pasay Property"),
-        (SECRETARY_ID, "✅ 待办", "Overdue rent"),
-        (SECRETARY_ID, "💰 收租", "Select unpaid unit"),
-        (SECRETARY_ID, "💸 支出", "Just tell me the expense"),
+        (OWNER_ID, "🏠 Properties", "房源"),
+        (OWNER_ID, "✅ Tasks", "待办"),
+        (OWNER_ID, "💰 Rent", "租金"),
+        (OWNER_ID, "💸 Expense", "支出"),
+        (SECRETARY_ID, "🏠 Properties", "Properties"),
+        (SECRETARY_ID, "✅ Tasks", "Tasks"),
+        (SECRETARY_ID, "💰 Rent", "Rent"),
+        (SECRETARY_ID, "💸 Expense", "Expense"),
     ]:
         run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
-        locale = "zh" if user_id == OWNER_ID else "en"
-        assert t("common.working", locale) in env.bot.last_send()["text"]
-        assert marker in env.bot.last_edit()["text"]
+        send = env.bot.last_send()
+        assert marker in send["text"]
     assert calls == []
 
 
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 首页", "Pasay Property"),
-        (OWNER_ID, "✅ 待办", "逾期租金"),
-        (OWNER_ID, "💰 收租", "选择未付款"),
-        (OWNER_ID, "💸 支出", "直接告诉我这笔支出"),
-        (SECRETARY_ID, "🏠 首页", "Pasay Property"),
-        (SECRETARY_ID, "✅ 待办", "Overdue rent"),
-        (SECRETARY_ID, "💰 收租", "Select unpaid unit"),
-        (SECRETARY_ID, "💸 支出", "Just tell me the expense"),
+        (OWNER_ID, "🏠 Properties", "房源"),
+        (OWNER_ID, "✅ Tasks", "待办"),
+        (OWNER_ID, "💰 Rent", "租金"),
+        (OWNER_ID, "💸 Expense", "支出"),
+        (SECRETARY_ID, "🏠 Properties", "Properties"),
+        (SECRETARY_ID, "✅ Tasks", "Tasks"),
+        (SECRETARY_ID, "💰 Rent", "Rent"),
+        (SECRETARY_ID, "💸 Expense", "Expense"),
     ],
 )
 def test_fixed_menu_slow_routes_status_message_is_editable(
     make_app, user_id, label, marker
 ):
-    """Live UX regression (OWNER-UX-FAILURE-LIVE-TRACE-001): the 'processing'
-    status message must be sent WITHOUT a reply keyboard. Telegram rejects
-    editMessageText on messages carrying a non-inline ReplyKeyboardMarkup
-    (400 'Message can't be edited'); FakeBot now enforces that real semantic,
-    so the old code leaves the user stuck on the status, while the fix renders
-    the page in place onto the same message."""
+    """PASAY-V2-FOUNDATION-001: Quick View buttons reply directly with a
+    single deterministic card (no 'processing' stub, no edit needed)."""
     env = make_app()
     run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
     sends = env.bot.sends()
-    edits = env.bot.edits()
-    assert len(sends) == 1  # exactly one durable status message, no junk
-    assert sends[0]["reply_markup"] is None  # editable by Telegram
-    assert edits and marker in edits[-1]["text"]
+    assert len(sends) == 1  # exactly one reply, no junk
+    assert marker in sends[0]["text"]
+    assert sends[0]["reply_markup"] is not None
 
 
 def test_rent_button_live_ux_failure_repro_edits_status_in_place(make_app):
-    """Live UX regression (OWNER-UX-FAILURE-LIVE-TRACE-001): the status
-    message is sent without a reply keyboard and the page is rendered onto
-    that same message (never a stuck '处理中…')."""
+    """V2 Rent Quick View replies directly (deterministic, no stub/edit)."""
     env = make_app()
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 收租", bot=env.bot)])
-    status = env.bot.sends()[0]
-    assert status["text"] == t("common.working", "zh")
-    assert status["reply_markup"] is None
-    edit = env.bot.last_edit()
-    assert edit["message_id"] == status["message_id"]  # same message mutated
-    assert "选择未付款" in edit["text"]
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    send = env.bot.sends()[0]
+    assert "租金" in send["text"]
+    assert send["reply_markup"] is not None
 
 
 def test_fakebot_mirrors_telegram_reply_keyboard_edit_semantics(make_app):

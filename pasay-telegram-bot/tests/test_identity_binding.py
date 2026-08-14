@@ -29,17 +29,8 @@ def test_registered_commands_bind_identity_before_page_or_api_work(make_app):
     ]
     assert {callback.__name__ for callback in callbacks} == {
         "cmd_start",
-        "cmd_menu",
         "cmd_help",
-        "cmd_properties",
-        "cmd_finance",
-        "cmd_overdue",
-        "cmd_rent",
-        "cmd_pending",
         "cmd_cancel",
-        "cmd_ops",
-        "cmd_todo",
-        "cmd_copilot",
     }
     for callback in callbacks:
         source = inspect.getsource(callback)
@@ -57,7 +48,7 @@ def test_command_callback_conversation_and_nl_bridge_separate_group_users(make_a
     )
     updates = [
         ("command", make_text_update(
-            OWNER_ID, GROUP_CHAT_ID, "/properties", update_id=101, bot=env.bot
+            OWNER_ID, GROUP_CHAT_ID, "/start", update_id=101, bot=env.bot
         )),
         ("callback", make_callback_update(
             SECRETARY_ID,
