@@ -231,10 +231,12 @@ def test_secretary_en_who_unpaid(make_app):
         make_text_update(SECRETARY_ID, SECRETARY_ID, "who hasn't paid this month?", bot=env.bot)
     ])
     text = env.bot.last_send()["text"]
-    assert "unpaid · 1" in text
+    # P0-RENT-SECRETARY-STATUS-004: who-unpaid == /reports/overdue-rents
+    # authority - every overdue unit is listed, never the "all collected" copy.
+    assert "unpaid · 2" in text
     assert "Unit 16B" in text
     assert "Juan Dela Cruz" in text
-    assert "Unit 2C" not in text  # 2C owes older months only, not this month
+    assert "Unit 2C" in text
 
 
 # --- who-unpaid list --------------------------------------------------------
@@ -244,10 +246,12 @@ def test_owner_zh_who_unpaid_list(make_app):
     set_who_unpaid_rows(env)
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "这个月谁还没交", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "未交 · 1笔" in text
+    # P0-RENT-SECRETARY-STATUS-004: who-unpaid == /reports/overdue-rents
+    # authority - every overdue unit is listed.
+    assert "未交 · 2笔" in text
     assert "Unit 16B" in text
     assert "Juan Dela Cruz" in text
-    assert "Unit 2C" not in text
+    assert "Unit 2C" in text
 
 
 def test_who_unpaid_all_collected(make_app):

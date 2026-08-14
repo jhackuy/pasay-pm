@@ -450,14 +450,12 @@ async def _answer_who_unpaid(context, chat_id, locale):
     except PasayApiError:
         pass  # property names are a nice-to-have, same as the overdue page
     month = pages._current_month()
-    unpaid = [
-        r
-        for r in rows
-        if any(
-            str(p.get("month", "")) == month
-            for p in (r.overdue_periods or [])
-        )
-    ]
+    # The full /reports/overdue-rents result is the authority for "exists
+    # outstanding": a unit that owes older periods (e.g. Jun-Jul while Aug is
+    # not yet due) is still unpaid, so the "all rent collected" empty state is
+    # only reachable when the overdue report is truly empty.
+    # (P0-RENT-SECRETARY-STATUS-004)
+    unpaid = rows
     await context.bot.send_message(
         chat_id,
         H.truncate(cards.unpaid_list_card(unpaid, month, locale, prop_by_unit)),

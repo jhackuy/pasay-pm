@@ -505,15 +505,7 @@ async def _begin_rent_entry(update, context, unit_id: int, role, locale):
         await _edit(update, t("rent.no_active_lease", locale), home_keyboard(locale))
         return
     month = _current_month()
-    covered = False
-    for inc in incomes:
-        if inc.lease_id != lease.id or inc.status != "confirmed":
-            continue
-        if month in (inc.description or "") or (
-            inc.received_date and inc.received_date.strftime("%Y-%m") == month
-        ):
-            covered = True
-            break
+    covered = pages._period_covered(incomes, lease.id, month)
     if covered:
         await _edit(update, t("unit.payment_paid", locale), home_keyboard(locale))
         return
