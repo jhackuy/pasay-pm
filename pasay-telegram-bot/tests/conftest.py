@@ -245,7 +245,59 @@ class FakeBackend:
         }
         self._next_income_id = max(self._next_income_id, inc["id"]) + 1
         self.incomes.append(inc)
+        if status == "confirmed":
+            self._recompute_overdue()
         return inc
+
+    @staticmethod
+    def _income_period(inc: dict) -> str | None:
+        """YYYY-MM rent period an income maps to (description first; received-
+        date month fallback when the description has no period). Mirrors the
+        real backend so the fake overdue report stays consistent."""
+        import re as _re
+        desc = inc.get("description") or ""
+        match = _re.search(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)", desc)
+        if match is not None:
+            year, month = int(match.group(1)), int(match.group(2))
+            if 1 <= month <= 12:
+                return f"{year:04d}-{month:02d}"
+        rd = inc.get("received_date")
+        if rd:
+            return str(rd)[:7]
+        return None
+
+    def _recompute_overdue(self) -> None:
+        """Keep the fake overdue report consistent with confirmed income (the
+        real backend recomputes it dynamically): a confirmed payment covering
+        a due period removes that period from the report."""
+        covered_by_lease: dict[int, set[str]] = {}
+        for inc in self.incomes:
+            if inc.get("status") != "confirmed" or not inc.get("lease_id"):
+                continue
+            period = self._income_period(inc)
+            if period:
+                covered_by_lease.setdefault(int(inc["lease_id"]), set()).add(period)
+        kept = []
+        for row in self.overdue_rows:
+            lease_id = int(row.get("lease_id") or 0)
+            covered = covered_by_lease.get(lease_id, set())
+            row_periods = row.get("overdue_periods") or []
+            if not row_periods:
+                # opaque row (no period detail) -> keep as configured
+                kept.append(row)
+                continue
+            periods = [
+                p for p in row_periods
+                if p.get("month") not in covered
+            ]
+            if not periods:
+                continue
+            per_month = Decimal(str(row.get("amount_per_month") or 0))
+            row["overdue_periods"] = periods
+            row["overdue_months"] = len(periods)
+            row["total_outstanding"] = f"{per_month * len(periods):.2f}"
+            kept.append(row)
+        self.overdue_rows = kept
 
     def add_expense(self, status="pending", expense_id=None, category="维修",
                     amount="5000.00", payee="Fix-It Co", unit_id=1,

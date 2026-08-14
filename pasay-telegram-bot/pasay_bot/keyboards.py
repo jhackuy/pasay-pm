@@ -833,11 +833,16 @@ def pending_list_keyboard(entries, locale: str = "zh") -> InlineKeyboardMarkup:
 # --- V1.1 UX keyboards ---
 
 def collect_list_keyboard(rows: list[dict], locale: str = "zh") -> InlineKeyboardMarkup:
-    """Unpaid-unit collect list (B4). One button per unit -> direct entry."""
+    """Collect list (B4 / P0-RENT-COLLECTION-UX-003). One DISTINCT button per
+    unit (unit + outstanding) -> direct entry; never repeated identical
+    generic labels."""
     buttons = []
     has_overdue = any(int(r.get("overdue_days") or 0) > 0 for r in rows)
     for r in rows:
-        label = f"{r.get('unit_number', '')} · {H.money(r.get('amount'))}"
+        label = (
+            f"{r.get('unit_number', '')} · "
+            f"{t('rent.outstanding', locale)} {H.money(r.get('outstanding'))}"
+        )
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -1369,7 +1374,7 @@ def todo_keyboard(
         kb.append(
             [
                 InlineKeyboardButton(
-                    t("todo.collect", locale),
+                    f"{t('todo.collect', locale)} · {row.get('unit', '')}",
                     callback_data=encode(ACTION_RENT, "go", str(row["unit_id"])),
                 )
             ]

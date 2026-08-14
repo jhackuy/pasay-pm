@@ -749,9 +749,11 @@ def dashboard_card(
 
 
 def rent_collect_list(rows: list[dict], locale: str = "zh") -> str:
-    """Unpaid-unit collect list (B4). ``rows``: unit_id, unit_number,
-    property_name, amount, overdue_days (0 when not overdue). Paid/vacant
-    units are filtered out before this renderer is called."""
+    """All collectible units (B4 / P0-RENT-COLLECTION-UX-003). ``rows``:
+    unit_number, property_name, tenant, receivable, received, outstanding,
+    overdue_days. Every unit shows Unit / Tenant / 应收 / 已收 / 尚欠 /
+    到期状态; units without outstanding are filtered out before this
+    renderer is called."""
     if not rows:
         return (
             f"{H.escape(t('rent.collect_title', locale))}\n\n"
@@ -762,15 +764,19 @@ def rent_collect_list(rows: list[dict], locale: str = "zh") -> str:
         where = " · ".join(
             x for x in (r.get("property_name"), r.get("unit_number")) if x
         )
-        marker = ""
+        tenant = r.get("tenant") or ""
+        head = H.escape(where) + (f" · {H.escape(tenant)}" if tenant else "")
+        amounts = (
+            f"{H.escape(t('rent.receivable', locale))} {H.money(r.get('receivable'))}"
+            f" · {H.escape(t('rent.received', locale))} {H.money(r.get('received'))}"
+            f" · {H.escape(t('rent.outstanding', locale))} {H.money(r.get('outstanding'))}"
+        )
+        block = f"{head}\n{amounts}"
         if int(r.get("overdue_days") or 0) > 0:
-            marker = " " + H.escape(
+            block += "\n" + H.escape(
                 t("rent.collect_overdue", locale, days=int(r["overdue_days"]))
             )
-        blocks.append(
-            f"{H.escape(where)}\n"
-            f"{H.escape(t('rent.amount', locale))}：<b>{H.money(r.get('amount'))}</b>{marker}"
-        )
+        blocks.append(block)
     return "\n\n".join(blocks)
 
 

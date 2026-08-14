@@ -7,7 +7,11 @@ home -> pick unpaid unit -> confirm with smart defaults.
 from __future__ import annotations
 
 import asyncio
+import calendar
+import re
 from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import Optional
 
 from telegram import Chat, Update
 from telegram.ext import ContextTypes
@@ -119,18 +123,70 @@ def _current_month() -> str:
     return date.today().strftime("%Y-%m")
 
 
+_PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
+
+
+def _income_period(inc) -> Optional[str]:
+    """YYYY-MM rent period an income maps to.
+
+    Mirrors the backend (``app/api/routers/reports.py:_income_period``): an
+    explicit YYYY-MM in the description is authoritative; the received-date
+    month is used ONLY when the description carries no period.
+    """
+    desc = getattr(inc, "description", None) or ""
+    match = _PERIOD_IN_DESC.search(desc)
+    if match is not None:
+        year, month = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+    if inc.received_date is not None:
+        return inc.received_date.strftime("%Y-%m")
+    return None
+
+
 def _period_covered(incomes, lease_id: int, month: str) -> bool:
-    """True when the lease has a confirmed income covering ``month`` (matched
-    via the backend's 'rent YYYY-MM' description, falling back to the
-    received-date month). Mirrors the backend's coverage rule."""
+    """True when the lease has a confirmed income covering ``month``.
+
+    Mirrors the backend coverage rule exactly: period matching is
+    description-first (YYYY-MM), with a received-date-month fallback ONLY
+    when the description has no period. A payment recorded in a different
+    month never covers this month.
+    """
     for inc in incomes:
         if inc.lease_id != lease_id or inc.status != "confirmed":
             continue
-        if month in (inc.description or ""):
-            return True
-        if inc.received_date and inc.received_date.strftime("%Y-%m") == month:
+        if _income_period(inc) == month:
             return True
     return False
+
+
+def _lease_accounting_start(lease) -> date:
+    """Earliest month the lease accrues rent (mirrors backend)."""
+    if lease.accounting_start_date is None:
+        return lease.start_date
+    return max(lease.start_date, lease.accounting_start_date)
+
+
+def _lease_periods(lease) -> list[tuple[str, date]]:
+    """(YYYY-MM, due_date) for every rent month from accounting start through
+    end, mirroring the backend's ``reports._lease_periods``."""
+    due_day = lease.due_day if lease.due_day is not None else lease.start_date.day
+    periods: list[tuple[str, date]] = []
+    accounting_start = _lease_accounting_start(lease)
+    year, month = accounting_start.year, accounting_start.month
+    end_year, end_month = lease.end_date.year, lease.end_date.month
+    end_is_fully_covered = lease.end_date.day >= calendar.monthrange(end_year, end_month)[1]
+    while (year, month) <= (end_year, end_month):
+        if (year, month) == (end_year, end_month) and not end_is_fully_covered:
+            # final month is partial (lease ends mid-month) -> skip
+            break
+        day = min(due_day, calendar.monthrange(year, month)[1])
+        periods.append((f"{year:04d}-{month:02d}", date(year, month, day)))
+        month += 1
+        if month > 12:
+            month = 1
+            year += 1
+    return periods
 
 
 def _last_income_for_lease(incomes, lease_id: int):
@@ -606,8 +662,11 @@ async def show_overdue(context, chat_id, locale: str, page: int = 1, message_id=
 # --- rent: collect list with smart defaults (B4) ---
 
 async def build_rent_collect_list(api, locale: str):
-    """Unpaid units only: paid units and vacant units are hidden; overdue
-    units sort first. Each row carries the current-month receivable."""
+    """All currently collectible units (the backend overdue report is the
+    authority): every unit with due-and-uncovered rent periods is listed with
+    Unit / Tenant / 应收 / 已收 / 尚欠 / 到期状态. Never picks a single unit
+    and never hides a unit because an unrelated income was recorded in the
+    current month (P0-RENT-COLLECTION-UX-003)."""
     try:
         units, leases, incomes, properties, overdue = await asyncio.gather(
             api.get_units(),
@@ -618,29 +677,36 @@ async def build_rent_collect_list(api, locale: str):
         )
     except PasayApiError as exc:
         return _load_error(exc.detail, locale), error_keyboard("rent", locale)
-    month = _current_month()
-    lease_by_unit = {l.unit_id: l for l in leases if l.status == "active"}
+    lease_by_id = {l.id: l for l in leases if l.status == "active"}
+    unit_by_id = {u.id: u for u in units}
     prop_by_id = {p.id: p.name for p in properties}
-    overdue_by_lease = {r.lease_id: r for r in overdue}
+    today = date.today()
     rows = []
-    for u in units:
-        lease = lease_by_unit.get(u.id)
+    for ovd in sorted(overdue, key=lambda r: (-r.overdue_days, r.unit)):
+        lease = lease_by_id.get(ovd.lease_id)
         if lease is None:
-            continue  # vacant / no active lease -> no collect button (B5)
-        if _period_covered(incomes, lease.id, month):
-            continue  # paid this month -> hidden (B5)
-        ovd = overdue_by_lease.get(lease.id)
+            continue
+        due_periods = [
+            (month, due) for month, due in _lease_periods(lease) if due <= today
+        ]
+        receivable = lease.monthly_rent * len(due_periods)
+        outstanding = ovd.total_outstanding
+        received = max(receivable - outstanding, Decimal("0"))
+        unit = unit_by_id.get(ovd.unit_id)
         rows.append(
             {
-                "unit_id": u.id,
-                "unit_number": u.unit_number,
-                "property_name": prop_by_id.get(u.property_id, ""),
-                "amount": lease.monthly_rent,
+                "unit_id": ovd.unit_id,
+                "lease_id": ovd.lease_id,
+                "unit_number": ovd.unit,
+                "property_name": prop_by_id.get(unit.property_id, "") if unit else "",
+                "tenant": ovd.tenant,
+                "monthly_rent": lease.monthly_rent,
+                "receivable": receivable,
+                "received": received,
+                "outstanding": outstanding,
                 "overdue_days": ovd.overdue_days if ovd else 0,
-                "lease_id": lease.id,
             }
         )
-    rows.sort(key=lambda r: (-r["overdue_days"], r["unit_number"]))
     text = cards.rent_collect_list(rows, locale)
     keyboard = collect_list_keyboard(rows, locale)
     return text, keyboard
