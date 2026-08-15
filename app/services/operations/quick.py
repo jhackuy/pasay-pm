@@ -29,10 +29,39 @@ from app.services.dates import month_range
 
 _TWO_PLACES = Decimal("0.01")
 _PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
+# PASAY-V2-EXPENSE-UX-AUDIT-005: Quick Expense caps the recent list at 20
+# records (newest-first). No pagination in-scope; fewer than 20 -> show all.
+_QUICK_EXPENSE_LIMIT = 20
 
 
 def _d2(value) -> Decimal:
     return Decimal(value).quantize(_TWO_PLACES)
+
+
+def _clean_text(value: str | None) -> str | None:
+    """Trim free text and drop placeholder/empty sentinels so the Quick View
+    never renders `??`, `None`, `null`, an empty string, or a bare dash as a
+    real value (PASAY-V2-EXPENSE-UX-AUDIT-005 §2). Returns None when no
+    meaningful text remains."""
+    if not value:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    if text.lower() in {"none", "null", "??", "-"}:
+        return None
+    return text
+
+
+def _clean_purpose(expense) -> str | None:
+    """Smallest existing-data purpose fallback chain for a Quick View row:
+    meaningful purpose -> meaningful category -> meaningful description/memo.
+    The final `Other / 其他` fallback lives in the renderer (locale-aware), not
+    here, so the backend never invents a classification system."""
+    for field in (_clean_text(expense.category), _clean_text(expense.description)):
+        if field:
+            return field
+    return None
 
 
 def _default_due_day(lease: Lease) -> int:
@@ -347,9 +376,12 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         .all()
     )
     unit_number_by_lease: dict[int, str] = {}
-    # PASAY-V2-EXPENSE-LIST-003: recent/current-month expense records (all
-    # statuses PENDING/APPROVED/REJECTED/PAID) so the 💸 Expense menu shows the
-    # actual history, not just the unresolved slices. PAID stays visible here.
+    # PASAY-V2-EXPENSE-UX-AUDIT-005: recent/current-month expense records held
+    # in the Quick View are PENDING/APPROVED/PAID only. Rejected/reversed
+    # (void/cancelled) entries are excluded from the expense history shown in
+    # the 💸 Expense card — those records are never deleted, only filtered here
+    # from the Quick View. PAID stays visible. Newest-first with a stable
+    # secondary order on id, capped at 20 records (no pagination in-scope).
     recent = (
         db.query(Expense)
         .filter(
@@ -357,7 +389,6 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
                 [
                     ExpenseStatus.pending,
                     ExpenseStatus.approved,
-                    ExpenseStatus.rejected,
                     ExpenseStatus.paid,
                 ]
             ),
@@ -365,6 +396,7 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
             Expense.expense_date <= end,
         )
         .order_by(Expense.expense_date.desc(), Expense.id.desc())
+        .limit(_QUICK_EXPENSE_LIMIT)
         .all()
     )
     unit_by_id: dict[int, Unit] = {}
@@ -378,8 +410,9 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         {
             "id": e.id,
             "unit": _unit_label(db, unit_by_id.get(e.unit_id)) or "",
-            "purpose": e.category,
-            "category": e.category,
+            "purpose": _clean_purpose(e),
+            "category": _clean_text(e.category),
+            "description": _clean_text(e.description),
             "amount": str(_d2(e.amount)),
             "expense_date": e.expense_date.isoformat(),
             "date": e.expense_date.isoformat(),

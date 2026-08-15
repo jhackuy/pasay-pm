@@ -339,12 +339,78 @@ def test_expense_quick_view_shows_recent_records_with_statuses(make_app):
     text = env.bot.last_send()["text"]
     # Case C: row shape unit · purpose · amount · date(MM-DD) · status.
     assert "1680 · Repair / 维修 ·" in text
-    assert "₱6,001 · 08-15 · 已付款" in text
+    assert "₱6,001</b> · 08-15 · 已付款" in text
     assert "1680 · Water / 水费 ·" in text
-    assert "₱3,500 · 08-02 · 待批准" in text
+    assert "₱3,500</b> · 08-02 · 待批准" in text
     # Case B: a paid record must be visible and there are no unresolved tasks.
     assert "已付款" in text
     assert "无未解决支出事项" in text
+
+
+def test_expense_quick_card_purpose_falls_back_to_other():
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test B (render): purpose falls back
+    purpose -> category -> description -> `Other / 其他`. `??`, None, null and
+    empty values never render; raw status enums are not exposed."""
+    from pasay_bot.render.cards import expense_quick_card
+
+    data = {
+        "month_total": "0.00",
+        "pending_approval_count": 0,
+        "pending_approval_amount": "0.00",
+        "unresolved_expense_tasks": [],
+        "recent_expenses": [
+            {"unit": "1680", "purpose": None, "category": "??",
+             "description": "Water / 水费", "amount": "3500.00",
+             "expense_date": "2026-08-02", "status": "pending"},
+            {"unit": "1680", "purpose": None, "category": None,
+             "description": None, "amount": "3500.00",
+             "expense_date": "2026-08-03", "status": "paid"},
+            {"unit": "1680", "purpose": "Repair / 维修", "category": "X",
+             "description": "bogus", "amount": "6001.00",
+             "expense_date": "2026-08-04", "status": "approved"},
+        ],
+    }
+    text = expense_quick_card(data, locale="zh")
+    assert "1680 · Water / 水费 ·" in text  # category `??` ignored, desc used
+    assert "1680 · Other / 其他 ·" in text  # final fallback for empty row
+    assert "1680 · Repair / 维修 ·" in text  # purpose wins when present
+    assert "??" not in text
+    assert "None" not in text
+    # English fallback is just `Other`.
+    en_text = expense_quick_card(data, locale="en")
+    assert "1680 · Other ·" in en_text
+
+
+def test_expense_quick_card_currency_never_trailing_point_zero():
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test C (render): integer money has no
+    `.0` while meaningful fractional money keeps its decimals. The backend
+    always emits 2-place strings, and H.money also guards the scalar float
+    form so ₱52,603.0 can never appear."""
+    from pasay_bot.render.cards import expense_quick_card
+
+    data = {
+        "month_total": "52603.0",  # float-form scalar: must strip .0
+        "pending_approval_count": 0,
+        "pending_approval_amount": "0.00",
+        "unresolved_expense_tasks": [],
+        "recent_expenses": [
+            {"unit": "1680", "purpose": "P", "category": "P",
+             "amount": "6001.00", "expense_date": "2026-08-15",
+             "status": "paid"},
+            {"unit": "1680", "purpose": "Q", "category": "Q",
+             "amount": "1250.50", "expense_date": "2026-08-14",
+             "status": "approved"},
+            {"unit": "1680", "purpose": "R", "category": "R",
+             "amount": "500", "expense_date": "2026-08-13",
+             "status": "pending"},
+        ],
+    }
+    text = expense_quick_card(data, locale="zh")
+    assert "本月：₱52,603" in text
+    assert "₱52,603.0" not in text
+    assert "₱6,001" in text
+    assert "₱1,250.50" in text  # valid fraction preserved
+    assert "₱500" in text
 
 
 def test_legacy_rent_alias_routes_to_quick_view(make_app):

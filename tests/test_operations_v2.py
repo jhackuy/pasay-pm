@@ -276,6 +276,106 @@ def test_quick_expense_recent_records_include_pending_and_paid(
         assert row["status"]
 
 
+def test_quick_expense_excludes_rejected_and_reversed(client, db_session, admin_headers):
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test A: the Quick Expense history shows
+    only PENDING/APPROVED/PAID. REJECTED/REVERSED rows are excluded from the
+    view but stay in the database (no data is ever deleted)."""
+    _, unit = _seed_lease(db_session)
+    today = date.today()
+    db_session.add_all([
+        Expense(expense_date=today, category="Keep A", amount="100.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.pending),
+        Expense(expense_date=today, category="Keep B", amount="200.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.approved),
+        Expense(expense_date=today, category="Keep C", amount="300.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.paid),
+        Expense(expense_date=today, category="Hide R", amount="400.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.rejected),
+        Expense(expense_date=today, category="Hide V", amount="500.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.reversed),
+    ])
+    db_session.commit()
+
+    resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
+    assert resp.status_code == 200
+    recent = resp.json()["recent_expenses"]
+    statuses = {r["status"] for r in recent}
+    assert statuses == {"pending", "approved", "paid"}
+    assert {"rejected", "reversed"} & statuses == set()
+    # Rejected/reversed rows remain in the database (not deleted).
+    kept = db_session.query(Expense).filter(
+        Expense.status.in_([ExpenseStatus.rejected, ExpenseStatus.reversed])
+    ).all()
+    assert len(kept) == 2
+
+
+def test_quick_expense_purpose_fallback_chain(client, db_session, admin_headers):
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test B: a row's purpose is the first
+    meaningful of category/description; `??`, None, null and empty values are
+    normalized away so the read model never carries a raw `??` placeholder."""
+    _, unit = _seed_lease(db_session)
+    today = date.today()
+    db_session.add_all([
+        Expense(expense_date=today, category="维修", amount="100.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.paid),
+        Expense(expense_date=today, category="??", description="Water / 水费",
+                amount="120.50", payee="X", unit_id=unit.id,
+                status=ExpenseStatus.paid),
+        Expense(expense_date=today, category="", amount="130.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.paid),
+    ])
+    db_session.commit()
+
+    resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
+    assert resp.status_code == 200
+    recent = resp.json()["recent_expenses"]
+    assert len(recent) >= 3
+    # category wins over description.
+    a = next(r for r in recent if r["purpose"] == "维修")
+    assert a["category"] == "维修"
+    # `??` category is cleaned; description becomes the meaningful fallback.
+    b = next(r for r in recent if r["amount"] == "120.50")
+    assert b["purpose"] == "Water / 水费"
+    assert b["category"] is None  # `??` never surfaces as a real value
+    # empty category and no description -> purpose falls back to None for the
+    # renderer's locale-aware `Other / 其他`.
+    c = next(r for r in recent if r["amount"] == "130.00")
+    assert c["purpose"] is None
+    assert "??" not in [r["purpose"] for r in recent]
+    assert "None" not in [r["purpose"] for r in recent]
+
+
+def test_quick_expense_ordering_and_limit(client, db_session, admin_headers):
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test D: newest-first with a stable id
+    tiebreaker; maximum 20 rows even when more current-month records match.
+    Test C (currency) is covered at the render layer because the read model
+    keeps 2-place decimals and H.money normalizes the trailing .0 (see bot
+    test_v2_ux)."""
+    _, unit = _seed_lease(db_session)
+    today = date.today()
+    db_session.add_all([
+        Expense(expense_date=today, category=f"E-{i}", amount="10.00",
+                payee="X", unit_id=unit.id, status=ExpenseStatus.paid)
+        for i in range(25)
+    ])
+    # A rejected current-month record beyond the visible set must stay hidden.
+    db_session.add(Expense(expense_date=today, category="HIDDEN-REJECTED",
+                           amount="10.00", payee="X", unit_id=unit.id,
+                           status=ExpenseStatus.rejected))
+    db_session.commit()
+
+    resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
+    assert resp.status_code == 200
+    recent = resp.json()["recent_expenses"]
+    assert len(recent) == 20
+    assert all(r["status"] != "rejected" for r in recent)
+    dates = [r["expense_date"] for r in recent]
+    assert dates == sorted(dates, reverse=True)  # newest-first
+    ids = [r["id"] for r in recent]
+    assert ids == sorted(ids, reverse=True)  # stable secondary id order
+    assert recent[0]["id"] == max(ids)
+
+
 def test_digest_structure(client, db_session, admin_headers):
     lease, _ = _seed_lease(db_session)
     _make_task(db_session, status=OperationalTaskStatus.PENDING, lease_id=lease.id,

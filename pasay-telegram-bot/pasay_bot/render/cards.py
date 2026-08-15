@@ -951,6 +951,27 @@ def _expense_location(expense: Expense, location: str = "") -> str:
     return H.escape(location) if location else ""
 
 
+def _expense_purpose(row: dict, locale: str = "zh") -> str:
+    """Smallest existing-data purpose fallback for one Quick Expense row:
+    purpose -> category -> description/memo, then the locale-aware
+    `Other / 其他` fallback. `??`/None/null/empty and raw sentinels never
+    render (PASAY-V2-EXPENSE-UX-AUDIT-005 §2)."""
+    for field in (row.get("purpose"), row.get("category"), row.get("description")):
+        text = _clean_free_text(field)
+        if text:
+            return text
+    return H.escape(t("v2.expense_other", locale))
+
+
+def _clean_free_text(value) -> str | None:
+    if not value:
+        return None
+    text = " ".join(str(value).split())
+    if not text or text.lower() in {"none", "null", "??", "-"}:
+        return None
+    return text
+
+
 def expense_approval_card(
     expense: Expense, locale: str = "zh", location: str = "",
 ) -> str:
@@ -1666,9 +1687,9 @@ def expense_quick_card(data, locale: str = "bi") -> str:
     recent = data.get("recent_expenses") or []
     if recent:
         blocks.append(H.escape(t("v2.expense_recent_records", locale)))
-        for row in recent[:10]:
+        for row in recent[:20]:
             unit = row.get("unit") or row.get("unit_code") or "-"
-            purpose = row.get("purpose") or row.get("category") or "-"
+            purpose = _expense_purpose(row, locale)
             status = _expense_status_label(row.get("status"), locale)
             date = row.get("expense_date") or row.get("date") or ""
             blocks.append(

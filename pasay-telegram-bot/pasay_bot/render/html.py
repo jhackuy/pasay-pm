@@ -39,23 +39,22 @@ def money(value) -> str:
     Whole amounts render without decimals (₱55,000); fractional amounts keep
     their two places (₱0.01, ₱1,500,000.50); reversals show a leading minus
     (-₱55,000).
+
+    The value is normalized to two decimal places first so an integer scalar
+    (e.g. float 52603.0 or Decimal('52603.0')) never renders as ₱52,603.0 —
+    it becomes ₱52,603 (PASAY-V2-EXPENSE-UX-AUDIT-005 §3).
     """
     d = _dec(value)
     sign = "-" if d < 0 else ""
+    d = d.quantize(Decimal("0.01"))
     s = format(abs(d), "f")
-    if "." in s:
-        int_part, _, frac = s.partition(".")
-        if frac == "00":
-            s = int_part
-        else:
-            s = f"{int_part}.{frac}"
     int_part, sep, frac = s.partition(".")
     if not int_part:
         int_part = "0"
     int_part = f"{int(int_part):,}"
-    if frac:
-        return f"{sign}{PESO}{int_part}.{frac}"
-    return f"{sign}{PESO}{int_part}"
+    if frac == "00":
+        return f"{sign}{PESO}{int_part}"
+    return f"{sign}{PESO}{int_part}.{frac}"
 
 
 def percent(part, whole) -> str:
