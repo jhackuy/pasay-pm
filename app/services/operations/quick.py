@@ -347,6 +347,46 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         .all()
     )
     unit_number_by_lease: dict[int, str] = {}
+    # PASAY-V2-EXPENSE-LIST-003: recent/current-month expense records (all
+    # statuses PENDING/APPROVED/REJECTED/PAID) so the 💸 Expense menu shows the
+    # actual history, not just the unresolved slices. PAID stays visible here.
+    recent = (
+        db.query(Expense)
+        .filter(
+            Expense.status.in_(
+                [
+                    ExpenseStatus.pending,
+                    ExpenseStatus.approved,
+                    ExpenseStatus.rejected,
+                    ExpenseStatus.paid,
+                ]
+            ),
+            Expense.expense_date >= start,
+            Expense.expense_date <= end,
+        )
+        .order_by(Expense.expense_date.desc(), Expense.id.desc())
+        .all()
+    )
+    unit_by_id: dict[int, Unit] = {}
+    unit_ids = {e.unit_id for e in recent if e.unit_id is not None}
+    if unit_ids:
+        unit_by_id = {
+            u.id: u
+            for u in db.query(Unit).filter(Unit.id.in_(unit_ids)).all()
+        }
+    recent_expenses = [
+        {
+            "id": e.id,
+            "unit": _unit_label(db, unit_by_id.get(e.unit_id)) or "",
+            "purpose": e.category,
+            "category": e.category,
+            "amount": str(_d2(e.amount)),
+            "expense_date": e.expense_date.isoformat(),
+            "date": e.expense_date.isoformat(),
+            "status": e.status.value,
+        }
+        for e in recent
+    ]
     return {
         "month_total": month_total,
         "pending_approval_count": len(pending_rows),
@@ -354,6 +394,7 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         "unresolved_expense_tasks": [
             _task_row(db, t, unit_number_by_lease) for t in unresolved
         ],
+        "recent_expenses": recent_expenses,
     }
 
 

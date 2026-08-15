@@ -1663,6 +1663,20 @@ def expense_quick_card(data, locale: str = "bi") -> str:
             blocks.append(_v2_task_line(task, locale, "💸"))
     else:
         blocks.append(H.escape(t("v2.expense_no_unresolved", locale)))
+    recent = data.get("recent_expenses") or []
+    if recent:
+        blocks.append(H.escape(t("v2.expense_recent_records", locale)))
+        for row in recent[:10]:
+            unit = row.get("unit") or row.get("unit_code") or "-"
+            purpose = row.get("purpose") or row.get("category") or "-"
+            status = _expense_status_label(row.get("status"), locale)
+            date = row.get("expense_date") or row.get("date") or ""
+            blocks.append(
+                f"💸 {H.escape(unit)} · {H.escape(purpose)} · "
+                f"<b>{H.money(row.get('amount'))}</b> · "  # type: ignore[arg-type]
+                f"{H.escape(str(date)[5:] if str(date)[:4].isdigit() else date)} · "
+                f"{status}"
+            )
     return "\n\n".join(blocks)
 
 

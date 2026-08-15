@@ -104,6 +104,16 @@ class V2FakeBackend(FakeBackend):
             "pending_approval_count": 1,
             "pending_approval_amount": "3500.00",
             "unresolved_expense_tasks": [],
+            "recent_expenses": [
+                {"id": 1, "unit": "1680", "purpose": "Repair / 维修",
+                 "category": "Repair / 维修", "amount": "6001.00",
+                 "expense_date": "2026-08-15", "date": "2026-08-15",
+                 "status": "paid"},
+                {"id": 2, "unit": "1680", "purpose": "Water / 水费",
+                 "category": "Water / 水费", "amount": "3500.00",
+                 "expense_date": "2026-08-02", "date": "2026-08-02",
+                 "status": "pending"},
+            ],
         }
         self.digest = {
             "pending": self.quick_tasks[:2],
@@ -314,6 +324,26 @@ def test_expense_quick_view_shows_amounts(make_app):
     text = env.bot.last_send()["text"]
     assert "本月：₱19,650" in text
     assert "待审批：1 笔 · ₱3,500" in text
+    assert "无未解决支出事项" in text
+
+
+def test_expense_quick_view_shows_recent_records_with_statuses(make_app):
+    """PASAY-V2-EXPENSE-LIST-003 Cases A, B, C.
+
+    A: current month holds one PENDING + one PAID — both appear.
+    B: the PAID record is not an unresolved task but stays in expense history.
+    C: each row exposes unit · purpose · amount · date · status.
+    """
+    env = make_app(backend=V2FakeBackend())
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    # Case C: row shape unit · purpose · amount · date(MM-DD) · status.
+    assert "1680 · Repair / 维修 ·" in text
+    assert "₱6,001 · 08-15 · 已付款" in text
+    assert "1680 · Water / 水费 ·" in text
+    assert "₱3,500 · 08-02 · 待批准" in text
+    # Case B: a paid record must be visible and there are no unresolved tasks.
+    assert "已付款" in text
     assert "无未解决支出事项" in text
 
 

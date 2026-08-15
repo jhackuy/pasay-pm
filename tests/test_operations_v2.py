@@ -241,6 +241,41 @@ def test_quick_rent_and_expense_shapes(client, db_session, admin_headers):
             "unresolved_expense_tasks"} <= set(body)
 
 
+def test_quick_expense_recent_records_include_pending_and_paid(
+    client, db_session, admin_headers,
+):
+    """PASAY-V2-EXPENSE-LIST-003: 💸 Expense returns recent/current-month
+    records across statuses (PENDING + PAID). A paid expense must remain
+    visible in expense history."""
+    _, unit = _seed_lease(db_session)
+    today = date.today()
+    db_session.add_all([
+        Expense(
+            expense_date=today, category="Repair / 维修", amount="6001.00",
+            payee="Carpenter", unit_id=unit.id, status=ExpenseStatus.paid,
+        ),
+        Expense(
+            expense_date=today, category="Water / 水费", amount="3500.00",
+            payee="MWCI", unit_id=unit.id, status=ExpenseStatus.pending,
+        ),
+    ])
+    db_session.commit()
+
+    resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
+    assert resp.status_code == 200
+    recent = resp.json()["recent_expenses"]
+    assert len(recent) == 2
+    statuses = {r["status"] for r in recent}
+    assert statuses == {"paid", "pending"}
+    for row in recent:
+        # Case C: every row exposes unit/purpose/amount/date/status.
+        assert row["unit"] == "1680"
+        assert row["purpose"]
+        assert row["amount"]
+        assert row["expense_date"]
+        assert row["status"]
+
+
 def test_digest_structure(client, db_session, admin_headers):
     lease, _ = _seed_lease(db_session)
     _make_task(db_session, status=OperationalTaskStatus.PENDING, lease_id=lease.id,
