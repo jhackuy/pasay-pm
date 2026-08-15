@@ -312,6 +312,40 @@ def test_quick_expense_records_empty_state(client, db_session, admin_headers):
     assert float(body["month_total"]) == 0.0
 
 
+def test_quick_expense_records_purpose_fallback(client, db_session, admin_headers):
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test B: purpose is the first meaningful
+    of category/description; `??`, None, null and empty are normalized away so
+    the read model never ships a raw `??` placeholder."""
+    _, unit = _seed_lease(db_session)
+    today = date.today()
+    db_session.add_all([
+        Expense(
+            expense_date=today, category="Repair / 维修", amount="6001.00",
+            payee="Carpenter", unit_id=unit.id, status=ExpenseStatus.paid,
+        ),
+        Expense(
+            expense_date=today, category="??", description="Water / 水费",
+            amount="3500.00", payee="MWCI", unit_id=unit.id,
+            status=ExpenseStatus.approved,
+        ),
+        Expense(
+            expense_date=today, category="", amount="1200.00",
+            payee="Meralco", unit_id=unit.id, status=ExpenseStatus.pending,
+        ),
+    ])
+    db_session.commit()
+
+    resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
+    assert resp.status_code == 200
+    records = resp.json()["records"]
+    by_amount = {float(r["amount"]): r for r in records}
+    assert by_amount[6001.0]["purpose"] == "Repair / 维修"  # category wins
+    assert by_amount[3500.0]["purpose"] == "Water / 水费"   # `??` ignored, desc used
+    assert by_amount[1200.0]["purpose"] == ""               # empty -> renderer fallback
+    assert "??" not in [r["purpose"] for r in records]
+    assert "None" not in [r["purpose"] for r in records]
+
+
 def test_digest_structure(client, db_session, admin_headers):
     lease, _ = _seed_lease(db_session)
     _make_task(db_session, status=OperationalTaskStatus.PENDING, lease_id=lease.id,

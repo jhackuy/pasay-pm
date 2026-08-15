@@ -75,3 +75,25 @@ def test_expense_quick_card_true_empty_state_only_when_no_records():
     )
     assert "本月暂无支出记录" not in paid
     assert "✅ 已付款" in paid
+
+
+def test_expense_quick_card_purpose_never_renders_question_placeholders():
+    """PASAY-V2-EXPENSE-UX-AUDIT-005 Test B: purpose falls back
+    purpose -> category -> description, else `Other / 其他`. `??`, None, null
+    and empty values never render, and no raw placeholder appears."""
+    rows = [
+        {**_record("paid"), "purpose": "??", "category": "??"},
+        {**_record("approved", amount="3500.00"), "purpose": None,
+         "category": None, "description": "Water / 水费"},
+        {**_record("pending", amount="500.00"), "purpose": None,
+         "category": "", "description": ""},
+        {**_record("paid", amount="777.00"), "purpose": "Repair / 维修"},
+    ]
+    zh = cards.expense_quick_card(_data(*rows), locale="zh")
+    assert "· Other / 其他 ·" in zh
+    assert "Water / 水费" in zh
+    assert "Repair / 维修" in zh
+    assert "??" not in zh  # placeholder never reaches the render
+    en = cards.expense_quick_card(_data(*rows), locale="en")
+    assert "· Other ·" in en
+    assert "??" not in en

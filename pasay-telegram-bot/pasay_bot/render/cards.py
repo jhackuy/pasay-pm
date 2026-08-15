@@ -1593,11 +1593,33 @@ def _v2_mmdd(value) -> str:
 def _v2_expense_record_line(row: dict, locale: str) -> str:
     """One expense record row: Unit · Purpose · Amount · MM-DD · Status."""
     unit = H.escape(str(row.get("unit") or row.get("unit_code") or "-"))
-    purpose = H.escape(str(row.get("purpose") or row.get("category") or "-"))
+    purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
     date = H.escape(_v2_mmdd(row.get("expense_date") or row.get("date")))
     status = _v2_expense_status(row.get("status"), locale)
     return f"{unit} · {purpose} · <b>{amount}</b> · {date} · {status}"
+
+
+def _clean_free_text(value) -> str | None:
+    """Trim text and drop placeholder/empty sentinels (`??`, None, null, empty,
+    bare dash) so a real value is never replaced by a placeholder
+    (PASAY-V2-EXPENSE-UX-AUDIT-005 §2)."""
+    if not value:
+        return None
+    text = " ".join(str(value).split())
+    if not text or text.lower() in {"none", "null", "??", "-"}:
+        return None
+    return text
+
+
+def _v2_expense_purpose(row: dict, locale: str) -> str:
+    """Purpose for one record row: purpose -> category -> description, else the
+    locale-aware `Other / 其他` fallback. Raw `??`/None/null never render."""
+    for field in (row.get("purpose"), row.get("category"), row.get("description")):
+        text = _clean_free_text(field)
+        if text:
+            return H.escape(text)
+    return H.escape(t("v2.expense_other", locale))
 
 
 def _v2_is_zero(value) -> bool:

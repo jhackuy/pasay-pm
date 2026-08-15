@@ -35,6 +35,29 @@ def _d2(value) -> Decimal:
     return Decimal(value).quantize(_TWO_PLACES)
 
 
+def _clean_text(value: str | None) -> str | None:
+    """Trim free text and drop placeholder/empty sentinels so the Quick View
+    never ships `??`, `None`, `null`, an empty string, or a bare dash as a
+    real purpose (PASAY-V2-EXPENSE-UX-AUDIT-005 §2). Returns None when no
+    meaningful text remains."""
+    if not value:
+        return None
+    text = " ".join(str(value).split())
+    if not text or text.lower() in {"none", "null", "??", "-"}:
+        return None
+    return text
+
+
+def _expense_purpose(expense) -> str | None:
+    """Smallest existing-data purpose fallback chain for a Quick View row:
+    purpose -> category -> description/memo. The final locale-aware
+    `Other / 其他` fallback lives in the renderer, not here."""
+    for field in (_clean_text(expense.category), _clean_text(expense.description)):
+        if field:
+            return field
+    return None
+
+
 def _default_due_day(lease: Lease) -> int:
     return lease.due_day if lease.due_day is not None else lease.start_date.day
 
@@ -380,7 +403,7 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         {
             "unit": label_by_unit.get(e.unit_id, ""),
             "unit_code": label_by_unit.get(e.unit_id, ""),
-            "purpose": e.category,
+            "purpose": _expense_purpose(e) or "",
             "amount": _d2(e.amount),
             "expense_date": e.expense_date.isoformat(),
             "status": e.status.value,
