@@ -27,6 +27,23 @@ if (-not (Test-Path -LiteralPath $AppPy)) { Write-Error "app venv missing: $AppP
 if (-not (Test-Path -LiteralPath $BotPy)) { Write-Error "bot venv missing: $BotPy"; exit 1 }
 New-Item -ItemType Directory -Force -Path $Runtime | Out-Null
 
+# Load config from the runtime worktree .env into this process so the worker's
+# config module (os.getenv for OPERATIONS_DEFAULT_ASSIGNEE / DATABASE_URL /
+# TELEGRAM_BOT_TOKEN) and the API/bot resolve them even when launched from a
+# clean context (Scheduled Task / Startup, which has no pre-set vars). Secrets
+# are never printed — mirror of bin/start-native-bot.ps1.
+$EnvFile = Join-Path $RT '.env'
+if (-not (Test-Path -LiteralPath $EnvFile)) { $EnvFile = Join-Path $Repo '.env' }
+if (Test-Path -LiteralPath $EnvFile) {
+    Get-Content -LiteralPath $EnvFile | ForEach-Object {
+        if ($_ -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') {
+            $k = $Matches[1]
+            $v = $Matches[2].Trim().Trim('"')
+            [Environment]::SetEnvironmentVariable($k, $v, 'Process')
+        }
+    }
+}
+
 # The runtime worktree HEAD is the LIVE_RUNTIME_SHA. The deploy step checks it
 # out to the final commit; this script records it and refuses to start from a
 # dirty worktree (deployed tree must be exactly the pinned commit).
