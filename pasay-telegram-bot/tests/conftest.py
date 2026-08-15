@@ -490,6 +490,19 @@ class FakeBackend:
             if expense["status"] != "approved":
                 return httpx.Response(409, json={"detail": "Only approved expenses can be paid"})
             expense["status"] = "paid"
+            # P0-EXPENSE-PAID-CLOSEOUT-001: paying closes the linked
+            # APPROVAL_PENDING / PAYMENT_PENDING operational task (mirrors the
+            # backend's atomic closure).
+            expense_id = int(path.split("/")[2])
+            for task in self.operational_tasks:
+                if (
+                    task.get("source_type") == "expense"
+                    and task.get("source_id") == expense_id
+                    and task.get("task_type") in ("APPROVAL_PENDING", "PAYMENT_PENDING")
+                    and task.get("status") in ("PENDING", "IN_PROGRESS")
+                ):
+                    task["status"] = "COMPLETED"
+                    task["completed_at"] = "2026-08-15T10:00:00Z"
             return httpx.Response(200, json=expense)
         if path.startswith("/expenses/") and method == "GET":
             expense = self._get_expense(int(path.split("/")[2]))
@@ -1036,7 +1049,8 @@ class FakeBackend:
     def add_ops_task(self, task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
                      status="PENDING", due_at=None, snoozed_until=None, property_id=1,
                      details=None, assigned_user_id=None, next_action=None,
-                     next_check_at=None, property_code=None):
+                     next_check_at=None, property_code=None, source_type="recurring_rule",
+                     source_id=1):
         row = {
             "id": task_id,
             "task_type": task_type,
@@ -1046,8 +1060,8 @@ class FakeBackend:
             "property_code": property_code,
             "tenant_id": None,
             "lease_id": None,
-            "source_type": "recurring_rule",
-            "source_id": 1,
+            "source_type": source_type,
+            "source_id": source_id,
             "source_event": None,
             "assigned_user_id": assigned_user_id,
             "priority": "medium",

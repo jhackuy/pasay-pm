@@ -47,6 +47,7 @@ class AuditAction(str, Enum):
     task_updated = "task_updated"
     task_completed_via_approval = "task_completed_via_approval"
     task_completed_via_rejection = "task_completed_via_rejection"
+    task_completed_via_payment = "task_completed_via_payment"
 
 
 class AuditLog(AuditMixin, Base):

@@ -100,6 +100,54 @@ def _complete_linked_approval_task(
     )
 
 
+def _complete_linked_payment_tasks(
+    db: Session,
+    expense: Expense,
+    *,
+    actor_id: int,
+) -> None:
+    """P0-EXPENSE-PAID-CLOSEOUT-001: marking an approved expense PAID also
+    closes every still-active expense-linked operational task (APPROVAL_PENDING
+    / PAYMENT_PENDING) atomically in the same transaction, so the to-do list
+    never keeps showing "waiting for payment" for a paid expense."""
+    now = datetime.now(timezone.utc)
+    tasks = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.source_type == "expense",
+            OperationalTask.source_id == expense.id,
+            OperationalTask.task_type.in_(
+                [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
+            ),
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .all()
+    )
+    for task in tasks:
+        old = serialize_row(task)
+        task.status = OperationalTaskStatus.COMPLETED
+        task.completed_at = now
+        task.completed_by = actor_id
+        task.reminder_generation = task.reminder_generation + 1
+        task.updated_by = actor_id
+        db.flush()
+        record_audit(
+            db,
+            table_name="operational_tasks",
+            record_id=task.id,
+            action="task_completed_via_payment",
+            actor_id=actor_id,
+            changed_fields={"status": [old.get("status"), "COMPLETED"]},
+            old_value=old,
+            new_value=serialize_row(task),
+        )
+        suppress_pending_redeliveries(
+            db, task.id, actor_id=actor_id, reason="expense_payment", now=now
+        )
+
+
 @router.get("", response_model=list[ExpenseRead])
 def list_expenses(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     return db.query(Expense).order_by(Expense.id).all()
@@ -299,6 +347,7 @@ def pay_expense(
     )
     if result.rowcount == 1:
         db.refresh(obj)
+        _complete_linked_payment_tasks(db, obj, actor_id=user.id)
         record_audit(
             db,
             table_name="expenses",

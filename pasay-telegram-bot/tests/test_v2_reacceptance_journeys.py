@@ -218,7 +218,7 @@ def test_journey_e_already_paid_advances_same_expense(make_app):
     assert expense["status"] == "paid"
     assert len(env.backend.expenses) == 1
     text = _last_text(env)
-    assert "Payment confirmed" in text or "已确认付款" in text
+    assert "Paid" in text or "已付款" in text
 
 
 def test_journey_f_cash_paid_completes_no_receipt(make_app):

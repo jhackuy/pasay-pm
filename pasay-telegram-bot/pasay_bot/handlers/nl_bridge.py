@@ -573,6 +573,32 @@ async def _v2_reply(update, context, text: str, role, locale: str):
         await context.bot.send_message(chat_id, H.escape(text), parse_mode=HTML)
 
 
+async def _notify_groups_expense_paid(context, expense) -> None:
+    """P0-EXPENSE-PAID-CLOSEOUT-001: after an expense is marked PAID, push a
+    bilingual completion card (Unit · purpose · amount · Paid / 已付款 ·
+    Expense completed / 支出已完成) to every known operation group."""
+    store = context.bot_data["store"]
+    groups = store.list_known_groups()
+    if not groups:
+        return
+    location = ""
+    if getattr(expense, "unit_id", None):
+        try:
+            units, properties = await asyncio.gather(
+                context.bot_data["api_client"].get_units(),
+                context.bot_data["api_client"].get_properties(),
+            )
+            location = pages._expense_location(expense, units, properties)
+        except PasayApiError:
+            location = ""
+    text = cards.expense_paid_card(expense, "bi", location=location)
+    for group in groups:
+        try:
+            await context.bot.send_message(group["chat_id"], H.truncate(text), parse_mode=HTML)
+        except Exception as exc:  # noqa: BLE001 - one bad group never blocks the rest
+            logger.warning("expense paid to group %s failed: %s", group["chat_id"], exc)
+
+
 def _v2_task_card_text(event: str, task: dict, locale: str) -> str:
     """task_event_card from Subagent B, with a defensive inline fallback."""
     try:
@@ -625,6 +651,7 @@ async def _handle_v2_task_event(
             except PasayApiError:
                 return False
             store.clear_v2_context(chat_id, user_id)
+            await _notify_groups_expense_paid(context, expense)
             await _v2_reply(
                 update, context,
                 cards.expense_paid_card(expense, locale),
@@ -651,6 +678,7 @@ async def _handle_v2_task_event(
             except PasayApiError:
                 return False
             store.clear_v2_context(chat_id, user_id)
+            await _notify_groups_expense_paid(context, expense)
             await _v2_reply(
                 update, context,
                 cards.expense_paid_card(expense, locale),
