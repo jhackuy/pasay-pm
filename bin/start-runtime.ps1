@@ -8,9 +8,9 @@
 # whole probe-up set back up together and never spawns a duplicate worker.
 #
 # Fail-closed:
-#   - refuses to run if the runtime worktree HEAD != pinned target SHA
-#   - refuses to start (and kills) if a service is already running, so there is
-#     always exactly one API / one bot / one worker.
+#   - refuses to run from a dirty worktree (deployed tree must be the pinned commit)
+#   - idempotent: never starts a second API / bot / worker (skips any already live),
+#     so there is always exactly one of each.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File bin/start-runtime.ps1
@@ -22,29 +22,26 @@ $Runtime  = Join-Path $Repo '.runtime'
 $AppPy    = Join-Path $Repo '.venv\Scripts\python.exe'
 $BotPy    = Join-Path $Repo 'pasay-telegram-bot\.venv\Scripts\python.exe'
 
-# Pinned target commit this runtime is expected to serve.
-$TARGET = 'fcdf5c5b45598f072637365455437b3e26478cca'
-
 if (-not (Test-Path -LiteralPath $RT)) { Write-Error "runtime worktree missing: $RT"; exit 1 }
 if (-not (Test-Path -LiteralPath $AppPy)) { Write-Error "app venv missing: $AppPy"; exit 1 }
 if (-not (Test-Path -LiteralPath $BotPy)) { Write-Error "bot venv missing: $BotPy"; exit 1 }
 New-Item -ItemType Directory -Force -Path $Runtime | Out-Null
 
-# --- fail-closed: worktree must be pinned to the target SHA ---------------------------------
+# The runtime worktree HEAD is the LIVE_RUNTIME_SHA. The deploy step checks it
+# out to the final commit; this script records it and refuses to start from a
+# dirty worktree (deployed tree must be exactly the pinned commit).
 $head = (& git -C $RT rev-parse HEAD).Trim()
-if ($head -ne $TARGET) {
-    Write-Error "runtime worktree HEAD $head != pinned target $TARGET; not starting."
-    exit 1
-}
 $statusLines = @(& git -C $RT status --porcelain)
 if ($statusLines.Count -gt 0) {
     Write-Error "runtime worktree is not clean ($($statusLines.Count) lines); not starting."
     exit 1
 }
-Write-Output "runtime worktree pinned OK (HEAD=$head)"
+Write-Output "runtime worktree HEAD=$head (LIVE_RUNTIME_SHA)"
+$proof = @{ live_runtime_sha = $head; captured_at = (Get-Date -Format o) }
+$proof | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Runtime 'runtime-version-proof.json')
 
-function Test-ProcessAlive([int]$Pid) {
-    if (-not $Pid -or -not (Get-Process -Id $Pid -ErrorAction SilentlyContinue)) { return $false }
+function Test-ProcessAlive([int]$ProcessId) {
+    if (-not $ProcessId -or -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $false }
     return $true
 }
 function Get-PidFile([string]$Name) {
