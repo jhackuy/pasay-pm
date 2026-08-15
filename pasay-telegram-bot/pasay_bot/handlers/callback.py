@@ -1005,6 +1005,30 @@ async def _render_expense_state(update, context, expense, locale):
     )
 
 
+async def _notify_groups_expense_result(
+    context, expense, action: str,
+):
+    """PASAY-V2-FOUNDATION-001: after approve/reject, push a bilingual result
+    to every known group (Secretary sees the outcome in the group too)."""
+    store = context.bot_data["store"]
+    groups = store.list_known_groups()
+    if not groups:
+        return
+    locale = "bi"
+    try:
+        location = await _expense_location(None, context, expense)
+    except Exception:  # noqa: BLE001 - best-effort label
+        location = ""
+    text = cards.expense_result_card(expense, locale, location=location)
+    if not text:
+        return
+    for group in groups:
+        try:
+            await context.bot.send_message(group["chat_id"], H.truncate(text), parse_mode=HTML)
+        except Exception as exc:  # noqa: BLE001 - one bad group never blocks the rest
+            logger.warning("expense result to group %s failed: %s", group["chat_id"], exc)
+
+
 async def _handle_expense_action(
     update, context, action: str, expense_id_raw: str, nonce: str, ts, role, locale
 ):
@@ -1059,6 +1083,26 @@ async def _handle_expense_action(
             updated = await api.reject_expense(expense_id)
         guard.settle(key, updated.as_dict(), resource=str(expense_id))
         await _render_expense_state(update, context, updated, locale)
+        # PASAY-V2-FOUNDATION-001: group bilingual closed loop (approve/reject).
+        await _notify_groups_expense_result(context, updated, action)
+        # Remember the approved/rejected expense in this chat's context so a
+        # follow-up payment statement ("已经付款") advances THIS record instead
+        # of creating a new expense.
+        try:
+            store = context.bot_data["store"]
+            chat_id = update.effective_chat.id
+            user_id = update.effective_user.id
+            store.save_v2_context(
+                chat_id, user_id,
+                {
+                    "expense_ref": str(expense_id),
+                    "expense_status": (updated.status or "").lower(),
+                    "unit_token": getattr(updated, "unit_id", None),
+                    "intent": "expense",
+                },
+            )
+        except Exception:  # noqa: BLE001 - context is best-effort, never blocks UX
+            logger.debug("expense context save failed", exc_info=True)
         await _answer(update, "")
     except PasayApiConflictError:
         # 409 = only pending expenses can change -> processed elsewhere.

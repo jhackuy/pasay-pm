@@ -984,8 +984,9 @@ def expense_approval_card(
     return "\n".join(lines)
 
 
-def expense_result_card(expense: Expense, locale: str = "zh") -> str:
+def expense_result_card(expense: Expense, locale: str = "zh", location: str = "") -> str:
     """Message-mutation result card: the tapped decision + the human next step.
+    ``location`` is an optional Property · Unit label (V2 group feedback).
     No raw status enum, no expense_id."""
     status = (expense.status or "").lower()
     if status == "approved":
@@ -1002,7 +1003,8 @@ def expense_result_card(expense: Expense, locale: str = "zh") -> str:
         next_step = H.escape(t("expense.rejected_next", locale))
     else:
         return expense_approval_card(expense, locale)
-    lines = [title, f"{H.escape(expense.category or '')} · {H.money(expense.amount)}", next_step]
+    where = " · ".join(x for x in (location, expense.category) if x)
+    lines = [title, f"{H.escape(where)}  ·  <b>{H.money(expense.amount)}</b>", next_step]
     return "\n".join(x for x in lines if x)
 
 
@@ -1075,6 +1077,19 @@ def expense_submitted_card(
         f"{H.escape(category)} · <b>{H.money(amount)}</b>",
         H.escape(t("expense.submitted_next", locale)),
     ]
+    return "\n".join(x for x in lines if x)
+
+
+def expense_paid_card(expense: Expense, locale: str = "zh", location: str = "") -> str:
+    """PASAY-V2-FOUNDATION-001: Owner confirmed payment of an approved
+    expense -> PAID/COMPLETED. Bilingual in groups; receipt optional and
+    never blocks completion. No raw enums, no ids."""
+    title = t("expense.payment_confirmed_title", locale)
+    lines = [title]
+    where = " · ".join(x for x in (location, expense.category) if x)
+    lines.append(f"{H.escape(where)}  ·  <b>{H.money(expense.amount)}</b>")
+    lines.append(H.escape(t("expense.payment_completed", locale)))
+    lines.append(H.escape(t("expense.receipt_optional", locale)))
     return "\n".join(x for x in lines if x)
 
 
@@ -1337,9 +1352,9 @@ def copilot_why_card(
 
 
 def copilot_ask_card(answer: str, *, fallback: bool = False, locale: str = "zh") -> str:
-    """Q&A answer card (C1.1). Human text only."""
-    blocks = [f"🤖 <b>{H.escape(t('copilot.ask_title', locale))}</b>"]
-    blocks.append(_copilot_one_line(answer, max_chars=900))
+    """PASAY-V2-FOUNDATION-001: direct answer, no 'Assistant answer' wrapper.
+    The bot IS the work entry; product-layer packaging is removed."""
+    blocks = [_copilot_one_line(answer, max_chars=900)]
     if fallback:
         blocks.append(H.escape(t("copilot.fallback_note", locale)))
     return "\n\n".join(blocks)
@@ -1692,11 +1707,12 @@ def task_event_card(event: str, task: dict, locale: str = "zh") -> str:
         emoji = "🟡"
     else:
         emoji = "✅"
+    event_low = str(event).lower()
     event_key = {
-        "created": "v2.event.created",
-        "updated": "v2.event.updated",
+        "created": "v2.event.repair_reported",
+        "updated": "v2.event.repair_in_progress",
         "completed": "v2.event.completed",
-    }.get(str(event).lower(), "v2.event.updated")
+    }.get(event_low, "v2.event.updated")
     header = _bi_line(locale, t(event_key, "en"), t(event_key, "zh"))
     lines = [f"{emoji} <b>{H.escape(header)}</b>"]
     unit = H.escape(str(task.get("property_code") or task.get("unit_code") or ""))
@@ -1704,10 +1720,17 @@ def task_event_card(event: str, task: dict, locale: str = "zh") -> str:
     where = f"{unit} · {title}" if unit else title
     if where:
         lines.append(where)
+    if event_low == "created":
+        lines.append(_bi_line(
+            locale,
+            t("v2.repair_waiting", "en"),
+            t("v2.repair_waiting", "zh"),
+        ))
+        return "\n".join(lines)
     next_action = task.get("next_action")
-    if next_action:
+    if next_action and event_low != "completed":
         lines.append(t("v2.next", locale, next=H.escape(str(next_action))))
     next_check = task.get("next_check_at")
-    if next_check:
+    if next_check and event_low != "completed":
         lines.append(t("v2.check_at", locale, date=H.format_date(next_check)))
     return "\n".join(lines)

@@ -15,7 +15,7 @@ from typing import Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 from pasay_bot.render import html as H
-from pasay_bot.render.i18n import t
+from pasay_bot.render.i18n import bl as t
 from pasay_bot.roles import Role
 
 VERSION = "v1"

@@ -879,6 +879,13 @@ class PasayApiClient:
         data = await self._request("POST", f"/expenses/{expense_id}/reject")
         return Expense.from_dict(data)
 
+    async def pay_expense(self, expense_id: int) -> Expense:
+        """POST /expenses/{id}/pay: an approved expense becomes PAID.
+        PASAY-V2-FOUNDATION-001: Owner's explicit payment confirmation is the
+        final fact; a receipt is optional and never blocks PAID."""
+        data = await self._request("POST", f"/expenses/{expense_id}/pay")
+        return Expense.from_dict(data)
+
     async def find_income(
         self,
         *,

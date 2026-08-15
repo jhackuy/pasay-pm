@@ -37,7 +37,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
@@ -83,6 +83,7 @@ logger = logging.getLogger(__name__)
 # ("付了1680电费3800" is an expense, never a rent payment) and the AI fallback
 # is the last lane for any text the deterministic parsers cannot classify.
 from pasay_bot.handlers.expense_flow import (
+    MAX_AMOUNT,
     detect_expense_ambiguity,
     detect_expense_statement,
     handle_expense_statement,
@@ -163,6 +164,22 @@ _CORRECTION_TASK_CN = re.compile(
 )
 _CORRECTION_TASK_EN = re.compile(r"\bnot\s+([0-9A-Za-z-]+)\s*,?\s+(?:it'?s|is)\s+([0-9A-Za-z-]+)", re.IGNORECASE)
 _GREETING_RE = re.compile(r"^\s*(hi|hello|hey|yo|你好|您好|嗨)\b[!.\s]*$", re.IGNORECASE)
+# PASAY-V2-FOUNDATION-001: Owner payment confirmations. These are Payment
+# Events for an APPROVED expense, NEVER a new expense (no amount/category
+# question, no receipt requirement, no duplicate record).
+_PAYMENT_EVENT_CN = (
+    "\u5df2\u7ecf\u4ed8\u6b3e", "\u5df2\u4ed8", "\u73b0\u91d1\u4ed8\u4e86",
+    "\u4ed8\u4e86\u73b0\u91d1", "\u4ed8\u6b3e\u5b8c\u6210", "\u652f\u4ed8\u5b8c\u6210",
+    "\u7ed3\u6e05\u4e86", "\u5df2\u7ed3\u7b97",
+)
+_PAYMENT_EVENT_EN = re.compile(
+    r"\b(already\s+paid|paid\s+already|payment\s+(done|complete[d]?|made)|"
+    r"paid\s+in\s+cash|cash\s+paid|paid\s+cash|payment\s+settled)\b",
+    re.IGNORECASE,
+)
+_QUOTE_CN = ("\u62a5\u4ef7", "\u8d39\u7528", "\u8981\u4ef7", "\u4fee\u7406\u8d39", "\u9700\u8981\u591a\u5c11")
+_QUOTE_EN = re.compile(r"\b(quote[d]?|costs?\b|will\s+cost|charges?|price)\b", re.IGNORECASE)
+_AMOUNT = re.compile(r"(?<![\d.])(\d[\d,]*(?:\.\d+)?)(?![\d])")
 
 
 def detect_repair_statement(text: str) -> Optional[str]:
@@ -192,6 +209,33 @@ def detect_task_completion(text: str) -> bool:
     raw = text or ""
     lowered = raw.lower()
     return any(w in raw for w in _COMPLETE_CN) or bool(_COMPLETE_EN.search(lowered))
+
+
+def detect_payment_event(text: str) -> bool:
+    """Owner payment confirmation phrase (Payment Event, not a new expense)."""
+    raw = text or ""
+    lowered = raw.lower()
+    return any(w in raw for w in _PAYMENT_EVENT_CN) or bool(
+        _PAYMENT_EVENT_EN.search(lowered)
+    )
+
+
+def detect_repair_quote(text: str) -> Optional[Decimal]:
+    """Extract a repair quote amount when the message is a quote (not a new
+    repair report and not a payment confirmation)."""
+    raw = text or ""
+    lowered = raw.lower()
+    is_quote = any(w in raw for w in _QUOTE_CN) or bool(_QUOTE_EN.search(lowered))
+    if not is_quote:
+        return None
+    for match in _AMOUNT.finditer(raw):
+        try:
+            value = Decimal(match.group(1).replace(",", ""))
+        except InvalidOperation:
+            continue
+        if 100 <= value <= MAX_AMOUNT:
+            return value
+    return None
 
 
 def detect_task_correction(text: str) -> Optional[tuple[str, str]]:
@@ -427,6 +471,15 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_rent_status_query(update, context, query, role, locale)
         return
 
+    # PASAY-V2-FOUNDATION-001: conversation -> Task. Active Business Context
+    # must beat the generic read-only query fallback (acceptance priority:
+    # Active Business Context > Task State Transition > New Business Intent >
+    # Generic AI / Read-only Query Fallback). Financial lanes above keep
+    # priority (an expense statement is never a repair report).
+    task_handled = await _handle_v2_task_event(update, context, text, role, locale)
+    if task_handled:
+        return
+
     # BOT-V1-USABLE-001 P0-3: income/expense summaries, unit info and
     # contract-expiry queries answer directly from existing read endpoints.
     general_query = nl_queries.detect_query(text)
@@ -441,12 +494,6 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await nl_queries.handle_query(
             context, chat_id, general_query, locale,
         )
-        return
-
-    # PASAY-V2-FOUNDATION-001: conversation -> Task (deterministic, before
-    # page routes and the AI fallback; financial lanes above keep priority).
-    task_handled = await _handle_v2_task_event(update, context, text, role, locale)
-    if task_handled:
         return
 
     route = route_for_text(text)
@@ -556,10 +603,96 @@ async def _handle_v2_task_event(
     payload = dict(ctx["payload"]) if ctx else {}
     task_ref = payload.get("task_ref")
     unit_token = payload.get("unit_token")
+    expense_ref = payload.get("expense_ref")
 
     completion = detect_task_completion(text)
     progress = detect_task_progress(text)
     repair_unit = detect_repair_statement(text)
+    payment = detect_payment_event(text)
+    quote = detect_repair_quote(text)
+
+    # PASAY-V2-FOUNDATION-001 P0-4/5: Owner's "已经付款/paid" with an APPROVED
+    # expense in context is a Payment Event -> PAID/COMPLETED. No amount
+    # question, no category question, no second expense, no receipt gate.
+    if payment and role == Role.OWNER and expense_ref:
+        try:
+            expense = await api.get_expense(int(expense_ref))
+        except (PasayApiError, ValueError):
+            expense = None
+        if expense is not None and (expense.status or "").lower() == "approved":
+            try:
+                expense = await api.pay_expense(int(expense_ref))
+            except PasayApiError:
+                return False
+            store.clear_v2_context(chat_id, user_id)
+            await _v2_reply(
+                update, context,
+                cards.expense_paid_card(expense, locale),
+                role, locale,
+            )
+            return True
+
+    # P0-6 Owner authority fallback: even without a live context, an explicit
+    # payment confirmation advances the single outstanding APPROVED expense
+    # (never guesses among several; ambiguous state keeps the fallback lane).
+    if payment and role == Role.OWNER:
+        try:
+            expenses = await api.list_expenses()
+        except PasayApiError:
+            expenses = []
+        approved = [
+            e for e in expenses
+            if (e.status or "").lower() == "approved"
+        ]
+        if len(approved) == 1:
+            latest = approved[0]
+            try:
+                expense = await api.pay_expense(latest.id)
+            except PasayApiError:
+                return False
+            store.clear_v2_context(chat_id, user_id)
+            await _v2_reply(
+                update, context,
+                cards.expense_paid_card(expense, locale),
+                role, locale,
+            )
+            return True
+
+    # PASAY-V2-FOUNDATION-001 Journey B: "technician quoted 7000" with an
+    # active repair context records the quote and creates the Expense Approval
+    # through the existing deterministic expense path (unit + category known
+    # from context; the first report never asked for an amount).
+    if quote is not None and task_ref:
+        unit_id, unit_number, property_name = await resolve_unit(
+            context, unit_token or ""
+        )
+        if unit_id is not None:
+            expense = await _submit_quote_expense(
+                update, context, api, store, unit_id, unit_number, quote, text, role, locale,
+            )
+            if expense is not None:
+                store.save_v2_context(
+                    chat_id, user_id,
+                    {
+                        "task_ref": task_ref,
+                        "unit_token": unit_number,
+                        "intent": "repair",
+                        "expense_ref": expense.id,
+                    },
+                )
+                submitted = cards.expense_submitted_card(
+                    unit_number=unit_number,
+                    property_name=property_name,
+                    category="维修",
+                    amount=quote,
+                    locale=locale,
+                )
+                await _v2_reply(
+                    update, context,
+                    submitted,
+                    role, locale,
+                )
+                return True
 
     # Completion of the active task in context.
     if completion and task_ref:
@@ -615,6 +748,12 @@ async def _handle_v2_task_event(
         unit_id, unit_number, property_name = await resolve_unit(context, repair_unit)
         if unit_id is None:
             return False  # unresolved unit -> normal lanes/AI fallback
+        # PASAY-V2-FOUNDATION-001: POST /operations/tasks validates
+        # property_id against the PROPERTIES table (never the unit id).
+        # Resolve the owning property id from the same unit list.
+        property_id = await _resolve_unit_property_id(context, unit_id)
+        if property_id is None:
+            return False
         if "air" in text.lower() or "\u7a7a\u8c03" in text:
             title = f"{unit_number} \u00b7 Aircon repair"
         else:
@@ -623,7 +762,7 @@ async def _handle_v2_task_event(
             task = await api.create_operational_task(
                 task_type="AC_MAINTENANCE",
                 title=title,
-                property_id=unit_id,
+                property_id=property_id,
                 description=text,
                 context=text,
                 source_event=text,
@@ -638,7 +777,7 @@ async def _handle_v2_task_event(
                 "task_ref": task.id,
                 "unit_token": unit_number,
                 "intent": "repair",
-                "property_id": unit_id,
+                "property_id": property_id,
             },
         )
         await _v2_reply(
@@ -653,6 +792,40 @@ async def _handle_v2_task_event(
         return True
 
     return False
+
+
+async def _resolve_unit_property_id(context, unit_id: int) -> Optional[int]:
+    """Map a resolved unit id to its owning property id (backend FK)."""
+    try:
+        units = await context.bot_data["api_client"].get_units()
+    except PasayApiError:
+        return None
+    for unit in units:
+        if unit.id == unit_id:
+            return unit.property_id
+    return None
+
+
+async def _submit_quote_expense(
+    update, context, api, store,
+    unit_id: int, unit_number: str, amount: Decimal, text: str, role, locale: str,
+):
+    """Journey B: a repair quote creates ONE pending expense via the existing
+    financial path (no amount/category questions, no duplicate). Returns the
+    created Expense or None on failure."""
+    try:
+        expense = await api.create_expense(
+            category="维修",
+            amount=amount,
+            expense_date=date.today().isoformat(),
+            unit_id=unit_id,
+            payee="Repair",
+            description=(text or "").strip() or None,
+            status="pending",
+        )
+    except PasayApiError:
+        return None
+    return expense
 
 
 def _progress_next_action(text: str, unit_token: Optional[str]) -> str:

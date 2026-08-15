@@ -36,6 +36,9 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.receipt_missing': '无凭证',
         'expense.approved_card': '✅ <b>已批准</b>',
         'expense.approved_next': '下一步：等待付款',
+        'expense.payment_confirmed_title': '✅ <b>已确认付款</b>',
+        'expense.payment_completed': '支出已完成。',
+        'expense.receipt_optional': '📎 如有凭证可直接上传（不影响完成）。',
         'expense.rejected_card': '❌ <b>已拒绝</b>',
         'expense.rejected_next': '这笔支出已结束。',
         'expense.paid_card': '✅ <b>已付款</b>',
@@ -424,6 +427,9 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.media_received': '已收到，后台处理中。',
         'v2.welcome': '欢迎加入 Pasay 群组',
         'v2.help': '直接告诉我发生了什么，或者你想查什么。\n按钮：Properties · Tasks · Rent · Expense',
+        'v2.event.repair_reported': '已登记维修',
+        'v2.event.repair_in_progress': '维修处理中',
+        'v2.repair_waiting': '等待安排维修。',
         'v2.event.created': '已创建任务',
         'v2.event.updated': '任务已更新',
         'v2.event.completed': '任务已完成',
@@ -463,6 +469,9 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.receipt_missing': 'No receipt',
         'expense.approved_card': '✅ <b>Approved</b>',
         'expense.approved_next': 'Next: waiting for payment',
+        'expense.payment_confirmed_title': '✅ <b>Payment confirmed</b>',
+        'expense.payment_completed': 'Expense completed.',
+        'expense.receipt_optional': '📎 Receipt can be uploaded if available (does not block completion).',
         'expense.rejected_card': '❌ <b>Rejected</b>',
         'expense.rejected_next': 'This expense is closed.',
         'expense.paid_card': '✅ <b>Paid</b>',
@@ -850,6 +859,9 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.media_received': 'Received. Processing in the background.',
         'v2.welcome': 'Welcome to the Pasay group',
         'v2.help': 'Just tell me what happened or what you need.\nButtons: Properties · Tasks · Rent · Expense',
+        'v2.event.repair_reported': 'Repair reported',
+        'v2.event.repair_in_progress': 'Repair in progress',
+        'v2.repair_waiting': 'Waiting for repair arrangement.',
         'v2.event.created': 'Task created',
         'v2.event.updated': 'Task updated',
         'v2.event.completed': 'Task completed',
@@ -862,6 +874,12 @@ def t(key: str, locale: str = "zh", **kwargs) -> str:
     if locale == "bi":
         return _render("en", key, **kwargs) + "\n" + _render("zh", key, **kwargs)
     return _render(locale, key, **kwargs)
+
+
+def bl(key: str, locale: str = "zh", **kwargs) -> str:
+    """Button label: always ONE language (V2 fixed buttons stay simple
+    English in groups; private chats keep the role locale)."""
+    return _render("en" if locale == "bi" else locale, key, **kwargs)
 
 
 def _render(locale: str, key: str, **kwargs) -> str:

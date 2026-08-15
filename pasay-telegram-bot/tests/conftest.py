@@ -483,6 +483,14 @@ class FakeBackend:
                 return httpx.Response(409, json={"detail": "Only pending expenses can be rejected"})
             expense["status"] = "rejected"
             return httpx.Response(200, json=expense)
+        if path.startswith("/expenses/") and path.endswith("/pay") and method == "POST":
+            expense = self._get_expense(int(path.split("/")[2]))
+            if expense is None:
+                return httpx.Response(404, json={"detail": "Expense not found"})
+            if expense["status"] != "approved":
+                return httpx.Response(409, json={"detail": "Only approved expenses can be paid"})
+            expense["status"] = "paid"
+            return httpx.Response(200, json=expense)
         if path.startswith("/expenses/") and method == "GET":
             expense = self._get_expense(int(path.split("/")[2]))
             if expense is None:
