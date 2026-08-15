@@ -29,39 +29,10 @@ from app.services.dates import month_range
 
 _TWO_PLACES = Decimal("0.01")
 _PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
-# PASAY-V2-EXPENSE-UX-AUDIT-005: Quick Expense caps the recent list at 20
-# records (newest-first). No pagination in-scope; fewer than 20 -> show all.
-_QUICK_EXPENSE_LIMIT = 20
 
 
 def _d2(value) -> Decimal:
     return Decimal(value).quantize(_TWO_PLACES)
-
-
-def _clean_text(value: str | None) -> str | None:
-    """Trim free text and drop placeholder/empty sentinels so the Quick View
-    never renders `??`, `None`, `null`, an empty string, or a bare dash as a
-    real value (PASAY-V2-EXPENSE-UX-AUDIT-005 §2). Returns None when no
-    meaningful text remains."""
-    if not value:
-        return None
-    text = " ".join(str(value).split())
-    if not text:
-        return None
-    if text.lower() in {"none", "null", "??", "-"}:
-        return None
-    return text
-
-
-def _clean_purpose(expense) -> str | None:
-    """Smallest existing-data purpose fallback chain for a Quick View row:
-    meaningful purpose -> meaningful category -> meaningful description/memo.
-    The final `Other / 其他` fallback lives in the renderer (locale-aware), not
-    here, so the backend never invents a classification system."""
-    for field in (_clean_text(expense.category), _clean_text(expense.description)):
-        if field:
-            return field
-    return None
 
 
 def _default_due_day(lease: Lease) -> int:
@@ -376,49 +347,45 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         .all()
     )
     unit_number_by_lease: dict[int, str] = {}
-    # PASAY-V2-EXPENSE-UX-AUDIT-005: recent/current-month expense records held
-    # in the Quick View are PENDING/APPROVED/PAID only. Rejected/reversed
-    # (void/cancelled) entries are excluded from the expense history shown in
-    # the 💸 Expense card — those records are never deleted, only filtered here
-    # from the Quick View. PAID stays visible. Newest-first with a stable
-    # secondary order on id, capped at 20 records (no pagination in-scope).
-    recent = (
+    # P1-EXPENSE-QUICKVIEW-LIST-001: this month's real expense records so the
+    # quick view shows actual spend, not only unresolved items.
+    # PENDING/APPROVED/PAID are real spend; REJECTED (cancelled) and REVERSED
+    # records are not normal expenses and never appear. The month_total
+    # semantics (approved + paid) are unchanged.
+    month_records = (
         db.query(Expense)
         .filter(
             Expense.status.in_(
-                [
-                    ExpenseStatus.pending,
-                    ExpenseStatus.approved,
-                    ExpenseStatus.paid,
-                ]
+                [ExpenseStatus.pending, ExpenseStatus.approved, ExpenseStatus.paid]
             ),
             Expense.expense_date >= start,
             Expense.expense_date <= end,
         )
         .order_by(Expense.expense_date.desc(), Expense.id.desc())
-        .limit(_QUICK_EXPENSE_LIMIT)
+        .limit(20)
         .all()
     )
-    unit_by_id: dict[int, Unit] = {}
-    unit_ids = {e.unit_id for e in recent if e.unit_id is not None}
+    unit_ids = {e.unit_id for e in month_records if e.unit_id is not None}
+    units = {}
     if unit_ids:
-        unit_by_id = {
+        units = {
             u.id: u
             for u in db.query(Unit).filter(Unit.id.in_(unit_ids)).all()
         }
-    recent_expenses = [
+    label_by_unit = {
+        u.id: (_unit_label(db, u) or u.unit_number)
+        for u in units.values()
+    }
+    records = [
         {
-            "id": e.id,
-            "unit": _unit_label(db, unit_by_id.get(e.unit_id)) or "",
-            "purpose": _clean_purpose(e),
-            "category": _clean_text(e.category),
-            "description": _clean_text(e.description),
-            "amount": str(_d2(e.amount)),
+            "unit": label_by_unit.get(e.unit_id, ""),
+            "unit_code": label_by_unit.get(e.unit_id, ""),
+            "purpose": e.category,
+            "amount": _d2(e.amount),
             "expense_date": e.expense_date.isoformat(),
-            "date": e.expense_date.isoformat(),
             "status": e.status.value,
         }
-        for e in recent
+        for e in month_records
     ]
     return {
         "month_total": month_total,
@@ -427,7 +394,7 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         "unresolved_expense_tasks": [
             _task_row(db, t, unit_number_by_lease) for t in unresolved
         ],
-        "recent_expenses": recent_expenses,
+        "records": records,
     }
 
 

@@ -199,6 +199,7 @@ class FakeBackend:
             "pending_approval_count": 0,
             "pending_approval_amount": "0.00",
             "unresolved_expense_tasks": [],
+            "records": [],
         }
         self.digest: dict = {"pending": [], "in_progress": [], "recently_completed": []}
         self._next_v2_task_id = 1000

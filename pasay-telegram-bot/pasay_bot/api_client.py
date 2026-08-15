@@ -1070,7 +1070,8 @@ class PasayApiClient:
         return data or {}
 
     async def get_quick_expense(self) -> dict:
-        """GET /operations/quick/expense: month total + pending approval."""
+        """GET /operations/quick/expense: month total + this month's expense
+        records (PAID included) + pending approval/unresolved."""
         data = await self._request("GET", "/operations/quick/expense")
         return data or {}
 

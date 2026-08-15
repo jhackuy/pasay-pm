@@ -951,27 +951,6 @@ def _expense_location(expense: Expense, location: str = "") -> str:
     return H.escape(location) if location else ""
 
 
-def _expense_purpose(row: dict, locale: str = "zh") -> str:
-    """Smallest existing-data purpose fallback for one Quick Expense row:
-    purpose -> category -> description/memo, then the locale-aware
-    `Other / 其他` fallback. `??`/None/null/empty and raw sentinels never
-    render (PASAY-V2-EXPENSE-UX-AUDIT-005 §2)."""
-    for field in (row.get("purpose"), row.get("category"), row.get("description")):
-        text = _clean_free_text(field)
-        if text:
-            return text
-    return H.escape(t("v2.expense_other", locale))
-
-
-def _clean_free_text(value) -> str | None:
-    if not value:
-        return None
-    text = " ".join(str(value).split())
-    if not text or text.lower() in {"none", "null", "??", "-"}:
-        return None
-    return text
-
-
 def expense_approval_card(
     expense: Expense, locale: str = "zh", location: str = "",
 ) -> str:
@@ -1584,6 +1563,53 @@ def _v2_task_line(task: dict, locale: str, emoji: str) -> str:
     return f"{emoji} {_bi_line(locale, en_line, zh_line)}"
 
 
+_V2_EXPENSE_STATUS_EMOJI = {
+    "pending": "⏳",
+    "approved": "📋",
+    "paid": "✅",
+    "rejected": "❌",
+    "reversed": "↩️",
+}
+
+
+def _v2_expense_status(status: str, locale: str) -> str:
+    """One expense-record status chip: emoji + human label, bilingual in
+    groups. Unknown statuses fall back to a neutral dot, never raw enums."""
+    status = str(status or "").lower()
+    emoji = _V2_EXPENSE_STATUS_EMOJI.get(status, "•")
+    en = _expense_status_label(status, "en")
+    zh = _expense_status_label(status, "zh")
+    return f"{emoji} {_bi_header(locale, en, zh)}"
+
+
+def _v2_mmdd(value) -> str:
+    """YYYY-MM-DD -> MM-DD (e.g. 2026-08-15 -> 08-15); other input as-is."""
+    s = str(value or "")
+    if len(s) >= 10 and s[4] == "-" and s[:4].isdigit():
+        return s[5:10]
+    return s
+
+
+def _v2_expense_record_line(row: dict, locale: str) -> str:
+    """One expense record row: Unit · Purpose · Amount · MM-DD · Status."""
+    unit = H.escape(str(row.get("unit") or row.get("unit_code") or "-"))
+    purpose = H.escape(str(row.get("purpose") or row.get("category") or "-"))
+    amount = H.money(row.get("amount"))
+    date = H.escape(_v2_mmdd(row.get("expense_date") or row.get("date")))
+    status = _v2_expense_status(row.get("status"), locale)
+    return f"{unit} · {purpose} · <b>{amount}</b> · {date} · {status}"
+
+
+def _v2_is_zero(value) -> bool:
+    """True for missing/empty/zero amounts (handles Decimal, float and str)."""
+    if value is None or value == "":
+        return True
+    try:
+        return Decimal(str(value)) == 0
+    except Exception:
+        return False
+
+
 def _v2_title(locale: str, key: str, emoji: str) -> str:
     return f"{emoji} <b>{H.escape(_bi_header(locale, t(key, 'en'), t(key, 'zh')))}</b>"
 
@@ -1652,7 +1678,9 @@ def rent_quick_card(data, locale: str = "bi") -> str:
 
 
 def expense_quick_card(data, locale: str = "bi") -> str:
-    """💸 Expense quick view: month total + pending approval + unresolved."""
+    """💸 Expense quick view: month total + this month's records + pending
+    approval + unresolved. Records are the default view (PAID included);
+    the unresolved line stays as auxiliary status only."""
     data = data or {}
     month_total = data.get("month_total")
     if month_total is None:
@@ -1660,11 +1688,17 @@ def expense_quick_card(data, locale: str = "bi") -> str:
     pending_count = data.get("pending_approval_count")
     pending_amount = data.get("pending_approval_amount")
     unresolved = data.get("unresolved_expense_tasks") or []
+    records = data.get("records") or []
     blocks = [_v2_title(locale, "v2.expense_title", "💸")]
     if month_total is not None:
         blocks.append(
             H.escape(t("v2.expense_month_total", locale, amount=H.money(month_total)))
         )
+    if records:
+        blocks.append(_v2_section("v2.expense_records_section", locale, "📋"))
+        blocks.extend(_v2_expense_record_line(row, locale) for row in records)
+    elif _v2_is_zero(month_total):
+        blocks.append(H.escape(t("v2.expense_records_empty", locale)))
     if pending_count:
         blocks.append(
             H.escape(
@@ -1684,20 +1718,6 @@ def expense_quick_card(data, locale: str = "bi") -> str:
             blocks.append(_v2_task_line(task, locale, "💸"))
     else:
         blocks.append(H.escape(t("v2.expense_no_unresolved", locale)))
-    recent = data.get("recent_expenses") or []
-    if recent:
-        blocks.append(H.escape(t("v2.expense_recent_records", locale)))
-        for row in recent[:20]:
-            unit = row.get("unit") or row.get("unit_code") or "-"
-            purpose = _expense_purpose(row, locale)
-            status = _expense_status_label(row.get("status"), locale)
-            date = row.get("expense_date") or row.get("date") or ""
-            blocks.append(
-                f"💸 {H.escape(unit)} · {H.escape(purpose)} · "
-                f"<b>{H.money(row.get('amount'))}</b> · "  # type: ignore[arg-type]
-                f"{H.escape(str(date)[5:] if str(date)[:4].isdigit() else date)} · "
-                f"{status}"
-            )
     return "\n\n".join(blocks)
 
 
