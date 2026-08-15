@@ -802,10 +802,14 @@ def test_reconciliation_payment_pending_completes_when_paid(client, db_session, 
     ).one()
     assert task.status == OperationalTaskStatus.PENDING
 
-    # Financial write happens ONLY through the V1.1 API (never by task code):
-    resp = client.post(f"{API}/expenses/{expense.id}/pay", headers=admin_headers)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "paid"
+    # Source state changes (expense becomes paid) OUTSIDE the API pay handler,
+    # so the task stays PENDING and the scheduler's reconcile pass is the one
+    # that auto-completes it (P0-EXPENSE-PAID-CLOSEOUT-001 closes linked tasks
+    # at API pay-time, which would preempt reconcile; here we exercise the
+    # reconcile auto-completion + task_auto_completed audit path instead).
+    expense.status = ExpenseStatus.paid
+    db_session.commit()
+    assert expense.status == ExpenseStatus.paid  # source is paid, task still PENDING
 
     run_scheduler_once(db_session, now=NOW)
     db_session.refresh(task)
