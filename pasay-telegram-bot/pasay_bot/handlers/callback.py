@@ -55,6 +55,8 @@ from pasay_bot.keyboards import (
     ACTION_EXPENSE_CREATE,
     ACTION_EXPENSE_DETAIL,
     ACTION_EXPENSE_EDIT,
+    ACTION_EXPENSE_PAY,
+    ACTION_EXPENSE_PAY_CONFIRM,
     ACTION_EXPENSE_REJECT,
     ACTION_HOME_NAV,
     ACTION_ISSUE,
@@ -90,6 +92,8 @@ from pasay_bot.keyboards import (
     expense_confirm_keyboard,
     expense_detail_keyboard,
     expense_edit_keyboard,
+    expense_pay_confirm_keyboard,
+    expense_pay_result_keyboard,
     expense_result_keyboard,
     expired_keyboard,
     home_keyboard,
@@ -314,6 +318,10 @@ async def _dispatch_callback(
         await _handle_expense_reject(update, context, entity, nonce, ts, role, locale)
     elif action == ACTION_EXPENSE_DETAIL:
         await _handle_expense_detail(update, context, entity, role, locale)
+    elif action == ACTION_EXPENSE_PAY:
+        await _handle_expense_pay(update, context, entity, ref, role, locale)
+    elif action == ACTION_EXPENSE_PAY_CONFIRM:
+        await _handle_expense_pay_confirm(update, context, entity, ref, nonce, ts, role, locale)
     elif action == ACTION_EXPENSE_CREATE:
         await _handle_expense_create(update, context, nonce, ts, role, locale)
     elif action == ACTION_EXPENSE_EDIT:
@@ -1167,6 +1175,196 @@ async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
         parse_mode=HTML,
         reply_markup=kb,
     )
+
+
+# --- PASAY-V2-EXPENSE-PAYABLE-TASK-006: owner payment (deterministic) -------
+
+async def _handle_expense_pay(update, context, entity, ref, role, locale):
+    """[付款] tap on an APPROVED (unpaid) expense: open the deterministic
+    payment-confirmation card.
+
+    Two sub-paths:
+    - ``entity == "cancel"`` -> dismiss the confirm and go home.
+    - Otherwise ``entity`` is the expense_id -> fetch the expense + any
+      possible-duplicate PAID rows and render the confirm card. The Owner
+      must tap an explicit Confirm/Continue; a receipt stays optional."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if entity == "cancel":
+        await _edit(update, t("expense.pay_cancel", locale), home_keyboard(locale))
+        await _answer(update, "")
+        return
+    if not entity.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    expense_id = int(entity)
+    api = context.bot_data["api_client"]
+    await _ack_working(update, locale)
+    try:
+        expense = await api.get_expense(expense_id)
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    status = (expense.status or "").lower()
+    location = await _expense_location(update, context, expense)
+    if status == "paid":
+        text = cards.expense_pay_result_card(expense, locale, already=True)
+        kb = expense_pay_result_keyboard(locale)
+        await edit_message_text_or_send(
+            update.get_bot(), chat_id=update.effective_chat.id,
+            message_id=update.callback_query.message.message_id,
+            text=H.truncate(text), parse_mode=HTML, reply_markup=kb,
+        )
+        await _answer(update, "")
+        return
+    if status != "approved":
+        # No longer payable -> route through the shared state renderer.
+        await _render_expense_state(update, context, expense, locale)
+        return
+    similar = []
+    try:
+        similar = await api.get_expense_duplicates(expense_id)
+    except PasayApiError:
+        similar = []  # advisory only; never blocks payment when it fails
+    text = cards.expense_pay_confirm_card(
+        expense, locale, location=location, similar=similar
+    )
+    kb = expense_pay_confirm_keyboard(expense_id, locale=locale, similar=similar)
+    await edit_message_text_or_send(
+        update.get_bot(), chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text), parse_mode=HTML, reply_markup=kb,
+    )
+    await _answer(update, "")
+
+
+async def _handle_expense_pay_confirm(update, context, expense_id_raw, ref, nonce, ts, role, locale):
+    """[✅ 确认已付款] -> deterministic finalization.
+
+    Owner-only, idempotency-guarded on the business ``expense_id``. The
+    expense is re-fetched and the backend state is the authority:
+    - already PAID -> idempotent 'already paid' result, no second write;
+    - not APPROVED -> render the current state, no write;
+    - APPROVED -> POST /pay (idempotent on the backend), then the PAID result.
+    If possible duplicates exist this handler refuses to pay until the Owner
+    explicitly passes ``ref == 'force'`` (the Continue button), honoring the
+    advisory warning without ever auto-rejecting the expense."""
+    if role != Role.OWNER:
+        await _answer(update, t("expense.no_permission_pay", locale))
+        return
+    if not expense_id_raw.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        await _edit(update, t("common.expired", locale), expired_keyboard(locale))
+        return
+    expense_id = int(expense_id_raw)
+    api = context.bot_data["api_client"]
+    guard = context.bot_data["idempotency"]
+    key = f"ik:exp:pay:{expense_id}:{nonce or '0'}"
+    status = guard.acquire(key, kind="expense", resource=str(expense_id))
+    if status == "done":
+        await _answer(update, t("expense.already_processed", locale))
+        try:
+            expense = await api.get_expense(expense_id)
+        except PasayApiError:
+            return
+        await _render_expense_state(update, context, expense, locale)
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale), durable=True)
+        return
+    await _ack_working(update, locale)
+    try:
+        current = await api.get_expense(expense_id)
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    current_status = (current.status or "").lower()
+    if current_status == "paid":
+        guard.settle(key, current.as_dict(), resource=str(expense_id))
+        text = cards.expense_pay_result_card(current, locale, already=True)
+        kb = expense_pay_result_keyboard(locale)
+        await edit_message_text_or_send(
+            update.get_bot(), chat_id=update.effective_chat.id,
+            message_id=update.callback_query.message.message_id,
+            text=H.truncate(text), parse_mode=HTML, reply_markup=kb,
+        )
+        await _answer(update, t("expense.pay_result_already", locale))
+        return
+    if current_status != "approved":
+        guard.settle(key, current.as_dict(), resource=str(expense_id))
+        await _answer(update, t("expense.already_processed", locale))
+        await _render_expense_state(update, context, current, locale)
+        return
+    # The possible-duplicate warning (if any) was already shown on the
+    # confirmation card returned by the opening tap; reaching this handler is
+    # the Owner's explicit Continue/Confirm, so finalize the payment. The
+    # backend /pay remains the state authority and is idempotent.
+    try:
+        updated = await api.pay_expense(expense_id)
+    except PasayApiConflictError:
+        # 409 = only approved can be paid -> reprocessed elsewhere.
+        try:
+            current = await api.get_expense(expense_id)
+        except PasayApiError:
+            guard.fail(key, resource=str(expense_id))
+            return
+        guard.settle(key, current.as_dict(), resource=str(expense_id))
+        if (current.status or "").lower() == "paid":
+            text = cards.expense_pay_result_card(current, locale, already=False)
+        else:
+            text = cards.expense_pay_result_card(current, locale, already=True)
+        kb = expense_pay_result_keyboard(locale)
+        await edit_message_text_or_send(
+            update.get_bot(), chat_id=update.effective_chat.id,
+            message_id=update.callback_query.message.message_id,
+            text=H.truncate(text), parse_mode=HTML, reply_markup=kb,
+        )
+        await _answer(update, "")
+        return
+    except PasayApiTimeoutError:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("common.timeout", locale), durable=True)
+        return
+    except PasayApiPermissionError:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("common.no_permission", locale), durable=True)
+        return
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    guard.settle(key, updated.as_dict(), resource=str(expense_id))
+    text = cards.expense_pay_result_card(updated, locale, already=False)
+    kb = expense_pay_result_keyboard(locale)
+    await edit_message_text_or_send(
+        update.get_bot(), chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text), parse_mode=HTML, reply_markup=kb,
+    )
+    await _answer(update, t("expense.pay_result_paid", locale))
+    # Remember the paid expense in this chat's context so a follow-up NL
+    # statement advances THIS record instead of creating a new one.
+    try:
+        store = context.bot_data["store"]
+        chat_id = update.effective_chat.id
+        user_id = update.effective_user.id
+        store.save_v2_context(
+            chat_id, user_id,
+            {
+                "expense_ref": str(expense_id),
+                "expense_status": "paid",
+                "unit_token": getattr(updated, "unit_id", None),
+                "intent": "expense",
+            },
+        )
+    except Exception:  # noqa: BLE001 - context is best-effort
+        logger.debug("expense context save failed", exc_info=True)
 
 
 # --- BOT-V1-USABLE-001 P0-2: expense create/edit (deterministic) -----------

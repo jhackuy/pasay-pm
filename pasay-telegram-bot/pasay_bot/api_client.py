@@ -882,9 +882,23 @@ class PasayApiClient:
     async def pay_expense(self, expense_id: int) -> Expense:
         """POST /expenses/{id}/pay: an approved expense becomes PAID.
         PASAY-V2-FOUNDATION-001: Owner's explicit payment confirmation is the
-        final fact; a receipt is optional and never blocks PAID."""
+        final fact; a receipt is optional and never blocks PAID.
+        Idempotent: a second call on an already-PAID expense returns the same
+        record (no duplicate write)."""
         data = await self._request("POST", f"/expenses/{expense_id}/pay")
         return Expense.from_dict(data)
+
+    async def get_expense_duplicates(self, expense_id: int) -> list[dict]:
+        """GET /operations/quick/expense-duplicates?expense_id=...
+
+        Advisory possible-duplicate matcher (PASAY-V2-EXPENSE-PAYABLE-TASK-006
+        §7/§8): returns OTHER highly similar PAID expenses (same unit, amount,
+        purpose/category, relevant date window). Amount alone is never a match.
+        Empty when nothing similar is found."""
+        data = await self._request(
+            "GET", f"/operations/quick/expense-duplicates", params={"expense_id": expense_id}
+        )
+        return [dict(r) for r in (data or [])]
 
     async def find_income(
         self,

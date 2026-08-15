@@ -167,8 +167,58 @@ def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int
     }
 
 
+def _payable_expense_rows(
+    db: Session, *, now: datetime | None = None
+) -> list[dict]:
+    """Owner-actionable payable expenses: every APPROVED (not yet PAID)
+    expense, which the product rule `PENDING -> APPROVED -> PAID` treats as an
+    unfinished task the Owner still must pay.
+
+    Only PAID is financially completed; APPROVED is approved-but-unpaid, so
+    each row carries the stable business identity (#E{id}) and the strong
+    matching fields (unit, purpose, amount, expense_date) the bot needs to
+    distinguish same-day/same-amount expenses and to run its advisory
+    possible-duplicate warning."""
+    expenses = (
+        db.query(Expense)
+        .filter(Expense.status == ExpenseStatus.approved)
+        .order_by(Expense.expense_date, Expense.id)
+        .all()
+    )
+    unit_ids = {e.unit_id for e in expenses if e.unit_id is not None}
+    label_by_unit: dict[int, str] = {}
+    if unit_ids:
+        units = {
+            u.id: u for u in db.query(Unit).filter(Unit.id.in_(unit_ids)).all()
+        }
+        for u in units.values():
+            label = _unit_label(db, u)
+            if label:
+                label_by_unit[u.id] = label
+    rows = []
+    for e in expenses:
+        rows.append(
+            {
+                "kind": "payable_expense",
+                "expense_id": e.id,
+                "unit": label_by_unit.get(e.unit_id, ""),
+                "purpose": _expense_purpose(e) or "",
+                "amount": _d2(e.amount),
+                "status": e.status.value,
+                "expense_date": e.expense_date.isoformat(),
+                "has_receipt": e.receipt_attachment_id is not None,
+            }
+        )
+    return rows
+
+
 def build_quick_tasks(db: Session, user: User, *, now: datetime | None = None) -> list[dict]:
-    """Active tasks (PENDING + IN_PROGRESS) for the caller's scope."""
+    """Active tasks (PENDING + IN_PROGRESS) for the caller's scope.
+
+    For the Owner (admin) the actionable set also includes every APPROVED
+    unpaid Expense as a payable task row (``kind == "payable_expense"``), so
+    the `✅ Tasks` Quick View never reports "Nothing here" while an approved
+    expense still awaits payment (PASAY-V2-EXPENSE-PAYABLE-TASK-006)."""
     now = now or datetime.now(timezone.utc)
     query = _agent_scope(db.query(OperationalTask), user).filter(
         OperationalTask.status.in_(
@@ -198,6 +248,69 @@ def build_quick_tasks(db: Session, user: User, *, now: datetime | None = None) -
             due_dt = datetime.fromisoformat(due)
             row["overdue_days"] = max((now - due_dt).days, 0) if due_dt < now else None
             row["due_in_days"] = (due_dt - now).days if due_dt >= now else None
+    if user.role == UserRole.admin:
+        rows.extend(_payable_expense_rows(db, now=now))
+    return rows
+
+
+def _similar_date_window(expense_date: date, *, now: datetime | None = None) -> tuple[date, date]:
+    """Relevant date window for a possible-duplicate check: centers on the
+    expense date (same relevant day ± one day) so a payment recorded a day or
+    two apart on the same unit/amount/purpose still raises the advisory
+    warning. Date only narrows the window — it is never the sole signal."""
+    window_start = expense_date - timedelta(days=1)
+    window_end = expense_date + timedelta(days=1)
+    return window_start, window_end
+
+
+def find_similar_paid_expenses(
+    db: Session, expense: Expense, *, now: datetime | None = None
+) -> list[dict]:
+    """Strong-attribute possible-duplicate matcher (advisory only, never a
+    delete/reject) — PASAY-V2-EXPENSE-PAYABLE-TASK-006 §7/§8.
+
+    A different but highly similar PAID expense signals a possible business
+    duplicate. Matching requires MULTIPLE strong fields: same unit identity,
+    same amount, same purpose/category, all within a relevant date window.
+    Amount alone is never enough. Returns similar PAID rows (existing-ID +
+    display fields) so the bot can show
+    ``Existing: #E{old} / Current: #E{new}`` and let the Owner Continue /
+    Cancel / View-existing without deleting business records."""
+    if expense.unit_id is None:
+        return []
+    window_start, window_end = _similar_date_window(expense.expense_date, now=now)
+    candidate_purpose = _clean_text(expense.category)
+    paid = (
+        db.query(Expense)
+        .filter(
+            Expense.id != expense.id,
+            Expense.status == ExpenseStatus.paid,
+            Expense.unit_id == expense.unit_id,
+            Expense.amount == expense.amount,
+            Expense.expense_date >= window_start,
+            Expense.expense_date <= window_end,
+        )
+        .all()
+    )
+    label = ""
+    if expense.unit_id is not None:
+        unit = db.query(Unit).filter(Unit.id == expense.unit_id).first()
+        label = _unit_label(db, unit) if unit is not None else ""
+    rows = []
+    for other in paid:
+        other_purpose = _clean_text(other.category)
+        if candidate_purpose and other_purpose and candidate_purpose == other_purpose:
+            rows.append(
+                {
+                    "expense_id": other.id,
+                    "status": other.status.value,
+                    "unit": label,
+                    "purpose": _expense_purpose(other) or "",
+                    "amount": _d2(other.amount),
+                    "expense_date": other.expense_date.isoformat(),
+                }
+            )
+    rows.sort(key=lambda r: (r["expense_date"], r["expense_id"]), reverse=True)
     return rows
 
 

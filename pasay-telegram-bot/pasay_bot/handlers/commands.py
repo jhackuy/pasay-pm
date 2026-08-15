@@ -41,6 +41,7 @@ from pasay_bot.keyboards import (
     pending_page_keyboard,
     property_list_keyboard,
     property_pagination_keyboard,
+    tasks_quick_keyboard,
     todo_keyboard,
     unit_list_keyboard,
     unit_page_keyboard,
@@ -600,13 +601,41 @@ async def show_quick_properties(context, chat_id, role, locale: str, message_id=
 
 
 async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None):
-    """✅ Tasks Quick View (deterministic, no LLM)."""
-    await _quick_view(
-        context, chat_id, role, locale, message_id,
-        lambda api: api.get_quick_tasks(),
-        cards.tasks_quick_card,
-        "tasks",
+    """✅ Tasks Quick View (deterministic, no LLM).
+
+    When payable APPROVED expenses are present, the card attaches per-row Pay
+    buttons so the Owner can open the deterministic payment flow straight from
+    the Quick View (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §4). Otherwise the card
+    carries the fixed Reply Keyboard, matching the other Quick Views."""
+    api = context.bot_data["api_client"]
+    try:
+        data = await api.get_quick_tasks()
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    except Exception as exc:  # noqa: BLE001 - user-visible fallback
+        logger.warning("quick view tasks failed: %s", exc)
+        await _render(context, chat_id, message_id, _load_error("tasks", locale),
+                      error_keyboard("home", locale))
+        return
+    text = cards.tasks_quick_card(data, locale)
+    rows = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
+    has_payable = any(
+        str(r.get("kind") or "") == "payable_expense" for r in rows
     )
+    if has_payable:
+        await _render(
+            context, chat_id, message_id, text,
+            keyboard=tasks_quick_keyboard(data, locale),
+        )
+    else:
+        await _render(
+            context, chat_id, message_id, text,
+            reply_keyboard=(reply_keyboard(role) if role else None),
+        )
+    if role:
+        _mark_menu_initialized(context, chat_id)
 
 
 async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
@@ -979,20 +1008,25 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
     owner_view = role == Role.OWNER
     expense_rows = []
     if owner_view:
-        pending_expenses = sorted(
-            (e for e in expenses if (e.status or "").lower() == "pending"),
+        # PASAY-V2-EXPENSE-PAYABLE-TASK-006: both PENDING (needs approval) and
+        # APPROVED (needs payment) expenses are Owner-actionable Tasks; PAID /
+        # REJECTED / REVERSED are not actionable. Each row carries its status so
+        # the keyboard can offer Approve/Reject or Pay accordingly.
+        actionable_expenses = sorted(
+            (e for e in expenses if (e.status or "").lower() in ("pending", "approved")),
             key=lambda e: (e.due_date or e.expense_date, e.id),
         )
         expense_rows = [
             {
                 "id": e.id,
+                "status": (e.status or "").lower(),
                 "category": e.category,
                 "payee": e.payee,
                 "amount": e.amount,
                 "location": _expense_location(e, units, properties),
                 "has_receipt": bool(e.receipt_attachment_id),
             }
-            for e in pending_expenses
+            for e in actionable_expenses
         ]
 
     confirm_rows = []

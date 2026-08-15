@@ -1042,6 +1042,68 @@ def expense_detail_card(
 
 # --- BOT-V1-USABLE-001 P0-2: expense create flow ---------------------------
 
+def expense_pay_confirm_card(
+    expense: Expense,
+    locale: str = "zh",
+    location: str = "",
+    *,
+    similar: list | None = None,
+) -> str:
+    """Owner payment-confirmation card for an APPROVED (unpaid) expense
+    (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §4/§5/§7).
+
+    Carries the stable identity ``#E{id}`` plus unit/purpose/amount/date. A
+    receipt is OPTIONAL (shown as a hint, never a blocker). When ``similar``
+    holds possible-duplicate PAID rows, an advisory bilingual warning lists the
+    existing IDs — it never deletes or rejects the current expense."""
+    id_part = f"#E{expense.id}"
+    blocks = [f"💸 <b>{H.escape(t('expense.pay_confirm_title', locale))}</b>"]
+    loc = _expense_location(expense, location)
+    header_bits = [id_part] + ([loc] if loc else []) + [H.escape(expense.category)]
+    blocks.append(" · ".join(b for b in header_bits if b))
+    blocks.append(f"<b>{H.money(expense.amount)}</b>")
+    if expense.description:
+        blocks.append(H.escape(expense.description))
+    blocks.append(
+        f"{H.escape(t('expense.date', locale))}：{H.format_date(expense.expense_date)}"
+    )
+    if similar:
+        dup = ["⚠️ " + H.escape(t("expense.pay_duplicate_title", locale))]
+        dup.append(
+            H.escape(
+                t(
+                    "expense.pay_duplicate_body",
+                    locale,
+                    unit=H.escape(str(similar[0].get("unit") or "")),
+                )
+            )
+        )
+        existing = " · ".join(
+            f"#E{int(r['expense_id'])}" for r in similar if r.get("expense_id")
+        )
+        if existing:
+            dup.append(H.escape(t("expense.pay_view_existing", locale) + ": " + existing))
+        blocks.append("\n".join(dup))
+    blocks.append(H.escape(t("expense.pay_confirm_hint", locale)))
+    return "\n\n".join(blocks)
+
+
+def expense_pay_result_card(expense: Expense, locale: str = "zh", *, already: bool = False) -> str:
+    """Payment result card: ``PAID`` the first time, an idempotent ``Already
+    paid`` on a repeated confirmation (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §6)."""
+    if already:
+        title = t("expense.pay_result_already", locale)
+        note = H.escape(t("expense.pay_result_already_note", locale))
+    else:
+        title = t("expense.pay_result_paid", locale)
+        note = H.escape(t("expense.pay_result_done", locale))
+    where = " · ".join(x for x in (f"#E{expense.id}", expense.category) if x)
+    lines = [H.escape(title), f"{H.escape(where)} · <b>{H.money(expense.amount)}</b>", note]
+    return "\n".join(x for x in lines if x)
+
+
+# --- BOT-V1-USABLE-001 P0-2: expense create flow ---------------------------
+
 def expense_confirm_card(
     *,
     unit_number: str,
@@ -1222,9 +1284,15 @@ def todo_overview_card(sections: dict, locale: str = "zh") -> str:
     expenses = sections.get("expenses") or []
     if expenses:
         items = [
-            f"💳 {H.escape(r.get('category', ''))} · {H.escape(r.get('payee', ''))}"
-            f" · <b>{H.money(r.get('amount'))}</b>"
+            f"{'💳' if (r.get('status') or '').lower() != 'approved' else '💸'} "
+            f"{'#E' + str(r['id']) if r.get('id') is not None else ''} · "
+            f"{H.escape(r.get('category', ''))} · <b>{H.money(r.get('amount'))}</b>"
             + (f"\n{H.escape(r.get('location', ''))}" if r.get("location") else "")
+            + (
+                f"\n📋 {H.escape(t('expense.status_approved', locale))}"
+                if (r.get("status") or "").lower() == "approved"
+                else ""
+            )
             for r in expenses
         ]
         blocks.append(H.escape(t("todo.section_expenses", locale, count=len(expenses))))
@@ -1649,19 +1717,50 @@ def properties_quick_card(data, locale: str = "bi") -> str:
     return "\n\n".join(blocks)
 
 
+def _payable_expense_line(row: dict, locale: str) -> str:
+    """One payable (APPROVED, unpaid) expense row with a stable visible
+    identity: ``💸 #E{id} · unit · purpose · amount · Approved``. The database
+    expense id is the stable identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3),
+    so same-day/same-amount expenses stay distinguishable."""
+    expense_id = row.get("expense_id")
+    id_part = f"#E{int(expense_id)}" if expense_id is not None else ""
+    unit = H.escape(str(row.get("unit") or ""))
+    purpose = H.escape(str(row.get("purpose") or t("v2.expense_other", locale)))
+    amount = H.money(row.get("amount"))
+    status = H.escape(_expense_status_label(row.get("status"), locale))
+    parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>", status) if x]
+    return "💸 " + " · ".join(parts)
+
+
 def tasks_quick_card(data, locale: str = "bi") -> str:
-    """✅ Tasks quick view: active tasks grouped by status."""
+    """✅ Tasks quick view: active tasks grouped by status, plus the Owner's
+    payable APPROVED expenses (PASAY-V2-EXPENSE-PAYABLE-TASK-006).
+
+    Payable expenses use ``#E{id}`` as the stable identity so same-day /
+    same-amount records stay distinguishable. When payable rows exist the card
+    never shows the empty state."""
     tasks = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
-    pending = [t_ for t_ in tasks if str(t_.get("status") or "").upper() == "PENDING"]
+    payable = [
+        t_ for t_ in tasks if str(t_.get("kind") or "") == "payable_expense"
+    ]
+    operational = [t_ for t_ in tasks if t_ not in payable]
+    pending = [
+        t_ for t_ in operational
+        if str(t_.get("status") or "").upper() == "PENDING"
+    ]
     in_progress = [
-        t_ for t_ in tasks
+        t_ for t_ in operational
         if str(t_.get("status") or "").upper() in ("IN_PROGRESS", "IN PROGRESS")
     ]
-    other = [t_ for t_ in tasks if t_ not in pending and t_ not in in_progress]
+    other = [t_ for t_ in operational if t_ not in pending and t_ not in in_progress]
     blocks = [_v2_title(locale, "v2.tasks_title", "✅")]
     if not tasks:
         blocks.append(H.escape(t("v2.empty", locale)))
         return "\n".join(blocks)
+    if payable:
+        subtitle = t("v2.payable_expenses", locale, count=len(payable))
+        blocks.append(f"💸 <b>{H.escape(subtitle)}</b>")
+        blocks.extend(_payable_expense_line(p_, locale) for p_ in payable)
     if pending:
         blocks.append(_v2_section("v2.status.pending", locale, "🔴"))
         blocks.extend(_v2_task_line(t_, locale, "🔴") for t_ in pending)

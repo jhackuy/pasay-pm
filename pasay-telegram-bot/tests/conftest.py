@@ -201,6 +201,8 @@ class FakeBackend:
             "unresolved_expense_tasks": [],
             "records": [],
         }
+        # PASAY-V2-EXPENSE-PAYABLE-TASK-006: advisory possible-duplicate matcher.
+        self.expense_duplicates: Optional[list] = None
         self.digest: dict = {"pending": [], "in_progress": [], "recently_completed": []}
         self._next_v2_task_id = 1000
         # --- V1.3 Slice 2: Entry B rent-payment matcher ---
@@ -638,13 +640,39 @@ class FakeBackend:
 
         # --- PASAY-V2-FOUNDATION-001: quick views / digest / task write ---
         if path == "/operations/quick/tasks" and method == "GET":
-            return httpx.Response(200, json=self.quick_tasks)
+            rows = list(self.quick_tasks)
+            # PASAY-V2-EXPENSE-PAYABLE-TASK-006: approved (unpaid) expenses are
+            # Owner-actionable payable task rows in the ✅ Tasks Quick View.
+            for exp in self.expenses:
+                if (exp.get("status") or "").lower() != "approved":
+                    continue
+                label = next(
+                    (u.get("unit_number", "") for u in self.units if u["id"] == exp.get("unit_id")),
+                    "",
+                )
+                rows.append(
+                    {
+                        "kind": "payable_expense",
+                        "expense_id": exp["id"],
+                        "unit": label,
+                        "purpose": exp.get("category") or "",
+                        "amount": exp.get("amount"),
+                        "status": "approved",
+                        "expense_date": exp.get("expense_date"),
+                        "has_receipt": exp.get("receipt_attachment_id") is not None,
+                    }
+                )
+            return httpx.Response(200, json=rows)
         if path == "/operations/quick/properties" and method == "GET":
             return httpx.Response(200, json=self.quick_properties)
         if path == "/operations/quick/rent" and method == "GET":
             return httpx.Response(200, json=self.quick_rent)
         if path == "/operations/quick/expense" and method == "GET":
             return httpx.Response(200, json=self.quick_expense)
+        if path == "/operations/quick/expense-duplicates" and method == "GET":
+            if self.expense_duplicates is not None:
+                return httpx.Response(200, json=self.expense_duplicates)
+            return httpx.Response(200, json=[])
         if path == "/operations/digest" and method == "GET":
             return httpx.Response(200, json=self.digest)
         if path == "/operations/tasks" and method == "POST":

@@ -576,6 +576,27 @@ def quick_expense(
     return quick_svc.build_quick_expense(db)
 
 
+@router.get("/quick/expense-duplicates")
+def quick_expense_duplicates(
+    expense_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """Possible-duplicate matcher for one payable expense (PASAY-V2
+    -EXPENSE-PAYABLE-TASK-006 §7/§8).
+
+    Advisory only: returns OTHER highly similar PAID expenses (same unit,
+    amount, purpose/category and a relevant date window) so the bot can warn
+    the Owner before finalizing payment. Amount alone is never a match, and
+    no business record is ever deleted or rejected here."""
+    from app.models.financial import Expense
+
+    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    if expense is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+    return quick_svc.find_similar_paid_expenses(db, expense)
+
+
 @router.get("/digest")
 def daily_digest(
     db: Session = Depends(get_db),

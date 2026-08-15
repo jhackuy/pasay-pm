@@ -41,6 +41,9 @@ ACTION_EXPENSE_DETAIL = "exd"
 # BOT-V1-USABLE-001 P0-2: expense create flow (submit for approval / edit).
 ACTION_EXPENSE_CREATE = "exc"
 ACTION_EXPENSE_EDIT = "exe"
+# PASAY-V2-EXPENSE-PAYABLE-TASK-006: pay an APPROVED (unpaid) expense.
+ACTION_EXPENSE_PAY = "exp"        # open the deterministic pay flow (confirm + warn)
+ACTION_EXPENSE_PAY_CONFIRM = "expc"  # finalize payment (idempotent, backend-verified)
 # BOT-V1-USABLE-001 P0-5: AI fallback ambiguity choices (deterministic taps).
 ACTION_AI_CHOICE = "aic"
 # BOT-V1-USABLE-001 home summary action buttons.
@@ -1290,6 +1293,79 @@ def expense_result_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
     )
 
 
+def expense_pay_confirm_keyboard(
+    expense_id: int,
+    locale: str = "zh",
+    *,
+    similar: list | None = None,
+) -> InlineKeyboardMarkup:
+    """Payment confirmation card for an APPROVED (unpaid) expense
+    (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §4/§5/§7).
+
+    Primary action is the deterministic ``✅ Confirm paid`` (calls the backend
+    pay transition); a receipt is OPTIONAL and never blocks PAID. When
+    ``similar`` carries possible-duplicate PAID rows the Owner is shown
+    ``Continue`` / ``Cancel`` / ``View existing`` — the warning is advisory
+    and never auto-rejects the current expense."""
+    nonce, ts = new_nonce(), now_ts()
+    kb: list[list[InlineKeyboardButton]] = []
+    if similar:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("expense.pay_duplicate_continue", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_PAY_CONFIRM, str(expense_id), "",
+                        nonce=nonce, ts=ts,
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.pay_cancel", locale),
+                    callback_data=encode(ACTION_EXPENSE_PAY, "cancel", str(expense_id)),
+                ),
+            ]
+        )
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("expense.pay_view_existing", locale),
+                    callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
+                ),
+            ]
+        )
+    else:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("expense.pay_now", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_PAY_CONFIRM, str(expense_id), "",
+                        nonce=nonce, ts=ts,
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("expense.pay_cancel", locale),
+                    callback_data=encode(ACTION_EXPENSE_PAY, "cancel", str(expense_id)),
+                ),
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def expense_pay_result_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
+    """Payment result card (paid / already paid): back home only."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))]]
+    )
+
+
 # --- BOT-V1-USABLE-001 P0-2: expense create flow ---------------------------
 
 def expense_confirm_keyboard(
@@ -1403,6 +1479,24 @@ def todo_keyboard(
     for row in sections.get("expenses") or []:
         expense_id = int(row["id"])
         nonce, ts = new_nonce(), now_ts()
+        if (row.get("status") or "").lower() == "approved":
+            # APPROVED unpaid expense -> the Owner must pay it (PASAY-V2
+            # -EXPENSE-PAYABLE-TASK-006 §2/§4). Deterministic pay flow.
+            kb.append(
+                [
+                    InlineKeyboardButton(
+                        t("expense.pay_button", locale),
+                        callback_data=encode(
+                            ACTION_EXPENSE_PAY, str(expense_id), "", nonce=nonce, ts=ts
+                        ),
+                    ),
+                    InlineKeyboardButton(
+                        t("expense.view_detail", locale),
+                        callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
+                    ),
+                ]
+            )
+            continue
         kb.append(
             [
                 InlineKeyboardButton(
@@ -1480,6 +1574,40 @@ def todo_keyboard(
                     t("ops.detail", locale),
                     callback_data=encode(ACTION_TASK_DETAIL, "ops", str(task.id)),
                 ),
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def tasks_quick_keyboard(data, locale: str = "bi") -> InlineKeyboardMarkup:
+    """✅ Tasks Quick View action buttons (PASAY-V2-EXPENSE-PAYABLE-TASK-006):
+    one deterministic ``Pay`` button per payable APPROVED expense row, then a
+    Home button. ``data`` is the backend quick-tasks payload (list of rows,
+    or dict with a ``tasks`` key)."""
+    tasks = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
+    kb: list[list[InlineKeyboardButton]] = []
+    for row in tasks:
+        if str(row.get("kind") or "") != "payable_expense":
+            continue
+        expense_id = row.get("expense_id")
+        if expense_id is None:
+            continue
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    f"{t('expense.pay_button', locale)} #E{int(expense_id)}",
+                    callback_data=encode(
+                        ACTION_EXPENSE_PAY, str(int(expense_id)), "", nonce=nonce, ts=ts
+                    ),
+                )
             ]
         )
     kb.append(
