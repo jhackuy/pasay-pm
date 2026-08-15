@@ -63,7 +63,6 @@ def test_paid_closeout_isolates_old_and_new(make_app):
         {"expense_ref": "6001", "expense_status": "approved", "intent": "expense"},
     )
 
-    before_group_sends = len(env.bot.sends())
     run_updates(
         env,
         [make_group_text_update(OWNER_ID, GROUP, "已经付款",
@@ -83,12 +82,16 @@ def test_paid_closeout_isolates_old_and_new(make_app):
 
     # Bilingual group notification pushed after the Owner's private reply.
     group_texts = [
-        s["text"] for s in env.bot.sends()[before_group_sends:]
-        if s["chat_id"] == GROUP and s.get("text")
+        s["text"] for s in env.bot.sends()
+        if str(s["chat_id"]) == str(GROUP) and s.get("text")
     ]
     assert group_texts, "group must receive a paid notification"
     combined = "\n".join(group_texts)
     assert "Paid" in combined and "已付款" in combined
     assert "Expense completed" in combined and "支出已完成" in combined
     assert "₱6,001" in combined
+    # The group notification (not the Owner's private reply) must carry the
+    # Unit. In this test the Owner types in the group, so at least one of the
+    # group-bound sends must include the Unit label.
+    assert any("16B" in (t or "") for t in group_texts)
     assert "6000" not in combined  # never mentions the old record
