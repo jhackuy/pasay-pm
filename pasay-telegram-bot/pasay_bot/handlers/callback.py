@@ -111,6 +111,7 @@ from pasay_bot.handlers.edit_utils import (
     edit_message_text_or_send,
 )
 from pasay_bot.render import cards, html as H
+from pasay_bot.render import completion
 from pasay_bot.render.i18n import t
 from pasay_bot.roles import (
     PERMISSION_OPERATIONS,
@@ -1831,6 +1832,19 @@ async def _handle_task_complete(update, context, ref, role, locale):
         "ops.completed_card", locale,
         title=H.escape(task.title or t("ops.task", locale)),
     )
+    # PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey M): append a varied,
+    # positive deterministic closing line (never LLM) so completion is not a
+    # cold mechanical line and does not repeat the same wording every time.
+    try:
+        recent = context.bot_data.setdefault("completion_recent", set())
+        key, closing = completion.select(locale, "task", recent)
+        if closing:
+            recent.add(key)
+            if len(recent) > completion._RECENT_LIMIT:
+                recent.pop()  # approximate LRU: drop an arbitrary old key
+        text += "\n" + closing
+    except Exception:  # noqa: BLE001 - completion feedback is best-effort
+        pass
     await _edit(update, text, ops_back_keyboard(locale))
     await _answer(update, t("ops.completed_toast", locale))
 

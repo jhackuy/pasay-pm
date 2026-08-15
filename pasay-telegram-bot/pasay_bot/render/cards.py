@@ -130,6 +130,17 @@ def _dec(value) -> Decimal:
     return Decimal(str(value or 0))
 
 
+def _pct(value) -> str:
+    """Render a percentage number without the peso sign and without a
+    trailing '.00' (e.g. '34.00' -> '34', '33.5' -> '33.5')."""
+    try:
+        d = _dec(value)
+    except Exception:  # noqa: BLE001 - never crash a card on a bad rate
+        return "0"
+    d = d.quantize(Decimal("0.1"))
+    return format(d, "f").rstrip("0").rstrip(".") or "0"
+
+
 def overdue_emoji(days: int) -> str:
     """Overdue entries are action items; all render the 🔴 severity marker."""
     return "🔴"
@@ -1659,13 +1670,18 @@ def _v2_mmdd(value) -> str:
 
 
 def _v2_expense_record_line(row: dict, locale: str) -> str:
-    """One expense record row: Unit · Purpose · Amount · MM-DD · Status."""
+    """One expense record row: Expense ID · Unit · Purpose · Amount · MM-DD ·
+    Status. Carries the stable ``#E{id}`` so same-date/same-amount records stay
+    distinguishable; if the id is absent the row still renders (unit-first)."""
+    expense_id = row.get("expense_id")
+    id_part = f"#E{int(expense_id)}" if expense_id is not None else ""
     unit = H.escape(str(row.get("unit") or row.get("unit_code") or "-"))
     purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
     date = H.escape(_v2_mmdd(row.get("expense_date") or row.get("date")))
     status = _v2_expense_status(row.get("status"), locale)
-    return f"{unit} · {purpose} · <b>{amount}</b> · {date} · {status}"
+    parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>", date, status) if x]
+    return " · ".join(parts)
 
 
 def _clean_free_text(value) -> str | None:
@@ -1705,16 +1721,44 @@ def _v2_title(locale: str, key: str, emoji: str) -> str:
 
 
 def properties_quick_card(data, locale: str = "bi") -> str:
-    """🏠 Properties quick view: one line per unit, abnormal first."""
+    """🏠 Properties quick view: occupancy summary + one line per unit.
+
+    Deterministic summary (no LLM): total / occupied (rented) / vacant /
+    occupancy rate derived from each unit row's status. ``vacant`` marks an
+    empty unit; every other status (overdue_rent / lease_expiring / normal /
+    paid) implies an active lease, i.e. occupied/rented. Rent delinquency is
+    NOT counted as a separate property stat — it stays a per-unit status only."""
     rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
     blocks = [_v2_title(locale, "v2.properties_title", "🏠")]
     if not rows:
         blocks.append(H.escape(t("v2.empty", locale)))
         return "\n".join(blocks)
+    total = len(rows)
+    vacant = sum(1 for r in rows if str(r.get("status") or "normal").lower() == "vacant")
+    occupied = total - vacant
+    rate = (occupied / total * 100) if total else 0
+    blocks.append(_properties_summary_line(locale, total, occupied, vacant, rate))
     for row in rows:
         emoji, line = _v2_property_label(row, locale)
         blocks.append(f"{emoji} {line}")
     return "\n\n".join(blocks)
+
+
+def _properties_summary_line(locale: str, total: int, occupied: int, vacant: int, rate) -> str:
+    """One compact occupancy summary line, bilingual in groups."""
+    en = (
+        f"{H.escape(t('properties.total', 'en'))} {total} · "
+        f"{H.escape(t('properties.occupied', 'en'))} {occupied} · "
+        f"{H.escape(t('properties.vacant', 'en'))} {vacant} · "
+        f"{H.escape(t('properties.occupancy_rate', 'en'))} {rate:.0f}%"
+    )
+    zh = (
+        f"{H.escape(t('properties.total', 'zh'))} {total} · "
+        f"{H.escape(t('properties.occupied', 'zh'))} {occupied} · "
+        f"{H.escape(t('properties.vacant', 'zh'))} {vacant} · "
+        f"{H.escape(t('properties.occupancy_rate', 'zh'))} {rate:.0f}%"
+    )
+    return f"📊 {_bi_line(locale, en, zh)}"
 
 
 def _payable_expense_line(row: dict, locale: str) -> str:
@@ -1773,11 +1817,23 @@ def tasks_quick_card(data, locale: str = "bi") -> str:
 
 
 def rent_quick_card(data, locale: str = "bi") -> str:
-    """💰 Rent quick view: overdue units + outstanding total."""
+    """💰 Rent quick view: current-month statistics (expected / collected /
+    outstanding / collection rate / unpaid unit count) + overdue units.
+
+    ``outstanding_rent`` = expected - valid collected in this month; partial
+    payments reduce it and are never treated as fully paid. The overdue list
+    below stays the per-period aggregate view."""
     data = data or {}
     overdue = data.get("overdue") or []
     outstanding = data.get("outstanding_total")
     blocks = [_v2_title(locale, "v2.rent_title", "💰")]
+    expected = data.get("expected_rent_total")
+    collected = data.get("collected_rent")
+    cur_outstanding = data.get("outstanding_rent")
+    rate = data.get("collection_rate")
+    unpaid_count = data.get("unpaid_unit_count")
+    if expected is not None:
+        blocks.append(_rent_month_stats(locale, expected, collected, cur_outstanding, rate, unpaid_count))
     if not overdue:
         blocks.append(H.escape(t("v2.rent_no_overdue", locale)))
     else:
@@ -1796,6 +1852,35 @@ def rent_quick_card(data, locale: str = "bi") -> str:
             H.escape(t("v2.outstanding_total", locale, amount=H.money(outstanding)))
         )
     return "\n\n".join(blocks)
+
+
+def _rent_month_stats(
+    locale: str, expected, collected, outstanding, rate, unpaid_count,
+) -> str:
+    """One bilingual current-month rent stats block (expected/collected/
+    outstanding/collection rate/unpaid unit count). ``None`` values are
+    skipped, so a partial payload never renders `None/null`."""
+    en_parts, zh_parts = [], []
+    if expected is not None:
+        en_parts.append(t("v2.rent_expected", "en", amount=H.money(expected)))
+        zh_parts.append(t("v2.rent_expected", "zh", amount=H.money(expected)))
+    if collected is not None:
+        en_parts.append(t("v2.rent_collected", "en", amount=H.money(collected)))
+        zh_parts.append(t("v2.rent_collected", "zh", amount=H.money(collected)))
+    if outstanding is not None:
+        en_parts.append(t("v2.rent_outstanding", "en", amount=H.money(outstanding)))
+        zh_parts.append(t("v2.rent_outstanding", "zh", amount=H.money(outstanding)))
+    if rate is not None:
+        en_parts.append(t("v2.rent_collection_rate", "en", rate=_pct(rate)))
+        zh_parts.append(t("v2.rent_collection_rate", "zh", rate=_pct(rate)))
+    if unpaid_count is not None:
+        en_parts.append(t("v2.rent_unpaid_units", "en", count=int(unpaid_count)))
+        zh_parts.append(t("v2.rent_unpaid_units", "zh", count=int(unpaid_count)))
+    en_line = " · ".join(p for p in en_parts if p)
+    zh_line = " · ".join(p for p in zh_parts if p)
+    if not en_line:
+        return ""
+    return f"📊 {_bi_line(locale, en_line, zh_line)}"
 
 
 def expense_quick_card(data, locale: str = "bi") -> str:

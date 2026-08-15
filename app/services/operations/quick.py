@@ -394,10 +394,36 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
     return rows
 
 
+def _month_from_income(income: Income) -> str:
+    """The rent period (YYYY-MM) a confirmed income maps to. Mirrors the
+    financial summary: an explicit YYYY-MM in the description is authoritative;
+    the received-date month is the fallback (never both)."""
+    return _month_from_description(income.description) or income.received_date.strftime("%Y-%m")
+
+
+def _current_month_collected(confirmed_by_lease: dict[int, list[Income]], lease_id: int, month: str) -> Decimal:
+    """Cash attributed to ONE month for a lease: sum of confirmed incomes whose
+    period resolves to ``month`` (description YYYY-MM else received-date month).
+    Partial payments reduce outstanding correctly (they add to collected)."""
+    total = Decimal("0.00")
+    for income in confirmed_by_lease.get(lease_id, []):
+        if _month_from_income(income) == month:
+            total += _d2(income.amount)
+    return total
+
+
 def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
-    """Overdue units + outstanding total (same semantics as /overdue-rents)."""
+    """Overdue units + outstanding total, plus the CURRENT month's rent
+    statistics (expected / collected / outstanding / collection rate / unpaid
+    unit count). Same period semantics as /overdue-rents and the financial
+    summary: an income covers a month when its description YYYY-MM (else its
+    received-date month) matches it. ``outstanding_rent`` = expected - valid
+    collected; partial payments reduce it — a partial payment is never treated
+    as fully paid. ``unpaid_unit_count`` counts active leases whose current
+    period is not yet fully covered."""
     now = now or datetime.now(timezone.utc)
     today = now.date()
+    month = today.strftime("%Y-%m")
     leases = (
         db.query(Lease)
         .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
@@ -422,11 +448,24 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
     }
     overdue_rows: list[dict] = []
     outstanding = Decimal("0.00")
+    expected_rent = Decimal("0.00")
+    collected_rent = Decimal("0.00")
+    unpaid_unit_count = 0
     for lease in leases:
         unit = units.get(lease.unit_id)
         if unit is None:
             continue
         periods = _lease_periods(lease)
+        # Does the lease cover the current month at all?
+        month_due = next((due for m, due in periods if m == month), None)
+        # Expected rent only counts months the lease actually covers.
+        covers_current = any(m == month for m, _ in periods)
+        if covers_current:
+            expected_rent += _d2(lease.monthly_rent)
+            cur_collected = _current_month_collected(confirmed_by_lease, lease.id, month)
+            collected_rent += cur_collected
+            if cur_collected < _d2(lease.monthly_rent) and month_due is not None and month_due <= today:
+                unpaid_unit_count += 1
         due_periods = [(m, due) for m, due in periods if due <= today]
         covered = _covered_periods(lease, periods, confirmed_by_lease.get(lease.id, []))
         overdue = [(m, due) for m, due in due_periods if m not in covered]
@@ -444,7 +483,21 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
             }
         )
     overdue_rows.sort(key=lambda r: r["overdue_days"], reverse=True)
-    return {"overdue": overdue_rows, "outstanding_total": outstanding}
+    outstanding_rent = _d2(expected_rent - collected_rent)
+    if expected_rent > 0:
+        collection_rate = (collected_rent / expected_rent * Decimal("100")).quantize(_TWO_PLACES)
+    else:
+        collection_rate = Decimal("0.00")
+    return {
+        "overdue": overdue_rows,
+        "outstanding_total": outstanding,
+        "month": month,
+        "expected_rent_total": _d2(expected_rent),
+        "collected_rent": _d2(collected_rent),
+        "outstanding_rent": outstanding_rent,
+        "collection_rate": collection_rate,
+        "unpaid_unit_count": unpaid_unit_count,
+    }
 
 
 def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
@@ -514,6 +567,7 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
     }
     records = [
         {
+            "expense_id": e.id,
             "unit": label_by_unit.get(e.unit_id, ""),
             "unit_code": label_by_unit.get(e.unit_id, ""),
             "purpose": _expense_purpose(e) or "",

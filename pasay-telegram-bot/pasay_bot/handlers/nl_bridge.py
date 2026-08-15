@@ -731,13 +731,29 @@ async def _handle_v2_task_event(
         except PasayApiError:
             return False  # let the AI lane produce a friendly fallback
         store.clear_v2_context(chat_id, user_id)
+        task_text = _v2_task_card_text(
+            "completed",
+            task.as_dict() if hasattr(task, "as_dict") else task.__dict__,
+            locale,
+        )
+        # PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey M): append a
+        # varied, positive deterministic closing line so repair completion is a
+        # human acknowledgement, never a cold mechanical line.
+        try:
+            from pasay_bot.render import completion
+
+            recent = context.bot_data.setdefault("completion_recent", set())
+            key, closing = completion.select(locale, "task", recent)
+            if closing:
+                recent.add(key)
+                if len(recent) > completion._RECENT_LIMIT:
+                    recent.pop()
+                task_text += "\n" + closing
+        except Exception:  # noqa: BLE001 - completion feedback is best-effort
+            pass
         await _v2_reply(
             update, context,
-            _v2_task_card_text(
-                "completed",
-                task.as_dict() if hasattr(task, "as_dict") else task.__dict__,
-                locale,
-            ),
+            task_text,
             role, locale,
         )
         return True

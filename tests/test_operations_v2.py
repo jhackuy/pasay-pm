@@ -233,12 +233,36 @@ def test_quick_rent_and_expense_shapes(client, db_session, admin_headers):
     body = rent.json()
     assert "overdue" in body and "outstanding_total" in body
     assert body["overdue"] and body["overdue"][0]["unit"] == "1680"
+    # Journey B statistics: current-month expected/collected/outstanding/rate/
+    # unpaid unit count are always present (may be zero).
+    for key in ("month", "expected_rent_total", "collected_rent",
+                "outstanding_rent", "collection_rate", "unpaid_unit_count"):
+        assert key in body
 
     exp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
     assert exp.status_code == 200
     body = exp.json()
     assert {"month_total", "pending_approval_count", "pending_approval_amount",
             "unresolved_expense_tasks", "records"} <= set(body)
+
+
+def test_quick_rent_month_statistics_contract(client, db_session, admin_headers):
+    """PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey B): the current-month
+    rent statistics are internally consistent. A lease whose current period is
+    uncovered contributes to expected but not collected -> outstanding = expected
+    - collected, collection_rate = collected/expected, unpaid_unit_count >= 1."""
+    lease, _ = _seed_lease(db_session)
+    resp = client.get(f"{API}/operations/quick/rent", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    expected = float(body["expected_rent_total"])
+    collected = float(body["collected_rent"])
+    outstanding = float(body["outstanding_rent"])
+    assert expected > 0
+    assert abs(outstanding - round(expected - collected, 2)) < 0.01
+    rate = float(body["collection_rate"])
+    assert 0 <= rate <= 100
+    assert body["unpaid_unit_count"] >= 1
 
 
 def test_quick_expense_records_show_paid_approved_pending_exclude_reversed(
@@ -292,6 +316,10 @@ def test_quick_expense_records_show_paid_approved_pending_exclude_reversed(
         assert row["purpose"]
         assert row["amount"]
         assert row["expense_date"]
+        # PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey E): every record
+        # carries the stable business identity so same-date/same-amount records
+        # stay distinguishable.
+        assert isinstance(row["expense_id"], int)
     # same expense_date -> most recently created first (id desc)
     assert records[0]["status"] == "pending"
     assert float(by_status["paid"]["amount"]) == 6001.0

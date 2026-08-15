@@ -98,6 +98,12 @@ class V2FakeBackend(FakeBackend):
                 {"unit": "1805", "amount": "24000.00", "overdue_days": 4},
             ],
             "outstanding_total": "99000.00",
+            "month": "2026-08",
+            "expected_rent_total": "150000.00",
+            "collected_rent": "51000.00",
+            "outstanding_rent": "99000.00",
+            "collection_rate": "34.00",
+            "unpaid_unit_count": 2,
         }
         self.quick_expense = {
             "month_total": "19650.00",
@@ -106,6 +112,7 @@ class V2FakeBackend(FakeBackend):
             "unresolved_expense_tasks": [],
             "records": [
                 {
+                    "expense_id": 101,
                     "unit": "1680",
                     "unit_code": "1680",
                     "purpose": "Repair / 维修",
@@ -114,6 +121,7 @@ class V2FakeBackend(FakeBackend):
                     "status": "paid",
                 },
                 {
+                    "expense_id": 102,
                     "unit": "1680",
                     "unit_code": "1680",
                     "purpose": "Water / 水费",
@@ -122,6 +130,7 @@ class V2FakeBackend(FakeBackend):
                     "status": "approved",
                 },
                 {
+                    "expense_id": 103,
                     "unit": "1680",
                     "unit_code": "1680",
                     "purpose": "Electric / 电费",
@@ -315,6 +324,20 @@ def test_properties_quick_view_group_bilingual(make_app):
     assert _copilot_calls(env) == []
 
 
+def test_properties_quick_view_occupancy_summary(make_app):
+    """PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey A): the 🏠 Properties
+    quick view must show the occupancy summary (total / occupied / vacant /
+    occupancy rate) above the unit list, and rent delinquency is never mixed
+    into it. 4 fixture units (3 leased of any status + 1 vacant) -> 75%."""
+    env = make_app(backend=V2FakeBackend())
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "总计 4" in text and "已出租 3" in text and "空置 1" in text and "出租率 75%" in text
+    # Occupancy stats must NOT quote the overdue rent amount (no delinquency mix).
+    assert "租金 ₱75,000" not in text.split("📊")[0]
+    assert _copilot_calls(env) == []
+
+
 def test_rent_quick_view_owner_chinese(make_app):
     env = make_app(backend=V2FakeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
@@ -334,6 +357,24 @@ def test_rent_quick_view_secretary_english(make_app):
     assert "逾期" not in text  # secretary private chat is English only
 
 
+def test_rent_quick_view_month_statistics(make_app):
+    """PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey B): the 💸 Rent quick
+    view must show current-month expected / collected / outstanding / collection
+    rate / unpaid unit count. outstanding = expected - collected (partial
+    payments reduce it). 150000 expected, 51000 collected -> 99000 outstanding
+    (kept in the summary, distinct from the overdue aggregate)."""
+    env = make_app(backend=V2FakeBackend())
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "本月应收 ₱150,000" in text
+    assert "已收 ₱51,000" in text
+    assert "未收 ₱99,000" in text
+    assert "收缴率 34%" in text
+    assert "未缴房间 2 间" in text
+    # The overdue aggregate line stays too.
+    assert "未收总额：₱99,000" in text
+
+
 def test_expense_quick_view_shows_amounts(make_app):
     env = make_app(backend=V2FakeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
@@ -346,14 +387,16 @@ def test_expense_quick_view_shows_amounts(make_app):
 def test_expense_quick_view_lists_month_records_owner_chinese(make_app):
     """P1-EXPENSE-QUICKVIEW-LIST-001: the 💸 Expense quick view lists this
     month's records (PAID + APPROVED) under the month total. Every row exposes
-    Unit · Purpose · Amount · MM-DD · Status. Owner private chat is Chinese."""
+    Expense ID · Unit · Purpose · Amount · MM-DD · Status (same-date/same-
+    amount records are distinguishable by #E{id}). Owner private chat is
+    Chinese."""
     env = make_app(backend=V2FakeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
     text = env.bot.last_send()["text"]
     assert "本月支出记录" in text
-    assert "1680 · Repair / 维修 · <b>₱6,001</b> · 08-15 · ✅ 已付款" in text
-    assert "1680 · Water / 水费 · <b>₱3,500</b> · 08-02 · 📋 已批准" in text
-    assert "1680 · Electric / 电费 · <b>₱1,200</b> · 08-01 · ⏳ 待批准" in text
+    assert "#E101 · 1680 · Repair / 维修 · <b>₱6,001</b> · 08-15 · ✅ 已付款" in text
+    assert "#E102 · 1680 · Water / 水费 · <b>₱3,500</b> · 08-02 · 📋 已批准" in text
+    assert "#E103 · 1680 · Electric / 电费 · <b>₱1,200</b> · 08-01 · ⏳ 待批准" in text
     assert "本月：₱19,650" in text
     # The unresolved line stays as auxiliary status, never replacing the list.
     assert "无未解决支出事项" in text
