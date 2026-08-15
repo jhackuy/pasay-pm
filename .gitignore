@@ -20,3 +20,8 @@ backups/
 pasay-telegram-bot/state/
 worktrees/
 ux/results/
+
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008: local pytest/scratch dirs stay untracked
+.git_tmp/
+pv-basetmp-*/
+pasay-telegram-bot/.pytest_tmp/

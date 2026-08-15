@@ -34,6 +34,8 @@ ACTION_EDIT = "ed"
 ACTION_ISSUE = "iss"
 # V1.3 Slice 2 (Entry D, rent status selector): multi-match candidate pick.
 ACTION_RENT_STATUS_SELECT = "rss"
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 C: payment-history candidate pick.
+ACTION_RENT_HISTORY_SELECT = "rhs"
 # V1.3 Slice 1: expense approval (exa = approve, exr = reject, exd = detail).
 ACTION_EXPENSE_APPROVE = "exa"
 ACTION_EXPENSE_REJECT = "exr"
@@ -235,6 +237,32 @@ def rent_status_candidates_keyboard(
     carries only the 1-based row index + per-card nonce; the handler resolves
     the row from the stored selector state, so no internal id ever travels in
     callback_data or the label."""
+    return _candidate_selector_keyboard(
+        ACTION_RENT_STATUS_SELECT, candidates, locale, nonce, ts,
+    )
+
+
+def rent_history_candidates_keyboard(
+    candidates: list[dict],
+    locale: str = "zh",
+    nonce: str = "",
+    ts: Optional[int] = None,
+) -> InlineKeyboardMarkup:
+    """Multi-match selector for payment-history questions (P1-...-008 C):
+    same shape as the rent-status selector, distinct action so the tap handler
+    renders the history card for the chosen candidate."""
+    return _candidate_selector_keyboard(
+        ACTION_RENT_HISTORY_SELECT, candidates, locale, nonce, ts,
+    )
+
+
+def _candidate_selector_keyboard(
+    action: str,
+    candidates: list[dict],
+    locale: str = "zh",
+    nonce: str = "",
+    ts: Optional[int] = None,
+) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
     for i, c in enumerate(candidates, start=1):
         parts = [
@@ -248,7 +276,7 @@ def rent_status_candidates_keyboard(
                 InlineKeyboardButton(
                     label,
                     callback_data=encode(
-                        ACTION_RENT_STATUS_SELECT, "sel", str(i),
+                        action, "sel", str(i),
                         nonce=nonce, ts=ts,
                     ),
                 )

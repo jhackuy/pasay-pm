@@ -19,6 +19,35 @@ from app.services.audit import audit_context
 
 TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 B1: fail closed — automated tests must
+# deterministically use an isolated test DB and must never silently fall back
+# to the live/production database. The session test engine DROPS and recreates
+# every table per test, so a PASAY_TEST_DB_NAME override (or a misconfigured
+# DATABASE_URL) pointing at the live/production database would destroy data.
+# Any such configuration is refused here, deterministically, before any engine
+# is created.
+_CONFIGURED_DB = make_url(settings.database_url).database
+_FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test"}
+
+
+def _test_db_allowed(name: str, configured_db: str) -> bool:
+    """True only when the requested test DB is a real, isolated test database
+    (never the configured live DB and never a production/live-named DB)."""
+    if not name:
+        return False
+    if name == configured_db:
+        return False
+    return name not in _FORBIDDEN_TEST_DBS
+
+
+if not _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB):
+    raise SystemExit(
+        "REFUSED: PASAY_TEST_DB_NAME=%r would run tests against the "
+        "live/production database (configured DATABASE_URL db=%r). "
+        "Set PASAY_TEST_DB_NAME to an isolated test database (e.g. pasay_pm_test)."
+        % (TEST_DB_NAME, _CONFIGURED_DB)
+    )
+
 
 def _test_url():
     return make_url(settings.database_url).set(database=TEST_DB_NAME)

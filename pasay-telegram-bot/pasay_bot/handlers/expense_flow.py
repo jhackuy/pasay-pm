@@ -46,6 +46,19 @@ from pasay_bot.roles import (
 HTML = "HTML"
 MAX_AMOUNT = Decimal("999999999999.99")
 
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A2: placeholder/empty text is never a
+# meaningful expense identity. Mirrors the backend schema validator so the bot
+# refuses to create a meaningless expense even if a future path forgets.
+_PLACEHOLDER_LABELS = {"??", "?", "--", "none", "null", "n/a", "na", "unknown"}
+
+
+def is_meaningful_label(value) -> bool:
+    """True when the text is a real human label (not empty/whitespace/placeholder)."""
+    text = " ".join(str(value or "").split())
+    if not text:
+        return False
+    return text.lower() not in _PLACEHOLDER_LABELS
+
 # Canonical expense categories + aliases (zh/en). The backend accepts any
 # label; canonical Chinese labels keep cards consistent across roles.
 CATEGORY_ALIASES: dict[str, str] = {
@@ -351,6 +364,19 @@ async def submit_expense(update, context, payload, role, locale):
     category = payload.get("category") or ""
     amount = payload.get("amount") or "0"
     expense_date = payload.get("expense_date") or date.today().isoformat()
+    if not is_meaningful_label(category):
+        # A2: never create an expense whose displayed identity would be a
+        # placeholder (`??`, `-`, empty). Ask for the category instead of
+        # booking a meaningless record.
+        store.save_conversation(
+            chat_id, user_id, "expense_edit_category", payload,
+        )
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("expense.ask_category", locale)),
+            parse_mode=HTML,
+        )
+        return
     try:
         amount_dec = Decimal(str(amount))
     except InvalidOperation:

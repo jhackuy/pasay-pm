@@ -50,9 +50,16 @@ def _clean_text(value: str | None) -> str | None:
 
 def _expense_purpose(expense) -> str | None:
     """Smallest existing-data purpose fallback chain for a Quick View row:
-    purpose -> category -> description/memo. The final locale-aware
-    `Other / 其他` fallback lives in the renderer, not here."""
-    for field in (_clean_text(expense.category), _clean_text(expense.description)):
+    category -> description/memo -> payee/vendor. A placeholder category such
+    as `??` is dropped, so an incomplete record (e.g. E7/E8) still resolves to
+    truthful existing facts (here: the 'Repair' payee) before the renderer's
+    neutral unspecified label. The final locale-aware `Other / 其他` fallback
+    lives in the renderer, not here (P1-...-008 A3)."""
+    for field in (
+        _clean_text(expense.category),
+        _clean_text(expense.description),
+        _clean_text(getattr(expense, "payee", None)),
+    ):
         if field:
             return field
     return None

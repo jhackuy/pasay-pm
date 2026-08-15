@@ -55,6 +55,15 @@ from app.services.operations.timeclock import MANILA_TZ
 TEST_DB_NAME = "pasay_pm_test"
 NOW = datetime(2026, 8, 11, 12, 0, 0, tzinfo=MANILA_TZ)
 
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 B1: fail closed even in the opt-in
+# eval harness — never run against the live/production database.
+_CONFIGURED_DB = make_url(settings.database_url).database
+if TEST_DB_NAME == _CONFIGURED_DB or TEST_DB_NAME in {"pasay_pm", "pasay_pm_win_test"}:
+    raise SystemExit(
+        f"REFUSED: eval TEST_DB_NAME={TEST_DB_NAME!r} would run against the "
+        f"live/production database (configured={_CONFIGURED_DB!r})."
+    )
+
 SCORED_DIMENSIONS = (
     "factual_grounding",
     "priority_ranking",

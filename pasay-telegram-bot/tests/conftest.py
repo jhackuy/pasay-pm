@@ -281,6 +281,25 @@ class FakeBackend:
             return str(rd)[:7]
         return None
 
+    @staticmethod
+    def _clean_label(value) -> str | None:
+        """Drop placeholder/empty sentinels (mirrors the backend read-model
+        cleaner): `??`, None, null, empty string and bare dash."""
+        if not value:
+            return None
+        text = " ".join(str(value).split())
+        if not text or text.lower() in {"none", "null", "??", "-"}:
+            return None
+        return text
+
+    def _expense_purpose(self, exp: dict) -> str:
+        """Backend-mirror purpose chain: category -> description -> payee."""
+        for field in ("category", "description", "payee"):
+            text = self._clean_label(exp.get(field))
+            if text:
+                return text
+        return ""
+
     def _recompute_overdue(self) -> None:
         """Keep the fake overdue report consistent with confirmed income (the
         real backend recomputes it dynamically): a confirmed payment covering
@@ -643,6 +662,9 @@ class FakeBackend:
             rows = list(self.quick_tasks)
             # PASAY-V2-EXPENSE-PAYABLE-TASK-006: approved (unpaid) expenses are
             # Owner-actionable payable task rows in the ✅ Tasks Quick View.
+            # P1-...-008 A3: the purpose mirrors the backend fallback chain
+            # (category -> description -> payee) so an incomplete record like
+            # E7/E8 (`??` category) still resolves to its truthful payee.
             for exp in self.expenses:
                 if (exp.get("status") or "").lower() != "approved":
                     continue
@@ -655,7 +677,8 @@ class FakeBackend:
                         "kind": "payable_expense",
                         "expense_id": exp["id"],
                         "unit": label,
-                        "purpose": exp.get("category") or "",
+                        "purpose": self._expense_purpose(exp),
+                        "payee": exp.get("payee"),
                         "amount": exp.get("amount"),
                         "status": "approved",
                         "expense_date": exp.get("expense_date"),

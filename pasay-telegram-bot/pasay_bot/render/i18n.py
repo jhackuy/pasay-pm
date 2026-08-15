@@ -51,6 +51,9 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.status_paid': '已付款',
         'expense.status_reversed': '已撤销',
         'expense.detail_title': '💳 支出详情',
+        # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A3: explicit unspecified-purpose
+        # state (never a silently blank purpose line).
+        'expense.purpose_unspecified': '未指定用途',
         # PASAY-V2-EXPENSE-PAYABLE-TASK-006: owner payment tasks.
         'expense.pay_button': '付款',
         'expense.pay_now': '✅ 确认已付款',
@@ -364,6 +367,13 @@ STRINGS: dict[str, dict[str, str]] = {
         'rent_status.due_line': '本月应付：{amount}',
         'rent_status.paid_line': '已付：{amount}',
         'rent_status.remain_line': '还欠：{amount}',
+        # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 C: rent payment-history answers.
+        'rent_history.title': '💰 交租记录',
+        'rent_history.title_month': '💰 交租记录 · {month}',
+        'rent_history.count': '共交 {count} 次',
+        'rent_history.total': '累计 {amount}',
+        'rent_history.latest': '最近一次：{date}',
+        'rent_history.none': '暂无交租记录',
         'pending.title': '⚠️ 待处理',
         'pending.empty': '✅ 今天没有紧急事项',
         'pending.section_overdue': '🔴 逾期租金 · {count}笔',
@@ -508,6 +518,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.status_paid': 'Paid',
         'expense.status_reversed': 'Reversed',
         'expense.detail_title': '💳 Expense details',
+        # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A3 (en parity).
+        'expense.purpose_unspecified': 'Unspecified purpose',
         # PASAY-V2-EXPENSE-PAYABLE-TASK-006: owner payment tasks.
         'expense.pay_button': 'Pay',
         'expense.pay_now': '✅ Confirm paid',
@@ -820,6 +832,13 @@ STRINGS: dict[str, dict[str, str]] = {
         'rent_status.due_line': 'Due this month: {amount}',
         'rent_status.paid_line': 'Paid: {amount}',
         'rent_status.remain_line': 'Remaining: {amount}',
+        # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 C (en parity).
+        'rent_history.title': '💰 Rent payment history',
+        'rent_history.title_month': '💰 Rent payment history · {month}',
+        'rent_history.count': 'Paid {count} time(s)',
+        'rent_history.total': 'Total {amount}',
+        'rent_history.latest': 'Latest: {date}',
+        'rent_history.none': 'No rent payments yet',
         'pending.title': '⚠️ To-do',
         'pending.empty': '✅ Nothing urgent today',
         'pending.section_overdue': '🔴 Overdue rent · {count}',

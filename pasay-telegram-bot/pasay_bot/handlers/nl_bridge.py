@@ -57,6 +57,7 @@ from pasay_bot.keyboards import (
     confirm_income_keyboard,
     new_nonce,
     now_ts,
+    rent_history_candidates_keyboard,
     rent_match_keyboard,
     rent_status_candidates_keyboard,
     secretary_registered_keyboard,
@@ -267,12 +268,15 @@ _QUERY_VERB_EN = re.compile(
 class RentStatusQuery:
     """Deterministic read-only rent status NL query (V1.3 Slice 2, Entry C).
 
-    ``kind`` is one of who_unpaid / unit / tenant; unit/tenant carry the token
-    to resolve exactly against the API data (never auto-selected here)."""
+    ``kind`` is one of who_unpaid / unit / tenant / payment_history;
+    unit/tenant carry the token to resolve exactly against the API data (never
+    auto-selected here). ``month_window`` is "this_month" for payment-history
+    questions scoped to the current rent period, else "" (all time)."""
 
     kind: str
     unit_token: str = ""
     tenant_token: str = ""
+    month_window: str = ""
 
 
 def detect_rent_status_query(text: str) -> Optional[RentStatusQuery]:
@@ -299,6 +303,62 @@ def detect_rent_status_query(text: str) -> Optional[RentStatusQuery]:
     name_m = _NAME_TOKEN.search(raw)
     if name_m:
         return RentStatusQuery(kind="tenant", tenant_token=name_m.group(1))
+    return None
+
+
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 C: deterministic payment-history
+# questions (0 LLM). Distinct from the status verbs in _QUERY_VERB_CN, so
+# "累计交了多少" (cumulative history) wins over the plain "交了多少" (current
+# month status) because the history detector runs first.
+_HISTORY_CN = (
+    "交了几次", "交过几次", "付了几次", "付过几次", "交了多少次",
+    "累计交了多少", "累计付了多少", "累计交了", "累计付了",
+    "一共交了", "一共付了", "总共交了", "总共付了",
+    "最近什么时候交", "最近一次交", "最后一次交", "上次什么时候交",
+    "什么时候交的租", "什么时候交的", "最近交租", "上次交租",
+    "交租记录", "付款记录", "交租历史", "交租情况",
+)
+_HISTORY_EN = re.compile(
+    r"\bhow\s+many\s+times\b.{0,24}\b(?:paid|pay)\b"
+    r"|\b(?:paid|pay)\b.{0,24}\bhow\s+many\s+times\b"
+    r"|\btotal\s+paid\b|\bpaid\s+in\s+total\b|\bcumulative\b"
+    r"|\blast\s+(?:time\s+)?paid\b|\bwhen\s+did\b.{0,24}\blast\s+pay\b"
+    r"|\bpayment\s+history\b|\brent\s+history\b",
+    re.IGNORECASE,
+)
+_MONTH_WINDOW_CN = ("这个月", "本月", "这个月交", "这个月付")
+_MONTH_WINDOW_EN = re.compile(r"\bthis\s+month\b", re.IGNORECASE)
+
+
+def detect_rent_payment_history_query(text: str) -> Optional[RentStatusQuery]:
+    """Deterministic detector for factual payment-history questions:
+    "1608 交了几次 / 累计交了多少 / 最近什么时候交的", "Paolo 最近什么时候交租",
+    "这个月 1608 交了几次". Runs BEFORE ``detect_rent_status_query`` so the
+    cumulative/count/latest questions never fall into the AI lane. Requires a
+    unit or tenant token (no entity -> not answerable here). No LLM, no writes.
+    """
+    raw = _normalize_correction((text or "").strip())
+    if not raw:
+        return None
+    has_cn = any(w in raw for w in _HISTORY_CN)
+    has_en = bool(_HISTORY_EN.search(raw.lower()))
+    if not (has_cn or has_en):
+        return None
+    window = (
+        "this_month"
+        if any(w in raw for w in _MONTH_WINDOW_CN) or _MONTH_WINDOW_EN.search(raw)
+        else ""
+    )
+    unit_m = _UNIT_TOKEN.search(raw)
+    name_m = _NAME_TOKEN.search(raw)
+    if unit_m is not None and not (name_m is not None and name_m.start() < unit_m.start()):
+        return RentStatusQuery(
+            kind="payment_history", unit_token=unit_m.group(1), month_window=window,
+        )
+    if name_m is not None:
+        return RentStatusQuery(
+            kind="payment_history", tenant_token=name_m.group(1), month_window=window,
+        )
     return None
 
 
@@ -464,6 +524,14 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_rent_payment_statement(text):
         await _handle_rent_payment_statement(update, context, text, role, locale)
+        return
+
+    # P1-...-008 C: payment-history questions ("1608 交了几次 / 累计交了多少 /
+    # 最近什么时候交的") are deterministic read-only answers — they must beat
+    # the plain rent-status lane ("交了多少" stays status) and the AI fallback.
+    history = detect_rent_payment_history_query(text)
+    if history is not None:
+        await _handle_rent_payment_history(update, context, history, role, locale)
         return
 
     query = detect_rent_status_query(text)
@@ -1196,6 +1264,204 @@ async def _answer_tenant_status(context, chat_id, tenant_token, locale, user_id=
         )
         return
     await _send_status_answer(context, chat_id, candidates, locale, user_id=user_id)
+
+
+# ---------------------------------------------------------------------------
+# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 C: deterministic rent payment-history
+# answers ("1608 交了几次 / 累计交了多少 / 最近什么时候交的 / Paolo 最近交租").
+# 0 LLM; only the existing read endpoints; same canonical unit/tenant matching
+# as the status lane; partial payments counted individually; only CONFIRMED
+# incomes count (pending/reversed excluded); multi-match uses the same
+# read-only candidate selector.
+# ---------------------------------------------------------------------------
+
+def _income_period(inc) -> str:
+    """The rent period (YYYY-MM) an income maps to. Mirrors the backend and
+    the status lane: an explicit YYYY-MM in the description is authoritative;
+    the received-date month is the fallback (never both)."""
+    desc = inc.description or ""
+    match = re.search(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)", desc)
+    if match is not None:
+        year, month = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+    rd = inc.received_date
+    return rd.strftime("%Y-%m") if rd else ""
+
+
+def _payment_history_stats(incomes, lease_id: int, month: str):
+    """(count, cumulative, latest_date) of valid rent payments for a lease.
+
+    A payment event is a CONFIRMED income row — partial payments each count
+    once and their amounts sum into the cumulative total; pending and
+    reversed rows are excluded per the existing financial semantics. When
+    ``month`` is set, only payments attributed to that rent period count.
+    """
+    confirmed = [
+        inc for inc in incomes
+        if inc.lease_id == lease_id and inc.status == "confirmed"
+    ]
+    if month:
+        confirmed = [inc for inc in confirmed if _income_period(inc) == month]
+    count = len(confirmed)
+    total = sum((inc.amount for inc in confirmed), Decimal("0"))
+    latest = max((inc.received_date for inc in confirmed), default=None)
+    return count, total, latest
+
+
+def _payment_history_candidates(
+    units, leases, tenants, incomes, properties, *, unit_ids=None, tenant_ids=None,
+    month: str = "",
+) -> list[dict]:
+    """One read-only candidate per active lease matching the requested unit(s)
+    or tenant(s); carries the history stats. Never selects, never writes."""
+    candidates: list[dict] = []
+    for lease in leases:
+        if lease.status != "active":
+            continue
+        if unit_ids is not None and lease.unit_id not in unit_ids:
+            continue
+        if tenant_ids is not None and lease.tenant_id not in tenant_ids:
+            continue
+        unit = next((u for u in units if u.id == lease.unit_id), None)
+        tenant = next((tn for tn in tenants if tn.id == lease.tenant_id), None)
+        if unit is None or tenant is None:
+            continue
+        prop = next((p for p in properties if p.id == unit.property_id), None)
+        count, total, latest = _payment_history_stats(incomes, lease.id, month)
+        candidates.append(
+            {
+                "tenant_name": tenant.full_name,
+                "unit_number": unit.unit_number,
+                "property_name": prop.name if prop else "",
+                "count": count,
+                "cumulative": str(total),
+                "latest_date": latest.isoformat() if latest else "",
+                "month": month,
+            }
+        )
+    return candidates
+
+
+def _payment_history_candidate_row(c: dict) -> dict:
+    """JSON-safe display-only row for the selector store (no internal ids)."""
+    return {
+        "tenant_name": str(c.get("tenant_name") or ""),
+        "unit_number": str(c.get("unit_number") or ""),
+        "property_name": str(c.get("property_name") or ""),
+        "count": int(c.get("count") or 0),
+        "cumulative": str(c.get("cumulative") or "0"),
+        "latest_date": str(c.get("latest_date") or ""),
+        "month": str(c.get("month") or ""),
+    }
+
+
+async def _handle_rent_payment_history(update, context, query, role, locale):
+    """Read-only payment-history answer lane (0 LLM, no writes)."""
+    chat_id = update.effective_chat.id
+    if not has_read_permission(role):
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("common.no_permission", locale)),
+            parse_mode=HTML,
+        )
+        return
+    try:
+        await _answer_rent_payment_history(
+            context, chat_id, query, locale,
+            user_id=update.effective_user.id if update.effective_user else None,
+        )
+    except PasayApiError:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.error", locale)),
+            parse_mode=HTML,
+        )
+        return
+
+
+async def _answer_rent_payment_history(context, chat_id, query, locale, user_id=None):
+    """'1608 交了几次 / 累计交了多少 / 最近什么时候交的' and tenant variants.
+
+    Single match -> the history card; several -> the same read-only candidate
+    selector as the status lane (one inline button per candidate, resolved by
+    the tap handler; never auto-selects, never writes)."""
+    api = context.bot_data["api_client"]
+    units, leases, tenants, incomes, properties = await asyncio.gather(
+        api.get_units(),
+        api.get_leases(),
+        api.get_tenants(),
+        api.list_incomes(),
+        api.get_properties(),
+    )
+    month = ""
+    if query.month_window == "this_month":
+        month = pages._current_month()
+    if query.unit_token:
+        matched = [
+            u for u in units
+            if _unit_number_matches(query.unit_token, u.unit_number)
+        ]
+        if not matched:
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("rent_status.no_unit", locale, unit=query.unit_token)),
+                parse_mode=HTML,
+            )
+            return
+        candidates = _payment_history_candidates(
+            units, leases, tenants, incomes, properties,
+            unit_ids={u.id for u in matched}, month=month,
+        )
+    elif query.tenant_token:
+        token = query.tenant_token.lower()
+        matched = [
+            tn for tn in tenants
+            if re.search(rf"\b{re.escape(token)}\b", tn.full_name.lower())
+        ]
+        if not matched:
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("rent_status.no_tenant", locale, name=query.tenant_token)),
+                parse_mode=HTML,
+            )
+            return
+        candidates = _payment_history_candidates(
+            units, leases, tenants, incomes, properties,
+            tenant_ids={tn.id for tn in matched}, month=month,
+        )
+    else:
+        return
+    if not candidates:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("rent_status.no_active_lease", locale)),
+            parse_mode=HTML,
+        )
+        return
+    if len(candidates) == 1:
+        row = _payment_history_candidate_row(candidates[0])
+        await context.bot.send_message(
+            chat_id,
+            H.truncate(cards.rent_history_card_for_candidate(row, locale)),
+            parse_mode=HTML,
+        )
+        return
+    payload = [_payment_history_candidate_row(c) for c in candidates]
+    nonce = new_nonce()
+    ts = now_ts()
+    if user_id is not None:
+        context.bot_data["store"].save_rent_status_selector(
+            nonce, chat_id, user_id, payload,
+        )
+    await context.bot.send_message(
+        chat_id,
+        H.truncate(cards.rent_history_selector_card(candidates, locale)),
+        parse_mode=HTML,
+        reply_markup=rent_history_candidates_keyboard(
+            candidates, locale, nonce=nonce, ts=ts,
+        ),
+    )
 
 
 async def _handle_rent_payment_statement(update, context, text, role, locale):

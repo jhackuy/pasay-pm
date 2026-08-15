@@ -309,6 +309,75 @@ def rent_status_card_for_candidate(candidate: dict, locale: str = "zh") -> str:
     )
 
 
+# --- P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 C: rent payment history ---------
+
+def rent_history_card(
+    *,
+    locale: str = "zh",
+    unit_number: str = "",
+    property_name: str = "",
+    tenant_name: str = "",
+    count: int = 0,
+    cumulative=None,
+    latest_date: str = "",
+    month: str = "",
+) -> str:
+    """'1608 交了几次 / 累计交了多少 / 最近什么时候交的' answer card.
+
+    Counts CONFIRMED payment events (partial payments each count once),
+    cumulative = sum of confirmed amounts, latest = newest confirmed
+    received_date. Pending/reversed rows are excluded by the caller's
+    financial semantics. ``month`` narrows the answer to one rent period.
+    Read-only text; no buttons."""
+    unit_label = (
+        f"{H.escape(property_name)} · Unit {H.escape(unit_number)}"
+        if property_name
+        else f"Unit {H.escape(unit_number)}"
+    )
+    title_key = "rent_history.title_month" if month else "rent_history.title"
+    if month:
+        title = t(title_key, locale, month=H.escape(month))
+    else:
+        title = t(title_key, locale)
+    lines = [f"<b>{H.escape(title)}</b>", unit_label]
+    if tenant_name:
+        lines.append(f"{H.escape(t('overdue.tenant', locale))}：{H.escape(tenant_name)}")
+    if count <= 0:
+        lines.append(H.escape(t("rent_history.none", locale)))
+        return "\n".join(lines)
+    total_line = (
+        f"{H.escape(t('rent_history.count', locale, count=count))} · "
+        f"{H.escape(t('rent_history.total', locale, amount=H.money(cumulative)))}"
+    )
+    lines.append(total_line)
+    if latest_date:
+        lines.append(
+            H.escape(t("rent_history.latest", locale, date=H.format_date(latest_date)))
+        )
+    return "\n".join(lines)
+
+
+def rent_history_card_for_candidate(candidate: dict, locale: str = "zh") -> str:
+    """Single-hit history card for one selector candidate (byte-identical to
+    the direct single-match answer)."""
+    return rent_history_card(
+        locale=locale,
+        unit_number=str(candidate.get("unit_number") or ""),
+        property_name=str(candidate.get("property_name") or ""),
+        tenant_name=str(candidate.get("tenant_name") or ""),
+        count=int(candidate.get("count") or 0),
+        cumulative=candidate.get("cumulative"),
+        latest_date=str(candidate.get("latest_date") or ""),
+        month=str(candidate.get("month") or ""),
+    )
+
+
+def rent_history_selector_card(candidates: list[dict], locale: str = "zh") -> str:
+    """Multi-match heading for payment-history questions; the rows are inline
+    buttons built by ``rent_history_candidates_keyboard`` (no auto-select)."""
+    return f"👥 <b>{H.escape(t('rent_status.multiple', locale))}</b>"
+
+
 def unpaid_list_card(
     rows: list[OverdueRent],
     month: str = "",
@@ -962,6 +1031,23 @@ def _expense_location(expense: Expense, location: str = "") -> str:
     return H.escape(location) if location else ""
 
 
+def _expense_purpose_text(expense) -> str | None:
+    """Existing-data purpose for one expense record: category -> description ->
+    payee/vendor, with placeholder sentinels dropped (`??`, None, null, bare
+    dash). An incomplete record (e.g. E7/E8 with a `??` category) still
+    resolves to truthful existing facts (here: the 'Repair' payee) before the
+    neutral unspecified-purpose label (P1-PASAY-NIGHTLY-...-008 A3)."""
+    for field in (
+        getattr(expense, "category", None),
+        getattr(expense, "description", None),
+        getattr(expense, "payee", None),
+    ):
+        text = _clean_free_text(field)
+        if text:
+            return text
+    return None
+
+
 def expense_approval_card(
     expense: Expense, locale: str = "zh", location: str = "",
 ) -> str:
@@ -975,11 +1061,16 @@ def expense_approval_card(
     lines.append(
         f"{H.escape(t('expense.payee', locale))}：{H.escape(expense.payee or '-')}"
     )
-    purpose = " · ".join(
-        x for x in (expense.category, expense.description or "") if x
-    )
+    purpose = _expense_purpose_text(expense)
     if purpose:
         lines.append(f"{H.escape(t('expense.purpose', locale))}：{H.escape(purpose)}")
+    else:
+        # Explicit unspecified-purpose state instead of a silently blank line
+        # (A3): no placeholder text is ever rendered as a purpose.
+        lines.append(
+            f"{H.escape(t('expense.purpose', locale))}："
+            f"{H.escape(t('expense.purpose_unspecified', locale))}"
+        )
     lines.append(
         f"{H.escape(t('expense.date', locale))}：{H.format_date(expense.expense_date)}"
         + (
@@ -1014,7 +1105,8 @@ def expense_result_card(expense: Expense, locale: str = "zh", location: str = ""
         next_step = H.escape(t("expense.rejected_next", locale))
     else:
         return expense_approval_card(expense, locale)
-    where = " · ".join(x for x in (location, expense.category) if x)
+    purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
+    where = " · ".join(x for x in (location, purpose) if x)
     lines = [title, f"{H.escape(where)}  ·  <b>{H.money(expense.amount)}</b>", next_step]
     return "\n".join(x for x in lines if x)
 
@@ -1028,7 +1120,11 @@ def expense_detail_card(
     loc = _expense_location(expense, location)
     if loc:
         lines.append(loc)
-    lines.append(f"{H.escape(t('expense.purpose', locale))}：{H.escape(expense.category)}")
+    purpose = _expense_purpose_text(expense)
+    lines.append(
+        f"{H.escape(t('expense.purpose', locale))}："
+        f"{H.escape(purpose or t('expense.purpose_unspecified', locale))}"
+    )
     if expense.description:
         lines.append(H.escape(expense.description))
     lines.append(f"{H.escape(t('expense.payee', locale))}：{H.escape(expense.payee or '-')}")
@@ -1070,7 +1166,8 @@ def expense_pay_confirm_card(
     id_part = f"#E{expense.id}"
     blocks = [f"💸 <b>{H.escape(t('expense.pay_confirm_title', locale))}</b>"]
     loc = _expense_location(expense, location)
-    header_bits = [id_part] + ([loc] if loc else []) + [H.escape(expense.category)]
+    purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
+    header_bits = [id_part] + ([loc] if loc else []) + [H.escape(purpose)]
     blocks.append(" · ".join(b for b in header_bits if b))
     blocks.append(f"<b>{H.money(expense.amount)}</b>")
     if expense.description:
@@ -1108,7 +1205,8 @@ def expense_pay_result_card(expense: Expense, locale: str = "zh", *, already: bo
     else:
         title = t("expense.pay_result_paid", locale)
         note = H.escape(t("expense.pay_result_done", locale))
-    where = " · ".join(x for x in (f"#E{expense.id}", expense.category) if x)
+    purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
+    where = " · ".join(x for x in (f"#E{expense.id}", purpose) if x)
     lines = [H.escape(title), f"{H.escape(where)} · <b>{H.money(expense.amount)}</b>", note]
     return "\n".join(x for x in lines if x)
 
@@ -1159,7 +1257,8 @@ def expense_paid_card(expense: Expense, locale: str = "zh", location: str = "") 
     never blocks completion. No raw enums, no ids."""
     title = t("expense.payment_confirmed_title", locale)
     lines = [title]
-    where = " · ".join(x for x in (location, expense.category) if x)
+    purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
+    where = " · ".join(x for x in (location, purpose) if x)
     lines.append(f"{H.escape(where)}  ·  <b>{H.money(expense.amount)}</b>")
     lines.append(H.escape(t("expense.payment_completed", locale)))
     lines.append(H.escape(t("expense.receipt_optional", locale)))
@@ -1207,16 +1306,27 @@ def expense_summary_card(
 def unit_expense_history_card(
     unit_number: str, rows: list[dict], locale: str = "zh",
 ) -> str:
-    """'1680最近有什么支出' -> recent expenses of one unit (read-only)."""
+    """'1680最近有什么支出' -> recent expenses of one unit (read-only). A
+    placeholder category (`??`) never renders; rows without a truthful purpose
+    show only amount/status/date (A3)."""
     if not rows:
         return H.escape(t("query.expense_none", locale))
     blocks = [f"💸 <b>{H.escape(t('query.expense_recent', locale))}</b> · {H.escape(unit_number)}"]
     for row in rows[:5]:
-        blocks.append(
-            f"{H.escape(row.get('category') or '')} · <b>{H.money(row.get('amount'))}</b>"
-            f" · {H.escape(row.get('status_label') or '')}"
-            f" · {H.format_date(row.get('expense_date'))}"
+        purpose = _clean_free_text(row.get("category")) or _clean_free_text(
+            row.get("description")
         )
+        bits = []
+        if purpose:
+            bits.append(H.escape(purpose))
+        bits.append(f"<b>{H.money(row.get('amount'))}</b>")
+        status = H.escape(str(row.get("status_label") or ""))
+        if status:
+            bits.append(status)
+        date_part = H.format_date(row.get("expense_date"))
+        if date_part:
+            bits.append(H.escape(date_part))
+        blocks.append(" · ".join(bits))
     return "\n\n".join(blocks)
 
 
@@ -1697,9 +1807,16 @@ def _clean_free_text(value) -> str | None:
 
 
 def _v2_expense_purpose(row: dict, locale: str) -> str:
-    """Purpose for one record row: purpose -> category -> description, else the
-    locale-aware `Other / 其他` fallback. Raw `??`/None/null never render."""
-    for field in (row.get("purpose"), row.get("category"), row.get("description")):
+    """Purpose for one record row: purpose -> category -> description -> payee,
+    else the locale-aware `Other / 其他` fallback. Raw `??`/None/null never
+    render (P1-...-008 A3 adds payee so an incomplete record like E7/E8 still
+    shows its truthful 'Repair' vendor before the neutral label)."""
+    for field in (
+        row.get("purpose"),
+        row.get("category"),
+        row.get("description"),
+        row.get("payee"),
+    ):
         text = _clean_free_text(field)
         if text:
             return H.escape(text)
@@ -1769,7 +1886,7 @@ def _payable_expense_line(row: dict, locale: str) -> str:
     expense_id = row.get("expense_id")
     id_part = f"#E{int(expense_id)}" if expense_id is not None else ""
     unit = H.escape(str(row.get("unit") or ""))
-    purpose = H.escape(str(row.get("purpose") or t("v2.expense_other", locale)))
+    purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
     status = H.escape(_expense_status_label(row.get("status"), locale))
     parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>", status) if x]

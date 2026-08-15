@@ -369,7 +369,9 @@ def test_quick_expense_records_purpose_fallback(client, db_session, admin_header
     by_amount = {float(r["amount"]): r for r in records}
     assert by_amount[6001.0]["purpose"] == "Repair / 维修"  # category wins
     assert by_amount[3500.0]["purpose"] == "Water / 水费"   # `??` ignored, desc used
-    assert by_amount[1200.0]["purpose"] == ""               # empty -> renderer fallback
+    # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A3: an empty category now falls
+    # back to the truthful payee/vendor before the renderer's neutral label.
+    assert by_amount[1200.0]["purpose"] == "Meralco"
     assert "??" not in [r["purpose"] for r in records]
     assert "None" not in [r["purpose"] for r in records]
 
