@@ -1353,10 +1353,10 @@ class FakeBackend:
 
 @pytest.fixture()
 def make_app(tmp_path):
-    created: list[tuple[Any, Any]] = []
+    created: list[tuple[Any, Any, Any]] = []
 
     def _make(backend=None, api_key="manager-key", admin_api_key="admin-key",
-              callback_ttl=900, state_db=None, bot=None):
+              callback_ttl=900, state_db=None, bot=None, job_api_key=""):
         backend = backend or FakeBackend()
         settings = Settings(
             state_db=state_db or str(tmp_path / f"state_{len(created)}.db"),
@@ -1364,6 +1364,7 @@ def make_app(tmp_path):
             pasay_api_base="http://test/api/v1",
             callback_ttl_seconds=callback_ttl,
             pasay_admin_api_key=admin_api_key,
+            pasay_job_api_key=job_api_key,
         )
         store = StateStore(settings.state_db)
         guard = IdempotencyGuard(store)
@@ -1381,17 +1382,31 @@ def make_app(tmp_path):
                 timeout=1.0,
                 transport=httpx.MockTransport(backend.handler),
             )
+        # JOB-SERVICE-AUTH-002: background jobs use a dedicated SYSTEM-keyed
+        # client (never the human-bound interactive client). Tests opt in with
+        # job_api_key; the default disables the jobs (fail closed).
+        job_api = None
+        if job_api_key:
+            job_api = PasayApiClient(
+                settings.pasay_api_base,
+                job_api_key,
+                timeout=1.0,
+                transport=httpx.MockTransport(backend.handler),
+            )
         bot = bot or FakeBot()
-        app = build_application(settings, api, store, bot=bot, admin_api_client=admin_api)
-        created.append((api, admin_api, store))
+        app = build_application(
+            settings, api, store, bot=bot, admin_api_client=admin_api,
+            job_api_client=job_api,
+        )
+        created.append((api, admin_api, store, job_api))
         return SimpleNamespace(
             app=app, bot=bot, backend=backend, store=store, guard=guard,
-            settings=settings, api=api, admin_api=admin_api,
+            settings=settings, api=api, admin_api=admin_api, job_api=job_api,
         )
 
     yield _make
 
-    for api, admin_api, store in created:
+    for api, admin_api, store, job_api in created:
         try:
             asyncio.run(api.aclose())
         except Exception:
@@ -1399,6 +1414,11 @@ def make_app(tmp_path):
         if admin_api is not None:
             try:
                 asyncio.run(admin_api.aclose())
+            except Exception:
+                pass
+        if job_api is not None:
+            try:
+                asyncio.run(job_api.aclose())
             except Exception:
                 pass
         try:

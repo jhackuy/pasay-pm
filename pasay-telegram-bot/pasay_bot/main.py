@@ -167,6 +167,7 @@ def build_application(
     store: StateStore,
     bot=None,
     admin_api_client: PasayApiClient | None = None,
+    job_api_client: PasayApiClient | None = None,
 ) -> Application:
     builder = Application.builder()
     if bot is not None:
@@ -220,10 +221,12 @@ def build_application(
     # PASAY-V2-FOUNDATION-001: daily digest + next_check reminders live in
     # pasay_bot/jobs.py (Subagent C). The seam below keeps the wiring
     # decoupled so the app stays runnable while the module lands in parallel.
+    # JOB-SERVICE-AUTH-002: jobs authenticate as a real SYSTEM principal via a
+    # dedicated SYSTEM-keyed client; without one the jobs are disabled.
     try:
         from pasay_bot import jobs
 
-        jobs.register_jobs(app, api_client, store, settings)
+        jobs.register_jobs(app, api_client, store, settings, job_api=job_api_client)
     except Exception as exc:  # noqa: BLE001 - wiring must never block startup
         logger.warning("jobs.register_jobs failed: %s", exc)
 
@@ -386,7 +389,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _load(args: argparse.Namespace) -> tuple[Settings, StateStore, PasayApiClient, PasayApiClient | None]:
+def _load(args: argparse.Namespace) -> tuple[Settings, StateStore, PasayApiClient, PasayApiClient | None, PasayApiClient | None]:
     settings = get_settings()
     if args.token:
         settings = settings.model_copy(update={"pasay_tg_bot_token": args.token})
@@ -402,7 +405,15 @@ def _load(args: argparse.Namespace) -> tuple[Settings, StateStore, PasayApiClien
         if settings.pasay_admin_api_key
         else None
     )
-    return settings, store, api, admin_api
+    # JOB-SERVICE-AUTH-002: dedicated SYSTEM credential for background jobs.
+    # The backend resolves it as the scheduler SYSTEM principal; the jobs never
+    # bind a HUMAN Telegram id. Empty -> jobs disabled (fail closed).
+    job_api = (
+        PasayApiClient(settings.pasay_api_base, settings.pasay_job_api_key)
+        if settings.pasay_job_api_key
+        else None
+    )
+    return settings, store, api, admin_api, job_api
 
 
 def main(argv=None) -> int:
@@ -414,7 +425,7 @@ def main(argv=None) -> int:
     harden_stdio()
     args = parse_args(argv)
     try:
-        settings, store, api, admin_api = _load(args)
+        settings, store, api, admin_api, job_api = _load(args)
     except RuntimeError as exc:
         print(f"[pasay-bot] {exc}", file=sys.stderr)
         return 2
@@ -436,7 +447,11 @@ def main(argv=None) -> int:
         # an outer runner.
         max_retries = 3
         for attempt in range(1, max_retries + 1):
-            app = build_application(settings, api, store, admin_api_client=admin_api)
+            app = build_application(
+                settings, api, store,
+                admin_api_client=admin_api,
+                job_api_client=job_api,
+            )
             print("[pasay-bot] starting polling ...")
             # P0 live-diagnostic: A2/A3/A4 production-chain tracing + task-health
             # probe. Failure-proof: a diagnostic print must never be able to kill
@@ -474,6 +489,12 @@ def main(argv=None) -> int:
             try:
                 import asyncio as _asyncio
                 _asyncio.run(admin_api.aclose())
+            except Exception:
+                pass
+        if job_api is not None:
+            try:
+                import asyncio as _asyncio
+                _asyncio.run(job_api.aclose())
             except Exception:
                 pass
         store.close()

@@ -51,11 +51,14 @@ def test_fixed_menu_buttons_send_real_sender_id_not_chat_or_fallback(make_app):
 
 def test_no_fixed_owner_telegram_id_fallback_in_bot_chain():
     """The bot chain never falls back to a hard-coded Owner Telegram id or a
-    PROPERTY_TELEGRAM_USER_ID-style credential override."""
+    PROPERTY_TELEGRAM_USER_ID-style credential override. JOB-SERVICE-AUTH-002:
+    jobs.py is included — background jobs authenticate as a SYSTEM principal,
+    never with a fixed Owner id."""
     targets = (
         "api_client.py",
         "config.py",
         "main.py",
+        "jobs.py",
         "handlers/buttons.py",
         "handlers/conversation.py",
     )

@@ -29,12 +29,12 @@ class Settings(BaseSettings):
     # AI-OPS-FOUNDATION-001 §12: private Telegram archive channel used as the
     # FREE-FIRST media storage layer; empty disables forwarding.
     archive_chat_id: str = ""
-    # BOT-BACKEND-AUTH-001: verified Telegram user id that background proactive
-    # jobs (daily digest / next_check reminders in jobs.py) bind as the caller
-    # for their deterministic backend reads. The backend resolves these reads
-    # against a HUMAN subject, so an unbound job (no X-Telegram-User-Id) is
-    # rejected 401. Defaults to the Owner's verified telegram id.
-    pasay_job_owner_telegram_id: int = 5177241442
+    # JOB-SERVICE-AUTH-002: dedicated SYSTEM credential for background proactive
+    # jobs (v2_daily_digest / v2_next_check in jobs.py). The backend resolves it
+    # as a real SYSTEM principal (scheduler, purpose internal:scheduler) so the
+    # jobs never impersonate a HUMAN Owner. Empty disables the jobs (fail
+    # closed — the jobs never fall back to any other identity).
+    pasay_job_api_key: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env", extra="ignore", case_sensitive=False
@@ -56,7 +56,7 @@ def _env() -> dict:
             "PASSAY_ADMIN_API_KEY", "HERMES_API_BASE", "HERMES_API_KEY",
             "STATE_DB", "HOOK_TOKEN", "CALLBACK_TTL_SECONDS",
             "PASSAY_HTTP_TIMEOUT_SECONDS", "PASSAY_ARCHIVE_CHAT_ID",
-            "PASSAY_JOB_OWNER_TELEGRAM_ID",
+            "PASSAY_JOB_API_KEY",
         }:
             data[key] = val
     return data
@@ -77,7 +77,5 @@ def get_settings() -> Settings:
         callback_ttl_seconds=int(e.get("CALLBACK_TTL_SECONDS", "900") or "900"),
         pasay_http_timeout_seconds=float(e.get("PASSAY_HTTP_TIMEOUT_SECONDS", "30") or "30"),
         archive_chat_id=(e.get("PASSAY_ARCHIVE_CHAT_ID") or "").strip(),
-        pasay_job_owner_telegram_id=int(
-            (e.get("PASSAY_JOB_OWNER_TELEGRAM_ID") or "5177241442").strip()
-        ),
+        pasay_job_api_key=(e.get("PASSAY_JOB_API_KEY") or "").strip(),
     )

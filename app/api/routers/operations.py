@@ -16,7 +16,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, manager_or_admin
+from app.api.deps import (
+    SystemReader,
+    get_current_user,
+    get_operations_reader,
+    manager_or_admin,
+)
 from app.database import get_db
 from app.models.copilot import CopilotActionProposal, CopilotActionStatus
 from app.models.operations import (
@@ -578,9 +583,19 @@ def create_task(
 def quick_tasks(
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    reader: User | SystemReader = Depends(get_operations_reader),
 ):
-    return quick_svc.build_quick_tasks(db, user, owner_only=(scope == "owner"))
+    # JOB-SERVICE-AUTH-002: a SYSTEM job reads the deterministic active-task
+    # set as itself (global scope, no human, no owner filter). The Owner
+    # attention filter is a personal HUMAN view — a SYSTEM credential is
+    # never allowed to request it.
+    if isinstance(reader, SystemReader):
+        if scope == "owner":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "SYSTEM reader cannot use the owner scope"
+            )
+        return quick_svc.build_quick_tasks(db, reader, owner_only=False)
+    return quick_svc.build_quick_tasks(db, reader, owner_only=(scope == "owner"))
 
 
 @router.get("/quick/properties")
@@ -643,9 +658,11 @@ def quick_unit_timeline(
 @router.get("/digest")
 def daily_digest(
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    reader: User | SystemReader = Depends(get_operations_reader),
 ):
-    return quick_svc.build_digest(db, user)
+    # JOB-SERVICE-AUTH-002: SYSTEM jobs read the deterministic daily digest as
+    # themselves (global active-task scope); human callers keep their own scope.
+    return quick_svc.build_digest(db, reader)
 
 
 @router.get("/summary", response_model=OperationsSummary)

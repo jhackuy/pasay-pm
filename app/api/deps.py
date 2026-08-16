@@ -15,6 +15,40 @@ from app.services.identity import (
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# JOB-SERVICE-AUTH-002: background proactive jobs (v2_daily_digest /
+# v2_next_check in pasay-telegram-bot/pasay_bot/jobs.py) authenticate as a real
+# SYSTEM principal with its own internal credential — they NEVER impersonate the
+# Owner's Telegram id. Only this one SYSTEM principal + purpose pair is accepted
+# for the read-only operations endpoints, and only WITHOUT X-Telegram-User-Id
+# (a SYSTEM credential must never present a Telegram subject).
+SYSTEM_JOB_READER_PRINCIPAL = "scheduler"
+SYSTEM_JOB_READER_PURPOSE = "internal:scheduler"
+SYSTEM_JOB_READER_CHANNEL = "internal"
+
+
+class SystemReader:
+    """SYSTEM scheduled-job subject authorized for read-only operations reads.
+
+    Carries the authenticated SYSTEM principal/credential so audit provenance
+    is unambiguous (subject = caller = the SYSTEM principal, never a HUMAN).
+    The service layer reads ``role``/``id``: ``role`` is pinned to the global
+    read scope (all active tasks, same payload the Owner-scoped jobs received
+    before JOB-SERVICE-AUTH-002) and ``id`` is None because there is NO HUMAN
+    user behind a SYSTEM job. This object is returned ONLY by
+    :func:`get_operations_reader` and is never accepted by
+    ``get_current_user`` / ``owner_subject_only`` / role gates, so a SYSTEM
+    credential can never reach a write endpoint.
+    """
+
+    __slots__ = ("principal", "credential")
+
+    def __init__(self, principal: Principal, credential: ApiCredential):
+        self.principal = principal
+        self.credential = credential
+
+    role = UserRole.admin  # global read scope (all active tasks)
+    id = None  # no HUMAN user behind a SYSTEM job
+
 
 def _resolve_current_user(
     credentials: HTTPAuthorizationCredentials | None,
@@ -106,6 +140,58 @@ def get_current_user(
     x_telegram_user_id: str | None = Header(default=None, alias="X-Telegram-User-Id"),
     db: Session = Depends(get_db),
 ) -> User:
+    return _resolve_current_user(credentials, x_telegram_user_id, db)
+
+
+def get_operations_reader(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    x_telegram_user_id: str | None = Header(default=None, alias="X-Telegram-User-Id"),
+    db: Session = Depends(get_db),
+) -> User | SystemReader:
+    """Authorize one caller for the deterministic read-only operations reads.
+
+    JOB-SERVICE-AUTH-002: a real SYSTEM principal (``scheduler``) with its
+    active internal credential may read the deterministic operations endpoints
+    AS ITSELF — no X-Telegram-User-Id, no human resolution, no Owner fallback.
+    Provenance is bound to the SYSTEM principal (channel ``internal``).
+
+    Every other caller (HUMAN credentials, the native-bot SERVICE credential
+    with a verified Telegram subject) is resolved exactly as before via
+    ``_resolve_current_user`` — Owner / Secretary behavior is unchanged. This
+    dependency is used ONLY on read-only operations endpoints; write and
+    role-gated endpoints still use ``get_current_user`` / ``owner_subject_only``,
+    where a SYSTEM credential is rejected, so it can never escalate to an
+    Owner-only write.
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    key_hash = hash_api_key(credentials.credentials)
+    record = (
+        db.query(ApiCredential, Principal)
+        .join(Principal, Principal.id == ApiCredential.principal_id)
+        .filter(ApiCredential.key_hash == key_hash)
+        .one_or_none()
+    )
+    if record is not None:
+        credential, caller = record
+        if (
+            caller.principal_type == PrincipalType.SYSTEM
+            and caller.name == SYSTEM_JOB_READER_PRINCIPAL
+            and credential.purpose == SYSTEM_JOB_READER_PURPOSE
+            and credential.state == CredentialState.ACTIVE
+            and credential.revoked_at is None
+            and caller.is_active
+            and x_telegram_user_id is None
+        ):
+            set_audit_context(
+                db, (caller.id, caller.id, credential.id, SYSTEM_JOB_READER_CHANNEL)
+            )
+            return SystemReader(principal=caller, credential=credential)
+    # All other identities follow the unchanged HUMAN / native-bot+Telegram path.
     return _resolve_current_user(credentials, x_telegram_user_id, db)
 
 
