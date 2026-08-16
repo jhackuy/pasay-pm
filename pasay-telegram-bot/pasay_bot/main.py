@@ -172,22 +172,10 @@ def main(argv=None) -> int:
             print("[pasay-bot] starting polling ...")
             # ---- P0 live-diagnostic: A1/A2/A3/A4 production-chain tracing ----
             try:
-                # (A1) get_updates: CALL / RETURN(count+ids) / EXC
-                _bot = app.bot
-                _orig_get_updates = _bot.get_updates
-                async def _traced_get_updates(*args, **kwargs):
-                    print("[A1] get_updates CALL kwargs=%r" % (kwargs,), flush=True)
-                    try:
-                        updates = await _orig_get_updates(*args, **kwargs)
-                        print("[A1] get_updates RETURN count=%d ids=%r" % (
-                            len(updates) if updates else 0,
-                            [u.update_id for u in updates] if updates else [],
-                        ), flush=True)
-                        return updates
-                    except Exception as _e:
-                        print("[A1] get_updates EXC %r" % (_e,), flush=True)
-                        raise
-                _bot.get_updates = _traced_get_updates
+                # (A1) get_updates RETURN is observed indirectly: ExtBot forbids
+                #      patching get_updates, so we rely on [A2] queue.put AFTER as the
+                #      proof that get_updates returned the update; an alive polling task
+                #      (task-probe below) + NO put on the tap => get_updates returned 0.
 
                 # (A2) update_queue.put: BEFORE / AFTER / size
                 _orig_put = app.update_queue.put
@@ -214,7 +202,6 @@ def main(argv=None) -> int:
                     ), flush=True)
                     return item
                 app.update_queue.get = _traced_get_q
-                # async gen mock? get() is bound method; patch on queue instance works.
 
                 # (A4) process_update ENTER (bound method replace)
                 _ORIG_PROCESS_UPDATE = app.process_update
@@ -251,24 +238,38 @@ def main(argv=None) -> int:
                 print("[PTB] handler inventory done", flush=True)
             except Exception as _diag:
                 print("[PTB] diag setup failed: %r" % (_diag,), flush=True)
-            # A periodic task-health + task inventory dump (asyncio tasks alive/done/cancelled).
+            # Periodic task-health probe (asyncio tasks alive/done/cancelled) — only
+            # makes sense once run_polling's loop is running, so schedule it via
+            # app.job_queue (PTB schedules after initialization inside run_polling).
             try:
                 import asyncio as _asyncio_mod
 
-                async def _task_health_probe(_app):
-                    await _asyncio_mod.sleep(3)
+                def _dump_tasks():
                     _tasks = [t for t in _asyncio_mod.all_tasks() if not t.done()]
-                    print("[TASK] alive asyncio tasks:", flush=True)
+                    print("[TASK] alive asyncio tasks count=%d:" % len(_tasks), flush=True)
                     for t in _tasks:
+                        try:
+                            _nm = t.get_name()
+                        except Exception:
+                            _nm = '?'
+                        _ex = 'n/a'
+                        if t.done() and not t.cancelled():
+                            try:
+                                _ex = repr(t.exception())
+                            except Exception:
+                                _ex = 'unknown'
                         print("[TASK]   done=%s cancelled=%s ex=%s name=%r" % (
-                            t.done(), t.cancelled(),
-                            (repr(t.exception()) if t.done() and not t.cancelled() else 'n/a'),
-                            getattr(t, "get_name", lambda: None)() if callable(getattr(t, "get_name", None)) else '?'
-                        ), flush=True)
-                    print("[TASK] alive-count=%d" % len(_tasks), flush=True)
-                app.create_task(_task_health_probe(app), name="P0_task_health")
-            except Exception as _diag2:
-                print("[PTB] task-probe setup failed: %r" % (_diag2,), flush=True)
+                            t.done(), t.cancelled(), _ex, _nm), flush=True)
+
+                _jq = getattr(app, "job_queue", None)
+                if _jq is not None:
+                    _jq.run_repeating(lambda _c: _dump_tasks(), interval=25, first=5,
+                                      name="P0_task_health")
+                    print("[TASK] probe registered via job_queue", flush=True)
+                else:
+                    print("[TASK] probe scheduling skipped (no job_queue)", flush=True)
+            except Exception as _diag3:
+                print("[TASK] probe registration failed: %r" % (_diag3,), flush=True)
             # ---- end P0 live-diagnostic ----
             try:
                 app.run_polling()
