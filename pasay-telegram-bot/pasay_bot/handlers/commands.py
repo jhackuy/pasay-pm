@@ -388,17 +388,23 @@ async def _send(context, chat_id, text, keyboard=None, reply_keyboard=None):
 
 async def _render(context, chat_id, message_id, text, keyboard=None, reply_keyboard=None):
     """edit-first: when a message_id is known we edit it, else send (B6)."""
-    if message_id:
-        await edit_message_text_idempotent(
-            context.bot,
-            chat_id=chat_id,
-            message_id=message_id,
-            text=H.truncate(text),
-            parse_mode=HTML,
-            reply_markup=keyboard,
-        )
-    else:
-        await _send(context, chat_id, text, keyboard, reply_keyboard=reply_keyboard)
+    print(f"[TRACE] render start chat_id={chat_id} message_id={message_id} text_len={len(text) if text else 0}", flush=True)
+    try:
+        if message_id:
+            await edit_message_text_idempotent(
+                context.bot,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=H.truncate(text),
+                parse_mode=HTML,
+                reply_markup=keyboard,
+            )
+        else:
+            await _send(context, chat_id, text, keyboard, reply_keyboard=reply_keyboard)
+        print(f"[TRACE] render OK chat_id={chat_id}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - trace must never swallow the reply failure
+        print(f"[TRACE] render FAIL {type(exc).__name__} {exc!r} chat_id={chat_id}", flush=True)
+        raise
 
 
 def _load_error(detail: str, locale: str) -> str:
@@ -614,15 +620,20 @@ async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None)
     the Quick View (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §4). Otherwise the card
     carries the fixed Reply Keyboard, matching the other Quick Views."""
     api = context.bot_data["api_client"]
+    print(f"[TRACE] quick_tasks api start role={role.value if role else None} chat_id={chat_id}", flush=True)
     try:
         # AI-OPS-FOUNDATION-001 §5: the Owner's Quick Tasks view is filtered
         # to their own Needs-You queue; the Secretary sees operational tasks.
         data = await api.get_quick_tasks(scope="owner" if role == Role.OWNER else None)
+        print(f"[TRACE] quick_tasks api OK type={type(data).__name__} "
+              f"len={len(data) if hasattr(data, '__len__') else '?'}", flush=True)
     except PasayApiError as exc:
+        print(f"[TRACE] quick_tasks api PasayApiError {type(exc).__name__} detail={getattr(exc, 'detail', None)!r}", flush=True)
         await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
                       error_keyboard("home", locale))
         return
     except Exception as exc:  # noqa: BLE001 - user-visible fallback
+        print(f"[TRACE] quick_tasks api EXC {type(exc).__name__} {exc!r}", flush=True)
         logger.warning("quick view tasks failed: %s", exc)
         await _render(context, chat_id, message_id, _load_error("tasks", locale),
                       error_keyboard("home", locale))

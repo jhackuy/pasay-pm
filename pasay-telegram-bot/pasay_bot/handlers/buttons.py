@@ -71,6 +71,9 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
         _track(context, route, (time.monotonic() - started) * 1000, outcome="no_chat")
         return
 
+    print(f"[TRACE] button route={route} role={role.value if role else None} locale={locale} chat_id={chat_id} "
+          f"user_id={update.effective_user.id if update.effective_user else None}", flush=True)
+
     if not has_read_permission(role):
         await context.bot.send_message(
             chat_id,

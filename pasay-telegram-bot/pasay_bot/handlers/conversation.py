@@ -63,6 +63,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = user.id if user else None
     store = context.bot_data["store"]
     text = (update.effective_message.text or "").strip()
+    import time as _t_trace
+    print(f"[TRACE] msg entry update_id={update.update_id} "
+          f"message_id={update.effective_message.message_id} "
+          f"chat_id={update.effective_chat.id if update.effective_chat else None} "
+          f"user_id={update.effective_user.id if update.effective_user else None} "
+          f"text={text!r} ts={_t_trace.time()}", flush=True)
 
     # PASAY-V2-FOUNDATION-001: remember groups so the daily digest + next_check
     # reminders have a delivery target (never spam; groups only).
