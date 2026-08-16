@@ -139,6 +139,31 @@ class V2FakeBackend(FakeBackend):
                     "status": "pending",
                 },
             ],
+            # EXPENSE-UX-FIX-001: pending-payment (APPROVED unpaid) and this
+            # month's PAID records are separate sections.
+            "payable": [
+                {
+                    "kind": "payable_expense",
+                    "expense_id": 102,
+                    "unit": "1680",
+                    "unit_code": "1680",
+                    "purpose": "Water / 水费",
+                    "amount": "3500.00",
+                    "status": "approved",
+                    "expense_date": "2026-08-02",
+                },
+            ],
+            "paid_records": [
+                {
+                    "expense_id": 101,
+                    "unit": "1680",
+                    "unit_code": "1680",
+                    "purpose": "Repair / 维修",
+                    "amount": "6001.00",
+                    "expense_date": "2026-08-15",
+                    "status": "paid",
+                },
+            ],
         }
         self.digest = {
             "pending": self.quick_tasks[:2],
@@ -381,39 +406,42 @@ def test_expense_quick_view_shows_amounts(make_app):
     text = env.bot.last_send()["text"]
     assert "本月：₱19,650" in text
     assert "待审批：1 笔 · ₱3,500" in text
-    assert "无未解决支出事项" in text
+    assert "待付款 · 1" in text
+    assert "无未解决支出事项" not in text
 
 
 def test_expense_quick_view_lists_month_records_owner_chinese(make_app):
-    """P1-EXPENSE-QUICKVIEW-LIST-001: the 💸 Expense quick view lists this
-    month's records (PAID + APPROVED) under the month total. Every row exposes
-    Expense ID · Unit · Purpose · Amount · MM-DD · Status (same-date/same-
-    amount records are distinguishable by #E{id}). Owner private chat is
-    Chinese."""
+    """EXPENSE-UX-FIX-001: the 💸 Expense quick view shows the pending-payment
+    queue (APPROVED unpaid, real fields, plain E{id}) first, then this
+    month's PAID records. Same-date/same-amount records stay distinguishable
+    by the plain-text Expense ID. Owner private chat is Chinese."""
     env = make_app(backend=V2FakeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "本月支出记录" in text
-    assert "#E101 · 1680 · Repair / 维修 · <b>₱6,001</b> · 08-15 · ✅ 已付款" in text
-    assert "#E102 · 1680 · Water / 水费 · <b>₱3,500</b> · 08-02 · 📋 已批准" in text
-    assert "#E103 · 1680 · Electric / 电费 · <b>₱1,200</b> · 08-01 · ⏳ 待批准" in text
     assert "本月：₱19,650" in text
-    # The unresolved line stays as auxiliary status, never replacing the list.
-    assert "无未解决支出事项" in text
+    # pending payment section first, with every real field
+    assert "E102 · 1680 · Water / 水费 · <b>₱3,500</b> · 08-02 · 📋 待付款" in text
+    # then the PAID records section
+    assert "E101 · 1680 · Repair / 维修 · <b>₱6,001</b> · 08-15 · ✅ 已付款" in text
+    # PENDING expenses stay a summary count only — never a duplicate row
+    assert "E103" not in text
+    # no unresolved-task duplicate block
+    assert "未解决" not in text
+    assert "无未解决支出事项" not in text
 
 
 def test_expense_quick_view_group_bilingual_records(make_app):
-    """P1-EXPENSE-QUICKVIEW-LIST-001: group replies keep English + 中文 on the
-    records list, including the status chips."""
+    """EXPENSE-UX-FIX-001: group replies keep English + 中文 on the expense
+    page, including the pending-payment and paid section chips."""
     env = make_app(backend=V2FakeBackend())
     run_updates(
         env,
         [make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "💸 Expense", bot=env.bot)],
     )
     text = env.bot.last_send()["text"]
-    assert "This month expenses / 本月支出记录" in text
+    assert "Pending payment / 待付款" in text
     assert "Paid / 已付款" in text
-    assert "Approved / 已批准" in text
+    assert "Approved / 待付款" in text
 
 
 class EmptyExpenseBackend(V2FakeBackend):
@@ -428,6 +456,8 @@ class EmptyExpenseBackend(V2FakeBackend):
             "pending_approval_amount": "0.00",
             "unresolved_expense_tasks": [],
             "records": [],
+            "payable": [],
+            "paid_records": [],
         }
 
 
@@ -436,7 +466,62 @@ def test_expense_quick_view_true_empty_state(make_app):
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
     text = env.bot.last_send()["text"]
     assert "本月暂无支出记录" in text
-    assert "无未解决支出事项" in text
+    assert "无未解决支出事项" not in text
+
+
+def test_expense_quick_view_live_shaped_payload_clean_and_unique(make_app):
+    """EXPENSE-UX-FIX-001 end-to-end: a live-shaped payload (E7/E8 APPROVED
+    with a legacy `??` category, E23 PAID) renders WITHOUT the `#E` hashtag,
+    WITHOUT `??`, and WITHOUT any duplicated APPROVED row."""
+    env = make_app(backend=V2FakeBackend())
+    env.backend.quick_expense = {
+        "month_total": "21002.00",
+        "pending_approval_count": 0,
+        "pending_approval_amount": "0.00",
+        "unresolved_expense_tasks": [
+            {"task_type": "PAYMENT_PENDING", "title": "待付款支出 · ??",
+             "status": "PENDING", "due_at": "2026-08-15T09:26:18+08:00",
+             "property_code": "DEV-BAY-1680", "source_type": "expense",
+             "source_id": 7},
+        ],
+        "records": [
+            {"expense_id": 7, "unit": "DEV-BAY-1680", "unit_code": "DEV-BAY-1680",
+             "purpose": "Repair", "amount": "7000.00",
+             "expense_date": "2026-08-15", "status": "approved"},
+            {"expense_id": 8, "unit": "DEV-BAY-1680", "unit_code": "DEV-BAY-1680",
+             "purpose": "Repair", "amount": "7000.00",
+             "expense_date": "2026-08-15", "status": "approved"},
+            {"expense_id": 23, "unit": "DEV-BAY-1680", "unit_code": "DEV-BAY-1680",
+             "purpose": "维修", "amount": "6002.00",
+             "expense_date": "2026-08-15", "status": "paid"},
+        ],
+        "payable": [
+            {"kind": "payable_expense", "expense_id": 8,
+             "unit": "DEV-BAY-1680", "unit_code": "DEV-BAY-1680",
+             "purpose": "Repair", "amount": "7000.00", "status": "approved",
+             "expense_date": "2026-08-15"},
+            {"kind": "payable_expense", "expense_id": 7,
+             "unit": "DEV-BAY-1680", "unit_code": "DEV-BAY-1680",
+             "purpose": "Repair", "amount": "7000.00", "status": "approved",
+             "expense_date": "2026-08-15"},
+        ],
+        "paid_records": [
+            {"expense_id": 23, "unit": "DEV-BAY-1680", "unit_code": "DEV-BAY-1680",
+             "purpose": "维修", "amount": "6002.00",
+             "expense_date": "2026-08-15", "status": "paid"},
+        ],
+    }
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
+    text = env.bot.last_send()["text"]
+    assert "#E" not in text
+    for banned in ("??", "None", "null", "undefined"):
+        assert banned not in text
+    # E7/E8 appear exactly once (pending payment), E23 once (paid)
+    assert text.count("E7") == 1
+    assert text.count("E8") == 1
+    assert text.count("E23") == 1
+    assert "待付款支出" not in text
+    assert "本月：₱21,002" in text
 
 
 def test_legacy_rent_alias_routes_to_quick_view(make_app):

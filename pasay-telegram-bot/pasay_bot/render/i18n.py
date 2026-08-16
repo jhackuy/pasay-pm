@@ -477,6 +477,10 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.expense_no_unresolved': '无未解决支出事项',
         'v2.expense_records_section': '本月支出记录',
         'v2.expense_records_empty': '本月暂无支出记录',
+        # EXPENSE-UX-FIX-001: pending-payment (APPROVED unpaid) + paid sections.
+        'v2.expense_pending_payment': '待付款',
+        'v2.expense_paid_section': '已付款',
+        'v2.expense_payable_status': '待付款',
         'v2.payable_expenses': '待付款支出 · {count}笔',
         'v2.expense_other': 'Other / 其他',
         'v2.empty': '暂无内容',
@@ -962,6 +966,10 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.expense_no_unresolved': 'No unresolved expense items',
         'v2.expense_records_section': 'This month expenses',
         'v2.expense_records_empty': 'No expenses this month',
+        # EXPENSE-UX-FIX-001: pending-payment (APPROVED unpaid) + paid sections.
+        'v2.expense_pending_payment': 'Pending payment',
+        'v2.expense_paid_section': 'Paid',
+        'v2.expense_payable_status': 'Approved',
         'v2.payable_expenses': 'Expenses awaiting payment · {count}',
         'v2.expense_other': 'Other',
         'v2.empty': 'Nothing here',

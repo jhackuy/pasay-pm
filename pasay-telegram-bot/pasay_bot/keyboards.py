@@ -1680,7 +1680,7 @@ def tasks_quick_keyboard(data, locale: str = "bi") -> InlineKeyboardMarkup:
         kb.append(
             [
                 InlineKeyboardButton(
-                    f"{t('expense.pay_button', locale)} #E{int(expense_id)}",
+                    f"{t('expense.pay_button', locale)} E{int(expense_id)}",
                     callback_data=encode(
                         ACTION_EXPENSE_PAY, str(int(expense_id)), "", nonce=nonce, ts=ts
                     ),

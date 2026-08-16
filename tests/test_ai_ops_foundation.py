@@ -282,6 +282,37 @@ def test_approved_expense_routes_payment_to_actual_payer(db_session, monkeypatch
     assert (task.details or {}).get("payer_user_id") == payer.id
 
 
+def test_payment_pending_task_title_never_embeds_placeholder_category(
+    db_session, monkeypatch,
+):
+    """EXPENSE-UX-FIX-001 Bug 2: a PAYMENT_PENDING task title is built from
+    the REAL purpose mapping — a legacy `??` expense category resolves to the
+    truthful payee and never appears in the title."""
+    from app.models.financial import Expense, ExpenseStatus
+    from app.services.operations import generation
+
+    owner = _user(db_session, "owner-title", UserRole.admin)
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner.id)
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner.id)
+
+    expense = Expense(
+        expense_date=date(2026, 8, 1), category="??", amount="7000.00",
+        payee="Repair", status=ExpenseStatus.approved,
+        approved_at=NOW - timedelta(days=10),
+    )
+    db_session.add(expense)
+    db_session.commit()
+
+    run_scheduler_once(db_session, now=NOW)
+    task = (
+        db_session.query(OperationalTask)
+        .filter(OperationalTask.task_type == OperationalTaskType.PAYMENT_PENDING)
+        .one()
+    )
+    assert task.title == "待付款支出 · Repair"
+    assert "??" not in task.title
+
+
 # ---------------------------------------------------------------------------
 # C: promises / follow-ups / escalation
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 html helpers) — no ad-hoc f-string message assembly in handlers."""
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -1159,11 +1160,12 @@ def expense_pay_confirm_card(
     """Owner payment-confirmation card for an APPROVED (unpaid) expense
     (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §4/§5/§7).
 
-    Carries the stable identity ``#E{id}`` plus unit/purpose/amount/date. A
+    Carries the stable plain-text identity ``E{id}`` (never the ``#E{id}``
+    hashtag) plus unit/purpose/amount/date. A
     receipt is OPTIONAL (shown as a hint, never a blocker). When ``similar``
     holds possible-duplicate PAID rows, an advisory bilingual warning lists the
     existing IDs — it never deletes or rejects the current expense."""
-    id_part = f"#E{expense.id}"
+    id_part = f"E{expense.id}"
     blocks = [f"💸 <b>{H.escape(t('expense.pay_confirm_title', locale))}</b>"]
     loc = _expense_location(expense, location)
     purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
@@ -1187,7 +1189,7 @@ def expense_pay_confirm_card(
             )
         )
         existing = " · ".join(
-            f"#E{int(r['expense_id'])}" for r in similar if r.get("expense_id")
+            f"E{int(r['expense_id'])}" for r in similar if r.get("expense_id")
         )
         if existing:
             dup.append(H.escape(t("expense.pay_view_existing", locale) + ": " + existing))
@@ -1206,7 +1208,7 @@ def expense_pay_result_card(expense: Expense, locale: str = "zh", *, already: bo
         title = t("expense.pay_result_paid", locale)
         note = H.escape(t("expense.pay_result_done", locale))
     purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
-    where = " · ".join(x for x in (f"#E{expense.id}", purpose) if x)
+    where = " · ".join(x for x in (f"E{expense.id}", purpose) if x)
     lines = [H.escape(title), f"{H.escape(where)} · <b>{H.money(expense.amount)}</b>", note]
     return "\n".join(x for x in lines if x)
 
@@ -1419,6 +1421,17 @@ def home_summary_card(
     return "\n".join(lines)
 
 
+def _todo_expense_purpose(row: dict, locale: str) -> str:
+    """Purpose for one to-do expense row: category -> payee, with placeholder
+    sentinels dropped (`??`, None, null, ...); explicit unspecified label as
+    the final fallback (never a raw placeholder, EXPENSE-UX-FIX-001 Bug 2)."""
+    for field in (row.get("category"), row.get("payee")):
+        text = _clean_free_text(field)
+        if text:
+            return text
+    return t("expense.purpose_unspecified", locale)
+
+
 def todo_overview_card(sections: dict, locale: str = "zh", title_key: str = "todo.title") -> str:
     """Unified to-do page (V1.3): only what the current user must act on.
     Rows are human-readable; action buttons ride below each row.
@@ -1436,10 +1449,14 @@ def todo_overview_card(sections: dict, locale: str = "zh", title_key: str = "tod
         )
     expenses = sections.get("expenses") or []
     if expenses:
+        # EXPENSE-UX-FIX-001: expense IDs render as plain `E{id}` (never the
+        # `#E{id}` Telegram hashtag) and the purpose uses the real-field
+        # fallback (category -> payee, sentinels dropped), so a legacy `??`
+        # category can never reach the to-do page.
         items = [
             f"{'💳' if (r.get('status') or '').lower() != 'approved' else '💸'} "
-            f"{'#E' + str(r['id']) if r.get('id') is not None else ''} · "
-            f"{H.escape(r.get('category', ''))} · <b>{H.money(r.get('amount'))}</b>"
+            f"{'E' + str(r['id']) if r.get('id') is not None else ''} · "
+            f"{H.escape(_todo_expense_purpose(r, locale))} · <b>{H.money(r.get('amount'))}</b>"
             + (f"\n{H.escape(r.get('location', ''))}" if r.get("location") else "")
             + (
                 f"\n📋 {H.escape(t('expense.status_approved', locale))}"
@@ -1752,10 +1769,27 @@ def _v2_property_label(row: dict, locale: str) -> tuple[str, str]:
     return emoji, line
 
 
+_TASK_TITLE_SENTINEL_RE = re.compile(
+    r"(?:^|[\s·])(?:\?\?|\?|--|none|null|n\/a|na|unknown)(?=$|[\s·])",
+    re.IGNORECASE,
+)
+
+
+def _clean_task_title(value) -> str:
+    """Drop placeholder sentinel fragments (`??`, `None`, `null`, ...) from a
+    task title. Legacy operational tasks created from a raw `??` expense
+    category (e.g. `待付款支出 · ??`) must never reach a user-visible card
+    (EXPENSE-UX-FIX-001 Bug 2). The real source fix lives in the backend task
+    generator; this is a render-side guard for already-persisted rows."""
+    text = " ".join(str(value or "").split())
+    text = _TASK_TITLE_SENTINEL_RE.sub("", text)
+    return text.strip(" ·")
+
+
 def _v2_task_line(task: dict, locale: str, emoji: str) -> str:
     """One active-task row: unit · title · due/overdue · next action."""
     unit = H.escape(str(task.get("property_code") or task.get("unit_code") or ""))
-    title = H.escape(str(task.get("title") or t("ops.task", locale)))
+    title = H.escape(_clean_task_title(task.get("title")) or t("ops.task", locale))
     en_parts: list[str] = []
     zh_parts: list[str] = []
     if unit:
@@ -1813,10 +1847,11 @@ def _v2_mmdd(value) -> str:
 
 def _v2_expense_record_line(row: dict, locale: str) -> str:
     """One expense record row: Expense ID · Unit · Purpose · Amount · MM-DD ·
-    Status. Carries the stable ``#E{id}`` so same-date/same-amount records stay
-    distinguishable; if the id is absent the row still renders (unit-first)."""
+    Status. Carries the stable plain-text ``E{id}`` (never the Telegram
+    ``#E{id}``) so same-date/same-amount records stay distinguishable; if the
+    id is absent the row still renders (unit-first)."""
     expense_id = row.get("expense_id")
-    id_part = f"#E{int(expense_id)}" if expense_id is not None else ""
+    id_part = f"E{int(expense_id)}" if expense_id is not None else ""
     unit = H.escape(str(row.get("unit") or row.get("unit_code") or "-"))
     purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
@@ -1912,11 +1947,12 @@ def _properties_summary_line(locale: str, total: int, occupied: int, vacant: int
 
 def _payable_expense_line(row: dict, locale: str) -> str:
     """One payable (APPROVED, unpaid) expense row with a stable visible
-    identity: ``💸 #E{id} · unit · purpose · amount · Approved``. The database
-    expense id is the stable identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3),
-    so same-day/same-amount expenses stay distinguishable."""
+    identity: ``💸 E{id} · unit · purpose · amount · Approved`` (plain text,
+    never a Telegram ``#E{id}`` hashtag). The database expense id is the
+    stable identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3), so same-day /
+    same-amount expenses stay distinguishable."""
     expense_id = row.get("expense_id")
-    id_part = f"#E{int(expense_id)}" if expense_id is not None else ""
+    id_part = f"E{int(expense_id)}" if expense_id is not None else ""
     unit = H.escape(str(row.get("unit") or ""))
     purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
@@ -1929,9 +1965,10 @@ def tasks_quick_card(data, locale: str = "bi") -> str:
     """✅ Tasks quick view: active tasks grouped by status, plus the Owner's
     payable APPROVED expenses (PASAY-V2-EXPENSE-PAYABLE-TASK-006).
 
-    Payable expenses use ``#E{id}`` as the stable identity so same-day /
-    same-amount records stay distinguishable. When payable rows exist the card
-    never shows the empty state."""
+    Payable expenses use the plain-text ``E{id}`` (never the ``#E{id}``
+    hashtag) as the stable identity so same-day / same-amount records stay
+    distinguishable. When payable rows exist the card never shows the empty
+    state."""
     tasks = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
     payable = [
         t_ for t_ in tasks if str(t_.get("kind") or "") == "payable_expense"
@@ -2033,26 +2070,36 @@ def _rent_month_stats(
 
 
 def expense_quick_card(data, locale: str = "bi") -> str:
-    """💸 Expense quick view: month total + this month's records + pending
-    approval + unresolved. Records are the default view (PAID included);
-    the unresolved line stays as auxiliary status only."""
+    """💸 Expense quick view: month total, then the pending-payment queue
+    (APPROVED, unpaid) built from the REAL expense fields, then this month's
+    PAID records. No unresolved-task text block is generated, so an APPROVED
+    expense appears exactly once per page and legacy `??` task titles can
+    never leak in (EXPENSE-UX-FIX-001)."""
     data = data or {}
     month_total = data.get("month_total")
     if month_total is None:
         month_total = data.get("current_month_total")
+    payable = data.get("payable") or []
+    paid_records = data.get("paid_records")
+    if paid_records is None:
+        paid_records = [
+            r for r in (data.get("records") or [])
+            if str(r.get("status") or "").lower() == "paid"
+        ]
     pending_count = data.get("pending_approval_count")
     pending_amount = data.get("pending_approval_amount")
-    unresolved = data.get("unresolved_expense_tasks") or []
-    records = data.get("records") or []
     blocks = [_v2_title(locale, "v2.expense_title", "💸")]
     if month_total is not None:
         blocks.append(
             H.escape(t("v2.expense_month_total", locale, amount=H.money(month_total)))
         )
-    if records:
-        blocks.append(_v2_section("v2.expense_records_section", locale, "📋"))
-        blocks.extend(_v2_expense_record_line(row, locale) for row in records)
-    elif _v2_is_zero(month_total):
+    if payable:
+        blocks.append(_v2_expense_payable_header(locale, len(payable)))
+        blocks.extend(_v2_expense_payable_line(row, locale) for row in payable)
+    if paid_records:
+        blocks.append(_v2_section("v2.expense_paid_section", locale, "✅"))
+        blocks.extend(_v2_expense_record_line(row, locale) for row in paid_records)
+    elif _v2_is_zero(month_total) and not payable:
         blocks.append(H.escape(t("v2.expense_records_empty", locale)))
     if pending_count:
         blocks.append(
@@ -2065,15 +2112,39 @@ def expense_quick_card(data, locale: str = "bi") -> str:
                 )
             )
         )
-    if unresolved:
-        blocks.append(
-            H.escape(t("v2.expense_unresolved", locale, count=len(unresolved)))
-        )
-        for task in unresolved[:5]:
-            blocks.append(_v2_task_line(task, locale, "💸"))
-    else:
-        blocks.append(H.escape(t("v2.expense_no_unresolved", locale)))
     return "\n\n".join(blocks)
+
+
+def _v2_expense_payable_header(locale: str, count: int) -> str:
+    """``📋 Pending payment / 待付款 · {count}`` — bilingual section header."""
+    header = _bi_header(
+        locale,
+        t("v2.expense_pending_payment", "en"),
+        t("v2.expense_pending_payment", "zh"),
+    )
+    return f"📋 <b>{H.escape(header)} · {count}</b>"
+
+
+def _v2_expense_payable_line(row: dict, locale: str) -> str:
+    """One APPROVED-unpaid (pending payment) expense row built from the REAL
+    expense fields — Expense ID · Unit · Purpose · Amount · MM-DD ·
+    ``📋 Approved/待付款``. Never derived from a task title, so a legacy `??`
+    category can never leak into the UI (EXPENSE-UX-FIX-001 Bug 2)."""
+    expense_id = row.get("expense_id")
+    id_part = f"E{int(expense_id)}" if expense_id is not None else ""
+    unit = H.escape(str(row.get("unit") or row.get("unit_code") or "-"))
+    purpose = _v2_expense_purpose(row, locale)
+    amount = H.money(row.get("amount"))
+    date = H.escape(_v2_mmdd(row.get("expense_date") or row.get("date")))
+    status = "📋 " + H.escape(
+        _bi_header(
+            locale,
+            t("v2.expense_payable_status", "en"),
+            t("v2.expense_payable_status", "zh"),
+        )
+    )
+    parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>", date, status) if x]
+    return " · ".join(parts)
 
 
 def active_tasks_digest_card(data, locale: str = "bi") -> str:

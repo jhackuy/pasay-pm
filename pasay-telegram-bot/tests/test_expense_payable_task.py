@@ -4,8 +4,9 @@ Covers the canonical ``PENDING -> APPROVED -> PAID`` rule and its bot UX:
 - every APPROVED (unpaid) expense is an Owner actionable Task;
 - a PAID expense never appears as a payable Task;
 - Tasks no longer shows the empty state while payable expenses exist;
-- each payable expense exposes a stable identity (#E{id}) so same-day /
-  same-amount records stay distinguishable;
+- each payable expense exposes a stable identity (E{id}, plain text — never
+  the Telegram `#E{id}` hashtag) so same-day / same-amount records stay
+  distinguishable;
 - the Owner can pay one specific expense through a deterministic flow;
 - a receipt is optional (paying without one succeeds);
 - payment moves the SAME expense to PAID (no new Expense created);
@@ -60,7 +61,8 @@ def _pay_cb(user_id, data, update_id, bot=None):
 
 
 def _distinct_pay_actions(env):
-    """Distinct Pay callback targets (#E{id}) on the last Tasks Quick View."""
+    """Distinct Pay callback targets (E{id}, plain text) on the last Tasks
+    Quick View."""
     kb = env.bot.last_send()["reply_markup"]
     if kb is None or not hasattr(kb, "inline_keyboard"):
         return set()
@@ -80,10 +82,10 @@ def test_approved_expense_appears_as_payable_task_paid_does_not(make_app):
     _add_approved(env, 1028, status="paid")       # NOT payable
     _open_tasks_quickview(env)
     text = env.bot.last_send()["text"]
-    assert "#E1027" in text
-    assert "#E1028" not in text
+    assert "E1027" in text
+    assert "E1028" not in text
 
-    # The payable row is actionable via a Pay button pointing at #E1027.
+    # The payable row is actionable via a Pay button pointing at E1027.
     assert 1027 in _distinct_pay_actions(env)
     assert 1028 not in _distinct_pay_actions(env)
 
@@ -96,8 +98,8 @@ def test_same_day_same_amount_expenses_are_distinguishable(make_app):
     _add_approved(env, 1031, unit_id=1)
     _open_tasks_quickview(env)
     text = env.bot.last_send()["text"]
-    assert "#E1027" in text
-    assert "#E1031" in text
+    assert "E1027" in text
+    assert "E1031" in text
     assert 1027 in _distinct_pay_actions(env)
     assert 1031 in _distinct_pay_actions(env)
 
@@ -124,7 +126,7 @@ def test_payment_completes_same_expense_and_removes_task(make_app):
     result_text = "".join(env.bot.all_texts())
     assert "已付款" in result_text
     _open_tasks_quickview(env)
-    assert "#E1027" not in env.bot.last_send()["text"]
+    assert "E1027" not in env.bot.last_send()["text"]
     assert 1027 not in _distinct_pay_actions(env)
     # It remains in Expense history (still one record).
     assert len(env.backend.expenses) == 1
@@ -163,7 +165,7 @@ def test_repeat_payment_on_same_expense_is_idempotent(make_app):
 def test_possible_duplicate_warning_shows_both_ids_and_does_not_reject(make_app):
     env = make_app()
     _add_approved(env, 1031, status="approved")          # current / payable
-    # Existing highly-similar PAID record (#E1027).
+    # Existing highly-similar PAID record (E1027).
     env.backend.add_expense(expense_id=1027, category="维修", amount="7000.00",
                             payee="Fix-It Co", unit_id=1,
                             expense_date="2026-08-15", status="paid")
@@ -176,7 +178,7 @@ def test_possible_duplicate_warning_shows_both_ids_and_does_not_reject(make_app)
     run_updates(env, [_pay_cb(OWNER_ID, _pay_data(1031), 1, bot=env.bot)])
     text = env.bot.last_edit()["text"]
     assert "可能重复" in text
-    assert "#E1027" in text
+    assert "E1027" in text
     # The current expense was NOT deleted or rejected (advisory only).
     assert env.backend._get_expense(1031)["status"] == "approved"
     # The warning card must NOT silently finalize the payment either.
@@ -201,4 +203,4 @@ def test_amount_alone_never_triggers_duplicate_warning(make_app):
     run_updates(env, [_pay_cb(OWNER_ID, _pay_data(1027), 1, bot=env.bot)])
     text = env.bot.last_edit()["text"]
     assert "可能重复" not in text
-    assert "#E2044" not in text
+    assert "E2044" not in text

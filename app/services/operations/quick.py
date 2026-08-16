@@ -296,7 +296,8 @@ def _payable_expense_rows(
     unfinished task the Owner still must pay.
 
     Only PAID is financially completed; APPROVED is approved-but-unpaid, so
-    each row carries the stable business identity (#E{id}) and the strong
+    each row carries the stable business identity (E{id}, plain text — never
+    the Telegram `#E{id}` hashtag) and the strong
     matching fields (unit, purpose, amount, expense_date) the bot needs to
     distinguish same-day/same-amount expenses and to run its advisory
     possible-duplicate warning."""
@@ -406,7 +407,7 @@ def find_similar_paid_expenses(
     same amount, same purpose/category, all within a relevant date window.
     Amount alone is never enough. Returns similar PAID rows (existing-ID +
     display fields) so the bot can show
-    ``Existing: #E{old} / Current: #E{new}`` and let the Owner Continue /
+    ``Existing: E{old} / Current: E{new}`` and let the Owner Continue /
     Cancel / View-existing without deleting business records."""
     if expense.unit_id is None:
         return []
@@ -709,6 +710,12 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         }
         for e in month_records
     ]
+    # EXPENSE-UX-FIX-001: the pending-payment section is built from the REAL
+    # expense records (APPROVED, not PAID), never from operational-task titles
+    # that used to embed a raw `??` category. `paid_records` is this month's
+    # PAID spend so an APPROVED expense appears exactly once per page.
+    payable = _payable_expense_rows(db, now=now)
+    paid_records = [r for r in records if r["status"] == "paid"]
     return {
         "month_total": month_total,
         "pending_approval_count": len(pending_rows),
@@ -717,6 +724,8 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
             _task_row(db, t, unit_number_by_lease) for t in unresolved
         ],
         "records": records,
+        "payable": payable,
+        "paid_records": paid_records,
     }
 
 

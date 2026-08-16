@@ -48,6 +48,32 @@ from app.services.operations.reconcile import auto_transition
 
 BUSINESS_SOURCE_TYPES = frozenset({"lease", "expense", "commission_settlement"})
 
+# Placeholder sentinels that must never appear in a user-visible task title
+# (EXPENSE-UX-FIX-001 Bug 2). Legacy rows may store `??` in expense.category;
+# the title is built from the REAL purpose mapping (category -> description ->
+# payee, sentinels dropped), never from the raw DB value.
+_TITLE_SENTINELS = frozenset({"??", "?", "--", "none", "null", "n/a", "na", "unknown"})
+
+
+def _clean_title_part(value) -> str:
+    """First truthful fragment (category -> description -> payee) with
+    placeholder sentinels dropped; empty string when nothing remains."""
+    for field in (value.category, value.description, getattr(value, "payee", None)):
+        if not field:
+            continue
+        text = " ".join(str(field).split())
+        if text and text.lower() not in _TITLE_SENTINELS:
+            return text
+    return ""
+
+
+def _expense_task_title(prefix: str, expense) -> str:
+    """Human task title like `待付款支出 · 维修`; the purpose part is the
+    cleaned real purpose, and is omitted entirely when no truthful purpose
+    exists (a bare `待付款支出` is still actionable)."""
+    purpose = _clean_title_part(expense)
+    return f"{prefix} · {purpose}" if purpose else prefix
+
 
 def secretary_assignee_id() -> int | None:
     """AI-OPS-FOUNDATION-001 §4: routine operational work (rent collection,
@@ -539,7 +565,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             now=now,
             fields={
                 "task_type": OperationalTaskType.APPROVAL_PENDING,
-                "title": f"待批准支出 · {expense.category}",
+                "title": _expense_task_title("待批准支出", expense),
                 "source_type": "expense",
                 "source_id": expense.id,
                 # AI-OPS-FOUNDATION-001 §4/§7: approval is Owner-only (the
@@ -585,7 +611,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             now=now,
             fields={
                 "task_type": OperationalTaskType.PAYMENT_PENDING,
-                "title": f"待付款支出 · {expense.category}",
+                "title": _expense_task_title("待付款支出", expense),
                 "source_type": "expense",
                 "source_id": expense.id,
                 "assigned_user_id": payer,

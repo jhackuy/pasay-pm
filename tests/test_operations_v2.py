@@ -243,7 +243,8 @@ def test_quick_rent_and_expense_shapes(client, db_session, admin_headers):
     assert exp.status_code == 200
     body = exp.json()
     assert {"month_total", "pending_approval_count", "pending_approval_amount",
-            "unresolved_expense_tasks", "records"} <= set(body)
+            "unresolved_expense_tasks", "records",
+            "payable", "paid_records"} <= set(body)
 
 
 def test_quick_rent_month_statistics_contract(client, db_session, admin_headers):
@@ -374,6 +375,61 @@ def test_quick_expense_records_purpose_fallback(client, db_session, admin_header
     assert by_amount[1200.0]["purpose"] == "Meralco"
     assert "??" not in [r["purpose"] for r in records]
     assert "None" not in [r["purpose"] for r in records]
+
+
+def test_quick_expense_payable_and_paid_sections_clean_and_disjoint(
+    client, db_session, admin_headers,
+):
+    """EXPENSE-UX-FIX-001: the quick expense payload splits APPROVED-unpaid
+    (payable) from this month's PAID (paid_records). Every payable row carries
+    the real fields (expense_id, unit, purpose, amount, expense_date, status);
+    a legacy `??` category resolves to the truthful payee and never ships as
+    `??`; an APPROVED expense never appears in paid_records (no duplication)."""
+    _, unit = _seed_lease(db_session)
+    today = date.today()
+    db_session.add_all([
+        Expense(
+            expense_date=today, category="??", amount="7000.00",
+            payee="Repair", unit_id=unit.id, status=ExpenseStatus.approved,
+        ),
+        Expense(
+            expense_date=today, category="??", amount="7000.00",
+            payee="Repair", unit_id=unit.id, status=ExpenseStatus.approved,
+        ),
+        Expense(
+            expense_date=today, category="维修", amount="6002.00",
+            payee="Fix-It Co", unit_id=unit.id, status=ExpenseStatus.paid,
+        ),
+        Expense(
+            expense_date=today, category="水费", amount="1200.00",
+            payee="MWCI", unit_id=unit.id, status=ExpenseStatus.pending,
+        ),
+    ])
+    db_session.commit()
+
+    resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    payable = body["payable"]
+    paid_records = body["paid_records"]
+
+    assert len(payable) == 2
+    assert all(r["status"] == "approved" for r in payable)
+    for row in payable:
+        assert isinstance(row["expense_id"], int)
+        assert row["unit"] == "1680"
+        assert row["purpose"] == "Repair"  # `??` category -> truthful payee
+        assert row["amount"]
+        assert row["expense_date"]
+        assert "??" not in row["purpose"]
+
+    assert len(paid_records) == 1
+    assert paid_records[0]["status"] == "paid"
+    assert paid_records[0]["purpose"] == "维修"
+    # the same APPROVED expense never leaks into the paid section
+    payable_ids = {r["expense_id"] for r in payable}
+    assert not ({r["expense_id"] for r in paid_records} & payable_ids)
+    assert "??" not in [r["purpose"] for r in payable + paid_records]
 
 
 def test_digest_structure(client, db_session, admin_headers):
