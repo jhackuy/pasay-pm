@@ -170,15 +170,59 @@ def main(argv=None) -> int:
         for attempt in range(1, max_retries + 1):
             app = build_application(settings, api, store, admin_api_client=admin_api)
             print("[pasay-bot] starting polling ...")
-            # ---- P0 live-diagnostic: observe raw update entry into PTB dispatch ----
+            # ---- P0 live-diagnostic: A1/A2/A3/A4 production-chain tracing ----
             try:
-                _UPSTREAM = app
+                # (A1) get_updates: CALL / RETURN(count+ids) / EXC
+                _bot = app.bot
+                _orig_get_updates = _bot.get_updates
+                async def _traced_get_updates(*args, **kwargs):
+                    print("[A1] get_updates CALL kwargs=%r" % (kwargs,), flush=True)
+                    try:
+                        updates = await _orig_get_updates(*args, **kwargs)
+                        print("[A1] get_updates RETURN count=%d ids=%r" % (
+                            len(updates) if updates else 0,
+                            [u.update_id for u in updates] if updates else [],
+                        ), flush=True)
+                        return updates
+                    except Exception as _e:
+                        print("[A1] get_updates EXC %r" % (_e,), flush=True)
+                        raise
+                _bot.get_updates = _traced_get_updates
+
+                # (A2) update_queue.put: BEFORE / AFTER / size
+                _orig_put = app.update_queue.put
+                async def _traced_put(item):
+                    print("[A2] queue.put BEFORE qsize=%d item_type=%s" % (
+                        app.update_queue.qsize(), type(item).__name__), flush=True)
+                    try:
+                        await _orig_put(item)
+                        print("[A2] queue.put AFTER qsize=%d" % app.update_queue.qsize(), flush=True)
+                    except Exception as _e:
+                        print("[A2] queue.put EXC %r" % (_e,), flush=True)
+                        raise
+                app.update_queue.put = _traced_put
+
+                # (A3) update_queue.get (consumer): GET
+                _orig_get_q = app.update_queue.get
+                async def _traced_get_q():
+                    item = await _orig_get_q()
+                    eff_msg = getattr(item, "effective_message", None)
+                    print("[A3] queue.get update_id=%s qsize_after=%d text=%r" % (
+                        getattr(item, "update_id", None),
+                        app.update_queue.qsize(),
+                        getattr(eff_msg, "text", None) if eff_msg else None,
+                    ), flush=True)
+                    return item
+                app.update_queue.get = _traced_get_q
+                # async gen mock? get() is bound method; patch on queue instance works.
+
+                # (A4) process_update ENTER (bound method replace)
                 _ORIG_PROCESS_UPDATE = app.process_update
                 async def _traced_process_update(update):
                     eff_msg = getattr(update, "effective_message", None)
                     eff_chat = getattr(update, "effective_chat", None)
                     eff_user = getattr(update, "effective_user", None)
-                    print("[PTB] process_update ENTER update_id=%s type=%s message_id=%s chat_id=%s user_id=%s text=%r" % (
+                    print("[A4] process_update ENTER update_id=%s type=%s message_id=%s chat_id=%s user_id=%s text=%r" % (
                         getattr(update, "update_id", None),
                         getattr(update, "update_type", None),
                         getattr(eff_msg, "message_id", None) if eff_msg else None,
@@ -189,9 +233,11 @@ def main(argv=None) -> int:
                     try:
                         return await _ORIG_PROCESS_UPDATE(update)
                     except Exception as _e:
-                        print("[PTB] process_update EXC %r" % (_e,), flush=True)
+                        print("[A4] process_update EXC %r" % (_e,), flush=True)
                         raise
                 app.process_update = _traced_process_update
+
+                # Handler inventory (registration + filters).
                 print("[PTB] handler inventory:", flush=True)
                 for group in sorted(app.handlers.keys()):
                     for h in app.handlers[group]:
@@ -205,6 +251,24 @@ def main(argv=None) -> int:
                 print("[PTB] handler inventory done", flush=True)
             except Exception as _diag:
                 print("[PTB] diag setup failed: %r" % (_diag,), flush=True)
+            # A periodic task-health + task inventory dump (asyncio tasks alive/done/cancelled).
+            try:
+                import asyncio as _asyncio_mod
+
+                async def _task_health_probe(_app):
+                    await _asyncio_mod.sleep(3)
+                    _tasks = [t for t in _asyncio_mod.all_tasks() if not t.done()]
+                    print("[TASK] alive asyncio tasks:", flush=True)
+                    for t in _tasks:
+                        print("[TASK]   done=%s cancelled=%s ex=%s name=%r" % (
+                            t.done(), t.cancelled(),
+                            (repr(t.exception()) if t.done() and not t.cancelled() else 'n/a'),
+                            getattr(t, "get_name", lambda: None)() if callable(getattr(t, "get_name", None)) else '?'
+                        ), flush=True)
+                    print("[TASK] alive-count=%d" % len(_tasks), flush=True)
+                app.create_task(_task_health_probe(app), name="P0_task_health")
+            except Exception as _diag2:
+                print("[PTB] task-probe setup failed: %r" % (_diag2,), flush=True)
             # ---- end P0 live-diagnostic ----
             try:
                 app.run_polling()
