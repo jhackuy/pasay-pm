@@ -25,6 +25,14 @@ _INCOME_QUERY_CN = ("收了多少钱", "收入多少", "收了多少", "收入",
 _EXPENSE_QUERY_CN = ("花了多少钱", "花了多少", "支出多少", "支出记录", "花销", "花了", "支出")
 _UNIT_INFO_CN = ("是谁租的", "谁在住", "谁租的", "租给谁", "租金多少", "月租多少", "房租多少", "合同什么时候到期", "租约什么时候到期", "租约到期", "合同到什么时候")
 _CONTRACTS_CN = ("合同快到期", "合同到期", "租约快到期", "租约到期", "快到期", "要到期", "合同还有")
+# AI-OPS-FOUNDATION-001 §14/§15: evidence + digital-file queries.
+_EVIDENCE_QUERY_CN = ("照片", "凭证", "发票", "图片", "证据", "相片", "影相")
+_EVIDENCE_QUERY_EN = re.compile(
+    r"\b(photo|photos|picture|pictures|receipt|evidence|proof|image|images|file|files)\b",
+    re.IGNORECASE,
+)
+_HISTORY_QUERY_CN = ("的历史", "全部记录", "历史记录", "历史", "时间线", "来龙去脉")
+_HISTORY_QUERY_EN = re.compile(r"\b(history|timeline|timeline of)\b", re.IGNORECASE)
 _QUERY_SUFFIX = re.compile(r"(吗|么|？|\?)\s*$")
 _UNIT_TOKEN = re.compile(
     r"(?<![A-Za-z0-9-])("
@@ -36,7 +44,7 @@ _UNIT_TOKEN = re.compile(
 
 @dataclass(frozen=True)
 class QueryIntent:
-    kind: str  # income_summary | expense_summary | unit_expenses | unit_info | contracts
+    kind: str  # income_summary | expense_summary | unit_expenses | unit_info | contracts | evidence | unit_history
     unit_token: str = ""
     month: str = ""
     days: int = 30
@@ -85,6 +93,17 @@ def detect_query(text: str) -> Optional[QueryIntent]:
     unit_token = unit_m.group(1) if unit_m else ""
     month = _parse_month(raw)
 
+    # AI-OPS-FOUNDATION-001 §14/§15: unit history ("Give me the history of
+    # 1608") and evidence ("Show the receipt", "1608 repair photos") — both
+    # need a unit token to be answerable.
+    if unit_token and (
+        any(w in raw for w in _HISTORY_QUERY_CN) or _HISTORY_QUERY_EN.search(raw)
+    ):
+        return QueryIntent(kind="unit_history", unit_token=unit_token)
+    if unit_token and (
+        any(w in raw for w in _EVIDENCE_QUERY_CN) or _EVIDENCE_QUERY_EN.search(raw)
+    ):
+        return QueryIntent(kind="evidence", unit_token=unit_token)
     if any(w in raw for w in _CONTRACTS_CN):
         return QueryIntent(kind="contracts", days=_parse_days(raw))
     if any(w in raw for w in _UNIT_INFO_CN):
@@ -102,6 +121,11 @@ def detect_query(text: str) -> Optional[QueryIntent]:
 
 async def handle_query(context, chat_id, query: QueryIntent, locale: str):
     """Dispatch a detected query to its direct data answer."""
+    # AI-OPS-FOUNDATION-001 §14: evidence queries also SEND the media files
+    # (photos/documents) stored in the archive, not only a text card.
+    if query.kind == "evidence":
+        await _answer_unit_evidence(context, chat_id, query.unit_token, locale)
+        return
     text = await build_query_answer(context, query, locale)
     await context.bot.send_message(
         chat_id, H.truncate(text), parse_mode=HTML,
@@ -122,6 +146,8 @@ async def build_query_answer(context, query: QueryIntent, locale: str) -> str:
         return await _answer_unit_info(context, query.unit_token, locale)
     if query.kind == "contracts":
         return await _answer_contracts(context, query.days, locale)
+    if query.kind == "unit_history":
+        return await _answer_unit_history(context, query.unit_token, locale)
     return t("ai.unknown", locale)
 
 
@@ -223,6 +249,73 @@ async def _answer_contracts(context, days, locale) -> str:
             )
     rows.sort(key=lambda r: r["end_date"])
     return cards.contracts_card(rows, days, locale)
+
+
+async def _resolve_unit(context, unit_token: str):
+    """Resolve a unit token to a Unit (or None) using the shared matcher."""
+    api = context.bot_data["api_client"]
+    units = await api.get_units()
+    return next((u for u in units if unit_matches(unit_token, u.unit_number)), None)
+
+
+async def _answer_unit_history(context, unit_token, locale) -> str:
+    """AI-OPS-FOUNDATION-001 §15: the unit's digital file (timeline)."""
+    api = context.bot_data["api_client"]
+    unit = await _resolve_unit(context, unit_token)
+    if unit is None:
+        return t("rent_status.no_unit", locale, unit=unit_token)
+    timeline = await api.get_unit_timeline(unit.id)
+    return cards.unit_timeline_card(timeline, unit.unit_number, locale)
+
+
+async def _answer_unit_evidence(context, chat_id, unit_token, locale) -> None:
+    """AI-OPS-FOUNDATION-001 §14: 'Show the receipt' / '1608 repair photos' —
+    list the indexed evidence for the unit and SEND the archived media back
+    (file_ids stay usable bot-wide for the archived files)."""
+    api = context.bot_data["api_client"]
+    unit = await _resolve_unit(context, unit_token)
+    if unit is None:
+        await context.bot.send_message(
+            chat_id, H.escape(t("rent_status.no_unit", locale, unit=unit_token)),
+            parse_mode=HTML,
+        )
+        return
+    rows = await api.list_evidence(unit_id=unit.id)
+    if not rows:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("evidence.empty", locale, unit=unit.unit_number)),
+            parse_mode=HTML,
+        )
+        return
+    header = f"<b>{H.escape(t('evidence.title', locale, unit=unit.unit_number))}</b>"
+    lines = [header]
+    sent_any = False
+    for row in rows:
+        file_id = (row.get("external_file_id") or "").strip()
+        category = row.get("category") or "other"
+        label = f"{category} · {(row.get('filename') or row.get('media_type') or '')}".strip(" ·")
+        if file_id:
+            try:
+                await _send_media(context.bot, chat_id, file_id, row.get("media_type"))
+                sent_any = True
+            except Exception:  # noqa: BLE001 - a stale file_id must not break the list
+                pass
+        lines.append(f"• {label}")
+    if sent_any:
+        lines.append(H.escape(t("evidence.sent", locale)))
+    await context.bot.send_message(chat_id, H.truncate("\n".join(lines)), parse_mode=HTML)
+
+
+async def _send_media(bot, chat_id, file_id: str, media_type: Optional[str]) -> None:
+    """Send an archived media file back by its stored file_id."""
+    media_type = (media_type or "").lower()
+    if media_type == "photo":
+        await bot.send_photo(chat_id=chat_id, photo=file_id)
+    elif media_type == "video":
+        await bot.send_video(chat_id=chat_id, video=file_id)
+    else:
+        await bot.send_document(chat_id=chat_id, document=file_id)
 
 
 async def _gather(api, *names: str):

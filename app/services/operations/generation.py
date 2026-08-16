@@ -40,12 +40,22 @@ from app.services.operations.config import (
     NOTIFY_CHANNEL_TELEGRAM,
     PAYMENT_PENDING_AFTER_DAYS,
     RENT_DUE_ADVANCE_DAYS,
+    SECRETARY_ASSIGNEE_ID,
     SETTLEMENT_PENDING_AFTER_DAYS,
 )
 from app.services.operations.outbox import enqueue_notification, resolve_recipient
 from app.services.operations.reconcile import auto_transition
 
 BUSINESS_SOURCE_TYPES = frozenset({"lease", "expense", "commission_settlement"})
+
+
+def secretary_assignee_id() -> int | None:
+    """AI-OPS-FOUNDATION-001 §4: routine operational work (rent collection,
+    lease follow-up) is assigned to the SECRETARY, never the Owner. Falls back
+    to the default (Owner) only when no secretary is configured."""
+    if SECRETARY_ASSIGNEE_ID is not None:
+        return SECRETARY_ASSIGNEE_ID
+    return DEFAULT_ASSIGNED_USER_ID
 
 
 def _money(value) -> str:
@@ -123,6 +133,92 @@ def _insert_task_on_conflict_do_nothing(db: Session, *, fields: dict) -> Operati
     return db.get(OperationalTask, row[0])
 
 
+def _get_active_task_by_dedupe(db: Session, dedupe_key: str) -> OperationalTask | None:
+    """One ACTIVE (PENDING or IN_PROGRESS) task with this dedupe_key.
+
+    The DB partial index only protects PENDING rows; an IN_PROGRESS row must
+    also be treated as "the same logical issue" so a reminder never creates a
+    duplicate sibling while a human is already working it."""
+    if not dedupe_key:
+        return None
+    return (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.dedupe_key == dedupe_key,
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .first()
+    )
+
+
+_REFRESHABLE_FIELDS = (
+    "title", "description", "details", "due_at", "priority",
+    "next_action", "next_check_at",
+)
+
+
+def _refresh_active_task(
+    db: Session,
+    task: OperationalTask,
+    *,
+    fields: dict,
+    now: datetime,
+    actor_id: int | None,
+    notification_message: str | None,
+    reply_markup: dict | None,
+) -> tuple[OperationalTask, bool]:
+    """Remind/update the SAME logical task (dedupe_key match) instead of
+    creating a duplicate active task (AI-OPS-FOUNDATION-001 §2: one business
+    issue = one active task; a new reminder updates/reminds the same task).
+
+    Only reminder-relevant fields are refreshed; status/assignee never change
+    here. The reminder generation is bumped and a fresh notification row is
+    enqueued so the human is reminded with the CURRENT facts.
+    """
+    old = serialize_row(task)
+    changed = False
+    for key in _REFRESHABLE_FIELDS:
+        if key not in fields:
+            continue
+        value = fields[key]
+        if key == "details" and value is not None:
+            merged = dict(task.details or {})
+            merged.update(value)
+            if merged != (task.details or {}):
+                task.details = merged
+                changed = True
+            continue
+        if getattr(task, key, None) != value:
+            setattr(task, key, value)
+            changed = True
+    if not changed:
+        return task, False
+    task.reminder_generation = (task.reminder_generation or 0) + 1
+    task.updated_at = now
+    db.flush()
+    record_audit(
+        db,
+        table_name="operational_tasks",
+        record_id=task.id,
+        action="task_reminded",
+        actor_id=actor_id,  # None = system / scheduler
+        changed_fields={
+            "title": [old.get("title"), task.title],
+            "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
+        },
+        old_value=old,
+        new_value=serialize_row(task),
+    )
+    enqueued = _enqueue_for_task(
+        db, task,
+        notification_message=notification_message,
+        reply_markup=reply_markup,
+    )
+    return task, enqueued
+
+
 def _enqueue_for_task(
     db: Session,
     task: OperationalTask,
@@ -137,8 +233,17 @@ def _enqueue_for_task(
     copilot executor renders an English secretary card); when omitted the
     Chinese ``_notification_message`` is used, so scheduler business tasks
     keep their existing message unchanged.
+
+    The dedupe key embeds the reminder generation so a refreshed reminder
+    (task_reminded) is a NEW logical notification even though the outbox
+    ``uq_notification_outbox_dedupe`` index would otherwise swallow it.
     """
-    recipient = resolve_recipient(db, task.assigned_user_id)
+    try:
+        recipient = resolve_recipient(db, task.assigned_user_id)
+    except LookupError:
+        # AI-OPS-FOUNDATION-001 §1: the TASK is the source of truth — an
+        # unresolvable notification recipient must never block task creation.
+        return False
     if recipient is None:
         return False
     details = task.details or {}
@@ -156,13 +261,14 @@ def _enqueue_for_task(
     }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
+    generation = task.reminder_generation or 0
     return enqueue_notification(
         db,
         task_id=task.id,
         channel=NOTIFY_CHANNEL_TELEGRAM,
         recipient=recipient,
         payload=payload,
-        dedupe_key=f"task:{task.id}:{NOTIFY_CHANNEL_TELEGRAM}:{recipient}",
+        dedupe_key=f"task:{task.id}:{generation}:{NOTIFY_CHANNEL_TELEGRAM}:{recipient}",
     )
 
 
@@ -174,14 +280,22 @@ def _register_task(
     actor_id: int | None = None,
     notification_message: str | None = None,
     reply_markup: dict | None = None,
-) -> tuple[OperationalTask | None, bool]:
+    refresh_on_conflict: bool = False,
+) -> tuple[OperationalTask | None, bool, bool]:
     """Create task + audit(task_created) + outbox in one transaction.
 
     Business-source tasks with no explicit assignee fall back to
     ``DEFAULT_ASSIGNED_USER_ID`` so proactive notifications get a recipient;
     recurring-rule tasks keep the rule's assignee as-is.
 
-    Returns (task_or_None, notification_enqueued).
+    When ``refresh_on_conflict`` is set and an ACTIVE task with the same
+    ``dedupe_key`` already exists, the existing task is REFRESHED in place
+    (task_reminded + new notification) instead of returning None — one
+    business issue keeps exactly one active task while reminders stay current.
+
+    Returns ``(task_or_None, notification_enqueued, is_new)`` where ``is_new``
+    is False for a no-op or in-place refresh (the caller must not count it as
+    a newly created task).
     """
     fields = dict(fields)
     if (
@@ -191,9 +305,22 @@ def _register_task(
         if DEFAULT_ASSIGNED_USER_ID is None:
             raise RuntimeError("OPERATIONS_DEFAULT_ASSIGNEE is not configured")
         fields["assigned_user_id"] = DEFAULT_ASSIGNED_USER_ID
+    if refresh_on_conflict and fields.get("dedupe_key"):
+        existing = _get_active_task_by_dedupe(db, fields["dedupe_key"])
+        if existing is not None:
+            refreshed, enqueued = _refresh_active_task(
+                db,
+                existing,
+                fields=fields,
+                now=now,
+                actor_id=actor_id,
+                notification_message=notification_message,
+                reply_markup=reply_markup,
+            )
+            return refreshed, enqueued, False
     task = _insert_task_on_conflict_do_nothing(db, fields=fields)
     if task is None:
-        return None, False
+        return None, False, False
     record_audit(
         db,
         table_name="operational_tasks",
@@ -206,7 +333,7 @@ def _register_task(
         db, task,
         notification_message=notification_message,
         reply_markup=reply_markup,
-    )
+    ), True
 
 
 def create_operational_task(
@@ -231,7 +358,7 @@ def create_operational_task(
     scheduler's Chinese ``_notification_message``.
     """
     now = now or datetime.now(timezone.utc)
-    return _register_task(
+    task, enqueued, _is_new = _register_task(
         db,
         fields=fields,
         now=now,
@@ -239,6 +366,7 @@ def create_operational_task(
         notification_message=notification_message,
         reply_markup=reply_markup,
     )
+    return task, enqueued
 
 
 def _supersede_rent_due(db: Session, lease_id: int, now: datetime) -> None:
@@ -310,7 +438,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         if overdue:
             oldest_due = overdue[0][1]
             amount = _d2(Decimal(str(lease.monthly_rent)) * len(overdue))
-            task, enqueued = _register_task(
+            task, enqueued, is_new = _register_task(
                 db,
                 now=now,
                 fields={
@@ -321,6 +449,9 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "lease_id": lease.id,
                     "source_type": "lease",
                     "source_id": lease.id,
+                    # AI-OPS-FOUNDATION-001 §4: overdue rent is daily
+                    # operational work -> SECRETARY, Owner only on escalation.
+                    "assigned_user_id": secretary_assignee_id(),
                     "priority": OperationalTaskPriority.high,
                     "status": OperationalTaskStatus.PENDING,
                     "due_at": datetime.combine(oldest_due, time.min, tzinfo=now.tzinfo),
@@ -330,14 +461,18 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                         {"periods": [m for m, _ in overdue], "total_outstanding": str(amount)},
                     ),
                 },
+                # AI-OPS-FOUNDATION-001 §2: a later pass that finds MORE overdue
+                # periods refreshes the SAME logical task (updated periods/total,
+                # fresh reminder) instead of creating a second active task.
+                refresh_on_conflict=True,
             )
             if task is not None:
-                created += 1
+                created += 1 if is_new else 0
                 notifications += 1 if enqueued else 0
                 _supersede_rent_due(db, lease.id, now)
 
         for month, due in upcoming:
-            task, enqueued = _register_task(
+            task, enqueued, is_new = _register_task(
                 db,
                 now=now,
                 fields={
@@ -348,15 +483,17 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "lease_id": lease.id,
                     "source_type": "lease",
                     "source_id": lease.id,
+                    "assigned_user_id": secretary_assignee_id(),
                     "priority": OperationalTaskPriority.medium,
                     "status": OperationalTaskStatus.PENDING,
                     "due_at": datetime.combine(due, time.min, tzinfo=now.tzinfo),
                     "dedupe_key": f"lease:{lease.id}:RENT_DUE:{month}",
                     "details": _rent_task_details(lease, unit, tenant, {"period": month}),
                 },
+                refresh_on_conflict=True,
             )
             if task is not None:
-                created += 1
+                created += 1 if is_new else 0
                 notifications += 1 if enqueued else 0
 
     # --- LEASE_EXPIRING ----------------------------------------------------------
@@ -365,7 +502,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         if not (today <= lease.end_date <= expiry_window_end):
             continue
         unit = units.get(lease.unit_id)
-        task, enqueued = _register_task(
+        task, enqueued, is_new = _register_task(
             db,
             now=now,
             fields={
@@ -376,6 +513,8 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 "lease_id": lease.id,
                 "source_type": "lease",
                 "source_id": lease.id,
+                # Routine operational follow-up -> Secretary (not Owner).
+                "assigned_user_id": secretary_assignee_id(),
                 "priority": OperationalTaskPriority.medium,
                 "status": OperationalTaskStatus.PENDING,
                 "due_at": datetime.combine(lease.end_date, time.min, tzinfo=now.tzinfo),
@@ -384,7 +523,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             },
         )
         if task is not None:
-            created += 1
+            created += 1 if is_new else 0
             notifications += 1 if enqueued else 0
 
     # --- APPROVAL_PENDING / PAYMENT_PENDING (expenses, read-only) ----------------
@@ -395,7 +534,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         .all()
     )
     for expense in pending_expenses:
-        task, enqueued = _register_task(
+        task, enqueued, is_new = _register_task(
             db,
             now=now,
             fields={
@@ -403,6 +542,8 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 "title": f"待批准支出 · {expense.category}",
                 "source_type": "expense",
                 "source_id": expense.id,
+                # AI-OPS-FOUNDATION-001 §4/§7: approval is Owner-only (the
+                # approver), never routine Secretary work.
                 "assigned_user_id": DEFAULT_ASSIGNED_USER_ID,
                 "priority": OperationalTaskPriority.medium,
                 "status": OperationalTaskStatus.PENDING,
@@ -414,6 +555,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "amount": str(expense.amount),
                     "category": expense.category,
                     "payee": expense.payee,
+                    "payer_user_id": expense.payer_user_id,
                 },
             },
             reply_markup=_expense_reply_markup(
@@ -421,7 +563,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             ),
         )
         if task is not None:
-            created += 1
+            created += 1 if is_new else 0
             notifications += 1 if enqueued else 0
 
     payment_cutoff = now - timedelta(days=PAYMENT_PENDING_AFTER_DAYS)
@@ -434,7 +576,11 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         .all()
     )
     for expense in approved_expenses:
-        task, enqueued = _register_task(
+        # AI-OPS-FOUNDATION-001 §4/§8: the next action belongs to the ACTUAL
+        # payer (expense.payer_user_id); Owner is only the fallback when the
+        # payer was never recorded.
+        payer = expense.payer_user_id or DEFAULT_ASSIGNED_USER_ID
+        task, enqueued, is_new = _register_task(
             db,
             now=now,
             fields={
@@ -442,7 +588,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 "title": f"待付款支出 · {expense.category}",
                 "source_type": "expense",
                 "source_id": expense.id,
-                "assigned_user_id": DEFAULT_ASSIGNED_USER_ID,
+                "assigned_user_id": payer,
                 "priority": OperationalTaskPriority.high,
                 "status": OperationalTaskStatus.PENDING,
                 "due_at": expense.due_date and datetime.combine(expense.due_date, time.min, tzinfo=now.tzinfo)
@@ -453,6 +599,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "amount": str(expense.amount),
                     "category": expense.category,
                     "payee": expense.payee,
+                    "payer_user_id": payer,
                 },
             },
             reply_markup=_expense_reply_markup(
@@ -460,7 +607,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             ),
         )
         if task is not None:
-            created += 1
+            created += 1 if is_new else 0
             notifications += 1 if enqueued else 0
 
     # --- SETTLEMENT_PENDING -------------------------------------------------------
@@ -474,7 +621,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         .all()
     )
     for settlement in pending_settlements:
-        task, enqueued = _register_task(
+        task, enqueued, is_new = _register_task(
             db,
             now=now,
             fields={
@@ -495,7 +642,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             },
         )
         if task is not None:
-            created += 1
+            created += 1 if is_new else 0
             notifications += 1 if enqueued else 0
 
     return created, notifications
@@ -508,7 +655,7 @@ def generate_rule_task(db: Session, rule, *, now: datetime) -> tuple[Operational
     details = dict(rule.details or {})
     details["rule_id"] = rule.id
     details["period"] = period_key
-    task, enqueued = _register_task(
+    task, enqueued, _is_new = _register_task(
         db,
         now=now,
         fields={

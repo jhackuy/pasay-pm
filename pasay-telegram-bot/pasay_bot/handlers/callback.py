@@ -68,10 +68,13 @@ from pasay_bot.keyboards import (
     ACTION_REVERSE,
     ACTION_RENT_STATUS_SELECT,
     ACTION_RENT_HISTORY_SELECT,
+    ACTION_REPAIR_COMPLETE_CANDIDATE,
     ACTION_TASK_COMPLETE,
     ACTION_TASK_DETAIL,
     ACTION_TASK_SNOOZE,
     ACTION_TASK_SNOOZE_PICK,
+    ACTION_UNIT_ADD_CONFIRM,
+    ACTION_VIEWING_CONFIRM,
     METHOD_LABELS,
     OPS_OVERVIEW,
     SNOOZE_PRESET_MAP,
@@ -348,6 +351,14 @@ async def _dispatch_callback(
         await _handle_task_snooze_pick(update, context, entity, ref, role, locale)
     elif action == ACTION_TASK_DETAIL:
         await _handle_task_detail(update, context, ref, role, locale)
+    elif action == ACTION_REPAIR_COMPLETE_CANDIDATE:
+        # AI-OPS-FOUNDATION-001 §9/§12: ambiguous "finished" candidate tap —
+        # completes exactly the repair the human picked (idempotent).
+        await _handle_task_complete(update, context, ref, role, locale)
+    elif action == ACTION_UNIT_ADD_CONFIRM:
+        await _handle_unit_add_confirm(update, context, nonce, ts, role, locale)
+    elif action == ACTION_VIEWING_CONFIRM:
+        await _handle_viewing_confirm(update, context, nonce, ts, role, locale)
     elif action == ACTION_COPILOT_NAV:
         await _handle_copilot_nav(update, context, role, locale)
     elif action == ACTION_COPILOT_WHY:
@@ -1230,8 +1241,108 @@ async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
     )
 
 
-# --- PASAY-V2-EXPENSE-PAYABLE-TASK-006: owner payment (deterministic) -------
+async def _handle_unit_add_confirm(update, context, nonce, ts, role, locale):
+    """AI-OPS-FOUNDATION-001 §14: [✅ 确认创建] — create the unit exactly as
+    the confirmation card showed (deterministic, idempotency-guarded)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        return
+    store = context.bot_data["store"]
+    chat_id, user_id = update.effective_chat.id, update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] != "unit_add_confirm" or conv["nonce"] != nonce:
+        await _answer(update, t("common.expired", locale))
+        return
+    payload = _payload(conv)
+    api = context.bot_data["api_client"]
+    guard = context.bot_data["idempotency"]
+    key = f"ik:unit:{payload['unit_number']}:{payload['monthly_rent']}:{nonce or '0'}"
+    status = guard.acquire(key, kind="unit", resource=payload["unit_number"])
+    if status in ("done", "in_flight"):
+        await _answer(update, t("common.processing", locale), durable=True)
+        return
+    await _ack_working(update, locale)
+    try:
+        unit = await api.create_unit(
+            property_id=int(payload["property_id"]),
+            unit_number=payload["unit_number"],
+            monthly_rent=payload["monthly_rent"],
+            status=payload["status"],
+        )
+        guard.settle(key, unit.as_dict(), resource=str(unit.id))
+    except PasayApiConflictError:
+        guard.fail(key)
+        await _answer(update, t("unit_add.exists", locale), durable=True)
+        return
+    except PasayApiError as exc:
+        guard.fail(key)
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    store.delete_conversation(chat_id, user_id)
+    text = t("unit_add.created", locale, unit=unit.unit_number)
+    await _edit(update, H.escape(text), home_keyboard(locale))
+    await _answer(update, "")
 
+
+async def _handle_viewing_confirm(update, context, nonce, ts, role, locale):
+    """AI-OPS-FOUNDATION-001 §17: [✅ 确认安排] — persist the viewing as a
+    business event (unit bound, scheduled time stored, Secretary reminded)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    if _expired(ts, settings):
+        await _answer(update, t("common.expired", locale))
+        return
+    store = context.bot_data["store"]
+    chat_id, user_id = update.effective_chat.id, update.effective_user.id
+    conv = store.get_conversation(chat_id, user_id)
+    if conv is None or conv["state"] != "viewing_confirm" or conv["nonce"] != nonce:
+        await _answer(update, t("common.expired", locale))
+        return
+    payload = _payload(conv)
+    api = context.bot_data["api_client"]
+    guard = context.bot_data["idempotency"]
+    key = f"ik:viewing:{payload['unit_token']}:{payload['scheduled_at']}:{nonce or '0'}"
+    status = guard.acquire(key, kind="viewing", resource=payload["unit_token"])
+    if status in ("done", "in_flight"):
+        await _answer(update, t("common.processing", locale), durable=True)
+        return
+    # Resolve the unit id (the card only carried the display token).
+    try:
+        units = await api.get_units()
+    except PasayApiError:
+        guard.fail(key)
+        await _answer(update, t("common.unexpected", locale), durable=True)
+        return
+    unit = next(
+        (u for u in units if u.unit_number.lower() == payload["unit_token"].lower()),
+        None,
+    )
+    if unit is None:
+        guard.fail(key)
+        await _answer(update, t("rent_status.no_unit", locale, unit=payload["unit_token"]),
+                      durable=True)
+        return
+    await _ack_working(update, locale)
+    try:
+        await api.create_viewing(unit_id=unit.id, scheduled_at=payload["scheduled_at"])
+        guard.settle(key, {"unit_id": unit.id}, resource=str(unit.id))
+    except PasayApiError as exc:
+        guard.fail(key)
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    store.delete_conversation(chat_id, user_id)
+    text = t("viewing.created", locale)
+    await _edit(update, H.escape(text), home_keyboard(locale))
+    await _answer(update, "")
+
+
+# --- PASAY-V2-EXPENSE-PAYABLE-TASK-006: owner payment (deterministic) -------
 async def _handle_expense_pay(update, context, entity, ref, role, locale):
     """[付款] tap on an APPROVED (unpaid) expense: open the deterministic
     payment-confirmation card.
@@ -1854,7 +1965,8 @@ async def _handle_ops_nav(update, context, entity, role, locale):
     await _ack_working(update, locale)
     if entity == OPS_OVERVIEW:
         await show_operations_center(
-            context, update.effective_chat.id, locale, message_id=cq.message.message_id
+            context, update.effective_chat.id, locale,
+            message_id=cq.message.message_id, role=role,
         )
     else:
         await show_operations_section(

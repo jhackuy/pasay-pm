@@ -71,6 +71,9 @@ class ExpenseBase(BaseModel):
     unit_id: int | None = None
     status: ExpenseStatus
     receipt_attachment_id: int | None = None
+    # AI-OPS-FOUNDATION-001 §4/§8: the actual payer; payment responsibility
+    # routes to this user after approval instead of always the Owner.
+    payer_user_id: int | None = None
 
     @field_validator("category")
     @classmethod
@@ -98,6 +101,7 @@ class ExpenseUpdate(BaseModel):
     description: str | None = None
     unit_id: int | None = None
     receipt_attachment_id: int | None = None
+    payer_user_id: int | None = None
 
     @field_validator("category")
     @classmethod

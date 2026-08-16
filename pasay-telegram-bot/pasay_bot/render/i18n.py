@@ -88,6 +88,12 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.unit_not_found': '没有找到编号为 {unit} 的房源，请确认后重试，或回复「无」。',
         'expense.ask_unit_first': '哪个房源？直接输入房号，例如 1680。',
         'todo.title': '✅ 待办',
+        # AI-OPS-FOUNDATION-001 §5: Owner queue framing.
+        'todo.title_owner': '🔔 需要您处理',
+        # AI-OPS-FOUNDATION-001 §9/§12: ambiguous completion candidate pick.
+        'repair.who_finished': '哪个维修完成了？点下面的按钮选择（绝不替你猜）。',
+        # AI-OPS-FOUNDATION-001 §12: media archived + indexed.
+        'v2.media_archived': '📎 已存档并索引 / Archived & indexed.',
         'todo.empty': '✅ 当前没有需要处理的事项。',
         'todo.section_expenses': '💳 支出待批准 · {count}笔',
         'todo.section_confirm': '⏳ 待确认收款 · {count}笔',
@@ -118,6 +124,22 @@ STRINGS: dict[str, dict[str, str]] = {
         'query.contracts_title': '📋 合同快到期',
         'query.contracts_window': '{days} 天内到期',
         'query.contracts_none': '✅ 近期没有快到期的合同。',
+        # AI-OPS-FOUNDATION-001 §14/§15: evidence + unit digital file.
+        'query.timeline_title': '🏢 {unit} 档案',
+        'query.timeline_empty': '暂无记录。',
+        'evidence.title': '📎 {unit} 的存档资料',
+        'evidence.empty': '{unit} 暂无存档资料。',
+        'evidence.sent': '（已附上存档文件）',
+        # AI-OPS-FOUNDATION-001 §14: Telegram-first Unit create.
+        'unit_add.confirm': '✅ 确认创建',
+        'unit_add.no_property': '⚠️ 还没有任何楼盘，请先创建楼盘。',
+        'unit_add.exists': '⚠️ 该单元可能已存在，未重复创建。',
+        'unit_add.card': '🏢 新单元 / New Unit\n\n单元 {unit} · 月租 <b>₱{rent}</b> · {status}',
+        'unit_add.created': '✅ 单元 {unit} 已创建。',
+        # AI-OPS-FOUNDATION-001 §17: viewing confirm.
+        'viewing.confirm': '✅ 确认安排',
+        'viewing.card': '👀 看房预约 / Viewing\n\n单元 {unit} · {time}',
+        'viewing.created': '✅ 已记录看房安排，秘书将按时提醒并跟进结果。',
         'query.month_bad': '我没看懂月份，请说「这个月」或「8月份」这样的说法。',
         # BOT-V1-USABLE-001 P0-5 AI fallback.
         'ai.thinking': '⏳ 正在理解…',
@@ -554,6 +576,10 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.unit_not_found': 'No unit found for {unit}. Check the number and retry, or reply "none".',
         'expense.ask_unit_first': 'Which unit? Reply with the unit number, e.g. 1680.',
         'todo.title': '✅ Tasks',
+        # AI-OPS-FOUNDATION-001 §5: Owner queue framing.
+        'todo.title_owner': '🔔 Needs You',
+        # AI-OPS-FOUNDATION-001 §9/§12: ambiguous completion candidate pick.
+        'repair.who_finished': 'Which repair is finished? Tap below (never guessed for you).',
         'todo.empty': '✅ Nothing needs your attention right now.',
         'todo.section_expenses': '💳 Expense approvals · {count}',
         'todo.section_confirm': '⏳ Rent to confirm · {count}',
@@ -584,6 +610,22 @@ STRINGS: dict[str, dict[str, str]] = {
         'query.contracts_title': '📋 Contracts expiring soon',
         'query.contracts_window': 'Expiring within {days} days',
         'query.contracts_none': '✅ No contracts expiring soon.',
+        # AI-OPS-FOUNDATION-001 §14/§15: evidence + unit digital file.
+        'query.timeline_title': '🏢 {unit} file',
+        'query.timeline_empty': 'No records yet.',
+        'evidence.title': '📎 {unit} archived files',
+        'evidence.empty': 'No archived files for {unit}.',
+        'evidence.sent': '(files attached above)',
+        # AI-OPS-FOUNDATION-001 §14: Telegram-first Unit create.
+        'unit_add.confirm': '✅ Create',
+        'unit_add.no_property': '⚠️ No property exists yet — create one first.',
+        'unit_add.exists': '⚠️ This unit may already exist — nothing duplicated.',
+        'unit_add.card': '🏢 New Unit\n\nUnit {unit} · Rent <b>₱{rent}</b> · {status}',
+        'unit_add.created': '✅ Unit {unit} created.',
+        # AI-OPS-FOUNDATION-001 §17: viewing confirm.
+        'viewing.confirm': '✅ Schedule',
+        'viewing.card': '👀 Viewing\n\nUnit {unit} · {time}',
+        'viewing.created': '✅ Viewing recorded; the secretary will remind and follow up.',
         'query.month_bad': 'I did not get the month — try "this month" or "August".',
         # BOT-V1-USABLE-001 P0-5 AI fallback.
         'ai.thinking': '⏳ Understanding…',
@@ -924,6 +966,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.expense_other': 'Other',
         'v2.empty': 'Nothing here',
         'v2.media_received': 'Received. Processing in the background.',
+        # AI-OPS-FOUNDATION-001 §12: media archived + indexed.
+        'v2.media_archived': '📎 Archived & indexed.',
         'v2.welcome': 'Welcome to the Pasay group',
         'v2.help': 'Just tell me what happened or what you need.\nButtons: Properties · Tasks · Rent · Expense',
         'v2.event.repair_reported': 'Repair reported',

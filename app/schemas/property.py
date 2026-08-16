@@ -38,6 +38,10 @@ class UnitBase(BaseModel):
     monthly_rent: Decimal = money_field(gt=0)
     status: UnitStatus = UnitStatus.vacant
     is_active: bool = True
+    # AI-OPS-FOUNDATION-001 §16: richer lifecycle state
+    # (VACANT/PREPARING/LISTED/VIEWING/RESERVED/OCCUPIED/NOTICE_GIVEN/
+    # MOVE_OUT/INSPECTION) — stored as VARCHAR, legacy enum untouched.
+    unit_state: str | None = Field(default=None, max_length=30)
 
 
 class UnitCreate(UnitBase):
@@ -51,6 +55,7 @@ class UnitUpdate(BaseModel):
     monthly_rent: Decimal | None = money_field(gt=0, default=None)
     status: UnitStatus | None = None
     is_active: bool | None = None
+    unit_state: str | None = Field(default=None, max_length=30)
 
 
 class UnitRead(UnitBase, AuditFields):

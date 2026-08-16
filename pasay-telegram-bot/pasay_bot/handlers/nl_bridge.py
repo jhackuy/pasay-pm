@@ -60,6 +60,7 @@ from pasay_bot.keyboards import (
     rent_history_candidates_keyboard,
     rent_match_keyboard,
     rent_status_candidates_keyboard,
+    repair_completion_candidates_keyboard,
     secretary_registered_keyboard,
 )
 from pasay_bot.render import html as H
@@ -165,6 +166,124 @@ _CORRECTION_TASK_CN = re.compile(
 )
 _CORRECTION_TASK_EN = re.compile(r"\bnot\s+([0-9A-Za-z-]+)\s*,?\s+(?:it'?s|is)\s+([0-9A-Za-z-]+)", re.IGNORECASE)
 _GREETING_RE = re.compile(r"^\s*(hi|hello|hey|yo|你好|您好|嗨)\b[!.\s]*$", re.IGNORECASE)
+
+# --- AI-OPS-FOUNDATION-001 §14/§17: Telegram-first Unit CRUD + viewings -----
+# "Add unit 1609, rent 35000, vacant" / "新增 1609 单元 租金 35000 空置"
+_ADD_UNIT_RE = re.compile(
+    r"(?:\badd\s+unit\b|\bnew\s+unit\b|\u65b0\u589e|\u6dfb\u52a0|\u65b0\u52a0)\s*"
+    r"[:\uff1a]?\s*"
+    r"(?P<unit>[A-Za-z0-9][A-Za-z0-9-]*)\s*"
+    r"(?:\u5355\u5143|\bunit\b)?\s*"
+    r"(?:,|\uff0c)?\s*"
+    r"(?:\u79df\u91d1|\u6708\u79df|\brent\b)?\s*"
+    r"(?P<amount>\d[\d,]*(?:\.\d+)?)\s*"
+    r"(?:\u5143|\bphp\b|\bpesos?\b)?\s*"
+    r"(?:,|\uff0c)?\s*"
+    r"(?P<status>\u7a7a\u7f6e|\u5df2\u79df|\u5360\u7528|vacant|occupied)?",
+    re.IGNORECASE,
+)
+_VIEWING_KW_CN = ("\u770b\u623f", "\u770b\u623f\u8005", "\u770b\u623f\u9884\u7ea6")
+_VIEWING_KW_EN = re.compile(r"\bview(?:ing)?\b", re.IGNORECASE)
+_TIME_CN_RE = re.compile(r"(?:\u660e\u5929|\u4eca\u5929)?\s*(?:\u4e0b\u5348|\u4e0a\u5348|\u665a\u4e0a)?\s*(\d{1,2})\s*(?:\u70b9|\uff1a)?(\d{0,2})\s*(?:pm|am)?")
+_TIME_EN_RE = re.compile(r"(?P<day>tomorrow|today)?\s*(?:at\s*)?(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>am|pm)", re.IGNORECASE)
+
+
+def detect_unit_add_statement(text: str) -> Optional[dict]:
+    """AI-OPS-FOUNDATION-001 §14: 'Add unit 1609, rent 35000, vacant' ->
+    ``{"unit_number", "monthly_rent", "status"}`` for a confirmation card.
+    Financial/expense/rent lanes keep priority (checked earlier)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if detect_expense_statement(raw) or is_rent_payment_statement(raw):
+        return None
+    m = _ADD_UNIT_RE.search(raw)
+    if not m or not m.group("amount"):
+        return None
+    status_raw = (m.group("status") or "").strip().lower()
+    status = {
+        "\u7a7a\u7f6e": "vacant", "vacant": "vacant",
+        "\u5df2\u79df": "occupied", "\u5360\u7528": "occupied", "occupied": "occupied",
+    }.get(status_raw)
+    if status is None and status_raw:
+        return None  # unknown status -> not confident, let NL fallback handle
+    return {
+        "unit_number": m.group("unit").upper(),
+        "monthly_rent": m.group("amount").replace(",", ""),
+        "status": status or "vacant",
+    }
+
+
+def detect_viewing_statement(text: str) -> Optional[dict]:
+    """AI-OPS-FOUNDATION-001 §17: 'Someone will view 1608 tomorrow at 2pm' ->
+    ``{"unit_token", "scheduled_at"}`` (ISO, local day/time). The unit token
+    is the unit-like token NEAREST the viewing keyword (the sentence subject
+    like "Someone" never wins)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if detect_expense_statement(raw) or is_rent_payment_statement(raw):
+        return None
+    lowered = raw.lower()
+    kw_positions = []
+    for kw in _VIEWING_KW_CN:
+        pos = raw.find(kw)
+        if pos >= 0:
+            kw_positions.append(pos)
+    m = _VIEWING_KW_EN.search(lowered)
+    if m:
+        kw_positions.append(m.start())
+    if not kw_positions:
+        return None
+    kw_pos = min(kw_positions)
+    tokens = list(_UNIT_TOKEN.finditer(raw))
+    if not tokens:
+        return None
+    unit_match = min(tokens, key=lambda tm: abs(tm.start() - kw_pos))
+    unit_token = unit_match.group(1)
+    when = _parse_viewing_time(raw)
+    if when is None:
+        return None
+    return {"unit_token": unit_token, "scheduled_at": when.isoformat()}
+
+
+def _parse_viewing_time(text: str) -> Optional[datetime]:
+    """Deterministic local-time parse for viewing statements."""
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+
+    lowered = (text or "").lower()
+    base = _dt.now()
+    day_offset = 0
+    if "tomorrow" in lowered or "\u660e\u5929" in text:
+        day_offset = 1
+    hour = minute = None
+    ampm = None
+    m = _TIME_EN_RE.search(lowered)
+    if m and m.group("h"):
+        hour = int(m.group("h"))
+        minute = int(m.group("m") or 0)
+        ampm = (m.group("ampm") or "").lower()
+    else:
+        mc = _TIME_CN_RE.search(text)
+        if mc and mc.group(1):
+            hour = int(mc.group(1))
+            minute = int(mc.group(2) or 0)
+            if "\u4e0b\u5348" in text and hour < 12:
+                hour += 12
+            if "\u665a\u4e0a" in text and hour < 12:
+                hour += 12
+    if hour is None:
+        return None
+    if ampm == "pm" and hour < 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    if hour > 23 or minute > 59:
+        return None
+    target = (base + _td(days=day_offset)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    return target
 # PASAY-V2-FOUNDATION-001: Owner payment confirmations. These are Payment
 # Events for an APPROVED expense, NEVER a new expense (no amount/category
 # question, no receipt requirement, no duplicate record).
@@ -184,13 +303,22 @@ _AMOUNT = re.compile(r"(?<![\d.])(\d[\d,]*(?:\.\d+)?)(?![\d])")
 
 
 def detect_repair_statement(text: str) -> Optional[str]:
-    """Return the unit token when the text creates/mentions a repair event."""
+    """Return the unit token when the text creates/mentions a repair event.
+
+    Read-style queries ("Show 16B repair photos", "查看 1608 维修照片") are
+    NOT repair reports — they are evidence/digital-file queries and must fall
+    through to the read lanes (AI-OPS-FOUNDATION-001 §14)."""
     raw = text or ""
     if not raw.strip():
         return None
     lowered = raw.lower()
     if detect_expense_statement(raw) or is_rent_payment_statement(raw):
         return None  # financial lanes keep their existing priority
+    if any(w in lowered for w in (
+        "show", "view", "photos", "photo", "receipt", "picture", "history",
+        "查看", "照片", "凭证", "图片", "证据", "相片", "历史",
+    )):
+        return None  # read/evidence query, not a new repair report
     has_issue = any(w in raw for w in _MAINTENANCE_CN) or bool(
         _MAINTENANCE_EN.search(lowered)
     )
@@ -548,6 +676,19 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if task_handled:
         return
 
+    # AI-OPS-FOUNDATION-001 §14: Telegram-first Unit CRUD fast path.
+    unit_draft = detect_unit_add_statement(text)
+    if unit_draft is not None:
+        await _render_unit_add_confirm(update, context, unit_draft, role, locale)
+        return
+
+    # AI-OPS-FOUNDATION-001 §17: a message that describes a viewing is
+    # persisted as a business event (never chat-only context).
+    viewing_draft = detect_viewing_statement(text)
+    if viewing_draft is not None:
+        await _render_viewing_confirm(update, context, viewing_draft, role, locale)
+        return
+
     # BOT-V1-USABLE-001 P0-3: income/expense summaries, unit info and
     # contract-expiry queries answer directly from existing read endpoints.
     general_query = nl_queries.detect_query(text)
@@ -790,7 +931,39 @@ async def _handle_v2_task_event(
                 )
                 return True
 
-    # Completion of the active task in context.
+    # AI-OPS-FOUNDATION-001 §9/§12: "finished"/"done" WITHOUT an active task
+    # in context is ambiguous — never guess which repair to close. Show one
+    # deterministic candidate button per active repair task; a single
+    # candidate completes directly.
+    if completion and not task_ref:
+        try:
+            active_repairs = await api.get_operational_tasks(status="PENDING")
+        except PasayApiError:
+            active_repairs = []
+        candidates = [t for t in active_repairs if t.task_type == "AC_MAINTENANCE"]
+        if len(candidates) == 1:
+            task_ref = str(candidates[0].id)
+            # fall through to the single-candidate completion below
+        elif len(candidates) > 1:
+            nonce = new_nonce()
+            ts = now_ts()
+            text = (
+                f"<b>{H.escape(t('repair.who_finished', locale))}</b>\n\n"
+                f"{H.escape(t('repair.who_finished', 'en' if locale != 'en' else 'zh'))}"
+            )
+            await context.bot.send_message(
+                chat_id,
+                H.truncate(text),
+                parse_mode=HTML,
+                reply_markup=repair_completion_candidates_keyboard(
+                    candidates, locale, nonce=nonce, ts=ts,
+                ),
+            )
+            return True
+
+    # Completion of the active task in context. The backend closes the repair
+    # and, when completion evidence is missing, assigns a SECRETARY
+    # evidence-follow-up (AI-OPS-FOUNDATION-001 §13) — never the Owner.
     if completion and task_ref:
         try:
             task = await api.update_operational_task(
@@ -830,6 +1003,10 @@ async def _handle_v2_task_event(
     if progress and task_ref:
         next_check = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
         next_action = _progress_next_action(text, unit_token)
+        # AI-OPS-FOUNDATION-001 §8: "Technician coming tomorrow" persists a
+        # structured promise (follow_up_at / responsible party) on the task —
+        # the system follows up instead of just acknowledging.
+        promise = _promise_from_progress(text, task_ref, unit_token)
         try:
             task = await api.update_operational_task(
                 int(task_ref),
@@ -837,6 +1014,7 @@ async def _handle_v2_task_event(
                 next_action=next_action,
                 next_check_at=next_check,
                 context=text,
+                details={"promise": promise, "repair_stage": "SCHEDULED"},
             )
         except PasayApiError:
             return False
@@ -879,6 +1057,8 @@ async def _handle_v2_task_event(
                 context=text,
                 source_event=text,
                 completion_condition="Repair confirmed done",
+                # AI-OPS-FOUNDATION-001 §13: track the repair lifecycle stage.
+                details={"repair_stage": "ISSUE_REPORTED"},
                 dedupe_key=f"conversation:{unit_number.lower()}:{int(time.time()) // 3600}",
             )
         except PasayApiError:
@@ -948,6 +1128,94 @@ def _progress_next_action(text: str, unit_token: Optional[str]) -> str:
     if "today" in lowered or "\u4eca\u5929" in text:
         return "Confirm repair completion today"
     return "Confirm repair completion"
+
+
+def _promise_from_progress(text: str, task_ref, unit_token: Optional[str]) -> dict:
+    """AI-OPS-FOUNDATION-001 §8: persist a structured follow-up promise
+    ("Technician coming tomorrow" / "Paolo will pay Friday") instead of only
+    replying conversationally.
+
+    Returns the promise dict stored in the task's JSONB details:
+    promised_at / follow_up_at / responsible_party / related_entity / status.
+    """
+    lowered = (text or "").lower()
+    now = datetime.now(timezone.utc)
+    if "tomorrow" in lowered or "\u660e\u5929" in text:
+        follow_up = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    elif "today" in lowered or "\u4eca\u5929" in text:
+        follow_up = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        if follow_up <= now:
+            follow_up += timedelta(days=1)
+    else:
+        follow_up = now + timedelta(hours=24)
+    if any(w in lowered for w in ("technician", "tech", "repairman", "mechanic", "electrician")) \
+            or any(w in text for w in ("\u5e08\u5085", "\u6280\u5e08", "\u7ef4\u4fee\u5de5", "\u5e08\u5085\u6765")):
+        responsible = "technician"
+    elif any(w in lowered for w in ("paolo", "tenant", "\u79df\u5ba2", "\u6237")):
+        responsible = "tenant"
+    else:
+        responsible = "secretary"
+    return {
+        "promised_at": now.isoformat(),
+        "follow_up_at": follow_up.isoformat(),
+        "responsible_party": responsible,
+        "related_entity": f"task:{task_ref}",
+        "status": "open",
+        "note": (text or "").strip()[:300],
+    }
+
+
+async def _render_unit_add_confirm(update, context, draft: dict, role, locale) -> None:
+    """AI-OPS-FOUNDATION-001 §14: confirmation card BEFORE the state-changing
+    Unit create (deterministic; the user confirms the parsed facts)."""
+    from pasay_bot.keyboards import unit_add_confirm_keyboard
+
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    api = context.bot_data["api_client"]
+    try:
+        properties = await api.get_properties()
+    except PasayApiError:
+        properties = []
+    if not properties:
+        await context.bot.send_message(
+            chat_id, H.escape(t("unit_add.no_property", locale)), parse_mode=HTML,
+        )
+        return
+    draft = dict(draft)
+    draft["property_id"] = properties[0].id
+    draft["property_name"] = properties[0].name
+    nonce = new_nonce()
+    ts = now_ts()
+    store.save_conversation(chat_id, user_id, "unit_add_confirm", draft, nonce=nonce)
+    status_label = (
+        "空置" if draft["status"] == "vacant" else "已租"
+    )
+    text = t("unit_add.card", locale, unit=draft["unit_number"],
+             rent=draft["monthly_rent"], status=status_label)
+    await context.bot.send_message(
+        chat_id, H.truncate(text), parse_mode=HTML,
+        reply_markup=unit_add_confirm_keyboard(nonce, ts, locale),
+    )
+
+
+async def _render_viewing_confirm(update, context, draft: dict, role, locale) -> None:
+    """AI-OPS-FOUNDATION-001 §17: confirmation card for a detected viewing."""
+    from pasay_bot.keyboards import viewing_confirm_keyboard
+
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    nonce = new_nonce()
+    ts = now_ts()
+    store.save_conversation(chat_id, user_id, "viewing_confirm", draft, nonce=nonce)
+    text = t("viewing.card", locale, unit=draft["unit_token"],
+             time=str(draft["scheduled_at"])[:16].replace("T", " "))
+    await context.bot.send_message(
+        chat_id, H.truncate(text), parse_mode=HTML,
+        reply_markup=viewing_confirm_keyboard(nonce, ts, locale),
+    )
 
 
 async def _handle_task_correction(

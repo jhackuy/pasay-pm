@@ -609,7 +609,9 @@ async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None)
     carries the fixed Reply Keyboard, matching the other Quick Views."""
     api = context.bot_data["api_client"]
     try:
-        data = await api.get_quick_tasks()
+        # AI-OPS-FOUNDATION-001 §5: the Owner's Quick Tasks view is filtered
+        # to their own Needs-You queue; the Secretary sees operational tasks.
+        data = await api.get_quick_tasks(scope="owner" if role == Role.OWNER else None)
     except PasayApiError as exc:
         await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
                       error_keyboard("home", locale))
@@ -676,13 +678,131 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     locale = locale_for_chat(
         update.effective_chat.type if update.effective_chat else None, role
     )
-    await context.bot.send_message(
-        chat_id,
-        H.escape(t("v2.media_received", locale)),
-        parse_mode=HTML,
-        reply_markup=reply_keyboard(role),
-    )
+    # AI-OPS-FOUNDATION-001 §12: forward media to the private Telegram archive
+    # channel (FREE-FIRST storage) and index it in the backend `evidence`
+    # table, linked to the active business context when available.
+    archived = False
+    try:
+        archived = await _archive_media(update, context)
+    except Exception as exc:  # noqa: BLE001 - archiving must never break the ack
+        logger.warning("media archive failed: %s", exc)
+        archived = False
+    if archived:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("v2.media_archived", locale)),
+            parse_mode=HTML,
+            reply_markup=reply_keyboard(role),
+        )
+    else:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("v2.media_received", locale)),
+            parse_mode=HTML,
+            reply_markup=reply_keyboard(role),
+        )
     _mark_menu_initialized(context, chat_id)
+
+
+async def _archive_media(update: Update, context) -> bool:
+    """Forward one photo/document/video to the archive channel and index it.
+
+    Returns True when the media was archived AND indexed. Falls back to
+    False when the archive chat is not configured (graceful no-op)."""
+    settings = context.bot_data["settings"]
+    archive_chat = (settings.archive_chat_id or "").strip()
+    if not archive_chat:
+        return False
+    msg = update.effective_message
+    if msg is None:
+        return False
+    try:
+        forwarded = await context.bot.forward_message(
+            chat_id=archive_chat,
+            from_chat_id=msg.chat_id,
+            message_id=msg.message_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail-open, keep old ack path
+        logger.warning("forward to archive failed: %s", exc)
+        return False
+    file_id, media_type, mime_type, filename, size = _media_file_info(forwarded, msg)
+    if not file_id:
+        return False
+    store = context.bot_data["store"]
+    user_id = update.effective_user.id if update.effective_user else None
+    ctx = store.get_v2_context(msg.chat_id, user_id) if user_id else None
+    payload = dict(ctx["payload"]) if ctx else {}
+    entity_type, entity_id, unit_id, category = _evidence_links(payload, msg)
+    try:
+        api = context.bot_data["api_client"]
+        await api.create_evidence(
+            external_file_id=file_id,
+            external_message_id=forwarded.message_id,
+            media_type=media_type,
+            mime_type=mime_type,
+            filename=filename,
+            size_bytes=size,
+            category=category,
+            unit_id=unit_id,
+            entity_type=entity_type,
+            entity_id=entity_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - index failure still archived
+        logger.warning("evidence index failed: %s", exc)
+    return True
+
+
+def _media_file_info(forwarded, original) -> tuple:
+    """Extract (file_id, media_type, mime_type, filename, size) from the
+    message. Real Telegram forwards keep the ORIGINAL file_id, so the source
+    message's info is authoritative; the forwarded object is the fallback."""
+    src = original if (
+        getattr(original, "photo", None) or getattr(original, "document", None)
+        or getattr(original, "video", None)
+    ) else forwarded
+    if getattr(src, "photo", None):
+        largest = src.photo[-1]
+        return (
+            largest.file_id, "photo", "image/jpeg",
+            f"photo_{largest.file_id[:20]}.jpg",
+            getattr(largest, "file_size", None),
+        )
+    if getattr(src, "document", None):
+        doc = src.document
+        return (
+            doc.file_id, "document", getattr(doc, "mime_type", None),
+            getattr(doc, "file_name", None), getattr(doc, "file_size", None),
+        )
+    if getattr(src, "video", None):
+        vid = src.video
+        return (
+            vid.file_id, "video", getattr(vid, "mime_type", None) or "video/mp4",
+            f"video_{vid.file_id[:20]}.mp4", getattr(vid, "file_size", None),
+        )
+    return (None, None, None, None, None)
+
+
+def _evidence_links(payload: dict, msg) -> tuple:
+    """Resolve (entity_type, entity_id, unit_id, category) from the active
+    conversation context — the media attaches to the current repair/expense
+    event instead of being a floating file."""
+    task_ref = payload.get("task_ref")
+    expense_ref = payload.get("expense_ref")
+    unit_token = payload.get("unit_token")
+    unit_id = payload.get("unit_id")
+    intent = payload.get("intent") or ""
+    if task_ref:
+        # A repair task: before/after photos and receipts are repair evidence.
+        category = (
+            "receipt" if ("receipt" in (payload.get("_media_hint") or ""))
+            else "after_repair"
+        )
+        return "task", int(task_ref), int(unit_id) if unit_id else None, category
+    if expense_ref:
+        return "expense", int(expense_ref), int(unit_id) if unit_id else None, "receipt"
+    if intent:
+        return None, None, int(unit_id) if unit_id else None, "other"
+    return None, None, None, "other"
 
 
 async def show_expense(context, chat_id, locale: str, message_id=None):
@@ -975,15 +1095,23 @@ def _expense_location(expense, units, properties) -> str:
 
 async def show_todo(context, chat_id, role, locale: str, message_id=None):
     """Unified to-do page (V1.3): only what the current user must act on.
-    Owner sees expense approvals, pending income confirmations, overdue rent
-    and their tasks; Secretary sees the tasks the backend scoped to them.
-    Every row carries its action button (action-at-source)."""
+    Owner sees the "需要您处理 / Needs You" queue — expense approvals,
+    payments, pending income confirmations and escalated/decision tasks ONLY;
+    Secretary sees the operational tasks the backend scoped to them (overdue
+    rent, maintenance, contracts, follow-ups). Every row carries its action
+    button (action-at-source)."""
     api = context.bot_data["api_client"]
+    owner_view = role == Role.OWNER
     expenses, incomes, overdue, tasks = await asyncio.gather(
         api.list_expenses(),
         api.list_incomes(),
         api.get_overdue_rents(),
-        api.get_operational_tasks(status="PENDING"),
+        # AI-OPS-FOUNDATION-001 §5: the Owner queue is backend-filtered to
+        # owner-actionable tasks (approvals / payments / decisions /
+        # escalations); routine operational work never reaches it.
+        api.get_operational_tasks(
+            status="PENDING", scope="owner" if owner_view else None,
+        ),
         return_exceptions=True,
     )
     if isinstance(expenses, Exception):
@@ -1049,17 +1177,23 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
             )
             confirm_rows.append({"id": inc.id, "amount": inc.amount, "where": where})
 
-    overdue_rows = [
-        {
-            "unit_id": r.unit_id,
-            "lease_id": r.lease_id,
-            "unit": r.unit,
-            "tenant": r.tenant,
-            "total_outstanding": r.total_outstanding,
-            "overdue_days": r.overdue_days,
-        }
-        for r in sorted(overdue, key=lambda x: (-x.overdue_days, -x.total_outstanding))
-    ]
+    # AI-OPS-FOUNDATION-001 §5: overdue rent, contract expiry and maintenance
+    # are routine Secretary work — they never enter the Owner queue. The
+    # Owner still sees them via the informational pages (/overdue, quick
+    # views), just not as Owner Tasks.
+    overdue_rows = []
+    if not owner_view:
+        overdue_rows = [
+            {
+                "unit_id": r.unit_id,
+                "lease_id": r.lease_id,
+                "unit": r.unit,
+                "tenant": r.tenant,
+                "total_outstanding": r.total_outstanding,
+                "overdue_days": r.overdue_days,
+            }
+            for r in sorted(overdue, key=lambda x: (-x.overdue_days, -x.total_outstanding))
+        ]
 
     # BOT-V1-USABLE-001 P0-4: 30-day contract expiry + open maintenance are
     # first-class todo sections (maintenance rows are NOT duplicated into the
@@ -1093,15 +1227,26 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
         (tk for tk in tasks if not _is_maintenance_task(tk)),
         key=lambda x: (x.due_at is None, x.due_at or ""),
     )
+    if owner_view:
+        # Expense approvals/payments are already represented by the 💳 expense
+        # rows with their action buttons; keep the Owner queue free of the
+        # duplicate task representation.
+        task_rows = [
+            tk for tk in task_rows
+            if tk.task_type not in ("APPROVAL_PENDING", "PAYMENT_PENDING")
+        ]
     sections = {
         "expenses": expense_rows,
         "confirm": confirm_rows,
         "overdue": overdue_rows,
-        "contracts": contract_rows,
-        "maintenance": maintenance_rows,
+        "contracts": contract_rows if not owner_view else [],
+        "maintenance": maintenance_rows if not owner_view else [],
         "tasks": task_rows,
     }
-    text = cards.todo_overview_card(sections, locale)
+    text = cards.todo_overview_card(
+        sections, locale,
+        title_key="todo.title_owner" if owner_view else "todo.title",
+    )
     keyboard = todo_keyboard(sections, owner_view=owner_view, locale=locale)
     # The persistent bottom keyboard stays visible from /start; this message
     # carries the per-row action buttons (action-at-source).
@@ -1262,11 +1407,17 @@ def _ops_sections(tasks: list) -> dict[str, list]:
     }
 
 
-async def show_operations_center(context, chat_id: int, locale: str, message_id=None):
-    """待办中心 overview with four section buttons + counts."""
+async def show_operations_center(context, chat_id: int, locale: str, message_id=None, role=None):
+    """待办中心 overview with four section buttons + counts.
+
+    AI-OPS-FOUNDATION-001 §5: the Owner's center counts only their Needs-You
+    queue (approvals / payments / decisions / escalations); the Secretary's
+    center counts their operational workload."""
     api = context.bot_data["api_client"]
+    from pasay_bot.roles import Role
+    scope = "owner" if role == Role.OWNER else None
     try:
-        summary = await api.get_operations_summary()
+        summary = await api.get_operations_summary(scope=scope)
     except PasayApiError as exc:
         await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
                       error_keyboard("home", locale))

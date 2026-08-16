@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -23,6 +24,8 @@ from app.services.operations.generation import generate_business_tasks, generate
 from app.services.operations.reconcile import reconcile_tasks
 from app.services.operations.redelivery import redeliver_due_snoozes
 from app.services.identity import bind_internal_audit
+
+logger = logging.getLogger(__name__)
 
 
 def claim_due_rules(db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_BATCH) -> list[RecurringRule]:
@@ -71,6 +74,24 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
     bind_internal_audit(db, "scheduler")
     snooze_redelivered = redeliver_due_snoozes(db, now=now)
 
+    # AI-OPS-FOUNDATION-001 §8: due human promises are reminded / escalated
+    # deterministically AFTER reconcile (a resolved business state is never
+    # re-reminded; reconcile already COMPLETED its task).
+    from app.services.operations.promises import escalate_due_promises
+
+    promise_result = escalate_due_promises(db, now=now)
+
+    # AI-OPS-FOUNDATION-001 §19: deterministic exception hooks (repeated
+    # repair / long vacancy / occupied-missing-lease / unusual expense) —
+    # WARNING lane to the Owner, deduped per day.
+    try:
+        from app.services.operations.exceptions import scan_exceptions
+
+        exceptions_found = scan_exceptions(db, now=now)
+    except Exception:  # noqa: BLE001 - exception scan must never break the pass
+        logger.exception("exception scan failed")
+        exceptions_found = []
+
     db.commit()
     return SchedulerRunResult(
         tasks_created=tasks_created,
@@ -80,4 +101,7 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
         reconciled_completed=auto_completed,
         reconciled_cancelled=auto_cancelled,
         snooze_redelivered=snooze_redelivered,
+        promises_escalated=promise_result["escalated"],
+        promises_reminded=promise_result["reminded"],
+        exceptions_found=len(exceptions_found),
     )

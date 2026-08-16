@@ -42,6 +42,18 @@ def _check_unit(db: Session, unit_id: int | None) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
 
 
+def _check_payer(db: Session, payer_user_id: int | None) -> None:
+    """AI-OPS-FOUNDATION-001 §4/§8: a recorded payer must be a real active
+    user so the PAYMENT_PENDING task can actually reach them."""
+    if payer_user_id is None:
+        return
+    from app.models.user import User
+
+    user = db.query(User).filter(User.id == payer_user_id, User.is_active.is_(True)).first()
+    if user is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Payer user not found")
+
+
 def _guard_edit(obj: Expense, updates: dict) -> None:
     if obj.status == ExpenseStatus.reversed:
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot edit a reversed expense")
@@ -169,6 +181,7 @@ def create_expense(
             status.HTTP_403_FORBIDDEN, "Only admin can create an approved expense"
         )
     _check_unit(db, payload.unit_id)
+    _check_payer(db, payload.payer_user_id)
     obj = Expense(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -210,6 +223,8 @@ def update_expense(
         return obj
     _guard_edit(obj, updates)
     _check_unit(db, updates.get("unit_id"))
+    if "payer_user_id" in updates:
+        _check_payer(db, updates.get("payer_user_id"))
     old = serialize_row(obj)
     changed = field_changes(obj, updates)
     for field, value in updates.items():

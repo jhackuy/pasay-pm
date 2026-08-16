@@ -77,6 +77,9 @@ def update_unit(
     for field, value in updates.items():
         setattr(obj, field, value)
     obj.updated_by = user.id
+    # AI-OPS-FOUNDATION-001 §16: every lifecycle transition (status or
+    # unit_state change) is recorded as a durable unit event.
+    _record_lifecycle(db, obj, old, updates, user.id)
     record_audit(
         db,
         table_name="units",
@@ -90,6 +93,29 @@ def update_unit(
     db.commit()
     db.refresh(obj)
     return obj
+
+
+def _record_lifecycle(db: Session, obj: Unit, old: dict, updates: dict, actor_id: int) -> None:
+    """Append a unit_lifecycle_event when status/unit_state actually changed."""
+    from datetime import datetime, timezone
+
+    from app.models.property import UnitLifecycleEvent
+
+    state_old = old.get("unit_state") or old.get("status")
+    state_new = updates.get("unit_state") or (updates.get("status").value if updates.get("status") else None)
+    if state_old == state_new or state_new is None:
+        return
+    event = UnitLifecycleEvent(
+        unit_id=obj.id,
+        from_status=state_old,
+        to_status=state_new,
+        reason="api_update",
+        occurred_at=datetime.now(timezone.utc),
+        created_by=actor_id,
+        updated_by=actor_id,
+    )
+    db.add(event)
+    db.flush()
 
 
 @router.delete("/{unit_id}", response_model=MessageResponse)

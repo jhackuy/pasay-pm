@@ -16,6 +16,7 @@ from app.api.routers import (
     audit,
     auth,
     commission,
+    evidence,
     expense,
     income,
     leases,
@@ -26,6 +27,7 @@ from app.api.routers import (
     tasks,
     tenants,
     units,
+    viewings,
 )
 from app.database import engine
 
@@ -51,6 +53,8 @@ app.include_router(reports.router, prefix=API_PREFIX)
 app.include_router(attachments.router, prefix=API_PREFIX)
 app.include_router(audit.router, prefix=API_PREFIX)
 app.include_router(operations.router, prefix=API_PREFIX)
+app.include_router(evidence.router, prefix=API_PREFIX)
+app.include_router(viewings.router, prefix=API_PREFIX)
 
 
 @app.get("/health", summary="Health check (no auth)")

@@ -109,11 +109,16 @@ def _seed_rule(db, *, rule_type=OperationalTaskType.AC_MAINTENANCE,
 
 def _seed_default_assignee(db, monkeypatch):
     """Pin the fallback assignee to a real user so business-source tasks
-    (and notification recipients) resolve in tests."""
+    (and notification recipients) resolve in tests.
+
+    AI-OPS-FOUNDATION-001: the secretary assignee is ALSO pinned to the same
+    real user so rent/lease tasks (routed to the Secretary) satisfy the users
+    FK and their notifications resolve in tests."""
     from app.services.operations import generation
 
     user = _user(db, "default-admin", UserRole.admin, "tg-default")
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", user.id)
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", user.id)
     return user
 
 
@@ -640,9 +645,11 @@ def test_rbac_agent_sees_only_own_tasks(client, db_session, admin_headers, agent
     assert resp.status_code == 200
     assert resp.json()["task"]["status"] == "COMPLETED"
 
-    # manager/admin can see everything and act on any task
+    # manager/admin can see everything and act on any task. Completing the
+    # agent's repair without evidence also created its secretary evidence
+    # follow-up (AI-OPS-FOUNDATION-001 §13), so the manager sees 4 rows.
     resp = client.get(f"{API}/operations/tasks", headers=manager_headers)
-    assert len(resp.json()) == 3
+    assert len(resp.json()) == 4
     resp = client.post(f"{API}/operations/tasks/{other.id}/complete", headers=admin_headers)
     assert resp.status_code == 200
 
@@ -959,8 +966,11 @@ def test_business_task_no_assignee_defaults_and_enqueues_notification(db_session
     admin = _user(db_session, "admin-tg", UserRole.admin, "tg-admin")
     db_session.commit()
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", admin.id)
+    # AI-OPS-FOUNDATION-001: rent tasks route to the SECRETARY; pin the
+    # secretary to the same real user so the task + notification resolve.
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", admin.id)
 
-    _seed_lease(db_session)  # due day 5 -> RENT_OVERDUE (no explicit assignee)
+    _seed_lease(db_session)  # due day 5 -> RENT_OVERDUE
     db_session.commit()
 
     run_scheduler_once(db_session, now=NOW)

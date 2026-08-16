@@ -57,6 +57,9 @@ class TaskUpdateIn(BaseModel):
     next_check_at: datetime | None = None
     context: str | None = None
     completion_condition: str | None = Field(default=None, max_length=300)
+    # AI-OPS-FOUNDATION-001 §8: structured promise/follow-up state (merged
+    # into the task's JSONB details — e.g. {"promise": {...}}).
+    details: dict | None = None
 
 
 class TaskCreateIn(BaseModel):
@@ -141,3 +144,8 @@ class SchedulerRunResult(BaseModel):
     reconciled_completed: int
     reconciled_cancelled: int
     snooze_redelivered: int = 0
+    # AI-OPS-FOUNDATION-001 §8: promise follow-up pass outcome.
+    promises_escalated: int = 0
+    promises_reminded: int = 0
+    # AI-OPS-FOUNDATION-001 §19: deterministic exception findings this pass.
+    exceptions_found: int = 0

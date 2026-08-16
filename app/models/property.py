@@ -1,7 +1,8 @@
+from datetime import datetime
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import Boolean, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin, Base, SoftDeleteMixin, pg_enum
@@ -35,3 +36,20 @@ class Unit(AuditMixin, SoftDeleteMixin, Base):
         pg_enum(UnitStatus, "unit_status"), nullable=False, default=UnitStatus.vacant
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # AI-OPS-FOUNDATION-001 §16: richer unit lifecycle state
+    # (VACANT/PREPARING/LISTED/VIEWING/RESERVED/OCCUPIED/NOTICE_GIVEN/MOVE_OUT/
+    # INSPECTION) kept as a VARCHAR so the legacy ``unit_status`` enum stays
+    # untouched and the lifecycle remains possible in future models.
+    unit_state: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+
+class UnitLifecycleEvent(AuditMixin, Base):
+    """Durable unit lifecycle timeline (AI-OPS-FOUNDATION-001 §16/§17)."""
+
+    __tablename__ = "unit_lifecycle_events"
+
+    unit_id: Mapped[int] = mapped_column(ForeignKey("units.id"), nullable=False, index=True)
+    from_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    to_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

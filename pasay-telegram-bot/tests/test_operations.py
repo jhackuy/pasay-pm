@@ -69,17 +69,38 @@ def test_dashboard_uses_persistent_todo_nav(make_app):
 
 
 def test_todo_command_shows_unified_page(make_app):
+    """Secretary's unified to-do page lists operational work (maintenance
+    task with action buttons). AI-OPS-FOUNDATION-001 §5: routine operational
+    work lives on the SECRETARY's queue, not the Owner's Needs-You queue."""
     env = make_app()
     env.backend.add_ops_task(task_id=1, title="季度空调保养",
                              due_at=f"{TODAY}T00:00:00+08:00")
-    send = _open_ops(env)
+    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "tasks", bot=env.bot)])
+    send = env.bot.last_send()
     text = send["text"]
-    assert "<b>✅ 待办</b>" in text
+    assert "<b>✅ Tasks</b>" in text  # Secretary DM is English-first
     assert "季度空调保养" in text
     labels = _button_labels(send["reply_markup"])
-    assert labels.count("✅ 完成") == 1
-    assert labels.count("👁 查看详情") == 1
-    assert "🏠 首页" in labels
+    assert labels.count("✅ Done") == 1
+    assert labels.count("👁 Detail") == 1
+    assert "🏠 Home" in labels
+
+
+def test_owner_todo_is_needs_you_queue_not_operational_work(make_app):
+    """AI-OPS-FOUNDATION-001 §5: the Owner's to-do page is framed as
+    '需要您处理 / Needs You' and excludes routine operational work (overdue
+    rent / maintenance tasks) that belongs to the Secretary."""
+    env = make_app()
+    env.backend.add_ops_task(task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
+                             due_at=f"{TODAY}T00:00:00+08:00")
+    env.backend.add_ops_task(task_id=2, title="租金逾期 · 1期", task_type="RENT_OVERDUE",
+                             due_at=f"{TODAY}T00:00:00+08:00")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "tasks", bot=env.bot)])
+    send = env.bot.last_send()
+    text = send["text"]
+    assert "需要您处理" in text  # Owner DM is Chinese-first
+    assert "季度空调保养" not in text
+    assert "租金逾期" not in text
 
 
 def test_ops_section_lists_tasks_with_actions(make_app):

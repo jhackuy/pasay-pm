@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     hook_token: str = ""
     callback_ttl_seconds: int = 900
     pasay_http_timeout_seconds: float = 30.0
+    # AI-OPS-FOUNDATION-001 §12: private Telegram archive channel used as the
+    # FREE-FIRST media storage layer; empty disables forwarding.
+    archive_chat_id: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env", extra="ignore", case_sensitive=False
@@ -46,7 +49,7 @@ def _env() -> dict:
             "PASSAY_TG_BOT_TOKEN", "PASSAY_API_BASE", "PASSAY_API_KEY",
             "PASSAY_ADMIN_API_KEY", "HERMES_API_BASE", "HERMES_API_KEY",
             "STATE_DB", "HOOK_TOKEN", "CALLBACK_TTL_SECONDS",
-            "PASSAY_HTTP_TIMEOUT_SECONDS",
+            "PASSAY_HTTP_TIMEOUT_SECONDS", "PASSAY_ARCHIVE_CHAT_ID",
         }:
             data[key] = val
     return data
@@ -66,4 +69,5 @@ def get_settings() -> Settings:
         hook_token=e.get("HOOK_TOKEN", ""),
         callback_ttl_seconds=int(e.get("CALLBACK_TTL_SECONDS", "900") or "900"),
         pasay_http_timeout_seconds=float(e.get("PASSAY_HTTP_TIMEOUT_SECONDS", "30") or "30"),
+        archive_chat_id=(e.get("PASSAY_ARCHIVE_CHAT_ID") or "").strip(),
     )

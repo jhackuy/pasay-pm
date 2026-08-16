@@ -1370,6 +1370,34 @@ def contracts_card(rows: list[dict], days: int, locale: str = "zh") -> str:
     return "\n".join(blocks)
 
 
+def unit_timeline_card(timeline: dict, unit_number: str, locale: str = "zh") -> str:
+    """AI-OPS-FOUNDATION-001 §15: the unit's digital file (time-ordered
+    timeline of rent/payments, expenses, repairs, evidence, lease events)."""
+    unit = timeline.get("unit") or {}
+    events = timeline.get("events") or []
+    lines = [
+        f"<b>{H.escape(t('query.timeline_title', locale, unit=unit_number))}</b>",
+        (
+            f"{H.escape(t('query.rent', locale))}: <b>{H.money(unit.get('monthly_rent'))}</b>"
+            f" · {H.escape(unit.get('status') or '')}"
+        ),
+    ]
+    if not events:
+        lines.append(H.escape(t("query.timeline_empty", locale)))
+        return "\n".join(lines)
+    _KIND_EMOJI = {
+        "lease": "📋", "rent": "💰", "expense": "💸",
+        "task": "🛠", "evidence": "📎",
+    }
+    for ev in events:
+        at = str(ev.get("at") or "")[:10]
+        lines.append(
+            f"{_KIND_EMOJI.get(ev.get('kind'), '·')} {at} · {H.escape(ev.get('label') or '')}"
+            + (f"\n   {H.escape(ev.get('detail') or '')}" if ev.get("detail") else "")
+        )
+    return "\n".join(lines)
+
+
 def home_summary_card(
     *,
     collected,
@@ -1391,14 +1419,18 @@ def home_summary_card(
     return "\n".join(lines)
 
 
-def todo_overview_card(sections: dict, locale: str = "zh") -> str:
+def todo_overview_card(sections: dict, locale: str = "zh", title_key: str = "todo.title") -> str:
     """Unified to-do page (V1.3): only what the current user must act on.
-    Rows are human-readable; action buttons ride below each row."""
-    blocks = [f"<b>{H.escape(t('todo.title', locale))}</b>"]
+    Rows are human-readable; action buttons ride below each row.
+
+    ``title_key`` lets the Owner queue render as "需要您处理 / Needs You"
+    (AI-OPS-FOUNDATION-001 §5) while the Secretary keeps the plain to-do
+    title."""
+    blocks = [f"<b>{H.escape(t(title_key, locale))}</b>"]
     if not any(sections.values()):
         return "\n".join(
             [
-                f"<b>{H.escape(t('todo.title', locale))}</b>",
+                f"<b>{H.escape(t(title_key, locale))}</b>",
                 H.escape(t("todo.empty", locale)),
             ]
         )

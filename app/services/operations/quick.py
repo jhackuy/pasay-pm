@@ -35,6 +35,120 @@ def _d2(value) -> Decimal:
     return Decimal(value).quantize(_TWO_PLACES)
 
 
+def build_unit_timeline(
+    db: Session, unit_id: int, *, now: datetime | None = None
+) -> dict:
+    """AI-OPS-FOUNDATION-001 §15: the unit's digital file — a deterministic,
+    time-ordered timeline of everything the business knows about this unit
+    (rent/payment history, expenses, repairs, tasks, evidence, lease events).
+
+    Returns ``{"unit": {...}, "events": [...]}`` with human-safe rows."""
+    from app.models.evidence import Evidence
+    from app.models.financial import Expense, Income, IncomeStatus
+    from app.models.lease import Lease
+    from app.models.operations import OperationalTask
+
+    unit = db.query(Unit).filter(Unit.id == unit_id, Unit.deleted_at.is_(None)).first()
+    if unit is None:
+        return {"unit": None, "events": []}
+    events: list[dict] = []
+
+    leases = (
+        db.query(Lease)
+        .filter(Lease.unit_id == unit_id, Lease.deleted_at.is_(None))
+        .all()
+    )
+    lease_ids = [l.id for l in leases]
+    tenant_names = {
+        t.id: t.full_name
+        for t in db.query(Tenant).filter(Tenant.id.in_([l.tenant_id for l in leases])).all()
+    }
+    for lease in leases:
+        events.append({
+            "at": lease.start_date.isoformat(),
+            "kind": "lease",
+            "label": f"Lease started · {tenant_names.get(lease.tenant_id, '?')}",
+            "detail": (
+                f"₱{_d2(lease.monthly_rent)}/mo · deposit ₱{_d2(lease.deposit)}"
+                f" · {lease.start_date} → {lease.end_date}"
+            ),
+        })
+        events.append({
+            "at": lease.end_date.isoformat(),
+            "kind": "lease",
+            "label": "Lease ends",
+            "detail": tenant_names.get(lease.tenant_id, "?"),
+        })
+
+    if lease_ids:
+        incomes = (
+            db.query(Income)
+            .filter(Income.lease_id.in_(lease_ids), Income.status == IncomeStatus.confirmed)
+            .order_by(Income.received_date, Income.id)
+            .all()
+        )
+        for inc in incomes:
+            events.append({
+                "at": inc.received_date.isoformat(),
+                "kind": "rent",
+                "label": f"Rent paid · ₱{_d2(inc.amount)}",
+                "detail": (inc.description or "")[:120],
+            })
+
+        tasks = (
+            db.query(OperationalTask)
+            .filter(OperationalTask.lease_id.in_(lease_ids))
+            .order_by(OperationalTask.due_at, OperationalTask.id)
+            .all()
+        )
+        for task in tasks:
+            events.append({
+                "at": (task.due_at or task.created_at).isoformat(),
+                "kind": "task",
+                "label": f"{task.task_type.value} · {task.title}",
+                "detail": f"{task.status.value}"[:120],
+            })
+
+    expenses = (
+        db.query(Expense)
+        .filter(Expense.unit_id == unit_id)
+        .order_by(Expense.expense_date, Expense.id)
+        .all()
+    )
+    for exp in expenses:
+        events.append({
+            "at": exp.expense_date.isoformat(),
+            "kind": "expense",
+            "label": f"Expense · {exp.category} · ₱{_d2(exp.amount)}",
+            "detail": f"{exp.status.value} · {exp.payee}"[:120],
+        })
+
+    evidence_rows = (
+        db.query(Evidence)
+        .filter(Evidence.unit_id == unit_id)
+        .order_by(Evidence.created_at, Evidence.id)
+        .all()
+    )
+    for ev in evidence_rows:
+        events.append({
+            "at": ev.created_at.isoformat() if ev.created_at else "",
+            "kind": "evidence",
+            "label": f"Evidence · {ev.category.value if ev.category else 'other'}",
+            "detail": (ev.filename or "")[:120],
+        })
+
+    events.sort(key=lambda e: (e["at"] or "", e["kind"]))
+    return {
+        "unit": {
+            "unit_number": unit.unit_number,
+            "monthly_rent": str(unit.monthly_rent),
+            "status": unit.status.value,
+            "unit_state": unit.unit_state,
+        },
+        "events": events,
+    }
+
+
 def _clean_text(value: str | None) -> str | None:
     """Trim free text and drop placeholder/empty sentinels so the Quick View
     never ships `??`, `None`, `null`, an empty string, or a bare dash as a
@@ -219,13 +333,20 @@ def _payable_expense_rows(
     return rows
 
 
-def build_quick_tasks(db: Session, user: User, *, now: datetime | None = None) -> list[dict]:
+def build_quick_tasks(
+    db: Session, user: User, *, now: datetime | None = None,
+    owner_only: bool = False,
+) -> list[dict]:
     """Active tasks (PENDING + IN_PROGRESS) for the caller's scope.
 
     For the Owner (admin) the actionable set also includes every APPROVED
     unpaid Expense as a payable task row (``kind == "payable_expense"``), so
     the `✅ Tasks` Quick View never reports "Nothing here" while an approved
-    expense still awaits payment (PASAY-V2-EXPENSE-PAYABLE-TASK-006)."""
+    expense still awaits payment (PASAY-V2-EXPENSE-PAYABLE-TASK-006).
+
+    AI-OPS-FOUNDATION-001 §5: ``owner_only=True`` applies the Owner attention
+    filter — the Owner queue holds only approvals, their payments, decisions
+    and escalations; routine operational work stays out."""
     now = now or datetime.now(timezone.utc)
     query = _agent_scope(db.query(OperationalTask), user).filter(
         OperationalTask.status.in_(
@@ -233,6 +354,10 @@ def build_quick_tasks(db: Session, user: User, *, now: datetime | None = None) -
         )
     )
     tasks = query.order_by(OperationalTask.due_at, OperationalTask.id).all()
+    if owner_only:
+        from app.services.operations.owner_scope import is_owner_actionable
+
+        tasks = [t for t in tasks if is_owner_actionable(t, user)]
     lease_ids = {t.lease_id for t in tasks if t.lease_id is not None}
     unit_number_by_lease: dict[int, str] = {}
     if lease_ids:

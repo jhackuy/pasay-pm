@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import time
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
 from decimal import Decimal
@@ -35,6 +38,44 @@ from pasay_bot.state.store import StateStore
 OWNER_ID = 5177241442
 SECRETARY_ID = 1083657401
 UNKNOWN_ID = 999888777
+
+
+class _WritableTempPathFactory:
+    """Test tmp-dir factory that never creates mode-0o700 directories.
+
+    The DSH file sandbox on this Windows node maps POSIX mode bits into
+    Windows DACLs: a directory created with mode 0o700 becomes unreadable by
+    every later process (pytest's own make_numbered_dir uses 0o700). We create
+    per-test dirs explicitly with a wide mode so the whole suite is runnable
+    under the sandbox. Root is overridable via ``PASAY_TEST_TMP``.
+    """
+
+    def __init__(self, root: Path):
+        root.mkdir(parents=True, exist_ok=True, mode=0o777)
+        self._root = root
+        # pytest's tmp_path fixture reads these at teardown; "all" keeps every
+        # per-test dir (no sandbox-blocked recursive deletion).
+        self._retention_policy = "all"
+        self._retention_count = 0
+
+    def getbasetemp(self):
+        return self._root
+
+    def mktemp(self, basename, numbered=True):
+        path = self._root / f"{basename}-{uuid.uuid4().hex[:8]}"
+        path.mkdir(mode=0o777)
+        return path
+
+
+@pytest.fixture(scope="session")
+def tmp_path_factory():
+    root = Path(
+        os.environ.get(
+            "PASAY_TEST_TMP",
+            "D:/AI-Review/pasay-pm/.runtime/pytest-tmp-aiops",
+        )
+    )
+    return _WritableTempPathFactory(root)
 
 
 class FakeBot:
@@ -105,6 +146,39 @@ class FakeBot:
         self.calls.append(
             {"type": "answer_callback_query", "id": callback_query_id, "text": text}
         )
+
+    # AI-OPS-FOUNDATION-001 §12/§14: archive forwarding + media resend.
+    async def forward_message(self, chat_id, from_chat_id, message_id, **kw):
+        self.calls.append(
+            {
+                "type": "forward_message",
+                "chat_id": chat_id,
+                "from_chat_id": from_chat_id,
+                "message_id": message_id,
+            }
+        )
+        return SimpleNamespace(
+            message_id=9000 + len(self.calls), chat_id=chat_id,
+            photo=[SimpleNamespace(file_id="fwd_photo_id", file_size=1234)],
+        )
+
+    async def send_photo(self, chat_id, photo=None, caption=None, **kw):
+        self.calls.append(
+            {"type": "send_photo", "chat_id": chat_id, "photo": photo, "caption": caption}
+        )
+        return SimpleNamespace(chat_id=chat_id, message_id=len(self.calls))
+
+    async def send_document(self, chat_id, document=None, caption=None, **kw):
+        self.calls.append(
+            {"type": "send_document", "chat_id": chat_id, "document": document, "caption": caption}
+        )
+        return SimpleNamespace(chat_id=chat_id, message_id=len(self.calls))
+
+    async def send_video(self, chat_id, video=None, caption=None, **kw):
+        self.calls.append(
+            {"type": "send_video", "chat_id": chat_id, "video": video, "caption": caption}
+        )
+        return SimpleNamespace(chat_id=chat_id, message_id=len(self.calls))
 
     # --- test helpers ---
     def of_type(self, kind):
@@ -225,6 +299,10 @@ class FakeBackend:
             ],
             "summary": "2 项待办。",
         }
+        # AI-OPS-FOUNDATION-001 §12/§15: evidence index + unit timeline.
+        self.evidence: list[dict] = []
+        self._next_evidence_id = 1
+        self.unit_timeline: dict = {"unit": None, "events": []}
         self.copilot_recommend_error = None      # (status, detail)
         self.copilot_recommend_response = None   # full CopilotRecommendOut dict
         self.copilot_confirm_error = None
@@ -397,7 +475,23 @@ class FakeBackend:
 
         if path == "/properties":
             return httpx.Response(200, json=self.properties)
-        if path == "/units":
+        # AI-OPS-FOUNDATION-001 §14: Telegram-first Unit create (POST first;
+        # the GET below only answers read requests).
+        if path == "/units" and method == "POST":
+            payload = body or {}
+            unit = {
+                "id": (max([u["id"] for u in self.units], default=0) + 1),
+                "property_id": payload.get("property_id", 1),
+                "unit_number": payload.get("unit_number", ""),
+                "floor": payload.get("floor"),
+                "size_sqm": payload.get("size_sqm"),
+                "monthly_rent": str(payload.get("monthly_rent", "0")),
+                "status": payload.get("status", "vacant"),
+                "is_active": True,
+            }
+            self.units.append(unit)
+            return httpx.Response(201, json=unit)
+        if path == "/units" and method == "GET":
             return httpx.Response(200, json=self.units)
         if path.startswith("/units/"):
             uid = int(path.rsplit("/", 1)[1])
@@ -532,6 +626,70 @@ class FakeBackend:
                 return httpx.Response(404, json={"detail": "Expense not found"})
             return httpx.Response(200, json=expense)
 
+        # --- AI-OPS-FOUNDATION-001 §17: viewings ---
+        if path == "/viewings" and method == "POST":
+            payload = body or {}
+            self.viewings = getattr(self, "viewings", [])
+            row = {
+                "id": len(self.viewings) + 1,
+                "unit_id": payload.get("unit_id"),
+                "property_id": 1,
+                "scheduled_at": payload.get("scheduled_at"),
+                "status": "scheduled",
+                "outcome": None,
+                "reason": None,
+                "notes": payload.get("notes"),
+                "created_by": 1,
+            }
+            self.viewings.append(row)
+            return httpx.Response(201, json=row)
+
+        # --- AI-OPS-FOUNDATION-001 §12/§15: evidence + unit timeline ---
+        if path == "/evidence" and method == "POST":
+            payload = body or {}
+            row = {
+                "id": self._next_evidence_id,
+                "storage_provider": payload.get("storage_provider", "telegram_channel"),
+                "external_file_id": payload.get("external_file_id", ""),
+                "external_message_id": payload.get("external_message_id"),
+                "media_type": payload.get("media_type"),
+                "mime_type": payload.get("mime_type"),
+                "filename": payload.get("filename"),
+                "size_bytes": payload.get("size_bytes"),
+                "checksum": payload.get("checksum"),
+                "category": payload.get("category"),
+                "property_id": payload.get("property_id"),
+                "unit_id": payload.get("unit_id"),
+                "entity_type": payload.get("entity_type"),
+                "entity_id": payload.get("entity_id"),
+                "uploaded_by": 1,
+                "created_at": "2026-08-16T08:00:00Z",
+            }
+            self._next_evidence_id += 1
+            self.evidence.append(row)
+            # Repair-task evidence closes its secretary evidence follow-up.
+            if row.get("entity_type") == "task" and row.get("entity_id") is not None:
+                for task in self.operational_tasks:
+                    if (
+                        task.get("task_type") == "FOLLOWUP"
+                        and task.get("dedupe_key") == f"repair-evidence:{row['entity_id']}"
+                        and task.get("status") in ("PENDING", "IN_PROGRESS")
+                    ):
+                        task["status"] = "COMPLETED"
+            return httpx.Response(201, json=row)
+        if path == "/evidence" and method == "GET":
+            rows = self.evidence
+            params = request.url.params
+            if "unit_id" in params:
+                rows = [r for r in rows if r.get("unit_id") == int(params["unit_id"])]
+            if "entity_type" in params:
+                rows = [r for r in rows if r.get("entity_type") == params["entity_type"]]
+            if "entity_id" in params:
+                rows = [r for r in rows if r.get("entity_id") == int(params["entity_id"])]
+            return httpx.Response(200, json=rows)
+        if path == "/operations/quick/unit-timeline" and method == "GET":
+            return httpx.Response(200, json=self.unit_timeline)
+
         # --- V1.2.2 C2 confirmed-action copilot ---
         if path == "/operations/copilot/today" and method == "POST":
             return httpx.Response(200, json=self.copilot_today_payload)
@@ -615,9 +773,18 @@ class FakeBackend:
             return httpx.Response(200, json=self._ops_summary())
         if path == "/operations/tasks" and method == "GET":
             status = request.url.params.get("status")
+            scope = request.url.params.get("scope")
             rows = self.operational_tasks
             if status:
                 rows = [r for r in rows if r.get("status") == status]
+            if scope == "owner":
+                # AI-OPS-FOUNDATION-001 §5 mirror: the Owner queue keeps only
+                # approvals / Owner payments / decisions / escalations.
+                rows = [
+                    r for r in rows
+                    if r.get("task_type") in ("APPROVAL_PENDING", "PAYMENT_PENDING")
+                    or (r.get("details") or {}).get("escalation", {}).get("level") == "owner"
+                ]
             return httpx.Response(200, json=rows)
         if path.startswith("/operations/tasks/") and method == "GET":
             task = self._ops_task(path)
@@ -753,6 +920,16 @@ class FakeBackend:
                         "context", "completion_condition"):
                 if key in payload:
                     task[key] = payload[key]
+            if payload.get("details") is not None:
+                # AI-OPS-FOUNDATION-001 §8: merge structured details (promise)
+                # like the backend's PATCH handler.
+                merged = dict(task.get("details") or {})
+                for dk, dv in payload["details"].items():
+                    if isinstance(dv, dict) and isinstance(merged.get(dk), dict):
+                        merged[dk] = {**merged[dk], **dv}
+                    else:
+                        merged[dk] = dv
+                task["details"] = merged
             if want_status == "COMPLETED":
                 task["completed_at"] = "2026-08-20T10:00:00Z"
                 task["completed_by"] = 1

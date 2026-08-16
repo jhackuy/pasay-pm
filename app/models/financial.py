@@ -66,3 +66,9 @@ class Expense(AuditMixin, Base):
     receipt_attachment_id: Mapped[int | None] = mapped_column(
         ForeignKey("attachments.id"), nullable=True
     )
+    # AI-OPS-FOUNDATION-001 §4/§8: the ACTUAL human responsible for payment.
+    # After approval the PAYMENT_PENDING task routes to this payer, not always
+    # the Owner; None falls back to the Owner at generation time.
+    payer_user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True, index=True
+    )

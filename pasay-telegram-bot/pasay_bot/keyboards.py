@@ -56,6 +56,12 @@ ACTION_TASK_COMPLETE = "tkc"
 ACTION_TASK_SNOOZE = "tks"
 ACTION_TASK_SNOOZE_PICK = "tsp"
 ACTION_TASK_DETAIL = "tkd"
+# AI-OPS-FOUNDATION-001 §9/§12: ambiguous "finished" -> deterministic
+# candidate pick (one repair per button; never guesses which task to close).
+ACTION_REPAIR_COMPLETE_CANDIDATE = "rcc"
+# AI-OPS-FOUNDATION-001 §14/§17: Telegram-first Unit CRUD + viewing confirms.
+ACTION_UNIT_ADD_CONFIRM = "uac"
+ACTION_VIEWING_CONFIRM = "vwc"
 # C1.1 运营助手 (copilot).
 ACTION_COPILOT_WHY = "cpw"
 ACTION_COPILOT_ASK = "cpa"
@@ -1186,6 +1192,49 @@ def ops_back_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def repair_completion_candidates_keyboard(
+    tasks: list, locale: str = "zh", nonce: str = "", ts: Optional[int] = None,
+) -> InlineKeyboardMarkup:
+    """AI-OPS-FOUNDATION-001 §9/§12: one deterministic button per active
+    repair candidate when "finished" is ambiguous — the bot never guesses
+    which task to close."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for task in tasks:
+        unit = (getattr(task, "property_code", None) or (task.details or {}).get("unit_number") or "")
+        label = f"{unit} · {task.title}".strip(" · ")[:60]
+        rows.append([
+            InlineKeyboardButton(
+                label,
+                callback_data=encode(
+                    ACTION_REPAIR_COMPLETE_CANDIDATE, "r", str(task.id), nonce, ts,
+                ),
+            )
+        ])
+    rows.append([InlineKeyboardButton(t("rent.cancelled", locale), callback_data=encode(ACTION_CANCEL))])
+    return InlineKeyboardMarkup(rows)
+
+
+def unit_add_confirm_keyboard(nonce: str, ts: Optional[int], locale: str = "zh") -> InlineKeyboardMarkup:
+    """AI-OPS-FOUNDATION-001 §14: confirmation card for the Telegram-first
+    Unit create fast path (state-changing creation needs one explicit tap)."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(t("unit_add.confirm", locale), callback_data=encode(ACTION_UNIT_ADD_CONFIRM, "u", "1", nonce, ts)),
+            InlineKeyboardButton(t("rent.cancelled", locale), callback_data=encode(ACTION_CANCEL)),
+        ]
+    ])
+
+
+def viewing_confirm_keyboard(nonce: str, ts: Optional[int], locale: str = "zh") -> InlineKeyboardMarkup:
+    """AI-OPS-FOUNDATION-001 §17: confirmation card for a detected viewing."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(t("viewing.confirm", locale), callback_data=encode(ACTION_VIEWING_CONFIRM, "v", "1", nonce, ts)),
+            InlineKeyboardButton(t("rent.cancelled", locale), callback_data=encode(ACTION_CANCEL)),
+        ]
+    ])
 
 
 # --- V1.3 Slice 1: expense approval action cards ---------------------------

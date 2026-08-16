@@ -14,6 +14,13 @@ from app.models.copilot import (
     CopilotRun,
     CopilotRunStatus,
 )
+from app.models.evidence import (
+    Evidence,
+    EvidenceCategory,
+    Viewing,
+    ViewingOutcome,
+    ViewingStatus,
+)
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.identity import (
     ApiCredential, CommunicationEndpoint, CredentialLifecycle, CredentialState,
@@ -30,7 +37,7 @@ from app.models.operations import (
     Recurrence,
     RecurringRule,
 )
-from app.models.property import Property, Unit, UnitStatus
+from app.models.property import Property, Unit, UnitLifecycleEvent, UnitStatus
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
@@ -50,6 +57,8 @@ __all__ = [
     "CopilotActionStatus",
     "CopilotRun",
     "CopilotRunStatus",
+    "Evidence",
+    "EvidenceCategory",
     "Expense",
     "ExpenseStatus",
     "Income",
@@ -73,7 +82,11 @@ __all__ = [
     "TaskStatus",
     "Tenant",
     "Unit",
+    "UnitLifecycleEvent",
     "UnitStatus",
     "User",
     "UserRole",
+    "Viewing",
+    "ViewingOutcome",
+    "ViewingStatus",
 ]

@@ -279,8 +279,10 @@ def test_expense_detail_callback(make_app):
 
 
 def test_todo_page_human_readable_no_internal_enums(make_app):
-    """★ The unified to-do page renders expense + task rows in human text;
-    APPROVAL_PENDING / RENT_DUE / PAYMENT_PENDING never reach the UI."""
+    """★ The unified to-do page renders expense rows in human text; the
+    duplicate APPROVAL_PENDING task row is NOT re-shown in the Owner queue
+    (AI-OPS-FOUNDATION-001 §5: one representation per issue); enums never
+    reach the UI."""
     env = make_app()
     _seed_pending_expense(env)
     env.backend.add_ops_task(
@@ -289,14 +291,15 @@ def test_todo_page_human_readable_no_internal_enums(make_app):
     )
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "todo", bot=env.bot)])
     text = env.bot.last_send()["text"]
+    assert "需要您处理" in text  # Owner queue framing (Chinese-first)
     assert "支出待批准 · 1笔" in text
-    assert "待批准支出 · 维修" in text
+    assert "待批准支出 · 维修" not in text  # no duplicate APPROVAL_PENDING row
     for banned in ("APPROVAL_PENDING", "RENT_DUE", "PAYMENT_PENDING"):
         assert banned not in text
     kb = env.bot.last_send()["reply_markup"]
     actions = [decode(b.callback_data)["action"] for b in _buttons(kb) if decode(b.callback_data)]
     assert "exa" in actions and "exr" in actions and "exd" in actions
-    assert "tkc" in actions and "tkd" in actions
+    assert "tkc" not in actions and "tkd" not in actions  # no task-row dupes
 
 
 def test_expense_approval_keyboard_secondary_label_depends_on_receipt():

@@ -18,15 +18,23 @@ from app.schemas.operations import OperationsSummary
 
 
 def build_operations_summary(
-    db: Session, user: User, *, now: datetime | None = None
+    db: Session, user: User, *, now: datetime | None = None,
+    owner_only: bool = False,
 ) -> OperationsSummary:
-    """Count pending operational tasks visible to ``user`` at ``now``."""
+    """Count pending operational tasks visible to ``user`` at ``now``.
+
+    ``owner_only=True`` applies the AI-OPS-FOUNDATION-001 §5 Owner attention
+    filter (approvals, Owner payments, decisions, escalations only)."""
     query = db.query(OperationalTask).filter(
         OperationalTask.status == OperationalTaskStatus.PENDING
     )
     if user.role == UserRole.agent:
         query = query.filter(OperationalTask.assigned_user_id == user.id)
     tasks = query.all()
+    if owner_only:
+        from app.services.operations.owner_scope import is_owner_actionable
+
+        tasks = [t for t in tasks if is_owner_actionable(t, user)]
     now = now or datetime.now(timezone.utc)
     start_of_today = datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
     end_of_today = start_of_today + timedelta(days=1)

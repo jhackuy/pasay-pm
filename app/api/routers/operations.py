@@ -70,6 +70,7 @@ from app.services.operations import quick as quick_svc
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
 from app.services.operations.generation import create_operational_task
+from app.services.operations.owner_scope import is_owner_actionable
 
 router = APIRouter(prefix="/operations", tags=["operations"])
 
@@ -196,6 +197,7 @@ def list_tasks(
     assignee: int | None = Query(default=None),
     task_type: OperationalTaskType | None = Query(default=None),
     status: OperationalTaskStatus | None = Query(default=None),
+    scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -208,7 +210,12 @@ def list_tasks(
         query = query.filter(OperationalTask.task_type == task_type)
     if status is not None:
         query = query.filter(OperationalTask.status == status)
-    return query.order_by(OperationalTask.due_at, OperationalTask.id).all()
+    rows = query.order_by(OperationalTask.due_at, OperationalTask.id).all()
+    if scope == "owner":
+        # AI-OPS-FOUNDATION-001 §5: Owner queue contains ONLY tasks needing
+        # the Owner (approvals, payments they owe, decisions, escalations).
+        rows = [t for t in rows if is_owner_actionable(t, user)]
+    return rows
 
 
 @router.get("/tasks/{task_id}", response_model=OperationalTaskRead)
@@ -263,6 +270,12 @@ def complete_task(
         suppress_pending_redeliveries(
             db, task_id, actor_id=user.id, reason="task_completed", now=now
         )
+        # AI-OPS-FOUNDATION-001 §13: a repair that completes without minimal
+        # completion evidence gets a SECRETARY follow-up (never the Owner).
+        if task.task_type == OperationalTaskType.AC_MAINTENANCE:
+            from app.services.operations.repair_flow import ensure_evidence_followup
+
+            ensure_evidence_followup(db, task, now=now, actor_id=user.id)
         db.commit()
         db.refresh(task)
         return TaskActionOut(task=task, detail="Task completed")
@@ -442,6 +455,17 @@ def update_task(
         updates["context"] = payload.context
     if payload.completion_condition is not None:
         updates["completion_condition"] = payload.completion_condition
+    if payload.details is not None:
+        # AI-OPS-FOUNDATION-001 §8: structured details (promise/escalation)
+        # are MERGED into the JSONB so a follow-up update never wipes other
+        # task metadata.
+        merged_details = dict(task.details or {})
+        for key, value in payload.details.items():
+            if isinstance(value, dict) and isinstance(merged_details.get(key), dict):
+                merged_details[key] = {**merged_details[key], **value}
+            else:
+                merged_details[key] = value
+        updates["details"] = merged_details
     if payload.status is not None:
         updates["status"] = payload.status
         if payload.status == OperationalTaskStatus.COMPLETED:
@@ -467,6 +491,12 @@ def update_task(
     )
     if task.status == OperationalTaskStatus.COMPLETED:
         suppress_pending_redeliveries(db, task.id, actor_id=user.id, reason="task_completed", now=now)
+        # AI-OPS-FOUNDATION-001 §13: a repair that completes without minimal
+        # completion evidence gets a SECRETARY follow-up (never the Owner).
+        if task.task_type == OperationalTaskType.AC_MAINTENANCE:
+            from app.services.operations.repair_flow import ensure_evidence_followup
+
+            ensure_evidence_followup(db, task, now=now, actor_id=user.id)
     db.commit()
     db.refresh(task)
     detail = "Task completed" if task.status == OperationalTaskStatus.COMPLETED else "Task updated"
@@ -546,10 +576,11 @@ def create_task(
 
 @router.get("/quick/tasks")
 def quick_tasks(
+    scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return quick_svc.build_quick_tasks(db, user)
+    return quick_svc.build_quick_tasks(db, user, owner_only=(scope == "owner"))
 
 
 @router.get("/quick/properties")
@@ -597,6 +628,18 @@ def quick_expense_duplicates(
     return quick_svc.find_similar_paid_expenses(db, expense)
 
 
+@router.get("/quick/unit-timeline")
+def quick_unit_timeline(
+    unit_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """AI-OPS-FOUNDATION-001 §15: the unit's digital file — deterministic
+    time-ordered timeline (rent/payment history, expenses, repairs/tasks,
+    evidence, lease events) for NL queries like 'Give me the history of 1608'."""
+    return quick_svc.build_unit_timeline(db, unit_id)
+
+
 @router.get("/digest")
 def daily_digest(
     db: Session = Depends(get_db),
@@ -607,13 +650,14 @@ def daily_digest(
 
 @router.get("/summary", response_model=OperationsSummary)
 def operations_summary(
+    scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Operational counts for the current user (agents scoped to their own)."""
     from app.services.operations.summary import build_operations_summary
 
-    return build_operations_summary(db, user)
+    return build_operations_summary(db, user, owner_only=(scope == "owner"))
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,13 @@ class AuditAction(str, Enum):
     task_completed_via_approval = "task_completed_via_approval"
     task_completed_via_rejection = "task_completed_via_rejection"
     task_completed_via_payment = "task_completed_via_payment"
+    # AI-OPS-FOUNDATION-001 (appended only): a reminder refreshed the SAME
+    # active task (one business issue = one active task) instead of creating a
+    # duplicate sibling.
+    task_reminded = "task_reminded"
+    # AI-OPS-FOUNDATION-001 §8: an unresolved promise/follow-up escalated to
+    # the Owner per policy (deterministic, system-triggered).
+    task_escalated = "task_escalated"
 
 
 class AuditLog(AuditMixin, Base):

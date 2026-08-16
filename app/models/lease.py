@@ -3,6 +3,7 @@ from enum import Enum
 from decimal import Decimal
 
 from sqlalchemy import Date, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin, Base, SoftDeleteMixin, pg_enum
@@ -29,3 +30,9 @@ class Lease(AuditMixin, SoftDeleteMixin, Base):
     )
     due_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # AI-OPS-FOUNDATION-001 §18 deposit foundation: required deposit is
+    # ``deposit``; the accounting columns below represent received / held /
+    # deductions / refund without inventing a complex accounting UI.
+    deposit_received: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    deposit_refund: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
+    deposit_deductions: Mapped[list | None] = mapped_column(JSONB, nullable=True)

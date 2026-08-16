@@ -81,6 +81,18 @@ class Unit:
             is_active=bool(d.get("is_active", True)),
         )
 
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "property_id": self.property_id,
+            "unit_number": self.unit_number,
+            "floor": self.floor,
+            "size_sqm": str(self.size_sqm) if self.size_sqm is not None else None,
+            "monthly_rent": str(self.monthly_rent),
+            "status": self.status,
+            "is_active": self.is_active,
+        }
+
 
 @dataclass
 class Lease:
@@ -263,6 +275,7 @@ class Expense:
     receipt_attachment_id: Optional[int] = None
     approved_by: Optional[int] = None
     approved_at: Optional[str] = None
+    payer_user_id: Optional[int] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Expense":
@@ -282,6 +295,9 @@ class Expense:
             ),
             approved_by=int(d["approved_by"]) if d.get("approved_by") is not None else None,
             approved_at=d.get("approved_at"),
+            payer_user_id=(
+                int(d["payer_user_id"]) if d.get("payer_user_id") is not None else None
+            ),
         )
 
     def as_dict(self) -> dict:
@@ -298,6 +314,7 @@ class Expense:
             "receipt_attachment_id": self.receipt_attachment_id,
             "approved_by": self.approved_by,
             "approved_at": self.approved_at,
+            "payer_user_id": self.payer_user_id,
         }
 
 
@@ -818,6 +835,52 @@ class PasayApiClient:
         data = await self._request("GET", f"/units/{unit_id}")
         return Unit.from_dict(data)
 
+    async def create_unit(
+        self,
+        *,
+        property_id: int,
+        unit_number: str,
+        monthly_rent: Any,
+        status: str = "vacant",
+        floor: Optional[str] = None,
+        size_sqm: Optional[Any] = None,
+        unit_state: Optional[str] = None,
+    ) -> Unit:
+        """POST /units — Telegram-first Unit CRUD (AI-OPS-FOUNDATION-001 §14)."""
+        payload: dict[str, Any] = {
+            "property_id": int(property_id),
+            "unit_number": unit_number,
+            "monthly_rent": str(_to_decimal(monthly_rent)),
+            "status": status,
+        }
+        if floor is not None:
+            payload["floor"] = floor
+        if size_sqm is not None:
+            payload["size_sqm"] = str(_to_decimal(size_sqm))
+        if unit_state is not None:
+            payload["unit_state"] = unit_state
+        data = await self._request("POST", "/units", json=payload, timeout=15.0)
+        return Unit.from_dict(data)
+
+    async def update_unit(
+        self,
+        unit_id: int,
+        *,
+        monthly_rent: Optional[Any] = None,
+        status: Optional[str] = None,
+        unit_state: Optional[str] = None,
+    ) -> Unit:
+        """PATCH /units/{id} — Telegram-first edits (rent / lifecycle state)."""
+        payload: dict[str, Any] = {}
+        if monthly_rent is not None:
+            payload["monthly_rent"] = str(_to_decimal(monthly_rent))
+        if status is not None:
+            payload["status"] = status
+        if unit_state is not None:
+            payload["unit_state"] = unit_state
+        data = await self._request("PATCH", f"/units/{unit_id}", json=payload, timeout=15.0)
+        return Unit.from_dict(data)
+
     async def get_leases(self) -> list[Lease]:
         data = await self._request("GET", "/leases")
         return [Lease.from_dict(d) for d in data]
@@ -853,10 +916,15 @@ class PasayApiClient:
         payee: str = "",
         description: Optional[str] = None,
         status: str = "pending",
+        payer_user_id: Optional[int] = None,
     ) -> Expense:
         """POST /expenses — BOT-V1-USABLE-001 P0-2. Secretary records PENDING
         expenses (Owner approval stays the backend's deterministic path);
-        only an admin key may create approved expenses directly."""
+        only an admin key may create approved expenses directly.
+
+        AI-OPS-FOUNDATION-001 §4/§8: ``payer_user_id`` records the actual
+        payer so the approved expense's payment task routes to them, not
+        always the Owner."""
         payload: dict[str, Any] = {
             "category": category,
             "amount": str(_to_decimal(amount)),
@@ -868,6 +936,8 @@ class PasayApiClient:
             payload["unit_id"] = int(unit_id)
         if description:
             payload["description"] = description
+        if payer_user_id is not None:
+            payload["payer_user_id"] = int(payer_user_id)
         data = await self._request("POST", "/expenses", json=payload)
         return Expense.from_dict(data)
 
@@ -952,13 +1022,16 @@ class PasayApiClient:
         return [OverdueRent.from_dict(d) for d in data]
 
     async def get_operational_tasks(
-        self, *, status: Optional[str] = None,
+        self, *, status: Optional[str] = None, scope: Optional[str] = None,
     ) -> list[OperationalTask]:
         """V1.2 operations center: backend filters per-role (agents only see
-        their own assigned tasks)."""
+        their own assigned tasks). ``scope="owner"`` applies the Owner
+        attention filter (AI-OPS-FOUNDATION-001 §5)."""
         params: dict[str, Any] = {}
         if status:
             params["status"] = status
+        if scope:
+            params["scope"] = scope
         data = await self._request("GET", "/operations/tasks", params=params)
         return [OperationalTask.from_dict(d) for d in data]
 
@@ -1003,6 +1076,7 @@ class PasayApiClient:
         source_event: Optional[str] = None,
         assigned_user_id: Optional[int] = None,
         dedupe_key: Optional[str] = None,
+        details: Optional[dict] = None,
     ) -> OperationalTask:
         """POST /operations/tasks: create a task from a conversation event."""
         body: dict[str, Any] = {
@@ -1032,6 +1106,8 @@ class PasayApiClient:
             body["assigned_user_id"] = assigned_user_id
         if dedupe_key is not None:
             body["dedupe_key"] = dedupe_key
+        if details is not None:
+            body["details"] = details
         data = await self._request("POST", "/operations/tasks", json=body, timeout=15.0)
         return OperationalTask.from_dict(data["task"])
 
@@ -1046,8 +1122,12 @@ class PasayApiClient:
         next_check_at: Optional[str] = None,
         context: Optional[str] = None,
         completion_condition: Optional[str] = None,
+        details: Optional[dict] = None,
     ) -> OperationalTask:
-        """PATCH /operations/tasks/{id}: conversation-driven partial update."""
+        """PATCH /operations/tasks/{id}: conversation-driven partial update.
+
+        ``details`` (AI-OPS-FOUNDATION-001 §8) carries structured promise /
+        follow-up state that the backend merges into the task's JSONB."""
         body: dict[str, Any] = {}
         if title is not None:
             body["title"] = title
@@ -1063,14 +1143,20 @@ class PasayApiClient:
             body["context"] = context
         if completion_condition is not None:
             body["completion_condition"] = completion_condition
+        if details is not None:
+            body["details"] = details
         data = await self._request(
             "PATCH", f"/operations/tasks/{task_id}", json=body, timeout=15.0
         )
         return OperationalTask.from_dict(data["task"])
 
-    async def get_quick_tasks(self) -> list[dict]:
-        """GET /operations/quick/tasks: deterministic active-task quick view."""
-        data = await self._request("GET", "/operations/quick/tasks")
+    async def get_quick_tasks(self, scope: Optional[str] = None) -> list[dict]:
+        """GET /operations/quick/tasks: deterministic active-task quick view.
+        ``scope="owner"`` applies the Owner attention filter."""
+        params: dict[str, Any] = {}
+        if scope:
+            params["scope"] = scope
+        data = await self._request("GET", "/operations/quick/tasks", params=params)
         return data if isinstance(data, list) else []
 
     async def get_quick_properties(self) -> list[dict]:
@@ -1089,13 +1175,33 @@ class PasayApiClient:
         data = await self._request("GET", "/operations/quick/expense")
         return data or {}
 
+    async def get_unit_timeline(self, unit_id: int) -> dict:
+        """GET /operations/quick/unit-timeline: the unit's digital file
+        (AI-OPS-FOUNDATION-001 §15)."""
+        data = await self._request(
+            "GET", "/operations/quick/unit-timeline", params={"unit_id": unit_id}
+        )
+        return data or {"unit": None, "events": []}
+
+    # --- AI-OPS-FOUNDATION-001 §17: viewings --------------------------------
+    async def create_viewing(self, *, unit_id: int, scheduled_at: str,
+                             notes: Optional[str] = None) -> dict:
+        """POST /viewings: persist a scheduled viewing as a business event."""
+        body: dict[str, Any] = {"unit_id": int(unit_id), "scheduled_at": scheduled_at}
+        if notes:
+            body["notes"] = notes
+        return await self._request("POST", "/viewings", json=body, timeout=15.0)
+
     async def get_digest(self) -> dict:
         """GET /operations/digest: daily Active Tasks Digest."""
         data = await self._request("GET", "/operations/digest")
         return data or {}
 
-    async def get_operations_summary(self) -> dict:
-        data = await self._request("GET", "/operations/summary")
+    async def get_operations_summary(self, scope: Optional[str] = None) -> dict:
+        params: dict[str, Any] = {}
+        if scope:
+            params["scope"] = scope
+        data = await self._request("GET", "/operations/summary", params=params)
         return {
             "overdue": int(data.get("overdue") or 0),
             "due_today": int(data.get("due_today") or 0),
@@ -1211,6 +1317,70 @@ class PasayApiClient:
         """POST /auth — the API key's backend user (used by the [我自己]
         assignee pick so the owner can assign to themselves)."""
         return await self._request("POST", "/auth", timeout=15.0)
+
+    # --- AI-OPS-FOUNDATION-001 §11/§12: universal evidence index ------------
+    async def create_evidence(
+        self,
+        *,
+        external_file_id: str,
+        external_message_id: Optional[int] = None,
+        media_type: Optional[str] = None,
+        mime_type: Optional[str] = None,
+        filename: Optional[str] = None,
+        size_bytes: Optional[int] = None,
+        category: Optional[str] = None,
+        property_id: Optional[int] = None,
+        unit_id: Optional[int] = None,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[int] = None,
+        storage_provider: str = "telegram_channel",
+    ) -> dict:
+        """POST /evidence: index one archived media record. The bytes live in
+        the storage layer (Telegram private archive); the backend keeps the
+        authoritative index/relationships."""
+        body: dict[str, Any] = {
+            "storage_provider": storage_provider,
+            "external_file_id": external_file_id,
+        }
+        for key, value in (
+            ("external_message_id", external_message_id),
+            ("media_type", media_type),
+            ("mime_type", mime_type),
+            ("filename", filename),
+            ("size_bytes", size_bytes),
+            ("category", category),
+            ("property_id", property_id),
+            ("unit_id", unit_id),
+            ("entity_type", entity_type),
+            ("entity_id", entity_id),
+        ):
+            if value is not None:
+                body[key] = value
+        return await self._request("POST", "/evidence", json=body, timeout=15.0)
+
+    async def list_evidence(
+        self,
+        *,
+        unit_id: Optional[int] = None,
+        property_id: Optional[int] = None,
+        entity_type: Optional[str] = None,
+        entity_id: Optional[int] = None,
+        category: Optional[str] = None,
+    ) -> list[dict]:
+        """GET /evidence with filters; newest first."""
+        params: dict[str, Any] = {}
+        if unit_id is not None:
+            params["unit_id"] = unit_id
+        if property_id is not None:
+            params["property_id"] = property_id
+        if entity_type is not None:
+            params["entity_type"] = entity_type
+        if entity_id is not None:
+            params["entity_id"] = entity_id
+        if category is not None:
+            params["category"] = category
+        data = await self._request("GET", "/evidence", params=params)
+        return [dict(r) for r in (data or [])]
 
     async def get_tasks(
         self, *, status: Optional[str] = None, overdue: bool = False,
