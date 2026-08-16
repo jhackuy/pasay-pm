@@ -37,6 +37,38 @@ from telegram.request import HTTPXRequest
 logger = logging.getLogger(__name__)
 
 
+def harden_stdio() -> None:
+    """P0-TELEGRAM-DISPATCH-CONSUMER-001: make stdout/stderr prints Unicode-safe.
+
+    On this Windows host the console/redirect stream uses the locale codec
+    (GBK / cp936). Printing user-controlled text that contains a character
+    outside the codec (e.g. emoji 🏠) raised ``UnicodeEncodeError``. Inside the
+    traced ``queue.get`` / ``process_update`` those prints were unguarded, so
+    the exception propagated up through the Application update-fetcher consumer
+    task and KILLED it: ``queue.get`` never ran again, the update queue grew
+    forever and users received no replies. Forcing UTF-8 with
+    ``errors='backslashreplace'`` guarantees a print can never raise.
+    """
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:  # noqa: BLE001 - best-effort, never fatal
+            pass
+
+
+def _safe_trace(msg: str) -> None:
+    """Diagnostic tracing must NEVER raise.
+
+    A raise from a diagnostic print lands inside the update-consumer task and
+    kills it (see :func:`harden_stdio`), so every diagnostic line is swallowed
+    on failure instead of propagating.
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:  # noqa: BLE001 - diagnostic only, never fatal
+        pass
+
+
 def _force_ipv4_transport() -> httpx.AsyncHTTPTransport:
     """Build an httpx async transport that only ever connects over IPv4.
 
@@ -217,6 +249,134 @@ async def self_check(app: Application) -> str:
     return f"getMe OK: @{me.username} (id={me.id})"
 
 
+def install_live_diagnostics(app: Application) -> None:
+    """P0 live-diagnostic: A2/A3/A4 production-chain tracing + task-health probe.
+
+    * (A2) update_queue.put BEFORE/AFTER/size
+    * (A3) update_queue.get (consumer)
+    * (A4) process_update ENTER/EXC
+    * PTB handler inventory
+    * periodic asyncio task-health probe (registered via job_queue)
+
+    Every diagnostic print goes through :func:`_safe_trace`: on Windows the
+    stream codec is GBK and printing a user message containing e.g. emoji 🏠
+    used to raise ``UnicodeEncodeError`` inside the traced ``queue.get``, which
+    killed the update-fetcher consumer task (queue kept growing, no replies).
+    A diagnostic must never be able to take down the pipeline.
+    """
+    import asyncio as _asyncio_mod
+
+    # (A2) update_queue.put: BEFORE / AFTER / size
+    _orig_put = app.update_queue.put
+    async def _traced_put(item):
+        _safe_trace("[A2] queue.put BEFORE qsize=%d item_type=%s" % (
+            app.update_queue.qsize(), type(item).__name__))
+        try:
+            await _orig_put(item)
+            _safe_trace("[A2] queue.put AFTER qsize=%d" % app.update_queue.qsize())
+        except Exception as _e:
+            _safe_trace("[A2] queue.put EXC %r" % (_e,))
+            raise
+    app.update_queue.put = _traced_put
+
+    # (A3) update_queue.get (consumer): GET
+    _orig_get_q = app.update_queue.get
+    async def _traced_get_q():
+        item = await _orig_get_q()
+        eff_msg = getattr(item, "effective_message", None)
+        _safe_trace("[A3] queue.get update_id=%s qsize_after=%d text=%r" % (
+            getattr(item, "update_id", None),
+            app.update_queue.qsize(),
+            getattr(eff_msg, "text", None) if eff_msg else None,
+        ))
+        return item
+    app.update_queue.get = _traced_get_q
+
+    # (A4) process_update ENTER (bound method replace)
+    _ORIG_PROCESS_UPDATE = app.process_update
+    async def _traced_process_update(update):
+        eff_msg = getattr(update, "effective_message", None)
+        eff_chat = getattr(update, "effective_chat", None)
+        eff_user = getattr(update, "effective_user", None)
+        _safe_trace("[A4] process_update ENTER update_id=%s type=%s message_id=%s chat_id=%s user_id=%s text=%r" % (
+            getattr(update, "update_id", None),
+            getattr(update, "update_type", None),
+            getattr(eff_msg, "message_id", None) if eff_msg else None,
+            getattr(eff_chat, "id", None) if eff_chat else None,
+            getattr(eff_user, "id", None) if eff_user else None,
+            getattr(eff_msg, "text", None) if eff_msg else None,
+        ))
+        try:
+            return await _ORIG_PROCESS_UPDATE(update)
+        except Exception as _e:
+            _safe_trace("[A4] process_update EXC %r" % (_e,))
+            raise
+    app.process_update = _traced_process_update
+
+    # Handler inventory (registration + filters).
+    _safe_trace("[PTB] handler inventory:")
+    for group in sorted(app.handlers.keys()):
+        for h in app.handlers[group]:
+            _filt = getattr(h, "filters", None)
+            try:
+                _filt_repr = repr(_filt)
+            except Exception:
+                _filt_repr = str(type(_filt).__name__)
+            _safe_trace("[PTB]   group=%s class=%s filters=%s" % (
+                group, type(h).__name__, _filt_repr))
+    _safe_trace("[PTB] handler inventory done")
+
+    # Periodic task-health probe (asyncio tasks alive/done/cancelled) — only
+    # makes sense once run_polling's loop is running, so schedule it via
+    # app.job_queue (PTB schedules after initialization inside run_polling).
+    def _dump_tasks():
+        _tasks = [t for t in _asyncio_mod.all_tasks() if not t.done()]
+        _safe_trace("[TASK] alive asyncio tasks count=%d:" % len(_tasks))
+        for t in _tasks:
+            try:
+                _nm = t.get_name()
+            except Exception:
+                _nm = '?'
+            _ex = 'n/a'
+            if t.done() and not t.cancelled():
+                try:
+                    _ex = repr(t.exception())
+                except Exception:
+                    _ex = 'unknown'
+            _safe_trace("[TASK]   done=%s cancelled=%s ex=%s name=%r" % (
+                t.done(), t.cancelled(), _ex, _nm))
+        # P0-TELEGRAM-DISPATCH-CONSUMER-001: also surface the update-fetcher
+        # consumer task even when it is DONE (all_tasks() only lists pending
+        # tasks, so a dead consumer was invisible and the P0 went unnoticed).
+        try:
+            _fetcher = getattr(app, "_Application__update_fetcher_task", None)
+            if _fetcher is not None:
+                _fex = 'n/a'
+                if _fetcher.done() and not _fetcher.cancelled():
+                    try:
+                        _fex = repr(_fetcher.exception())
+                    except Exception:
+                        _fex = 'unknown'
+                _safe_trace("[TASK] update_fetcher done=%s cancelled=%s ex=%s" % (
+                    _fetcher.done(), _fetcher.cancelled(), _fex))
+        except Exception:
+            pass
+
+    _jq = getattr(app, "job_queue", None)
+    if _jq is not None:
+        # PTB's JobQueue awaits the callback, so it must be a coroutine
+        # function; a sync callback returning None raised "TypeError: object
+        # NoneType can't be used in 'await' expression" on every tick.
+        async def _task_health_tick(_c):
+            _dump_tasks()
+
+        _jq.run_repeating(_task_health_tick, interval=25, first=5,
+                          name="P0_task_health")
+        _safe_trace("[TASK] probe registered via job_queue")
+    else:
+        _safe_trace("[TASK] probe scheduling skipped (no job_queue)")
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="pasay_bot.main")
     parser.add_argument("--dry-run", action="store_true",
@@ -246,6 +406,12 @@ def _load(args: argparse.Namespace) -> tuple[Settings, StateStore, PasayApiClien
 
 
 def main(argv=None) -> int:
+    # P0-TELEGRAM-DISPATCH-CONSUMER-001: never let a print of user-controlled
+    # text raise (Windows stream codec is GBK; emoji are not encodable). A raise
+    # inside the update-consumer path used to kill the consumer task, leaving
+    # the update queue to grow forever (no replies). This must run before any
+    # print of user content.
+    harden_stdio()
     args = parse_args(argv)
     try:
         settings, store, api, admin_api = _load(args)
@@ -272,107 +438,10 @@ def main(argv=None) -> int:
         for attempt in range(1, max_retries + 1):
             app = build_application(settings, api, store, admin_api_client=admin_api)
             print("[pasay-bot] starting polling ...")
-            # ---- P0 live-diagnostic: A1/A2/A3/A4 production-chain tracing ----
-            try:
-                # (A1) get_updates RETURN is observed indirectly: ExtBot forbids
-                #      patching get_updates, so we rely on [A2] queue.put AFTER as the
-                #      proof that get_updates returned the update; an alive polling task
-                #      (task-probe below) + NO put on the tap => get_updates returned 0.
-
-                # (A2) update_queue.put: BEFORE / AFTER / size
-                _orig_put = app.update_queue.put
-                async def _traced_put(item):
-                    print("[A2] queue.put BEFORE qsize=%d item_type=%s" % (
-                        app.update_queue.qsize(), type(item).__name__), flush=True)
-                    try:
-                        await _orig_put(item)
-                        print("[A2] queue.put AFTER qsize=%d" % app.update_queue.qsize(), flush=True)
-                    except Exception as _e:
-                        print("[A2] queue.put EXC %r" % (_e,), flush=True)
-                        raise
-                app.update_queue.put = _traced_put
-
-                # (A3) update_queue.get (consumer): GET
-                _orig_get_q = app.update_queue.get
-                async def _traced_get_q():
-                    item = await _orig_get_q()
-                    eff_msg = getattr(item, "effective_message", None)
-                    print("[A3] queue.get update_id=%s qsize_after=%d text=%r" % (
-                        getattr(item, "update_id", None),
-                        app.update_queue.qsize(),
-                        getattr(eff_msg, "text", None) if eff_msg else None,
-                    ), flush=True)
-                    return item
-                app.update_queue.get = _traced_get_q
-
-                # (A4) process_update ENTER (bound method replace)
-                _ORIG_PROCESS_UPDATE = app.process_update
-                async def _traced_process_update(update):
-                    eff_msg = getattr(update, "effective_message", None)
-                    eff_chat = getattr(update, "effective_chat", None)
-                    eff_user = getattr(update, "effective_user", None)
-                    print("[A4] process_update ENTER update_id=%s type=%s message_id=%s chat_id=%s user_id=%s text=%r" % (
-                        getattr(update, "update_id", None),
-                        getattr(update, "update_type", None),
-                        getattr(eff_msg, "message_id", None) if eff_msg else None,
-                        getattr(eff_chat, "id", None) if eff_chat else None,
-                        getattr(eff_user, "id", None) if eff_user else None,
-                        getattr(eff_msg, "text", None) if eff_msg else None,
-                    ), flush=True)
-                    try:
-                        return await _ORIG_PROCESS_UPDATE(update)
-                    except Exception as _e:
-                        print("[A4] process_update EXC %r" % (_e,), flush=True)
-                        raise
-                app.process_update = _traced_process_update
-
-                # Handler inventory (registration + filters).
-                print("[PTB] handler inventory:", flush=True)
-                for group in sorted(app.handlers.keys()):
-                    for h in app.handlers[group]:
-                        _filt = getattr(h, "filters", None)
-                        try:
-                            _filt_repr = repr(_filt)
-                        except Exception:
-                            _filt_repr = str(type(_filt).__name__)
-                        print("[PTB]   group=%s class=%s filters=%s" % (
-                            group, type(h).__name__, _filt_repr), flush=True)
-                print("[PTB] handler inventory done", flush=True)
-            except Exception as _diag:
-                print("[PTB] diag setup failed: %r" % (_diag,), flush=True)
-            # Periodic task-health probe (asyncio tasks alive/done/cancelled) — only
-            # makes sense once run_polling's loop is running, so schedule it via
-            # app.job_queue (PTB schedules after initialization inside run_polling).
-            try:
-                import asyncio as _asyncio_mod
-
-                def _dump_tasks():
-                    _tasks = [t for t in _asyncio_mod.all_tasks() if not t.done()]
-                    print("[TASK] alive asyncio tasks count=%d:" % len(_tasks), flush=True)
-                    for t in _tasks:
-                        try:
-                            _nm = t.get_name()
-                        except Exception:
-                            _nm = '?'
-                        _ex = 'n/a'
-                        if t.done() and not t.cancelled():
-                            try:
-                                _ex = repr(t.exception())
-                            except Exception:
-                                _ex = 'unknown'
-                        print("[TASK]   done=%s cancelled=%s ex=%s name=%r" % (
-                            t.done(), t.cancelled(), _ex, _nm), flush=True)
-
-                _jq = getattr(app, "job_queue", None)
-                if _jq is not None:
-                    _jq.run_repeating(lambda _c: _dump_tasks(), interval=25, first=5,
-                                      name="P0_task_health")
-                    print("[TASK] probe registered via job_queue", flush=True)
-                else:
-                    print("[TASK] probe scheduling skipped (no job_queue)", flush=True)
-            except Exception as _diag3:
-                print("[TASK] probe registration failed: %r" % (_diag3,), flush=True)
-            # ---- end P0 live-diagnostic ----
+            # P0 live-diagnostic: A2/A3/A4 production-chain tracing + task-health
+            # probe. Failure-proof: a diagnostic print must never be able to kill
+            # the update-consumer task (P0-TELEGRAM-DISPATCH-CONSUMER-001).
+            install_live_diagnostics(app)
             try:
                 # Explicit allowed_updates: PTB omits the field when allowed_updates is
                 # None (see request/_requestdata.py filtering), and Telegram then keeps
