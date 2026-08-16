@@ -128,16 +128,48 @@ if ($workerStarted) {
 }
 
 # --- verify ---------------------------------------------------------------------------------
+# Readiness gate (fail-closed): the launcher must return a clear success/failure
+# within a finite time. It refuses to report success for a partial runtime, and
+# specifically flags the P0 failure mode (Telegram getUpdates 409 Conflict from
+# a duplicate bot poller) so it can never be mistaken for a healthy bot.
 Start-Sleep -Seconds 6
 $apiNow = Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue
 $wPid = Get-PidFile 'worker_runtime.pid'
+$bPid = Get-PidFile 'bot_runtime.pid'
+$apiOk    = [bool]$apiNow
+$workerOk = Test-ProcessAlive $wPid
+$botOk    = Test-ProcessAlive $bPid
+$botPolling = $false
+$botOut = Join-Path $Runtime 'bot_runtime.log'
+if (Test-Path -LiteralPath $botOut) {
+    $botPolling = [bool](Select-String -LiteralPath $botOut -Pattern 'starting polling' -Quiet -ErrorAction SilentlyContinue)
+}
+$botConflict = $false
+$botErr = Join-Path $Runtime 'bot_runtime.log.err'
+if (Test-Path -LiteralPath $botErr) {
+    $botConflict = [bool](Select-String -LiteralPath $botErr -Pattern 'Conflict|terminated by other getUpdates' -Quiet -ErrorAction SilentlyContinue)
+}
+
 Write-Output ""
 Write-Output "--- verify ---"
 Write-Output ("API  listener : " + $(if ($apiNow) { "pid=$($apiNow[0].OwningProcess)" } else { 'NONE' }))
-Write-Output ("WORKER pid    : " + $(if (Test-ProcessAlive $wPid) { "$wPid (alive)" } else { 'NONE' }))
-$botSt = Get-PidFile 'bot_runtime.pid'
-Write-Output ("BOT   pid file: " + $(if ($botSt) { "$botSt" } else { 'none' }))
+Write-Output ("WORKER pid    : " + $(if ($workerOk) { "$wPid (alive)" } else { 'NONE' }))
+Write-Output ("BOT   pid     : " + $(if ($botOk) { "$bPid (alive)" } else { 'NONE' }))
+Write-Output ("BOT   polling : " + $(if ($botPolling) { 'yes' } else { 'not-yet/unknown' }))
+if ($botConflict) { Write-Output "BOT   CONFLICT: telegram getUpdates Conflict detected (duplicate consumer)" }
 Write-Output "--- worker_runtime.log tail ---"
 Get-Content (Join-Path $Runtime 'worker_runtime.log') -Tail 10 -ErrorAction SilentlyContinue
 Write-Output "--- worker_runtime.log.err tail ---"
 Get-Content (Join-Path $Runtime 'worker_runtime.log.err') -Tail 10 -ErrorAction SilentlyContinue
+if ($botConflict) {
+    Write-Output "--- bot_runtime.log.err tail ---"
+    Get-Content $botErr -Tail 12 -ErrorAction SilentlyContinue
+}
+
+# Fail closed: a partial runtime is not success.
+if (-not $apiOk)     { Write-Error "READINESS_FAILED: API not listening on 127.0.0.1:8001"; exit 1 }
+if (-not $workerOk)  { Write-Error "READINESS_FAILED: operations worker not alive"; exit 1 }
+if (-not $botOk)     { Write-Error "READINESS_FAILED: bot poller not alive"; exit 1 }
+if ($botConflict)    { Write-Error "READINESS_FAILED: bot hit Telegram getUpdates Conflict (duplicate consumer)"; exit 1 }
+Write-Output "READINESS_OK: 1 API + 1 bot poller + 1 operations worker"
+exit 0
