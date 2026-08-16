@@ -170,6 +170,42 @@ def main(argv=None) -> int:
         for attempt in range(1, max_retries + 1):
             app = build_application(settings, api, store, admin_api_client=admin_api)
             print("[pasay-bot] starting polling ...")
+            # ---- P0 live-diagnostic: observe raw update entry into PTB dispatch ----
+            try:
+                _UPSTREAM = app
+                _ORIG_PROCESS_UPDATE = app.process_update
+                async def _traced_process_update(update):
+                    eff_msg = getattr(update, "effective_message", None)
+                    eff_chat = getattr(update, "effective_chat", None)
+                    eff_user = getattr(update, "effective_user", None)
+                    print("[PTB] process_update ENTER update_id=%s type=%s message_id=%s chat_id=%s user_id=%s text=%r" % (
+                        getattr(update, "update_id", None),
+                        getattr(update, "update_type", None),
+                        getattr(eff_msg, "message_id", None) if eff_msg else None,
+                        getattr(eff_chat, "id", None) if eff_chat else None,
+                        getattr(eff_user, "id", None) if eff_user else None,
+                        getattr(eff_msg, "text", None) if eff_msg else None,
+                    ), flush=True)
+                    try:
+                        return await _ORIG_PROCESS_UPDATE(update)
+                    except Exception as _e:
+                        print("[PTB] process_update EXC %r" % (_e,), flush=True)
+                        raise
+                app.process_update = _traced_process_update
+                print("[PTB] handler inventory:", flush=True)
+                for group in sorted(app.handlers.keys()):
+                    for h in app.handlers[group]:
+                        _filt = getattr(h, "filters", None)
+                        try:
+                            _filt_repr = repr(_filt)
+                        except Exception:
+                            _filt_repr = str(type(_filt).__name__)
+                        print("[PTB]   group=%s class=%s filters=%s" % (
+                            group, type(h).__name__, _filt_repr), flush=True)
+                print("[PTB] handler inventory done", flush=True)
+            except Exception as _diag:
+                print("[PTB] diag setup failed: %r" % (_diag,), flush=True)
+            # ---- end P0 live-diagnostic ----
             try:
                 app.run_polling()
                 return 0
