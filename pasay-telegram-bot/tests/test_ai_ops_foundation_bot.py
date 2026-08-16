@@ -152,6 +152,31 @@ def test_media_without_archive_config_keeps_old_ack(make_app):
     assert all(("POST", "/evidence") != (m, p) for m, p, _ in env.backend.calls)
 
 
+def test_media_forward_failure_never_claims_archived(make_app):
+    """AI-OPS-001 §12 (pre-acceptance): when forwarding fails, the bot MUST NOT
+    send the 'archived/indexed' success and must not write an evidence row."""
+    from telegram.error import TelegramError
+
+    env = make_app()
+    env.settings.archive_chat_id = "-1001234567890"
+    env.bot.forward_error = TelegramError("Forbidden: bot is not a member of the channel")
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])
+    texts = " ".join(env.bot.all_texts())
+    assert "已存档" not in texts and "Archived" not in texts
+    assert all(("POST", "/evidence") != (m, p) for m, p, _ in env.backend.calls)
+
+
+def test_media_index_failure_never_claims_archived(make_app):
+    """AI-OPS-001 §12 (pre-acceptance): when the evidence index write fails
+    (backend 500), the bot MUST NOT send the 'archived/indexed' success."""
+    env = make_app()
+    env.settings.archive_chat_id = "-1001234567890"
+    env.backend.fail_status["/evidence"] = 500
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])
+    texts = " ".join(env.bot.all_texts())
+    assert "已存档" not in texts and "Archived" not in texts
+
+
 # --- §14 evidence retrieval ---------------------------------------------------
 
 def test_evidence_query_sends_archived_media(make_app):

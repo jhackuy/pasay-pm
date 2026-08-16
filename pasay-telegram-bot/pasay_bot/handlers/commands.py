@@ -735,7 +735,7 @@ async def _archive_media(update: Update, context) -> bool:
     entity_type, entity_id, unit_id, category = _evidence_links(payload, msg)
     try:
         api = context.bot_data["api_client"]
-        await api.create_evidence(
+        evidence = await api.create_evidence(
             external_file_id=file_id,
             external_message_id=forwarded.message_id,
             media_type=media_type,
@@ -747,8 +747,13 @@ async def _archive_media(update: Update, context) -> bool:
             entity_type=entity_type,
             entity_id=entity_id,
         )
-    except Exception as exc:  # noqa: BLE001 - index failure still archived
+        if not evidence or not (evidence.get("id")):
+            # The backend did not persist an evidence row -> never claim success.
+            logger.warning("evidence index returned no row; media not marked archived")
+            return False
+    except Exception as exc:  # noqa: BLE001 - index failure must never look like success
         logger.warning("evidence index failed: %s", exc)
+        return False
     return True
 
 

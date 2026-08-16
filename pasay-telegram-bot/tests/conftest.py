@@ -148,7 +148,13 @@ class FakeBot:
         )
 
     # AI-OPS-FOUNDATION-001 §12/§14: archive forwarding + media resend.
+    # ``forward_error`` (when set) makes forward_message raise, simulating the
+    # archive channel being unavailable / the bot lacking permission.
+    forward_error = None
+
     async def forward_message(self, chat_id, from_chat_id, message_id, **kw):
+        if self.forward_error is not None:
+            raise self.forward_error
         self.calls.append(
             {
                 "type": "forward_message",
