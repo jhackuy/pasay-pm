@@ -29,7 +29,49 @@ from pasay_bot.state.idempotency import IdempotencyGuard
 from pasay_bot.state.latency import LatencyTracker
 from pasay_bot.state.store import StateStore
 
+from telegram import Update  # noqa: F401  (Update.ALL_TYPES for explicit allowed_updates)
+from telegram.request import HTTPXRequest
+
 logger = logging.getLogger(__name__)
+
+
+class _TraceUpdatesRequest(HTTPXRequest):
+    """Minimal BaseRequest tracing wrapper for the official getUpdates request.
+
+    Logs each getUpdates POST (endpoint / offset / timeout / allowed_updates, with
+    auth token redacted from the URL) and the returned update ids, so the
+    production consumer's own poller is observed without a competing probe or
+    monkey-patching ExtBot. Used only while the P0 live-diagnostic is active.
+    """
+
+    async def post(self, url, request_data=None, read_timeout=HTTPXRequest.DEFAULT_NONE,
+                   write_timeout=HTTPXRequest.DEFAULT_NONE, connect_timeout=HTTPXRequest.DEFAULT_NONE,
+                   pool_timeout=HTTPXRequest.DEFAULT_NONE):
+        try:
+            params = dict(request_data.parameters) if request_data is not None else {}
+            # Redact the auth token and any secret-like value; keep the rest for debugging.
+            params.pop("token", None)
+            print("[GU] getUpdates POST url=%s params=%r" % (
+                url.replace("://api.telegram.org/bot", "://api.telegram.org/bot<REDACTED>"),
+                params,
+            ), flush=True)
+        except Exception:
+            pass
+        try:
+            json_data = await super().post(
+                url, request_data=request_data,
+                read_timeout=read_timeout, write_timeout=write_timeout,
+                connect_timeout=connect_timeout, pool_timeout=pool_timeout,
+            )
+        except Exception as _e:
+            print("[GU] getUpdates EXC %r" % (_e,), flush=True)
+            raise
+        if isinstance(json_data, list):
+            print("[GU] getUpdates RETURN count=%d ids=%r" % (
+                len(json_data), [getattr(u, "update_id", None) for u in json_data]
+                if json_data and isinstance(json_data[0], (int, dict)) else [getattr(u, "update_id", None) for u in json_data]),
+                flush=True)
+        return json_data
 
 
 def build_application(
@@ -51,6 +93,10 @@ def build_application(
             .read_timeout(timeout)
             .write_timeout(timeout)
             .pool_timeout(timeout)
+            # P0 live-diagnostic: wrap ONLY the official getUpdates request in a
+            # tracing request object (no monkey-patching of ExtBot, no competing
+            # probe) so we can observe the producer's poll within this consumer.
+            .get_updates_request(_TraceUpdatesRequest())
         )
     app = builder.build()
     app.bot_data["api_client"] = api_client
@@ -272,7 +318,13 @@ def main(argv=None) -> int:
                 print("[TASK] probe registration failed: %r" % (_diag3,), flush=True)
             # ---- end P0 live-diagnostic ----
             try:
-                app.run_polling()
+                # Explicit allowed_updates: PTB omits the field when allowed_updates is
+                # None (see request/_requestdata.py filtering), and Telegram then keeps
+                # the previously-persisted (possibly restrictive) update types, which can
+                # silently drop `message` updates. Pass the full set so business types
+                # (message, callback_query, ...) are always subscribed. The official PTB
+                # example uses Update.ALL_TYPES here.
+                app.run_polling(allowed_updates=Update.ALL_TYPES)
                 return 0
             except telegram.error.TimedOut as exc:
                 print(
