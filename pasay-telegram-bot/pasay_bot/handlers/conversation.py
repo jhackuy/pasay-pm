@@ -50,6 +50,13 @@ _WRITE_STATES = (
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from pasay_bot.handlers.commands import _bind_identity
+
+    # AI-OPS-FOUNDATION-001 §12: a channel_post / anonymous update has no
+    # effective_user and is NOT a user action — ignore it gracefully instead
+    # of crashing the handler (the archive channel delivers channel posts).
+    if update.effective_user is None:
+        _bind_identity(update, context)
+        return
     _bind_identity(update, context)
     user = update.effective_user
     chat_id = update.effective_chat.id

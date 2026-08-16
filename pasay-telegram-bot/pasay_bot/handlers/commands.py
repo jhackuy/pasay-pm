@@ -71,7 +71,10 @@ TASK_WINDOW_DAYS = 7
 EXPIRING_CONTRACT_DAYS = 30  # BOT-V1-USABLE-001 P0 spec: 30-day contract window
 
 
-def _bind_identity(update, context, user_id=None):
+def _bind_identity(update, context, user_id=None) -> bool:
+    """Bind the Telegram effective_user to the API clients. Returns True when
+    an identity was bound, False when the update has no effective_user (a
+    channel_post or other anonymous update) — callers must then ignore it."""
     api = context.bot_data["api_client"]
     admin = context.bot_data.get("admin_api_client")
     # Clear first so even a malformed update cannot inherit the previous
@@ -81,11 +84,14 @@ def _bind_identity(update, context, user_id=None):
         admin.clear_telegram_user()
     if user_id is None:
         if update.effective_user is None:
-            raise ValueError("Telegram update has no effective_user")
+            # AI-OPS-FOUNDATION-001 §12: a channel_post / anonymous update is
+            # not a user action — ignore it, never crash the handler.
+            return False
         user_id = update.effective_user.id
     api.bind_telegram_user(user_id)
     if admin is not None:
         admin.bind_telegram_user(user_id)
+    return True
 
 
 # --- SLICE3-UX-PERSISTENT-MENU-002: persistent menu initialization ----------

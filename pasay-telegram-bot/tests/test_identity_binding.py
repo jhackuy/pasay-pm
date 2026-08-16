@@ -90,12 +90,14 @@ def test_command_callback_conversation_and_nl_bridge_separate_group_users(make_a
 
 
 def test_bind_identity_rejects_missing_effective_user_before_api(make_app):
+    """AI-OPS-FOUNDATION-001 §12: an update without effective_user (a channel
+    post) must NOT crash the handler — _bind_identity returns False, makes no
+    API call, and clears any prior identity."""
     env = make_app()
     env.api.bind_telegram_user(OWNER_ID)
     env.admin_api.bind_telegram_user(OWNER_ID)
     update = Update(update_id=999)
-    with pytest.raises(ValueError):
-        commands._bind_identity(update, env.app)
+    assert commands._bind_identity(update, env.app) is False
     assert env.backend.calls == []
     assert env.api._telegram_user_id.get() is None
     assert env.admin_api._telegram_user_id.get() is None

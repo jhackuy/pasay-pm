@@ -61,6 +61,28 @@ def _group_text_update(user_id, chat_id, text, message_id=60, update_id=60):
     return Update.de_json({"update_id": update_id, "message": msg}, None)
 
 
+def _channel_post_update(chat_id, text="archive post", message_id=80, update_id=80):
+    """A channel_post update (no effective_user) — e.g. a post in the archive
+    channel the bot administers."""
+    msg = {
+        "message_id": message_id,
+        "date": int(time.time()),
+        "chat": {"id": chat_id, "type": "channel", "title": "pasay property archive"},
+        "sender_chat": {"id": chat_id, "type": "channel", "title": "pasay property archive"},
+        "text": text,
+    }
+    return Update.de_json({"update_id": update_id, "channel_post": msg}, None)
+
+
+def test_channel_post_is_ignored_not_crashed(make_app):
+    """AI-OPS-001 §12: a channel_post update (archive channel) has no
+    effective_user — the bot ignores it without raising and without replying."""
+    env = make_app()
+    run_updates(env, [_channel_post_update(-1004292596162)])
+    assert len(env.bot.sends()) == 0
+    assert env.backend.calls == []
+
+
 # --- §8 promise persistence --------------------------------------------------
 
 def test_technician_coming_tomorrow_persists_structured_promise(make_app):
