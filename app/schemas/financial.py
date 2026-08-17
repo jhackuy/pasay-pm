@@ -163,6 +163,9 @@ class ExpensePaymentInfo(BaseModel):
     fully_paid: bool
     pending_claims: int
     has_mismatch: bool
+    verified_claim_count: int = 0
+    pending_claim_count: int = 0
+    claims: list[dict] = []
 
 
 class ExpenseDetailOut(ExpenseRead):

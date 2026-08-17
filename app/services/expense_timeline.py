@@ -132,24 +132,35 @@ def build_expense_timeline(
 
     # 4. Claims: PENDING, VERIFIED, FAILED, REVERSED in chronological order.
     for c in sorted(claims, key=lambda x: (x.claimed_at or x.created_at, x.id)):
-        claimed = {
-            "at": _iso(c.claimed_at or c.created_at),
-            "kind": "payment_claim",
-            "label": f"Payment claim {_money(c.claimed_amount)}",
-            "detail": c.verification_note or "",
-        }
+        # The claim-as-reported event always appears (payment reported).
+        if c.status != ClaimStatus.VERIFIED or True:
+            events.append({
+                "at": _iso(c.claimed_at or c.created_at),
+                "kind": "payment_claim",
+                "label": f"Payment claim {_money(c.claimed_amount)}",
+                "detail": c.verification_note or "",
+            })
         if c.status == ClaimStatus.VERIFIED:
-            claimed["kind"] = "verified"
-            claimed["label"] = f"{_money(c.verified_amount or c.claimed_amount)} verified"
+            events.append({
+                "at": _iso(c.verified_at or c.claimed_at or c.created_at),
+                "kind": "verified",
+                "label": f"{_money(c.verified_amount or c.claimed_amount)} verified",
+                "detail": c.verification_note or "",
+            })
         elif c.status == ClaimStatus.FAILED:
-            claimed["kind"] = "claim_failed"
-            claimed["label"] = f"Claim {_money(c.claimed_amount)} failed"
-            claimed["detail"] = c.failure_reason or c.mismatch_reason or ""
+            events.append({
+                "at": _iso(c.updated_at or c.claimed_at or c.created_at),
+                "kind": "claim_failed",
+                "label": f"Claim {_money(c.claimed_amount)} failed",
+                "detail": c.failure_reason or c.mismatch_reason or "",
+            })
         elif c.status == ClaimStatus.REVERSED:
-            claimed["kind"] = "claim_reversed"
-            claimed["label"] = f"Payment {_money(c.claimed_amount)} reversed"
-            claimed["detail"] = c.failure_reason or ""
-        events.append(claimed)
+            events.append({
+                "at": _iso(c.updated_at or c.claimed_at or c.created_at),
+                "kind": "claim_reversed",
+                "label": f"Payment {_money(c.claimed_amount)} reversed",
+                "detail": c.failure_reason or "",
+            })
 
     # 5. Fully paid derived from VERIFIED aggregate.
     from app.services.expense_payment_truth import payment_truth
