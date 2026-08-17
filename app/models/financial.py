@@ -44,6 +44,13 @@ class ExpenseStatus(str, Enum):
     rejected = "rejected"
     paid = "paid"
     reversed = "reversed"
+    # PASAY-EXPENSE-OPERATION-003B: distinct truth states between APPROVED and
+    # PAID. A payment claim has been reported but is NOT yet verified
+    # (payment_claimed = "payment reported / awaiting verification"); a partial
+    # verified amount makes the expense PARTIALLY_PAID until the full amount is
+    # VERIFIED. `paid` is reached ONLY via verified-claims aggregation.
+    payment_claimed = "payment_claimed"
+    partially_paid = "partially_paid"
 
 
 class Expense(AuditMixin, Base):
@@ -71,4 +78,23 @@ class Expense(AuditMixin, Base):
     # the Owner; None falls back to the Owner at generation time.
     payer_user_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id"), nullable=True, index=True
+    )
+    # PASAY-EXPENSE-OPERATION-003B: approve-vs-pay, reject->resubmit, and
+    # critical-field reapproval continuity.
+    #
+    # rejection_reason: Owner's reason when the CURRENT version was rejected
+    # (section 8) — preserved so the next version + Mini App/timeline can show
+    # why V1 was rejected.
+    rejection_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # reapproval_reason: why a previously-approved expense was demoted back to
+    # PENDING because a critical financial field changed (section 9).
+    reapproval_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # version: an increasing version counter for the SAME logical expense need.
+    # Reject->edit->resubmit and critical-field reapproval bump this; the OLD
+    # rejected state is never overwritten in place (section 8/9).
+    version: Mapped[int | None] = mapped_column(BigInteger, nullable=True, default=1)
+    # parent_expense_id: points to the immediately-previous version row, so the
+    # family (V1 REJECTED -> V2 PENDING) is preserved without a separate table.
+    parent_expense_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, index=True
     )

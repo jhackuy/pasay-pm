@@ -153,14 +153,22 @@ def test_expense_reject_flow(client, admin_headers, manager_headers):
 
 
 def test_expense_amount_locked_after_approve(client, admin_headers, manager_headers):
+    """003B §9: a critical financial field (amount) changed after approval must
+    INVALIDATE the old approval and return the expense to PENDING for Owner
+    re-review — it must NOT keep showing a stale APPROVED with the new amount."""
     resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
     expense_id = resp.json()["id"]
     client.post(f"{API}/expenses/{expense_id}/approve", headers=admin_headers)
 
     resp = client.patch(
-        f"{API}/expenses/{expense_id}", json={"amount": "1.00"}, headers=admin_headers
+        f"{API}/expenses/{expense_id}", json={"amount": "35000.00"}, headers=admin_headers
     )
-    assert resp.status_code == 409
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "pending"  # re-approval required, never stale APPROVED
+    assert body["amount"] == "35000.00"
+    assert body["approved_by"] is None
+    assert body["reapproval_reason"] is not None
 
 
 def test_expense_pay_requires_approved(client, admin_headers, manager_headers):

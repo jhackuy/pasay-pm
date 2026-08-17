@@ -491,6 +491,31 @@ def _rent_task_details(lease: Lease, unit: Unit | None, tenant: Tenant | None, e
     return details
 
 
+def _complete_payment_task(db: Session, expense: Expense, *, now: datetime) -> None:
+    """Complete the active PAYMENT_PENDING task for a now-fully-paid expense
+    (derived truth §4/§13 / E12). One active task per dedupe_key is guaranteed
+    by the DB partial index, so this finds a single candidate."""
+    from app.services.operations.reconcile import auto_transition
+
+    tasks = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.source_type == "expense",
+            OperationalTask.source_id == expense.id,
+            OperationalTask.task_type == OperationalTaskType.PAYMENT_PENDING,
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .all()
+    )
+    for task in tasks:
+        auto_transition(
+            db, task, to=OperationalTaskStatus.COMPLETED, now=now,
+            reason="payment_fully_verified",
+        )
+
+
 def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
     """Create tasks from business sources. Returns (tasks_created, notifications_enqueued)."""
     created = 0
@@ -682,25 +707,44 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             notifications += 1 if enqueued else 0
 
     payment_cutoff = now - timedelta(days=PAYMENT_PENDING_AFTER_DAYS)
-    approved_expenses = (
+    # PASAY-EXPENSE-OPERATION-003B: a PAYMENT_PENDING task exists only while
+    # there is still REAL remaining money to pay (derived from VERIFIED claims,
+    # §4). Fully-paid expenses are skipped; partial expenses refresh the task
+    # amount to the REMAINING balance. The dedupe boundary guarantees at most
+    # one active payment task per expense (§13 / E11).
+    payable_expenses = (
         db.query(Expense)
         .filter(
-            Expense.status == ExpenseStatus.approved,
+            Expense.status.in_([
+                ExpenseStatus.approved,
+                ExpenseStatus.partially_paid,
+                ExpenseStatus.payment_claimed,
+            ]),
             (Expense.approved_at.isnot(None)) & (Expense.approved_at <= payment_cutoff),
         )
         .all()
     )
-    for expense in approved_expenses:
+    from app.services.expense_payment_truth import payment_truth
+
+    for expense in payable_expenses:
+        truth = payment_truth(db, expense)
+        if truth.fully_paid or truth.remaining <= 0:
+            # Fully verified -> the payment task must be completed (not re-created).
+            _complete_payment_task(db, expense, now=now)
+            continue
         # AI-OPS-FOUNDATION-001 §4/§8: the next action belongs to the ACTUAL
         # payer (expense.payer_user_id); Owner is only the fallback when the
         # payer was never recorded.
         payer = expense.payer_user_id or DEFAULT_ASSIGNED_USER_ID
+        title = _expense_task_title("待付款支出", expense)
+        if truth.pending_claims > 0:
+            title = _expense_task_title("待核验付款", expense)
         task, enqueued, is_new = _register_task(
             db,
             now=now,
             fields={
                 "task_type": OperationalTaskType.PAYMENT_PENDING,
-                "title": _expense_task_title("待付款支出", expense),
+                "title": title,
                 "source_type": "expense",
                 "source_id": expense.id,
                 "assigned_user_id": payer,
@@ -711,10 +755,14 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 "dedupe_key": f"expense:{expense.id}:PAYMENT_PENDING",
                 "details": {
                     "expense_id": expense.id,
-                    "amount": str(expense.amount),
+                    "amount": str(truth.remaining),
+                    "remaining": str(truth.remaining),
+                    "verified_paid": str(truth.verified_paid),
                     "category": expense.category,
                     "payee": expense.payee,
                     "payer_user_id": payer,
+                    "pending_claims": truth.pending_claims,
+                    "fully_paid": truth.fully_paid,
                 },
             },
             reply_markup=_expense_reply_markup(

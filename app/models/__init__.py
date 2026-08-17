@@ -21,6 +21,7 @@ from app.models.evidence import (
     ViewingOutcome,
     ViewingStatus,
 )
+from app.models.expense_claim import ClaimStatus, ExpensePaymentClaim
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.identity import (
     ApiCredential, CommunicationEndpoint, CredentialLifecycle, CredentialState,
@@ -67,7 +68,9 @@ __all__ = [
     "CopilotRunStatus",
     "Evidence",
     "EvidenceCategory",
+    "ClaimStatus",
     "Expense",
+    "ExpensePaymentClaim",
     "ExpenseStatus",
     "Income",
     "IncomeStatus",

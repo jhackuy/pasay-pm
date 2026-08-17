@@ -78,6 +78,19 @@ class AuditAction(str, Enum):
     repair_completed_pending_verification = "repair_completed_pending_verification"
     repair_closed_after_verification = "repair_closed_after_verification"
     repair_cancelled = "repair_cancelled"
+    # PASAY-EXPENSE-OPERATION-003B (appended only): expense payment-claim truth
+    # lifecycle. Each distinguishes exactly WHO did WHAT (actor_id real human /
+    # principal; never mixes SYSTEM/AI/Owner/Secretary into one).
+    expense_claim_created = "expense_claim_created"
+    expense_claim_verified = "expense_claim_verified"
+    expense_claim_failed = "expense_claim_failed"
+    expense_claim_reversed = "expense_claim_reversed"
+    expense_amount_mismatch = "expense_amount_mismatch"
+    expense_partially_paid = "expense_partially_paid"
+    expense_fully_paid = "expense_fully_paid"
+    expense_requires_reapproval = "expense_requires_reapproval"
+    expense_resubmitted = "expense_resubmitted"
+    expense_rejected = "expense_rejected"  # explicit rejection with reason + version preserved
 
 
 class AuditLog(AuditMixin, Base):

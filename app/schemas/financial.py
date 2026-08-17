@@ -120,3 +120,57 @@ class ExpenseRead(ExpenseBase, AuditFields):
     id: int
     approved_by: int | None = None
     approved_at: datetime | None = None
+    # PASAY-EXPENSE-OPERATION-003B: additional facts surfaced on reads.
+    rejection_reason: str | None = None
+    reapproval_reason: str | None = None
+    version: int | None = None
+    parent_expense_id: int | None = None
+
+
+class PaymentClaimIn(BaseModel):
+    """Create/verify/fail/reverse a payment claim."""
+    claimed_amount: Decimal | None = Field(default=None, gt=0)
+    verification_note: str | None = None
+    evidence_ids: list[int] | None = None
+    idempotency_key: str | None = Field(default=None, max_length=255)
+    # verify-specific
+    verified_amount: Decimal | None = Field(default=None, gt=0)
+    result: str | None = None
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class PaymentClaimOut(BaseModel):
+    id: int
+    expense_id: int
+    claimed_amount: str
+    claimed_by: int | None = None
+    claimed_at: datetime | None = None
+    status: str
+    evidence_ids: list = []
+    verification_note: str | None = None
+    verified_amount: str | None = None
+    verified_by: int | None = None
+    verified_at: datetime | None = None
+    mismatch: bool = False
+    mismatch_reason: str | None = None
+    failure_reason: str | None = None
+
+
+class ExpensePaymentInfo(BaseModel):
+    required_amount: str
+    verified_paid: str
+    remaining: str
+    fully_paid: bool
+    pending_claims: int
+    has_mismatch: bool
+
+
+class ExpenseDetailOut(ExpenseRead):
+    """Mini App full detail view (PASAY-EXPENSE-OPERATION-003B section 15):
+    Expense / Approval / Payment / Claims / Evidence / Verification /
+    Actions / Timeline — all derived from the real rows."""
+    payment: ExpensePaymentInfo
+    claims: list[PaymentClaimOut] = []
+    evidence: dict | None = None
+    timeline: list[dict] = []
+    reviewed: dict | None = None

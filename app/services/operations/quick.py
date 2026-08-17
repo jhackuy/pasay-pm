@@ -328,19 +328,26 @@ def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int
 def _payable_expense_rows(
     db: Session, *, now: datetime | None = None
 ) -> list[dict]:
-    """Owner-actionable payable expenses: every APPROVED (not yet PAID)
-    expense, which the product rule `PENDING -> APPROVED -> PAID` treats as an
-    unfinished task the Owner still must pay.
+    """Owner-actionable payable expenses: every expense that still has REAL
+    remaining money to pay (APPROVED, PARTIALLY_PAID, or PAYMENT_CLAIMED with a
+    remaining balance), derived from the VERIFIED-claims truth (003B §4 / §12).
+    A fully-pa (PAID) expense is financially completed and never appears.
 
-    Only PAID is financially completed; APPROVED is approved-but-unpaid, so
-    each row carries the stable business identity (E{id}, plain text — never
-    the Telegram `#E{id}` hashtag) and the strong
+    Each row carries the stable business identity (E{id}) and the strong
     matching fields (unit, purpose, amount, expense_date) the bot needs to
     distinguish same-day/same-amount expenses and to run its advisory
     possible-duplicate warning."""
+    from app.services.expense_payment_truth import payment_truth
+
     expenses = (
         db.query(Expense)
-        .filter(Expense.status == ExpenseStatus.approved)
+        .filter(
+            Expense.status.in_([
+                ExpenseStatus.approved,
+                ExpenseStatus.partially_paid,
+                ExpenseStatus.payment_claimed,
+            ])
+        )
         .order_by(Expense.expense_date, Expense.id)
         .all()
     )
@@ -356,6 +363,9 @@ def _payable_expense_rows(
                 label_by_unit[u.id] = label
     rows = []
     for e in expenses:
+        truth = payment_truth(db, e)
+        if truth.fully_paid or truth.remaining <= 0:
+            continue  # fully verified -> not payable
         waiting_days = 0
         if e.approved_at is not None:
             try:
@@ -368,7 +378,7 @@ def _payable_expense_rows(
                 "expense_id": e.id,
                 "unit": label_by_unit.get(e.unit_id, ""),
                 "purpose": _expense_purpose(e) or "",
-                "amount": _d2(e.amount),
+                "amount": truth.remaining,
                 "status": e.status.value,
                 "expense_date": e.expense_date.isoformat(),
                 # ZERO-LEARNING-004 §6: the SAME waiting-day fact the task rows
@@ -767,7 +777,12 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
     for amount, in (
         db.query(Expense.amount)
         .filter(
-            Expense.status.in_([ExpenseStatus.approved, ExpenseStatus.paid]),
+            Expense.status.in_([
+                ExpenseStatus.approved,
+                ExpenseStatus.paid,
+                ExpenseStatus.partially_paid,
+                ExpenseStatus.payment_claimed,
+            ]),
             Expense.expense_date >= start,
             Expense.expense_date <= end,
         )
@@ -803,9 +818,13 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
     month_records = (
         db.query(Expense)
         .filter(
-            Expense.status.in_(
-                [ExpenseStatus.pending, ExpenseStatus.approved, ExpenseStatus.paid]
-            ),
+            Expense.status.in_([
+                ExpenseStatus.pending,
+                ExpenseStatus.approved,
+                ExpenseStatus.paid,
+                ExpenseStatus.partially_paid,
+                ExpenseStatus.payment_claimed,
+            ]),
             Expense.expense_date >= start,
             Expense.expense_date <= end,
         )
