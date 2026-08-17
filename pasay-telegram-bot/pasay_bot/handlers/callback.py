@@ -2311,7 +2311,9 @@ async def _render_expense_detail_in_place(
         role = role_for_telegram_id(user.id if user else None)
     api = context.bot_data["api_client"]
     try:
-        expense = await api.get_expense(expense_id)
+        # 003B: fetch the FULL detail so the bot carries the authoritative
+        # verified_paid / remaining / pending-claims truth (§19 / §14 / E16).
+        expense = await api.get_expense_detail(expense_id)
     except PasayApiError as exc:
         await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
         return

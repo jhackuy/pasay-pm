@@ -1020,6 +1020,9 @@ def _expense_status_label(status: str, locale: str = "zh") -> str:
         "rejected": "expense.status_rejected",
         "paid": "expense.status_paid",
         "reversed": "expense.status_reversed",
+        # 003B: a pending payment claim / partial payment are NOT paid.
+        "payment_claimed": "expense.status_awaiting_verification",
+        "partially_paid": "expense.status_partially_paid",
     }.get((status or "").lower())
     # Unknown statuses never reach the user as raw enum text; a neutral dash
     # keeps the card human (SLICE1-UX-003).
@@ -1134,6 +1137,14 @@ def expense_result_card(expense: Expense, locale: str = "zh", location: str = ""
     elif status == "reversed":
         title = t("expense.reversed_card", locale)
         next_step = H.escape(t("expense.rejected_next", locale))
+    elif status == "payment_claimed":
+        # 003B / E16: reported-but-unverified must read "verification pending".
+        title = t("expense.payment_reported", locale)
+        next_step = H.escape(t("expense.awaiting_verification_next", locale))
+    elif status == "partially_paid":
+        remaining = getattr(expense, "remaining", None) or 0
+        title = t("expense.partial_paid_card", locale, remaining=H.money(remaining))
+        next_step = H.escape(t("expense.partial_paid_next", locale))
     else:
         return expense_approval_card(expense, locale)
     purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
@@ -1199,6 +1210,18 @@ def expense_detail_card(
         lines.append(H.escape(_bi_value(locale, "Waiting for payment", "等待付款")))
     elif status == "paid":
         lines.append(H.escape(_bi_value(locale, "Paid", "已付款")))
+    elif status == "payment_claimed":
+        # 003B / E16: a reported-but-unverified payment is NEVER shown as paid.
+        lines.append(H.escape(_bi_value(
+            locale, "Payment reported · verification pending", "已上报付款 · 待核验")))
+    elif status == "partially_paid":
+        verified = getattr(expense, "verified_paid", None) or 0
+        remaining = getattr(expense, "remaining", None) or 0
+        lines.append(H.escape(_bi_value(
+            locale,
+            f"Partially paid · {H.money(verified)} verified · {H.money(remaining)} remaining",
+            f"部分付款 · 已核验 {H.money(verified)} · 剩余 {H.money(remaining)}",
+        )))
     elif status == "pending":
         lines.append(H.escape(_bi_value(locale, "Pending approval", "待批准")))
     elif status in ("rejected", "reversed"):

@@ -280,8 +280,12 @@ class RentMatchResult:
 @dataclass
 class Expense:
     """Expense record (V1.3 expense approval). ``status`` is one of the backend
-    values (pending/approved/rejected/paid/reversed); UI text is derived in
-    render/cards.py — never shown raw."""
+    values (pending/approved/rejected/paid/reversed/payment_claimed/partially_paid);
+    UI text is derived in render/cards.py — never shown raw.
+
+    PASAY-EXPENSE-OPERATION-003B: also carries the derived payment truth
+    (verified_paid / remaining / claims) so the bot can never render a PENDING
+    claim as paid (§14 / E16) and can show the real remaining balance (§4)."""
 
     id: int
     expense_date: date = date.today()
@@ -296,9 +300,17 @@ class Expense:
     approved_by: Optional[int] = None
     approved_at: Optional[str] = None
     payer_user_id: Optional[int] = None
+    # 003B payment truth (from GET /expenses/{id}/detail). Defaults keep a
+    # bare /expenses/{id} read safe when no detail payload is present.
+    verified_paid: Decimal = Decimal("0")
+    remaining: Decimal = Decimal("0")
+    fully_paid: bool = False
+    pending_claims: int = 0
+    claims: list[dict] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Expense":
+        payment = d.get("payment") or {}
         return cls(
             id=int(d.get("id") or 0),
             expense_date=_to_date(d.get("expense_date")) or date.today(),
@@ -318,6 +330,11 @@ class Expense:
             payer_user_id=(
                 int(d["payer_user_id"]) if d.get("payer_user_id") is not None else None
             ),
+            verified_paid=_to_decimal(payment.get("verified_paid")) if payment.get("verified_paid") else Decimal("0"),
+            remaining=_to_decimal(payment.get("remaining")) if payment.get("remaining") else Decimal(_to_decimal(d.get("amount"))),
+            fully_paid=bool(payment.get("fully_paid")),
+            pending_claims=int(payment.get("pending_claims") or 0),
+            claims=[dict(c) for c in (payment.get("claims") or [])],
         )
 
     def as_dict(self) -> dict:
@@ -1175,13 +1192,63 @@ class PasayApiClient:
         return Expense.from_dict(data)
 
     async def pay_expense(self, expense_id: int) -> Expense:
-        """POST /expenses/{id}/pay: an approved expense becomes PAID.
-        PASAY-V2-FOUNDATION-001: Owner's explicit payment confirmation is the
-        final fact; a receipt is optional and never blocks PAID.
+        """POST /expenses/{id}/pay: an approved expense becomes PAID only via a
+        VERIFIED payment claim (003B §3/§7) — Owner is the final verifier.
         Idempotent: a second call on an already-PAID expense returns the same
         record (no duplicate write)."""
         data = await self._request("POST", f"/expenses/{expense_id}/pay")
         return Expense.from_dict(data)
+
+    async def get_expense_detail(self, expense_id: int) -> Expense:
+        """GET /expenses/{id}/detail: full truth (payment verified_paid /
+        remaining / claims / timeline). The bot reads the SAME authoritative
+        payload as the Mini App (003B §19)."""
+        data = await self._request("GET", f"/expenses/{expense_id}/detail")
+        return Expense.from_dict(data)
+
+    async def create_expense_claim(self, expense_id: int, *, amount, idempotency_key=None,
+                                   verification_note=None, evidence_ids=None) -> dict:
+        """POST /expenses/{id}/claims — Secretary reports a payment -> PENDING
+        claim (awaiting verification). Idempotent via idempotency_key."""
+        payload: dict[str, Any] = {"claimed_amount": str(_to_decimal(amount))}
+        if verification_note:
+            payload["verification_note"] = verification_note
+        if evidence_ids:
+            payload["evidence_ids"] = [int(x) for x in evidence_ids]
+        if idempotency_key:
+            payload["idempotency_key"] = idempotency_key
+        data = await self._request("POST", f"/expenses/{expense_id}/claims", json=payload)
+        return dict(data)
+
+    async def verify_expense_claim(self, expense_id: int, claim_id: int, *,
+                                   result: str | None = None,
+                                   verified_amount: str | None = None) -> dict:
+        """POST .../claims/{id}/verify — Owner/verifier confirms the payment.
+        Only then does the amount enter the verified aggregate (E3/E4)."""
+        payload: dict[str, Any] = {}
+        if result:
+            payload["result"] = result
+        if verified_amount:
+            payload["verified_amount"] = str(_to_decimal(verified_amount))
+        data = await self._request(
+            "POST", f"/expenses/{expense_id}/claims/{claim_id}/verify", json=payload)
+        return dict(data)
+
+    async def fail_expense_claim(self, expense_id: int, claim_id: int, *,
+                                 reason: str | None = None) -> dict:
+        """POST .../claims/{id}/fail — verification failed; amount never enters
+        the aggregate (E7)."""
+        payload: dict[str, Any] = {}
+        if reason:
+            payload["reason"] = reason
+        data = await self._request(
+            "POST", f"/expenses/{expense_id}/claims/{claim_id}/fail", json=payload)
+        return dict(data)
+
+    async def get_expense_claims(self, expense_id: int) -> list[dict]:
+        """GET /expenses/{id}/claims — every claim for the expense."""
+        data = await self._request("GET", f"/expenses/{expense_id}/claims")
+        return [dict(r) for r in (data or [])]
 
     async def get_expense_duplicates(self, expense_id: int) -> list[dict]:
         """GET /operations/quick/expense-duplicates?expense_id=...

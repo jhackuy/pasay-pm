@@ -50,6 +50,13 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.status_rejected': '已拒绝',
         'expense.status_paid': '已付款',
         'expense.status_reversed': '已撤销',
+        # 003B: reported-but-unverified must never read as paid (E16).
+        'expense.status_awaiting_verification': '已上报付款 · 待核验',
+        'expense.status_partially_paid': '部分付款',
+        'expense.payment_reported': '📤 <b>付款已上报</b>',
+        'expense.awaiting_verification_next': '下一步：等待 Owner 核验付款真实性。',
+        'expense.partial_paid_card': '⏳ <b>部分付款</b> · 剩余 {remaining}',
+        'expense.partial_paid_next': '下一步：完成剩余付款。',
         'expense.detail_title': '💳 支出详情',
         # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A3: explicit unspecified-purpose
         # state (never a silently blank purpose line).
@@ -672,6 +679,13 @@ STRINGS: dict[str, dict[str, str]] = {
         'expense.status_rejected': 'Rejected',
         'expense.status_paid': 'Paid',
         'expense.status_reversed': 'Reversed',
+        # 003B: reported-but-unverified must never read as paid (E16).
+        'expense.status_awaiting_verification': 'Payment reported · verification pending',
+        'expense.status_partially_paid': 'Partially paid',
+        'expense.payment_reported': '📤 <b>Payment reported</b>',
+        'expense.awaiting_verification_next': 'Next: await Owner to verify the payment.',
+        'expense.partial_paid_card': '⏳ <b>Partially paid</b> · {remaining} remaining',
+        'expense.partial_paid_next': 'Next: complete the remaining payment.',
         'expense.detail_title': '💳 Expense details',
         # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A3 (en parity).
         'expense.purpose_unspecified': 'Unspecified purpose',
