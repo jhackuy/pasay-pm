@@ -173,9 +173,12 @@ def build_timeline(
             "detail": repair.closure_reason or "",
         })
 
-    # Sort deterministically: by time, then by the canonical step order for
-    # events sharing the same instant (e.g. Verified + Closed both at closed_at).
-    order = {
+    # Sort deterministically: by time (normalized to a sortable epoch), then by
+    # the canonical step order for events sharing the same instant (e.g.
+    # Verified + Closed both at closed_at). ``at`` values may mix DB server
+    # defaults (+) and stored isoformat() (±) offsets, so we normalize to a
+    # UTC epoch for comparison instead of string-sorting.
+    sort_orders = {
         "repair_created": 0,
         "proposal_submitted": 1,
         "proposal_rejected": 2,
@@ -187,5 +190,26 @@ def build_timeline(
         "verified": 8,
         "closed": 9,
     }
-    events.sort(key=lambda e: ((e["at"] or ""), order.get(e["kind"], 99), e["label"]))
+    for ev in events:
+        ev["_at_epoch"] = _epoch(ev.get("at"))
+    events.sort(key=lambda e: (e["_at_epoch"] or 0, sort_orders.get(e["kind"], 99), e["label"]))
+    for ev in events:
+        ev.pop("_at_epoch", None)
     return events
+
+
+def _epoch(value) -> float | None:
+    """Best-effort epoch seconds from a datetime or ISO string (any offset)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (ValueError, TypeError):
+            return None
+    if dt.tzinfo is None:
+        from datetime import timezone as _tz
+        dt = dt.replace(tzinfo=_tz.utc)
+    return dt.timestamp()
