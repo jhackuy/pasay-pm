@@ -128,7 +128,7 @@ class RepairOut(BaseModel):
 class RepairDetailOut(RepairOut):
     proposals: list[RepairProposalOut] = []
     actions: list[RepairActionOut] = []
-    evidence: dict = {}
+    evidence: Optional[dict] = None
     expense_ids: list[int] = []
 
 

@@ -128,8 +128,9 @@ def get_repair_detail(
     _scope_guard(repair, user)
     proposals = prop_svc.list_proposals(db, repair.id)
     actions = continuation.resolve_actions(db, repair.id)
+    base = RepairDetailOut.model_validate(repair).model_dump()
     return RepairDetailOut(
-        **RepairDetailOut.model_validate(repair).model_dump(),
+        **base,
         proposals=proposals,
         actions=actions,
         evidence=repair.evidence or {},
