@@ -114,17 +114,32 @@ def build_timeline(
             })
 
     # 4. Expense paid for an approved proposal (PAID != Closed).
+    #   a) from an expense linked to a proposal (proposal.expense_id),
+    #   b) from the repair's own record written by the payment coordination
+    #      (details["expense_paid_at"]) — covers paid expenses recorded without
+    #      being linked to a proposal.
     expense_ids = {p.expense_id for p in proposals if p.expense_id is not None}
-    if expense_ids:
+    paid_at = None
+    repair_details = repair.details or {}
+    if repair_details.get("expense_paid_at"):
+        paid_at = repair_details["expense_paid_at"]
+    if not paid_at:
+        if expense_ids:
+            linked_paid = db.query(Expense).filter(
+                Expense.id.in_(expense_ids), Expense.status == ExpenseStatus.paid
+            ).first()
+            if linked_paid is not None:
+                paid_at = linked_paid.updated_at
+    if paid_at:
+        events.append({
+            "at": _iso(paid_at),
+            "kind": "expense_paid",
+            "label": "Expense paid",
+            "detail": "For the approved repair quote",
+        })
+    elif expense_ids:
         for expense in db.query(Expense).filter(Expense.id.in_(expense_ids)).all():
-            if expense.status == ExpenseStatus.paid:
-                events.append({
-                    "at": _iso(expense.updated_at),
-                    "kind": "expense_paid",
-                    "label": "Expense paid",
-                    "detail": f"{_money(expense.amount)} · {expense.payee}",
-                })
-            elif expense.status == ExpenseStatus.approved:
+            if expense.status == ExpenseStatus.approved:
                 events.append({
                     "at": _iso(expense.approved_at or expense.created_at),
                     "kind": "expense_approved",
