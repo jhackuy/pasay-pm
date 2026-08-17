@@ -166,15 +166,17 @@ def test_reply_keyboard_always_four_keys_no_ops_assistant(make_app):
 
 
 def test_home_callback_lands_on_unique_home(make_app):
-    """§2.1: every 🏠 Home callback renders the ONE Home (Operations Overview)
-    — never the legacy dashboard with Rent/Overdue/Operations Assistant."""
+    """§2.1 + PASAY-AI-EMPLOYEE-FOUNDATION-007A §C: every 🏠 Home callback
+    renders the ONE global Operations Overview (运营总览 / Pasay Operations) —
+    never "Pasay Property", never the legacy dashboard."""
     env = make_app(backend=C3Backend())
     run_updates(
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, encode(ACTION_NAV, "home"), bot=env.bot)],
     )
     edit = env.bot.edits()[-1]
-    assert "Pasay Property" in edit["text"]
+    assert "运营总览" in edit["text"] or "Pasay Operations" in edit["text"]
+    assert "Pasay Property" not in edit["text"]
     assert "本月应收" in edit["text"] or "Expected" in edit["text"]
     assert "运营助手" not in edit["text"]
     assert "Operations Assistant" not in edit["text"]
@@ -223,7 +225,9 @@ def test_expense_list_short_open_buttons_and_detail_actions(make_app):
     detail_labels = _inline_labels(detail["reply_markup"])
     assert any("提醒" in l or "Remind" in l for l in detail_labels)
     assert any("已付" in l or "Paid" in l for l in detail_labels)
-    assert any("返回" in l or "Back" in l for l in detail_labels)
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ◀ 支出 back (parent) + 🏠 Home.
+    assert any("◀ 支出" in l or "◀ Expense" in l or "返回" in l or "Back" in l
+               for l in detail_labels)
     assert any("首页" in l or "Home" in l for l in detail_labels)
     assert "Approved 2026-08-15" in detail["text"] or "批准于" in detail["text"]
 

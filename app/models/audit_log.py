@@ -58,6 +58,17 @@ class AuditAction(str, Enum):
     # TELEGRAM-OPS-UX-CONVERGENCE-003 §1.5: the human tapped ✅ Acknowledge on
     # a proactive reminder (PENDING -> IN_PROGRESS, reminders stop for today).
     task_acknowledged = "task_acknowledged"
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 (appended only): AI Employee Foundation
+    # audit actions — each distinguishes exactly WHO did WHAT (a human-supplied
+    # low-risk write vs a self-healing resume vs a payment-promise scheduler).
+    phone_direct_update = "phone_direct_update"
+    blocked_created = "blocked_created"
+    blocked_resolved = "blocked_resolved"
+    payment_promise_recorded = "payment_promise_recorded"
+    promise_fulfilled = "promise_fulfilled"
+    promise_missed_refollow = "promise_missed_refollow"
+    action_assigned = "action_assigned"
+    rent_followup_sent = "rent_followup_sent"
 
 
 class AuditLog(AuditMixin, Base):

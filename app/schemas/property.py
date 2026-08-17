@@ -12,6 +12,13 @@ class PropertyBase(BaseModel):
     city: str = Field(min_length=1, max_length=100)
     total_units: int = Field(default=0, ge=0)
     is_active: bool = True
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §5: management contact + output.
+    management_company: str | None = Field(default=None, max_length=200)
+    management_office_phone: str | None = Field(default=None, max_length=50)
+    management_contact_person: str | None = Field(default=None, max_length=200)
+    management_email: str | None = Field(default=None, max_length=200)
+    management_office_location: str | None = Field(default=None, max_length=300)
+    operational_notes: str | None = None
 
 
 class PropertyCreate(PropertyBase):
@@ -24,6 +31,12 @@ class PropertyUpdate(BaseModel):
     city: str | None = Field(default=None, min_length=1, max_length=100)
     total_units: int | None = Field(default=None, ge=0)
     is_active: bool | None = None
+    management_company: str | None = Field(default=None, max_length=200)
+    management_office_phone: str | None = Field(default=None, max_length=50)
+    management_contact_person: str | None = Field(default=None, max_length=200)
+    management_email: str | None = Field(default=None, max_length=200)
+    management_office_location: str | None = Field(default=None, max_length=300)
+    operational_notes: str | None = None
 
 
 class PropertyRead(PropertyBase, AuditFields):

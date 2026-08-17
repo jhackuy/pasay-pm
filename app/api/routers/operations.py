@@ -34,9 +34,13 @@ from app.models.user import User, UserRole
 from app.schemas.operations import (
     OperationsSummary,
     OperationalTaskRead,
+    PaymentPromiseIn,
+    PaymentPromiseOut,
     RecurringRuleCreate,
     RecurringRuleRead,
     RecurringRuleUpdate,
+    ResumeActionIn,
+    ResumeActionOut,
     SchedulerRunResult,
     TaskActionOut,
     TaskCreateIn,
@@ -1611,3 +1615,312 @@ def cancel_copilot_proposal(
             else "Proposal cancelled"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# PASAY-AI-EMPLOYEE-FOUNDATION-007: Rent Action Pack + self-healing + conflicts
+# ---------------------------------------------------------------------------
+
+@router.get("/action-pack")
+def rent_action_pack(
+    unit_id: int = Query(...),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """§11-§15: the FULL Rent Action Pack for a unit — tenant phone, real
+    outstanding / periods / overdue days, last follow-up, latest payment
+    promise, payment method, and call+message scripts built ENTIRELY from
+    structured truth (never LLM-fabricated). ``assignable`` is False (with
+    ``blocked_hint``) when the tenant phone is missing/invalid — the caller
+    must NOT hand a collection job to the Secretary in that case (§12)."""
+    from app.services.operations.rent_pack import build_rent_action_pack
+
+    pack = build_rent_action_pack(db, unit_id)
+    if pack.get("error") == "unit_not_found":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
+    if pack.get("error") == "no_active_lease":
+        raise HTTPException(status.HTTP_409_CONFLICT, "Unit has no active lease")
+    return pack
+
+
+@router.get("/conflict-report")
+def conflict_report(
+    unit_id: int = Query(...),
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """§10: deterministic DATA-CONFLICT report for one unit — never silently
+    chooses; returns human-resolvable options for rent-vs-legacy conflicts."""
+    from app.services.operations.conflicts import build_conflict_report
+
+    return build_conflict_report(db, unit_id)
+
+
+@router.get("/route")
+def action_route(
+    action_type: str = Query(..., description="RENT_FOLLOWUP / EXPENSE_OWNER_PAYMENT"),
+    _: User = Depends(manager_or_admin),
+):
+    """§19: resolve the canonical responsibility for an action type
+    (RENT_FOLLOWUP -> SECRETARY, EXPENSE_OWNER_PAYMENT -> OWNER). Fails closed
+    for not-yet-routed types."""
+    from app.services.operations.action_router import (
+        RouteNotRouted,
+        route_action,
+        route_code,
+    )
+
+    try:
+        code = route_code(action_type)
+    except (RouteNotRouted, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)
+        ) from exc
+    return {"action_type": str(action_type), "route": code, "responsibility": route_action(action_type).value}
+
+
+@router.post("/promise", response_model=PaymentPromiseOut, status_code=status.HTTP_201_CREATED)
+def record_payment_promise(
+    payload: PaymentPromiseIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """§17: persist a REAL payment promise (amount / promised_date / recorded_by)
+    on the unit's active rent task so the workflow auto-checks it at the
+    promised date. This is a HIGH-risk enter-the-workflow action only in the
+    sense it starts a scheduled check — the promise itself is a commitment
+    (not money), so no financial write; the bot confirms before calling."""
+    from datetime import datetime, timezone
+
+    from app.models.lease import Lease
+    from app.models.operations import OperationalTask, OperationalTaskType, OperationalTaskStatus
+    from app.services.operations.promises import apply_payment_promise
+
+    lease = None
+    if payload.lease_id is not None:
+        lease = db.query(Lease).filter(Lease.id == payload.lease_id).first()
+    if lease is None:
+        # Resolve lease from unit if not given (caller may pass either).
+        if payload.lease_id is None:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "lease_id is required")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
+
+    task = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.lease_id == lease.id,
+            OperationalTask.task_type.in_(
+                [OperationalTaskType.RENT_OVERDUE, OperationalTaskType.FOLLOWUP]
+            ),
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .order_by(OperationalTask.id)
+        .first()
+    )
+    if task is None:
+        # No active task: create a RENT_OVERDUE one to carry the promise.
+        from app.services.operations.generation import create_operational_task
+
+        task, _ = create_operational_task(
+            db,
+            fields={
+                "task_type": OperationalTaskType.RENT_OVERDUE,
+                "title": f"Collect overdue rent · {lease.unit_id}",
+                "lease_id": lease.id,
+                "tenant_id": lease.tenant_id,
+                "source_type": "lease",
+                "source_id": lease.id,
+                "status": OperationalTaskStatus.PENDING,
+                "due_at": datetime.now(timezone.utc),
+                "next_action": "Follow up with tenant for promised payment.",
+                "dedupe_key": f"lease:{lease.id}:RENT_OVERDUE",
+            },
+            now=datetime.now(timezone.utc),
+            actor_id=user.id,
+        )
+        if task is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Promise task de-duplicated elsewhere")
+
+    amount = None
+    if payload.amount is not None:
+        from decimal import Decimal
+
+        amount = Decimal(str(payload.amount)).quantize(Decimal("0.01"))
+    from datetime import timezone as _tz
+
+    apply_payment_promise(
+        db,
+        task,
+        amount=amount,
+        promised_date=payload.promised_date.astimezone(_tz.utc),
+        recorded_by=user.id,
+        note=payload.note or "",
+    )
+    record_audit(
+        db,
+        table_name="operational_tasks",
+        record_id=task.id,
+        action="payment_promise_recorded",
+        actor_id=user.id,
+        changed_fields={"details.promise": [None, dict(task.details or {}).get("promise")]},
+        old_value=serialize_row(task),
+        new_value=serialize_row(task),
+    )
+    db.commit()
+    return PaymentPromiseOut(
+        task_id=task.id,
+        amount=str(amount) if amount is not None else None,
+        promised_date=payload.promised_date.astimezone(_tz.utc).isoformat(),
+        recorded_by=user.id,
+        status="open",
+    )
+
+
+@router.post("/resume", response_model=ResumeActionOut)
+def resume_blocked(
+    payload: ResumeActionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """§2 / §8: self-healing. The human supplied the missing low-risk data
+    (e.g. ``tenant_phone``); this saves it, resolves the block on any matching
+    task and returns the ``blocked_action`` so the caller auto-executes it —
+    the user NEVER re-clicks the original action."""
+    from app.models.lease import Lease
+    from app.models.operations import OperationalTask, OperationalTaskStatus
+    from app.models.tenant import Tenant
+    from app.services.operations import resolver as resolver_svc
+    from app.services.operations.resolver import task_blocked
+
+    lease_id = payload.lease_id
+    unit_id = payload.unit_id
+    task = None
+
+    if payload.task_id is not None:
+        task = db.query(OperationalTask).filter(OperationalTask.id == payload.task_id).first()
+
+    if task is None and lease_id is not None:
+        task = (
+            db.query(OperationalTask)
+            .filter(
+                OperationalTask.lease_id == lease_id,
+                OperationalTask.status.in_(
+                    [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+                ),
+            )
+            .order_by(OperationalTask.id)
+            .first()
+        )
+
+    # 1) Apply the low-risk direct write.
+    message_parts = []
+    if payload.field == "tenant_phone" and payload.value:
+        lease = None
+        if lease_id is not None:
+            from app.models.lease import Lease as _Lease
+
+            lease = db.get(_Lease, lease_id)
+        if lease is None and unit_id is not None:
+            from app.models.lease import Lease as _Lease
+
+            lease = (
+                db.query(_Lease)
+                .filter(_Lease.unit_id == unit_id, _Lease.status == "active",
+                        _Lease.deleted_at.is_(None))
+                .first()
+            )
+        tenant = None
+        if lease is not None:
+            tenant = db.get(Tenant, lease.tenant_id)
+        if tenant is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found for the block")
+        old_phone = tenant.phone
+        tenant.phone = (payload.value or "").strip()
+        from app.models.tenant import TenantContactStatus
+
+        if tenant.contact_status == TenantContactStatus.WRONG_NUMBER:
+            tenant.contact_status = TenantContactStatus.UNVERIFIED
+        if tenant.contact_status is None:
+            tenant.contact_status = TenantContactStatus.UNVERIFIED
+        tenant.updated_by = user.id
+        record_audit(
+            db,
+            table_name="tenants",
+            record_id=tenant.id,
+            action="phone_direct_update",
+            actor_id=user.id,
+            changed_fields={"phone": [old_phone, tenant.phone]},
+            old_value=serialize_row(tenant),
+            new_value=serialize_row(tenant),
+        )
+        message_parts.append(f"已记录租客电话：{tenant.phone}")
+
+    # 2) Resolve the block on the matched task.
+    blocked_action = None
+    if task is not None and task_blocked(task):
+        blocked_action = resolver_svc.resolve_issue(task)
+        if blocked_action:
+            record_audit(
+                db,
+                table_name="operational_tasks",
+                record_id=task.id,
+                action="blocked_resolved",
+                actor_id=user.id,
+                changed_fields={"details.blocked": ["present", "resolved"]},
+                old_value=serialize_row(task),
+                new_value=serialize_row(task),
+            )
+
+    db.commit()
+    resolved = bool(blocked_action is not None) or bool(
+        task is not None and not task_blocked(task)
+    )
+    return ResumeActionOut(
+        resolved=resolved,
+        blocked_action=blocked_action,
+        message=" ".join(message_parts) or (
+            "资料已保存；请执行下一步。" if blocked_action else "无阻塞项待恢复。"
+        ),
+    )
+
+
+@router.get("/resolver/issues")
+def list_resolver_issues(
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user),
+):
+    """§8: current blocked issues across active tasks (what is blocking, why,
+    and the one-line fix each) — the Owner / dashboard can enumerate dead-ends
+    that still need a human input to unblock self-healing."""
+    from app.models.operations import OperationalTask, OperationalTaskStatus
+    from app.services.operations.resolver import task_blocked
+
+    active = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            )
+        )
+        .all()
+    )
+    issues = []
+    for t in active:
+        b = task_blocked(t)
+        if not b:
+            continue
+        issues.append(
+            {
+                "task_id": t.id,
+                "unit_id": t.lease_id,
+                "issue_type": b.get("issue_type"),
+                "field": b.get("field"),
+                "blocked_action": b.get("blocked_action"),
+                "risk_level": b.get("risk_level"),
+                "suggested_fix": b.get("suggested_fix"),
+                "created_at": b.get("created_at"),
+            }
+        )
+    return {"issues": issues}

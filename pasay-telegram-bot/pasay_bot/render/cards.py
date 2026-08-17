@@ -1472,7 +1472,9 @@ def home_summary_card(
     today_count: int = 0,
     locale: str = "zh",
 ) -> str:
-    """CONVERGENCE-003 §2.2 Home = Telegram lightweight Operations Overview.
+    """CONVERGENCE-003 §2.2 + PASAY-AI-EMPLOYEE-FOUNDATION-007A §C: Home =
+    the ONE global Operations Overview (God View), titled ``运营总览`` for the
+    Owner (zh) / ``Pasay Operations`` (en) — never "Pasay Property".
 
     Ten deterministic numbers: this month expected / collected / outstanding,
     historical total arrears, overdue units, expiring contracts, vacant units,
@@ -1481,7 +1483,8 @@ def home_summary_card(
     Keyboard carries navigation); only the two situational actions (⚠️ Today /
     🔄 Refresh) ride on the keyboard.
     """
-    lines = ["<b>Pasay Property</b>"]
+    title = _home_title(locale)
+    lines = [f"<b>{H.escape(title)}</b>"]
     if expected is not None:
         lines.append(H.escape(_bi_value(locale, f"Expected {H.money(expected)}", f"本月应收 {H.money(expected)}")))
     lines.append(H.escape(_bi_value(locale, f"Collected {H.money(collected)}", f"本月已收 {H.money(collected)}")))
@@ -1869,6 +1872,16 @@ def _bi_header(locale: str, en: str, zh: str) -> str:
     return en if locale == "en" else zh
 
 
+def _home_title(locale: str) -> str:
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007A §C: the Global Home title. Owner sees
+    the Chinese single-language ``运营总览``; Secretary sees English
+    ``Pasay Operations``. Never "Pasay Property" (avoid confusion with
+    Properties)."""
+    if locale == "en":
+        return "Pasay Operations"
+    return "运营总览"
+
+
 def _bi_value(locale: str, en: str, zh: str) -> str:
     """Compact one-line bilingual VALUE, e.g. 'Outstanding ₱75,000 · 未付
     ₱75,000' (CONVERGENCE-003 §6.1) — one line, never two."""
@@ -2035,16 +2048,22 @@ def secretary_followup_card(
     unit_label: str,
     locale: str = "bi",
     tenant_name: str = "",
+    tenant_phone: str = "",
     outstanding=None,
     unpaid_periods: int = 0,
     overdue_days: int = 0,
     last_followup: str = "",
+    call_script: str = "",
+    message_script: str = "",
     done: bool = False,
 ) -> str:
-    """Secretary private-chat collection task card (§3). Built ONLY from the
+    """Secretary private-chat collection task card (§3/§13). Built ONLY from the
     real rent truth source (quick-rent row + unit/lease/tenant) — the amount,
     period count and overdue days are never re-derived by the renderer. When
-    ``done`` the card shows the executed state and the buttons go away."""
+    the tenant phone is present it is shown, and the call/message scripts (also
+    built from structured truth, §14/§15) are attached so the Secretary never
+    re-organizes language. When ``done`` the card shows the executed state and
+    the buttons go away."""
     if done:
         lines = [
             f"<b>{H.escape(t('v2.sec_dm_contact_recorded', locale))}</b>",
@@ -2058,6 +2077,8 @@ def secretary_followup_card(
     lines = [f"🔴 <b>{title}</b>", ""]
     if tenant_name:
         lines.append(H.escape(t("v2.sec_dm_tenant", locale, tenant=H.escape(tenant_name))))
+    if tenant_phone:
+        lines.append(H.escape(t("v2.sec_dm_phone", locale, phone=H.escape(tenant_phone))))
     if outstanding is not None:
         lines.append(H.escape(t("v2.sec_dm_outstanding", locale, amount=H.money(outstanding))))
     if unpaid_periods:
@@ -2072,6 +2093,12 @@ def secretary_followup_card(
     lines.append(H.escape(t("v2.sec_dm_body", locale)))
     if outstanding is not None and _dec(outstanding) > 0:
         lines.append(H.escape(t("v2.sec_dm_redirect_payment", locale)))
+    if call_script:
+        lines.append("")
+        lines.append(H.escape(t("v2.sec_dm_call_script", locale, script=H.escape(call_script))))
+    if message_script:
+        lines.append("")
+        lines.append(H.escape(t("v2.sec_dm_message_script", locale, script=H.escape(message_script))))
     return "\n".join(lines)
 
 

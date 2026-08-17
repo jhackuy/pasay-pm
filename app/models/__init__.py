@@ -39,7 +39,7 @@ from app.models.operations import (
 )
 from app.models.property import Property, Unit, UnitLifecycleEvent, UnitStatus
 from app.models.task import Task, TaskPriority, TaskStatus
-from app.models.tenant import Tenant
+from app.models.tenant import Tenant, TenantContactStatus
 from app.models.user import User, UserRole
 
 __all__ = [
@@ -81,6 +81,7 @@ __all__ = [
     "TaskPriority",
     "TaskStatus",
     "Tenant",
+    "TenantContactStatus",
     "Unit",
     "UnitLifecycleEvent",
     "UnitStatus",

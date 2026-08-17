@@ -346,7 +346,9 @@ def test_home_button_returns_to_dashboard(make_app):
     )
     assert "本月" in env.bot.last_edit()["text"]
     assert len(env.bot.answers()) == 1
-    assert "处理中" in (env.bot.answers()[0]["text"] or "")
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A: deterministic nav ACKs FAST (empty),
+    # no "处理中" toast — the render is the result.
+    assert (env.bot.answers()[0]["text"] or "") == ""
 
 
 def test_retry_button_reloads_same_page(make_app):
@@ -387,8 +389,13 @@ def test_latency_sample_has_no_llm_fields(make_app):
     _seed_expense(env)
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, _reject_data(), bot=env.bot)])
     sample = _latency(env).last("callback")
-    allowed = {"kind", "label", "elapsed_ms", "outcome", "detail", "ts"}
-    assert set(sample) == allowed
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A: callbacks carry the phase profile.
+    allowed = {
+        "kind", "label", "elapsed_ms", "outcome", "detail", "ts",
+        "callback_ack_ms", "backend_fetch_ms", "render_ms",
+        "telegram_edit_ms", "total_ms",
+    }
+    assert set(sample) <= allowed
     for banned in ("model", "llm", "prompt", "tokens", "provider", "nlu"):
         assert banned not in sample["label"]
         assert banned not in str(sample["detail"]).lower()

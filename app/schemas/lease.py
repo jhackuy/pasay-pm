@@ -18,6 +18,10 @@ class LeaseBase(BaseModel):
     status: LeaseStatus = LeaseStatus.active
     due_day: int | None = Field(default=None, ge=1, le=31)
     notes: str | None = None
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §4: structured lease truth.
+    renewal_notice_period_days: int | None = Field(default=None, ge=0, le=365)
+    management_fee_included: bool | None = None
+    special_terms: str | None = None
 
     @model_validator(mode="after")
     def check_dates(self):
@@ -46,6 +50,9 @@ class LeaseUpdate(BaseModel):
     status: LeaseStatus | None = None
     due_day: int | None = Field(default=None, ge=1, le=31)
     notes: str | None = None
+    renewal_notice_period_days: int | None = Field(default=None, ge=0, le=365)
+    management_fee_included: bool | None = None
+    special_terms: str | None = None
 
     @model_validator(mode="after")
     def check_accounting_start_date(self):

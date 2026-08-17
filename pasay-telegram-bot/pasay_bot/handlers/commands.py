@@ -10,6 +10,7 @@ import asyncio
 import calendar
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
@@ -398,8 +399,10 @@ async def _send(context, chat_id, text, keyboard=None, reply_keyboard=None):
 async def _render(context, chat_id, message_id, text, keyboard=None, reply_keyboard=None):
     """edit-first: when a message_id is known we edit it, else send (B6)."""
     print(f"[TRACE] render start chat_id={chat_id} message_id={message_id} text_len={len(text) if text else 0}", flush=True)
+    _ph_start = time.monotonic()
     try:
         if message_id:
+            _tg_start = time.monotonic()
             await edit_message_text_idempotent(
                 context.bot,
                 chat_id=chat_id,
@@ -408,12 +411,32 @@ async def _render(context, chat_id, message_id, text, keyboard=None, reply_keybo
                 parse_mode=HTML,
                 reply_markup=keyboard,
             )
+            _record_phase("telegram_edit_ms", (time.monotonic() - _tg_start) * 1000)
         else:
+            _tg_start = time.monotonic()
             await _send(context, chat_id, text, keyboard, reply_keyboard=reply_keyboard)
+            _record_phase("telegram_edit_ms", (time.monotonic() - _tg_start) * 1000)
         print(f"[TRACE] render OK chat_id={chat_id}", flush=True)
     except Exception as exc:  # noqa: BLE001 - trace must never swallow the reply failure
         print(f"[TRACE] render FAIL {type(exc).__name__} {exc!r} chat_id={chat_id}", flush=True)
         raise
+    finally:
+        _record_phase("render_ms", (time.monotonic() - _ph_start) * 1000)
+
+
+def _record_phase(attr: str, ms: float) -> None:
+    """Best-effort record of a phase into the active PhaseProbe (007A A)."""
+    try:
+        from pasay_bot.state.latency import current_phase
+
+        probe = current_phase()
+        if probe is not None:
+            if attr == "render_ms":
+                probe.add_render(ms)
+            elif attr == "telegram_edit_ms":
+                probe.add_telegram(ms)
+    except Exception:  # noqa: BLE001 - profiling never breaks rendering
+        pass
 
 
 def _load_error(detail: str, locale: str) -> str:
@@ -493,7 +516,10 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
     card carries only the situational ⚠️ Today / 🔄 Refresh buttons."""
     api = context.bot_data["api_client"]
     month = _current_month()
-    expenses, incomes, overdue, leases, units, tasks, quick_exp, quick_rent = await asyncio.gather(
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A: one parallel gather (never serial
+    # N+1); every read-model ack clears the spinner immediately, so the God
+    # View renders as fast as the slowest single snapshot.
+    expenses, incomes, overdue, leases, units, tasks, quick_exp, quick_rent, fin = await asyncio.gather(
         api.list_expenses(),
         api.list_incomes(),
         api.get_overdue_rents(),
@@ -502,14 +528,10 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
         api.get_operational_tasks(status="PENDING"),
         api.get_quick_expense(),
         api.get_quick_rent(),
+        api.get_financial_summary(month),
         return_exceptions=True,
     )
-    fin = None
-    try:
-        fin = await api.get_financial_summary(month)
-    except PasayApiError:
-        fin = None
-    if fin is None:
+    if isinstance(fin, Exception) or not fin:
         await _render(context, chat_id, message_id, _load_error("home", locale),
                       home_summary_keyboard(locale))
         if role and message_id is None:
@@ -652,6 +674,31 @@ async def show_quick_properties(context, chat_id, role, locale: str, message_id=
         _mark_menu_initialized(context, chat_id)
 
 
+async def show_today_digest(context, chat_id, role, locale: str, message_id=None):
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007A §D: ⚠️ Today = the SAME Daily Digest
+    path as the scheduled job — one truth, one renderer.
+
+    Calls ``GET /operations/digest`` (the same ``build_digest`` with business
+    dedup + HUMAN/SYSTEM completion filter) and renders with the SAME
+    ``cards.active_tasks_digest_card`` used by the scheduled private deliverer.
+    Never a second per-page logic set: the Owner sees their own (zh) digest
+    on demand, without waiting for the next scheduled delivery."""
+    api = context.bot_data["api_client"]
+    try:
+        data = await api.get_digest()
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    data = data or {}
+    text = cards.active_tasks_digest_card(data, locale)
+    # Same situational nav as Home: ⚠️ Today re-entry is the digest itself.
+    await _render(
+        context, chat_id, message_id, text,
+        keyboard=home_summary_keyboard(locale),
+    )
+
+
 async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None):
     """✅ Tasks Quick View (deterministic, no LLM).
 
@@ -786,10 +833,13 @@ async def show_quick_expense(context, chat_id, role, locale: str, message_id=Non
 
 
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """PASAY-V2-FOUNDATION-001: photo/document receipt ack.
+    """Media receipt ack (PASAY-AI-EMPLOYEE-FOUNDATION-007 §6.2).
 
-    Media is accepted immediately (background processing happens later) and
-    the reply carries the persistent keyboard — one message, no junk."""
+    A photo/document may NEVER be blind-published to the archive. If the media
+    already has a semantic caption or the active business context implies a
+    category, it is archived and indexed as an ArchiveAsset. Otherwise the bot
+    asks ONE clarifying question (``1608 水表`` / ``1608 房租手机``) and only
+    archives AFTER the semantic caption arrives — never a floating file."""
     user = update.effective_user
     role = role_for_telegram_id(user.id if user else None)
     chat_id = update.effective_chat.id if update.effective_chat else (user.id if user else None)
@@ -803,30 +853,76 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
     locale = locale_for_chat(
         update.effective_chat.type if update.effective_chat else None, role
     )
-    # AI-OPS-FOUNDATION-001 §12: forward media to the private Telegram archive
-    # channel (FREE-FIRST storage) and index it in the backend `evidence`
-    # table, linked to the active business context when available.
+    msg = update.effective_message
+    caption = (getattr(msg, "caption", None) or "").strip()
+    # Semantic signal: a caption, or an active business context that pins a
+    # category (repair/expense evidence). If neither -> ask, never blind-publish.
+    semantic = bool(caption) or _media_has_context(update, context)
     archived = False
-    try:
-        archived = await _archive_media(update, context)
-    except Exception as exc:  # noqa: BLE001 - archiving must never break the ack
-        logger.warning("media archive failed: %s", exc)
-        archived = False
-    if archived:
-        await context.bot.send_message(
-            chat_id,
-            H.escape(t("v2.media_archived", locale)),
-            parse_mode=HTML,
-            reply_markup=reply_keyboard(role),
-        )
+    if semantic:
+        try:
+            archived = await _archive_media(update, context)
+        except Exception as exc:  # noqa: BLE001 - archiving never breaks the ack
+            logger.warning("media archive failed: %s", exc)
+            archived = False
+        if archived:
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("v2.media_archived", locale)),
+                parse_mode=HTML,
+                reply_markup=reply_keyboard(role),
+            )
+        else:
+            await context.bot.send_message(
+                chat_id,
+                H.escape(t("v2.media_received", locale)),
+                parse_mode=HTML,
+                reply_markup=reply_keyboard(role),
+            )
     else:
+        # §6.2: no semantic caption -> one clarifying question, NO publication.
+        # Store the pending media so the follow-up reply ("1608 水表") archives
+        # it with real business semantics.
+        store = context.bot_data["store"]
+        file_id, media_type, mime_type, filename, size = _media_file_info(msg, msg)
+        store.save_conversation(
+            chat_id, user.id,
+            "archive_caption",
+            {
+                "media_pending": True,
+                "message_id": getattr(msg, "message_id", None),
+                "file_id": file_id,
+                "media_type": media_type,
+                "mime_type": mime_type,
+                "filename": filename,
+                "size_bytes": size,
+            },
+        )
         await context.bot.send_message(
             chat_id,
-            H.escape(t("v2.media_received", locale)),
+            H.escape(t("v2.media_ask_caption", locale)),
             parse_mode=HTML,
             reply_markup=reply_keyboard(role),
         )
     _mark_menu_initialized(context, chat_id)
+
+
+def _media_has_context(update, context) -> bool:
+    """A media message is 'semantic' when an active business context (repair /
+    expense) pins the file to a real entity + category — only then forward."""
+    try:
+        user = update.effective_user
+        if user is None:
+            return False
+        ctx = context.bot_data["store"].get_v2_context(
+            update.effective_chat.id, user.id
+        )
+        if not ctx:
+            return False
+        payload = dict(ctx["payload"] or {})
+        return bool(payload.get("task_ref") or payload.get("expense_ref") or payload.get("intent"))
+    except Exception:  # noqa: BLE001 - context is best-effort
+        return False
 
 
 async def _archive_media(update: Update, context) -> bool:
@@ -1387,15 +1483,18 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
 
 async def build_unit_page(api, unit_id: int, can_rent: bool, locale: str,
                           back_entity: str = "home"):
-    """Unit page used by the rent flow, overdue detail and payment view."""
+    """Unit page used by the rent flow, overdue detail and payment view.
+
+    PASAY-AI-EMPLOYEE-FOUNDATION-007A §A8: fast-path — only the few fields this
+    card really needs are fetched, in one parallel gather (no unused round-trip
+    to the overdue report, no N+1 serial calls)."""
     try:
-        unit, properties, leases, tenants, incomes, overdue = await asyncio.gather(
+        unit, properties, leases, tenants, incomes = await asyncio.gather(
             api.get_unit(unit_id),
             api.get_properties(),
             api.get_leases(),
             api.get_tenants(),
             api.list_incomes(),
-            api.get_overdue_rents(),
         )
     except PasayApiError as exc:
         return _load_error(exc.detail, locale), error_keyboard(back_entity, locale)

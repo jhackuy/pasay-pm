@@ -6,6 +6,7 @@ handlers can implement the "uncertain write" reconciliation path.
 """
 from __future__ import annotations
 
+import time as _time_module
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -15,6 +16,11 @@ from contextvars import ContextVar
 import httpx
 
 MAX_TELEGRAM_USER_ID = 2**63 - 1
+
+
+def _time_ms() -> float:
+    """Wall-clock milliseconds for callback phase profiling (007A A)."""
+    return _time_module.monotonic() * 1000
 
 
 def _to_decimal(value: Any) -> Decimal:
@@ -131,6 +137,11 @@ class Tenant:
     full_name: str
     phone: Optional[str] = None
     email: Optional[str] = None
+    secondary_phone: Optional[str] = None
+    contact_status: Optional[str] = None
+    id_registered: bool = False
+    emergency_name: Optional[str] = None
+    emergency_phone: Optional[str] = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "Tenant":
@@ -139,7 +150,16 @@ class Tenant:
             full_name=d.get("full_name") or "",
             phone=d.get("phone"),
             email=d.get("email"),
+            secondary_phone=d.get("secondary_phone"),
+            contact_status=d.get("contact_status"),
+            id_registered=bool(d.get("id_registered")),
+            emergency_name=d.get("emergency_name"),
+            emergency_phone=d.get("emergency_phone"),
         )
+
+    @property
+    def available_phone(self) -> Optional[str]:
+        return self.phone or self.secondary_phone
 
 
 @dataclass
@@ -788,12 +808,22 @@ class PasayApiClient:
             headers = dict(kwargs.pop("headers", {}) or {})
             headers["X-Telegram-User-Id"] = str(user_id)
             kwargs["headers"] = headers
+        _pstart = _time_ms()
         try:
             resp = await self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
             raise PasayApiTimeoutError() from exc
         except httpx.HTTPError as exc:
             raise PasayApiError(None, f"network error: {exc}") from exc
+        finally:
+            try:
+                from pasay_bot.state.latency import current_phase
+
+                probe = current_phase()
+                if probe is not None:
+                    probe.add_backend(_time_ms() - _pstart)
+            except Exception:  # noqa: BLE001 - instrumentation never breaks requests
+                pass
         if resp.status_code >= 400:
             detail, error_code = _extract_detail(resp)
             if resp.status_code == 401:
@@ -888,6 +918,44 @@ class PasayApiClient:
     async def get_tenants(self) -> list[Tenant]:
         data = await self._request("GET", "/tenants")
         return [Tenant.from_dict(d) for d in data]
+
+    async def update_tenant(self, tenant_id: int, **fields) -> dict:
+        """PASAY-AI-EMPLOYEE-FOUNDATION-007: low-risk tenant write (e.g.
+        supplying a missing phone). ``/tenants/{id}`` responds with the safe
+        public shape (ID number redacted)."""
+        return await self._request("PATCH", f"/tenants/{tenant_id}", json=fields)
+
+    async def resume_action(self, *, field: str, value: str, lease_id: int | None = None,
+                            unit_id: int | None = None, task_id: int | None = None) -> dict:
+        """§2/§8 self-healing: supply the missing data and get the blocked
+        action returned so the bot auto-executes it (no re-click)."""
+        payload = {"field": field, "value": value}
+        if lease_id is not None:
+            payload["lease_id"] = lease_id
+        if unit_id is not None:
+            payload["unit_id"] = unit_id
+        if task_id is not None:
+            payload["task_id"] = task_id
+        return await self._request("POST", "/operations/resume", json=payload)
+
+    async def get_action_pack(self, unit_id: int) -> dict:
+        """§13: the full Rent Action Pack (phone / scripts / assignable).
+        Returns the dict; frontends read ``assignable`` before assigning."""
+        return await self._request("GET", f"/operations/action-pack?unit_id={unit_id}")
+
+    async def get_action_route(self, action_type: str) -> dict:
+        return await self._request("GET", f"/operations/route?action_type={action_type}")
+
+    async def record_payment_promise(self, *, lease_id: int, amount: float | None,
+                                     promised_date: str, note: str = "") -> dict:
+        return await self._request(
+            "POST", "/operations/promise",
+            json={"lease_id": lease_id, "amount": amount,
+                  "promised_date": promised_date, "note": note},
+        )
+
+    async def get_conflict_report(self, unit_id: int) -> dict:
+        return await self._request("GET", f"/operations/conflict-report?unit_id={unit_id}")
 
     async def get_income(self, income_id: int) -> Income:
         data = await self._request("GET", f"/incomes/{income_id}")

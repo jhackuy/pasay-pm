@@ -66,6 +66,21 @@ def percent(part, whole) -> str:
     return format(p, "f")
 
 
+def mask_phone(phone: str) -> str:
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007 §2/§9: mask a phone for safe echo
+    (``0917•••4567``) so a fully-typed number is never broadcast verbatim to a
+    group/DM surface."""
+    if not phone:
+        return ""
+    digits = [c for c in phone if c.isdigit()]
+    if len(digits) < 4:
+        return phone
+    head = "".join(digits[:4])
+    tail = "".join(digits[-4:])
+    prefix = "+" if str(phone).startswith("+") else ""
+    return f"{prefix}{head}•••{tail}"
+
+
 def utf16_len(text) -> int:
     """Telegram counts message length in UTF-16 code units."""
     return len(str(text).encode("utf-16-le")) // 2

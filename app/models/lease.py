@@ -2,7 +2,7 @@ from datetime import date
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import Date, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import Boolean, Date, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -30,6 +30,12 @@ class Lease(AuditMixin, SoftDeleteMixin, Base):
     )
     due_day: Mapped[int | None] = mapped_column(Integer, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §4: structured lease truth (a contract is
+    # NEVER just a PDF — these are the operational fields the AI reads instead
+    # of re-deriving from the document).
+    renewal_notice_period_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    management_fee_included: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    special_terms: Mapped[str | None] = mapped_column(Text, nullable=True)
     # AI-OPS-FOUNDATION-001 §18 deposit foundation: required deposit is
     # ``deposit``; the accounting columns below represent received / held /
     # deductions / refund without inventing a complex accounting UI.

@@ -100,6 +100,9 @@ ACTION_EXPENSE_BACK = "exb"         # ◀ Back on the Expense detail -> list
 ACTION_SEC_FOLLOWUP_CONTACT = "sfc"   # ✅ 已联系租客
 ACTION_SEC_FOLLOWUP_PAYMENT = "sfp"   # 💰 已收款
 ACTION_SEC_FOLLOWUP_SNOOZE = "sfs"    # ⏰ 稍后处理
+ACTION_SEC_FOLLOWUP_NO_ANSWER = "sfna"      # 📵 未接听 (PASAY-AI-EMPLOYEE-FOUNDATION-007)
+ACTION_SEC_FOLLOWUP_PROMISE = "sfpro"       # 📅 承诺付款 (PASAY-AI-EMPLOYEE-FOUNDATION-007)
+ACTION_SEC_FOLLOWUP_WRONG_NUMBER = "sfwn"   # 📞 号码错误 (PASAY-AI-EMPLOYEE-FOUNDATION-007)
 
 # --- Fixed bottom Reply Keyboard (single source of truth) -------------------
 # Exact button label -> deterministic route. These labels are UI commands,
@@ -692,7 +695,11 @@ def unit_page_keyboard(
     - action='reopen'  -> reversed: [🔄 重新登记]
     - action='view'    -> paid:     [💰 查看付款] (ref = income id)
     - action=None      -> vacant / no active lease: no collect button
-    """
+
+    PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: the detail always ends with a
+    ``◀ <parent> | 🏠 Home`` row so Back returns to the business parent
+    (e.g. Properties) and Home stays the ONE global Operations Overview —
+    Home never doubles as "back"."""
     buttons = []
     if action == "collect":
         buttons.append(
@@ -721,11 +728,61 @@ def unit_page_keyboard(
                 )
             ]
         )
-    label = t("common.home", locale) if back_entity == "home" else t("rent.back", locale)
-    buttons.append(
-        [InlineKeyboardButton(label, callback_data=encode(ACTION_NAV, back_entity))]
-    )
+    buttons.append(_back_home_row(back_entity, locale))
     return InlineKeyboardMarkup(buttons)
+
+
+def back_home_keyboard(back_entity: str, locale: str = "zh") -> InlineKeyboardMarkup:
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: public ``◀ <parent> | 🏠 Home``
+    navigation row (Back = business parent, Home = global Operations Overview)."""
+    return InlineKeyboardMarkup([_back_home_row(back_entity, locale)])
+
+
+def _back_home_row(back_entity: str, locale: str):
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ``[◀ <parent> | 🏠 Home]`` nav row.
+    Back returns to the business parent page; Home is ALWAYS the one global
+    Operations Overview. When there is no parent (``back_entity in ('home',
+    'menu')``) only 🏠 Home is shown — Back and Home never collapse into one."""
+    back = _parent_back_label(back_entity, locale)
+    home = [
+        InlineKeyboardButton(
+            t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+        )
+    ]
+    if back is None:
+        return home
+    # Expense Back and Archive Back use their own deterministic parent callback
+    # (not ACTION_NAV which only knows properties/rent/overdue/pending/home).
+    if back_entity == "expense":
+        return [
+            InlineKeyboardButton(back, callback_data=encode(ACTION_EXPENSE_BACK)),
+            home[0],
+        ]
+    if back_entity == "archive":
+        return [
+            InlineKeyboardButton(back, callback_data=encode(ACTION_PROP_ARCHIVE)),
+            home[0],
+        ]
+    return [
+        InlineKeyboardButton(back, callback_data=encode(ACTION_NAV, back_entity)),
+        home[0],
+    ]
+
+
+def _parent_back_label(back_entity: str, locale: str):
+    """Map a back target to its parent-page label (◀ 房源 / ◀ 租金 / ...)."""
+    key = {
+        "properties": "nav.back_properties",
+        "rent": "nav.back_rent",
+        "expense": "nav.back_expense",
+        "pending": "nav.back_tasks",
+        "tasks": "nav.back_tasks",
+        "overdue": "nav.back_overdue",
+        "archive": "nav.back_archive",
+    }.get(back_entity)
+    if key:
+        return t(key, locale)
+    return None
 
 
 def payment_method_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
@@ -1372,13 +1429,7 @@ def expense_detail_keyboard(
                 ),
             ]
         )
-    kb.append(
-        [
-            InlineKeyboardButton(
-                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
-            )
-        ]
-    )
+    kb.append(_back_home_row("expense", locale))
     return InlineKeyboardMarkup(kb)
 
 
@@ -1431,10 +1482,11 @@ def expense_open_keyboard(
                 ),
             ]
         )
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ◀ 支出 (back parent) | 🏠 Home.
     kb.append(
         [
             InlineKeyboardButton(
-                t("common.back_short", locale),
+                _parent_back_label("expense", locale) or t("common.back_short", locale),
                 callback_data=encode(ACTION_EXPENSE_BACK),
             ),
             InlineKeyboardButton(
@@ -1867,11 +1919,10 @@ def rent_detail_keyboard(unit_id: int, locale: str = "bi", *, followed_up_today:
                 t("v2.rent_history", locale),
                 callback_data=encode(ACTION_DETAIL, "unit", str(unit_id)),
             ),
-            InlineKeyboardButton(
-                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
-            ),
         ],
     ]
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ◀ 租金 | 🏠 Home.
+    kb.append(_back_home_row("rent", locale))
     return InlineKeyboardMarkup(kb)
 
 
@@ -1908,39 +1959,47 @@ def expense_remind_keyboard(
 # --- TELEGRAM-OPS-REAL-WORLD-CLOSURE-005: Secretary DM follow-up card --------
 
 def secretary_followup_keyboard(task_id: int, unit_id: int, locale: str = "bi") -> InlineKeyboardMarkup:
-    """Secretary private-chat collection card: exactly the three REAL execution
-    actions (§3.1):
-    - ``✅ 已联系租客``   ACTION_SEC_FOLLOWUP_CONTACT — the ONLY path 🟡 -> ✅
-    - ``💰 已收款``      ACTION_SEC_FOLLOWUP_PAYMENT — enters record-payment flow
-    - ``⏰ 稍后处理``     ACTION_SEC_FOLLOWUP_SNOOZE  — enters the existing snooze
+    """Secretary private-chat collection card (PASAY-AI-EMPLOYEE-FOUNDATION-007
+    §13.1) — realistic second-tier results, mobile-first:
+    - ``✅ 已联系租客``   sfc  — the ONLY path 🟡 -> ✅ (real contact)
+    - ``📵 未接听``       sfna — records an attempt, never "contacted"
+    - ``📅 承诺付款``     sfpro — captures a structured payment promise
+    - ``💰 已收款``      sfp  — enters the record-payment flow
+    - ``📞 号码错误``     sfwn — sets WRONG_NUMBER + creates a resolver issue
+    - ``⏰ 稍后处理``     sfs  — enters the existing snooze
 
     Buttons stay SHORT (one language) — never a bilingual button label."""
+    kw = {
+        "contact": t("v2.sec_dm_contact_btn", locale),
+        "no_answer": t("v2.sec_dm_no_answer_btn", locale),
+        "promise": t("v2.sec_dm_promise_btn", locale),
+        "payment": t("v2.sec_dm_payment_btn", locale),
+        "wrong": t("v2.sec_dm_wrong_number_btn", locale),
+        "snooze": t("v2.sec_dm_snooze_btn", locale),
+    }
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    t("v2.sec_dm_contact_btn", locale),
-                    callback_data=encode(
-                        ACTION_SEC_FOLLOWUP_CONTACT, "sec", str(task_id),
-                        nonce=new_nonce(), ts=now_ts(),
-                    ),
-                ),
-                InlineKeyboardButton(
-                    t("v2.sec_dm_payment_btn", locale),
-                    callback_data=encode(
-                        ACTION_SEC_FOLLOWUP_PAYMENT, "sec", str(unit_id),
-                        nonce=new_nonce(), ts=now_ts(),
-                    ),
-                ),
+                InlineKeyboardButton(kw["contact"], callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_CONTACT, "sec", str(task_id),
+                    nonce=new_nonce(), ts=now_ts())),
+                InlineKeyboardButton(kw["no_answer"], callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_NO_ANSWER, "sec", str(task_id),
+                    nonce=new_nonce(), ts=now_ts())),
+                InlineKeyboardButton(kw["promise"], callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_PROMISE, "sec", str(task_id),
+                    nonce=new_nonce(), ts=now_ts())),
             ],
             [
-                InlineKeyboardButton(
-                    t("v2.sec_dm_snooze_btn", locale),
-                    callback_data=encode(
-                        ACTION_SEC_FOLLOWUP_SNOOZE, "sec", str(task_id),
-                        nonce=new_nonce(), ts=now_ts(),
-                    ),
-                ),
+                InlineKeyboardButton(kw["payment"], callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_PAYMENT, "sec", str(unit_id),
+                    nonce=new_nonce(), ts=now_ts())),
+                InlineKeyboardButton(kw["wrong"], callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_WRONG_NUMBER, "sec", str(task_id),
+                    nonce=new_nonce(), ts=now_ts())),
+                InlineKeyboardButton(kw["snooze"], callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_SNOOZE, "sec", str(task_id),
+                    nonce=new_nonce(), ts=now_ts())),
             ],
         ]
     )

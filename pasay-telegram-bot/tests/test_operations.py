@@ -144,7 +144,9 @@ def test_ops_complete_edits_message(make_app):
     _open_section(env, "otd")
     done = _find_button(env.bot.last_edit()["reply_markup"], "✅ 完成")
     before = len(env.bot.calls)
-    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, done.callback_data, bot=env.bot)])
+    # Fresh callback_query_id (update_id) so this click is a real distinct tap;
+    # a reused id would make the processing-toast answer look like a no-op.
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, done.callback_data, update_id=999, bot=env.bot)])
     # original message edited (no new send_message) + backend POST /complete
     assert len(env.bot.sends()) == 0, "complete must edit, not send a new message"
     assert ("POST", "/operations/tasks/7/complete") in [

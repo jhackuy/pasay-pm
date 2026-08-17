@@ -609,13 +609,15 @@ def test_new_chat_member_group_gets_fixed_keyboard_no_start_prompt(make_app):
     assert "/start" not in "\n".join(env.bot.all_texts()).lower()
 
 
-# --- media ack: photo carries the keyboard ----------------------------------
+# --- media ack: photo carries the keyboard (PASAY-AI-EMPLOYEE-FOUNDATION-007
+# §6.2: no-caption photo asks for a semantic caption, never blind-publishes) --
 
 def test_photo_message_ack_received_with_keyboard(make_app):
     env = make_app(backend=V2FakeBackend())
     run_updates(env, [make_photo_update(OWNER_ID, OWNER_ID, bot=env.bot)])
     send = env.bot.last_send()
-    assert "已收到，后台处理中" in send["text"]
+    # Without a semantic caption the bot asks ONE question (never "received").
+    assert "水表" in send["text"] or "water meter" in send["text"]
     assert _labels(send["reply_markup"]) == V2_LABELS
 
 

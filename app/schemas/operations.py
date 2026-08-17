@@ -149,3 +149,50 @@ class SchedulerRunResult(BaseModel):
     promises_reminded: int = 0
     # AI-OPS-FOUNDATION-001 §19: deterministic exception findings this pass.
     exceptions_found: int = 0
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §17.2: payment-promise auto-check.
+    payment_promises_fulfilled: int = 0
+    payment_promises_refollowed: int = 0
+
+
+# --- PASAY-AI-EMPLOYEE-FOUNDATION-007 §17: payment promise capture ---
+
+
+class PaymentPromiseIn(BaseModel):
+    """A tenant payment commitment logged by the Secretary ("明天付30000，
+    周五付剩下的"). Stored structured; the workflow auto-checks it at the
+    promised date (§17.2)."""
+
+    lease_id: int | None = None
+    amount: float | None = Field(default=None, gt=0)
+    promised_date: datetime
+    note: str | None = None
+
+
+class PaymentPromiseOut(BaseModel):
+    task_id: int | None = None
+    amount: str | None = None
+    promised_date: str
+    recorded_by: int
+    status: str = "open"
+
+
+# --- PASAY-AI-EMPLOYEE-FOUNDATION-007 §8: self-healing resume body ---
+
+
+class ResumeActionIn(BaseModel):
+    """The human supplied the missing data; the backend saves it (low-risk
+    direct write) then returns the resolved blocked action to auto-resume."""
+
+    unit_id: int | None = None
+    lease_id: int | None = None
+    # The low-risk field being supplied (e.g. ``tenant_phone``).
+    field: str
+    value: str
+    # Optional: the blocked task id to resume directly.
+    task_id: int | None = None
+
+
+class ResumeActionOut(BaseModel):
+    resolved: bool
+    blocked_action: str | None = None
+    message: str = ""

@@ -26,6 +26,13 @@ def today_str():
     return date.today().isoformat()
 
 
+def _split_query(qs: str):
+    """Split a query string into a list of (key, value) pairs (FakeBackend)."""
+    from urllib.parse import parse_qsl
+
+    return parse_qsl(qs)
+
+
 def _add_days(iso: str, days: int) -> str:
     return (date.fromisoformat(iso) + timedelta(days=days)).isoformat()
 
@@ -91,12 +98,17 @@ class FakeBot:
         # live API does ("Message can't be edited").
         self._sent_by_id: dict[int, dict] = {}
 
+    def clear(self):
+        """Reset recorded calls (used to inspect a fresh window of output)."""
+        self.calls = []
+        self._answered_ids = set()
+        self._sent_by_id = {}
+
     async def initialize(self):
         pass
 
     async def shutdown(self):
         pass
-
     async def get_me(self):
         return SimpleNamespace(username=self.username, id=self.id)
 
@@ -334,6 +346,9 @@ class FakeBackend:
         # AI-OPS-FOUNDATION-001 §12/§15: evidence index + unit timeline.
         self.evidence: list[dict] = []
         self._next_evidence_id = 1
+        # PASAY-AI-EMPLOYEE-FOUNDATION-007: promised payment recording capture.
+        self.payment_promises: list[dict] = []
+        self.last_resume: Optional[dict] = None
         self.unit_timeline: dict = {"unit": None, "events": []}
         self.copilot_recommend_error = None      # (status, detail)
         self.copilot_recommend_response = None   # full CopilotRecommendOut dict
@@ -535,6 +550,18 @@ class FakeBackend:
             return httpx.Response(200, json=self.leases)
         if path == "/tenants":
             return httpx.Response(200, json=self.tenants)
+        if path.startswith("/tenants/") and method == "PATCH":
+            # PASAY-AI-EMPLOYEE-FOUNDATION-007: low-risk tenant write (safe shape).
+            tid = int(path.split("/")[2])
+            tenant = next((t for t in self.tenants if t["id"] == tid), None)
+            if tenant is None:
+                return httpx.Response(404, json={"detail": "Tenant not found"})
+            tenant = {**tenant, **{k: v for k, v in (body or {}).items() if v is not None}}
+            tenant["id_registered"] = bool(tenant.get("id_number"))
+            for i, t in enumerate(self.tenants):
+                if t["id"] == tid:
+                    self.tenants[i] = tenant
+            return httpx.Response(200, json=tenant)
         if path == "/reports/financial-summary":
             return httpx.Response(200, json=self.financial_summary)
         if path == "/reports/overdue-rents":
@@ -915,6 +942,37 @@ class FakeBackend:
             # Secretary DM target for a REAL 催租 assign-to-Secretary message.
             return httpx.Response(200, json={"telegram_chat_id": str(SECRETARY_ID),
                                              "principal_id": 2})
+        if path == "/operations/action-pack" and method == "GET":
+            # PASAY-AI-EMPLOYEE-FOUNDATION-007 §13: Rent Action Pack.
+            params = dict(_split_query(request.url.query))
+            unit_id = int(params.get("unit_id", 0))
+            return httpx.Response(200, json=self._action_pack(unit_id))
+        if path == "/operations/route" and method == "GET":
+            params = dict(_split_query(request.url.query))
+            at = params.get("action_type", "")
+            return httpx.Response(200, json={"action_type": at,
+                                             "route": f"{at}->SECRETARY",
+                                             "responsibility": "SECRETARY"})
+        if path == "/operations/promise" and method == "POST":
+            # PASAY-AI-EMPLOYEE-FOUNDATION-007 §17: record a payment promise.
+            self.payment_promises.append((body or {}))
+            return httpx.Response(201, json={"task_id": 9, "amount": "30000.00",
+                                             "promised_date": "2026-08-20",
+                                             "recorded_by": 2, "status": "open"})
+        if path == "/operations/resume" and method == "POST":
+            # PASAY-AI-EMPLOYEE-FOUNDATION-007 §8: self-healing resume.
+            payload = body or {}
+            lease_id = payload.get("lease_id") or 1
+            # apply the low-risk phone write to the tenant.
+            lease = next((l for l in self.leases if l["id"] == lease_id), self.leases[0])
+            tid = lease.get("tenant_id")
+            for i, t in enumerate(self.tenants):
+                if t["id"] == tid:
+                    self.tenants[i] = {**t, "phone": payload.get("value")}
+            self.last_resume = body or {}
+            return httpx.Response(200, json={"resolved": True,
+                                             "blocked_action": "assign_to_secretary",
+                                             "message": "已记录租客电话"})
         if path == "/operations/tasks" and method == "POST":
             payload = body or {}
             self._next_v2_task_id += 1
@@ -1001,6 +1059,33 @@ class FakeBackend:
             return httpx.Response(200, json={"task": task, "detail": "Task updated"})
 
         return httpx.Response(404, json={"detail": f"no route {method} {path}"})
+
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §13: Rent Action Pack (deterministic fake).
+    def _action_pack(self, unit_id):
+        unit = next((u for u in self.units if u.get("id") == unit_id), self.units[0])
+        lease = next((l for l in self.leases if l.get("unit_id") == unit.get("id")), None)
+        tenant = None
+        if lease is not None:
+            tenant = next((t for t in self.tenants if t.get("id") == lease.get("tenant_id")), None)
+        phone = (tenant or {}).get("phone") or ""
+        return {
+            "unit_id": unit.get("id"),
+            "unit_number": unit.get("unit_number"),
+            "tenant_name": (tenant or {}).get("full_name", ""),
+            "tenant_phone": phone,
+            "contact_status": (tenant or {}).get("contact_status", ""),
+            "outstanding_total": "75000.00",
+            "outstanding_periods": 3,
+            "unpaid_periods": ["2026-05", "2026-06", "2026-07"],
+            "overdue_days": 104,
+            "last_follow_up": None,
+            "latest_promise": None,
+            "payment_method": None,
+            "assignable": bool(phone),
+            "blocked_hint": ("1680 租客电话 09XXXXXXXXX" if not phone else ""),
+            "call_script": f"Hi {(tenant or {}).get('full_name','')}...Unit {unit.get('unit_number')}...",
+            "message_script": f"Hi {(tenant or {}).get('full_name','')}...",
+        }
 
     # --- V1.3 Slice 2: Entry B matcher (deterministic fake over fake data) ---
     def _rent_match(self, body):

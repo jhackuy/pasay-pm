@@ -34,6 +34,18 @@ class EvidenceCategory(str, Enum):
     move_in = "move_in"
     move_out = "move_out"
     other = "other"
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §6.1: archive categories (additional).
+    lease_contract = "LEASE_CONTRACT"
+    move_in_photo = "MOVE_IN_PHOTO"
+    move_out_photo = "MOVE_OUT_PHOTO"
+    inventory = "INVENTORY"
+    equipment = "EQUIPMENT"
+    rent_phone = "RENT_PHONE"
+    water_meter = "WATER_METER"
+    electric_meter = "ELECTRIC_METER"
+    key_access = "KEY_ACCESS"
+    property_management = "PROPERTY_MANAGEMENT"
+    repair = "REPAIR"
 
 
 class Evidence(AuditMixin, Base):

@@ -81,6 +81,13 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
 
     promise_result = escalate_due_promises(db, now=now)
 
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §17.2: at the promised date, a payment
+    # promise is auto-fulfilled if payment arrived, else a Secretary follow-up
+    # is re-created (no one keeps the calendar in their head).
+    from app.services.operations.promises import check_due_payment_promises
+
+    payment_promise_result = check_due_payment_promises(db, now=now)
+
     # AI-OPS-FOUNDATION-001 §19: deterministic exception hooks (repeated
     # repair / long vacancy / occupied-missing-lease / unusual expense) —
     # WARNING lane to the Owner, deduped per day.
@@ -104,4 +111,6 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
         promises_escalated=promise_result["escalated"],
         promises_reminded=promise_result["reminded"],
         exceptions_found=len(exceptions_found),
+        payment_promises_fulfilled=payment_promise_result["fulfilled"],
+        payment_promises_refollowed=payment_promise_result["refollowed_up"],
     )

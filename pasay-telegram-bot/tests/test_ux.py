@@ -83,7 +83,9 @@ def test_more_keyword_opens_fallback_inline_menu(make_app):
     env = make_app()
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "☰ 更多", bot=env.bot)])
     send = env.bot.last_send()
-    assert "Pasay Property" in send["text"]  # the unique Home card
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §C: Home = global Operations Overview.
+    assert "运营总览" in send["text"]
+    assert "Pasay Property" not in send["text"]
     kb = send["reply_markup"]
     labels = [b.text for row in kb.keyboard for b in row] \
         if kb.__class__.__name__ == "ReplyKeyboardMarkup" else []
@@ -301,8 +303,9 @@ def test_edit_navigation_no_message_spam(make_app):
     assert len(env.bot.sends()) == sends  # zero new messages
     edits = env.bot.edits()
     assert all(c["message_id"] == 10 for c in edits)
-    # CONVERGENCE-003 §2.1: 🏠 Home lands on the ONE Home overview.
-    assert "Pasay Property" in edits[-1]["text"]
+    # CONVERGENCE-003 §2.1 + 007A §C: 🏠 Home lands on the ONE Operations
+    # Overview (运营总览).
+    assert "运营总览" in edits[-1]["text"]
 
 
 def test_callback_ack_fast(make_app):

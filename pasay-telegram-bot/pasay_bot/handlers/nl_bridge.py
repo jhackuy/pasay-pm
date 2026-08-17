@@ -135,6 +135,15 @@ _UNIT_TOKEN = re.compile(
 )
 _NAME_TOKEN = re.compile(r"\b([A-Z][a-zA-Z]+(?: [A-Z][a-zA-Z]+)?)\b")
 
+# --- PASAY-AI-EMPLOYEE-FOUNDATION-007 §8/§9: tenant phone low-risk direct
+# write ("1680 租客电话 09171234567") + self-healing resume. ---
+_TENANT_PHONE_KW = re.compile(
+    r"(?:租客电话|租客联系电话|租客号码|租客手机|手机号|租客telegram|"
+    r"tenant phone|tenant number|tenant\'?s phone|phone of tenant)\s*[:：]?\s*"
+    r"(?P<phone>\+?\d[\d\s\-()]{6,19})",
+    re.IGNORECASE,
+)
+
 # --- PASAY-V2-FOUNDATION-001: conversation -> Task (repair/maintenance) -----
 # "1680 aircon leaking" / "aircon leaking again" / "ac not cold" create an
 # AC_MAINTENANCE task; follow-ups ("technician coming tomorrow", "coming
@@ -507,6 +516,31 @@ _ROUTES = [
 ]
 
 
+def detect_tenant_phone_update(text: str) -> Optional[dict]:
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007 §9: low-risk direct phone write
+    ("1680 租客电话 09171234567" / "1608 tenant phone 0917 123 4567").
+
+    Returns ``{"unit_token", "phone"}``; the caller resolves the unit -> lease
+    and supplies it via the self-healing resume path so any blocked rent task
+    auto-resumes (no re-click). Runs BEFORE the rent statement/routing lanes so
+    a phone-fix message is never treated as a menu word or a rent statement.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    m = _TENANT_PHONE_KW.search(raw)
+    if not m or not m.group("phone"):
+        return None
+    unit_m = _UNIT_TOKEN.search(raw)
+    unit_token = unit_m.group(1) if unit_m else None
+    phone = re.sub(r"[\s\-()]", "", m.group("phone"))
+    # A phone must look phone-like (>=7 digits); otherwise treat as not-a-fix.
+    digit_count = sum(1 for c in phone if c.isdigit())
+    if digit_count < 7 or digit_count > 15:
+        return None
+    return {"unit_token": unit_token, "phone": phone}
+
+
 def is_rent_payment_statement(text: str) -> bool:
     """Deterministic detector for "rent was received" statements. Queries
     ("收到租金了吗？") and menu words ("收租") are NOT statements."""
@@ -592,7 +626,6 @@ def route_for_text(text: str):
                 return route
     return None
 
-
 async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle a free-text message that has no active conversation state."""
     pages._bind_identity(update, context)
@@ -630,6 +663,16 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update, context, old_unit, new_unit, role, locale,
         )
         if fixed:
+            return
+
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §9: low-risk tenant phone direct write +
+    # self-healing resume. A "1680 租客电话 09XXXXXXXX" message supplies missing
+    # phone data (and any blocked rent task auto-resumes). Runs BEFORE the
+    # expense/rent statement lanes so the phone-fix is never misrouted.
+    phone_fix = detect_tenant_phone_update(text)
+    if phone_fix is not None and phone_fix.get("phone"):
+        handled = await _handle_tenant_phone_update(update, context, phone_fix, role, locale)
+        if handled:
             return
 
     # BOT-V1-USABLE-001 P0-2: expense statements first (they share payment
@@ -760,6 +803,79 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # BOT-V1-USABLE-001 P0-5: every unmatched ordinary text enters the AI
         # intent lane — never a /help fallback, never silence.
         await _handle_ai_fallback(update, context, text, role, locale)
+
+
+async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: str) -> bool:
+    """§9 low-risk tenant phone direct write + §2 self-healing auto-resume.
+
+    Resolves the entity from the unit token, supplies the phone via the
+    ``/operations/resume`` endpoint (which saves it and returns the blocked
+    action), then AUTO-EXECUTES the resumed action — the user never re-clicks
+    the original 催租 (NO-DEAD-END §1 / §2)."""
+    from pasay_bot.api_client import PasayApiError
+
+    api = context.bot_data["api_client"]
+    chat_id = update.effective_chat.id
+    phone = fix.get("phone")
+    unit_token = fix.get("unit_token")
+    if not phone:
+        return False
+    if not has_read_permission(role):
+        await context.bot.send_message(
+            chat_id, H.escape(t("common.no_permission", locale)), parse_mode=HTML,
+        )
+        return True
+    # Resolve the unit -> lease (needs the lease_id for a targeted resume).
+    unit_id = lease_id = None
+    try:
+        units = await api.get_units()
+        leases = await api.get_leases()
+    except PasayApiError:
+        units, leases = [], []
+    key = (unit_token or "").split("-")[-1]
+    for u in units:
+        if (u.unit_number or "").split("-")[-1] == key:
+            unit_id = u.id
+            break
+    if unit_id is None:
+        return False  # unresolved -> normal lanes / AI fallback
+    active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
+    if active is not None:
+        lease_id = active.id
+    try:
+        result = await api.resume_action(
+            field="tenant_phone", value=phone,
+            lease_id=lease_id, unit_id=unit_id,
+        )
+    except PasayApiError:
+        return False
+    tenant_name = ""
+    try:
+        tenants = await api.get_tenants()
+        if active is not None:
+            tn = next((t for t in tenants if t.id == active.tenant_id), None)
+            tenant_name = tn.full_name if tn else ""
+    except PasayApiError:
+        pass
+    masked = H.mask_phone(phone) if hasattr(H, "mask_phone") else phone
+    lines = [f"✅ 已记录 {H.escape(tenant_name or '租客')} 电话：{masked}"]
+    resumed = result.get("blocked_action")
+    if resumed:
+        # Auto-resume: if the resumed action is a rent-follow-up assignment,
+        # run the same 催租 flow so the Secretary DM is sent automatically.
+        from pasay_bot.handlers import callback as cb
+
+        try:
+            if resumed == "assign_to_secretary" and unit_id:
+                # Re-route to the deterministic 催租 action (it re-checks the
+                # now-present phone and DMs the Secretary).
+                await cb._handle_rent_followup(update, context, str(unit_id), role, locale)
+                return True
+        except Exception:  # noqa: BLE001 - self-heal must never hard-fail
+            pass
+        lines.append("✅ 已自动恢复原任务。")
+    await _v2_reply(update, context, "\n".join(lines), role, locale)
+    return True
 
 
 async def _v2_reply(update, context, text: str, role, locale: str):

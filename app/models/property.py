@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin, Base, SoftDeleteMixin, pg_enum
@@ -16,6 +16,14 @@ class Property(AuditMixin, SoftDeleteMixin, Base):
     city: Mapped[str] = mapped_column(String(100), nullable=False)
     total_units: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §5: property management contact + output.
+    management_company: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    management_office_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    management_contact_person: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    management_email: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    management_office_location: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §5: free-form operational notes.
+    operational_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class UnitStatus(str, Enum):

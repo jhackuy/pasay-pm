@@ -150,11 +150,12 @@ def test_ambiguous_finished_candidate_tap_completes_only_picked_repair(make_app)
 # --- §12 archive + index ------------------------------------------------------
 
 def test_media_message_archived_and_indexed(make_app):
-    """AI-OPS-001 §12: a photo is forwarded to the private archive channel and
-    indexed in the backend evidence table (portable metadata)."""
+    """AI-OPS-001 §12 + PASAY-AI-EMPLOYEE-FOUNDATION-007 §6.2: a photo WITH a
+    semantic caption is forwarded to the private archive channel and indexed in
+    the backend evidence table (portable metadata)."""
     env = make_app()
     env.settings.archive_chat_id = "-1001234567890"
-    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID, caption="1608 水表")])
     forwards = env.bot.of_type("forward_message")
     assert len(forwards) == 1
     assert forwards[0]["chat_id"] == "-1001234567890"
@@ -165,11 +166,24 @@ def test_media_message_archived_and_indexed(make_app):
     assert "已存档" in texts or "Archived" in texts
 
 
-def test_media_without_archive_config_keeps_old_ack(make_app):
-    """AI-OPS-001 §12: when no archive channel is configured, media keeps the
-    friendly ack and nothing is forwarded (graceful no-op)."""
+def test_media_without_caption_asks_not_blind_publish(make_app):
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007 §6.2: a photo WITHOUT a semantic caption
+    is NOT blind-published — the bot asks ONE clarifying question instead."""
     env = make_app()
-    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])
+    env.settings.archive_chat_id = "-1001234567890"
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])  # no caption
+    # Never forwarded / never indexed without a caption.
+    assert len(env.bot.of_type("forward_message")) == 0
+    assert all(("POST", "/evidence") != (m, p) for m, p, _ in env.backend.calls)
+    texts = " ".join(env.bot.all_texts())
+    assert "水表" in texts or "water meter" in texts  # the one clarifying question
+
+
+def test_media_without_archive_config_keeps_old_ack(make_app):
+    """AI-OPS-001 §12: when no archive channel is configured, a captioned photo
+    keeps the friendly ack and nothing is forwarded (graceful no-op)."""
+    env = make_app()
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID, caption="1608 水表")])
     assert len(env.bot.of_type("forward_message")) == 0
     assert all(("POST", "/evidence") != (m, p) for m, p, _ in env.backend.calls)
 
@@ -182,7 +196,7 @@ def test_media_forward_failure_never_claims_archived(make_app):
     env = make_app()
     env.settings.archive_chat_id = "-1001234567890"
     env.bot.forward_error = TelegramError("Forbidden: bot is not a member of the channel")
-    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID, caption="1608 水表")])
     texts = " ".join(env.bot.all_texts())
     assert "已存档" not in texts and "Archived" not in texts
     assert all(("POST", "/evidence") != (m, p) for m, p, _ in env.backend.calls)
@@ -194,7 +208,7 @@ def test_media_index_failure_never_claims_archived(make_app):
     env = make_app()
     env.settings.archive_chat_id = "-1001234567890"
     env.backend.fail_status["/evidence"] = 500
-    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID)])
+    run_updates(env, [_photo_update(SECRETARY_ID, SECRETARY_ID, caption="1608 水表")])
     texts = " ".join(env.bot.all_texts())
     assert "已存档" not in texts and "Archived" not in texts
 

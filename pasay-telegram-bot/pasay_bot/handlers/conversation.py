@@ -133,12 +133,238 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _enter_ai_expense_partial(update, context, payload, locale)
     elif state == "ops_snooze_custom":
         await _enter_ops_snooze_custom(update, context, payload, locale)
+    elif state == "sec_promise":
+        await _enter_sec_promise(update, context, payload, locale)
+    elif state == "archive_caption":
+        await _enter_archive_caption(update, context, payload, locale)
     elif state == "copilot_ask":
         await _handle_copilot_ask_question(update, context, locale)
     else:
         from pasay_bot.handlers import nl_bridge
 
         await nl_bridge.handle_nl(update, context)
+
+
+async def _enter_archive_caption(update, context, payload, locale: str):
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007 §6.2: the user supplied the semantic
+    caption for a pending photo ("1608 水表"). Resolve unit + category, publish
+    to the archive and index it as an ArchiveAsset (Evidence) with the semantic
+    title/caption. Never a floating file."""
+    from pasay_bot.api_client import PasayApiError
+
+    store = context.bot_data["store"]
+    api = context.bot_data["api_client"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = (update.effective_message.text or "").strip()
+    store.delete_conversation(chat_id, user_id)
+    if text.lower() in ("取消", "cancel"):
+        await context.bot.send_message(
+            chat_id, H.escape(t("rent.cancelled", locale)), parse_mode=HTML,
+            reply_markup=home_keyboard(locale),
+        )
+        return
+    unit_token, category, title = _parse_archive_caption(text)
+    if unit_token is None:
+        await context.bot.send_message(
+            chat_id, H.escape(t("v2.archive_caption_invalid", locale)),
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+    # Resolve the unit id for the semantic link.
+    unit_id = None
+    try:
+        units = await api.get_units()
+        key = unit_token.split("-")[-1]
+        unit = next((u for u in units if (u.unit_number or "").split("-")[-1] == key), None)
+        if unit is not None:
+            unit_id = unit.id
+    except PasayApiError:
+        pass
+    file_id = payload.get("file_id")
+    if not file_id:
+        await context.bot.send_message(
+            chat_id, H.escape(t("v2.archive_caption_lost", locale)), parse_mode=HTML,
+            reply_markup=home_keyboard(locale),
+        )
+        return
+    # Publish to the archive channel (send the stored file_id under the title).
+    settings = context.bot_data["settings"]
+    archive_chat = (settings.archive_chat_id or "").strip()
+    forwarded_id = None
+    if archive_chat:
+        try:
+            if payload.get("media_type") == "document":
+                fwd = await update.get_bot().send_document(
+                    archive_chat, document=file_id, caption=title[:200] or None,
+                )
+            elif payload.get("media_type") == "video":
+                fwd = await update.get_bot().send_video(
+                    archive_chat, video=file_id, caption=title[:200] or None,
+                )
+            else:
+                fwd = await update.get_bot().send_photo(
+                    archive_chat, photo=file_id, caption=title[:200] or None,
+                )
+            forwarded_id = getattr(fwd, "message_id", None)
+        except Exception as exc:  # noqa: BLE001 - publication failure is real
+            logger = context.bot_data.get("logger")
+            if logger:
+                logger.warning("archive caption publish failed: %s", exc)
+            await context.bot.send_message(
+                chat_id, H.escape(t("v2.archive_publish_failed", locale)),
+                parse_mode=HTML, reply_markup=home_keyboard(locale),
+            )
+            return
+    # Index as an ArchiveAsset with the semantic caption.
+    try:
+        await api.create_evidence(
+            external_file_id=file_id,
+            external_message_id=forwarded_id,
+            media_type=payload.get("media_type") or "photo",
+            mime_type=payload.get("mime_type"),
+            filename=payload.get("filename"),
+            size_bytes=payload.get("size_bytes"),
+            category=_EVIDENCE_CATEGORY.get(category, "other"),
+            unit_id=unit_id,
+            entity_type="unit" if unit_id else None,
+            entity_id=unit_id,
+        )
+    except PasayApiError:
+        pass
+    await context.bot.send_message(
+        chat_id,
+        H.escape(t("v2.media_archived", locale)),
+        parse_mode=HTML, reply_markup=home_keyboard(locale),
+    )
+
+
+# Archive category hint -> evidence category (PASAY-AI-EMPLOYEE-FOUNDATION-007).
+_EVIDENCE_CATEGORY = {
+    "水表": "water_meter", "电表": "electric_meter",
+    "房租手机": "rent_phone", "钥匙": "key_access",
+    "租约": "lease", "合同": "lease", "入住": "move_in", "迁出": "move_out",
+    "物业": "property_management", "维修": "before_repair", "设备": "equipment",
+}
+
+
+def _parse_archive_caption(text: str):
+    """Parse a semantic caption ("1608 水表") -> (unit_token, category, title)."""
+    tokens = [t for t in text.replace("，", " ").replace(",", " ").split() if t]
+    unit_token = None
+    rest = []
+    for token in tokens:
+        if any(c.isdigit() for c in token) and not unit_token:
+            unit_token = token
+        else:
+            rest.append(token)
+    caption_words = "".join(rest)
+    category = None
+    for keyword in _EVIDENCE_CATEGORY:
+        if keyword in text:
+            category = keyword
+            break
+    if unit_token is None or not category:
+        return None, None, None
+    return unit_token, category, caption_words or category
+
+
+async def _enter_sec_promise(update, context, payload, locale: str):
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007 §17: the Secretary replied with a
+    payment promise (e.g. ``周五`` / ``明天付30000``). We record it via the
+    backend so the workflow auto-checks at the promised date, then confirm."""
+    from datetime import datetime as _dt, timedelta as _td
+    from decimal import Decimal as _Dec, InvalidOperation as _Invalid
+
+    from pasay_bot.api_client import PasayApiError
+
+    store = context.bot_data["store"]
+    api = context.bot_data["api_client"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    task_id = int(payload.get("task_id") or 0)
+    text = (update.effective_message.text or "").strip()
+    store.delete_conversation(chat_id, user_id)
+    if text.lower() in ("取消", "cancel"):
+        await context.bot.send_message(chat_id, H.escape(t("rent.cancelled", locale)),
+                                       parse_mode=HTML, reply_markup=home_keyboard(locale))
+        return
+    if not task_id:
+        await context.bot.send_message(chat_id, H.escape(t("common.invalid", locale)),
+                                       parse_mode=HTML, reply_markup=home_keyboard(locale))
+        return
+    promised_date, amount = _parse_promise(text)
+    if promised_date is None:
+        await context.bot.send_message(
+            chat_id,
+            H.escape(t("v2.sec_promise_invalid", locale)),
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+    # Resolve lease_id from the task.
+    lease_id = None
+    try:
+        task = await api.get_operational_task(task_id)
+        lease_id = getattr(task, "lease_id", None)
+    except PasayApiError:
+        pass
+    try:
+        recorded = await api.record_payment_promise(
+            lease_id=lease_id,
+            amount=float(amount) if amount is not None else None,
+            promised_date=promised_date.isoformat(), note=text,
+        )
+    except PasayApiError:
+        await context.bot.send_message(
+            chat_id, f"⚠️ {H.escape(t('common.unexpected', locale))}",
+            parse_mode=HTML, reply_markup=home_keyboard(locale),
+        )
+        return
+    amount_txt = f"₱{amount:,.2f}" if amount else ""
+    date_txt = promised_date.strftime("%m-%d")
+    reply = t("v2.sec_promise_saved", locale, date=date_txt, amount=amount_txt)
+    await context.bot.send_message(chat_id, H.escape(reply), parse_mode=HTML,
+                                   reply_markup=home_keyboard(locale))
+
+
+def _parse_promise(text: str):
+    """Parse a payment-promise reply into (promised_date, amount|None).
+
+    Supports: 周五/friday -> next Friday 18:00; 明天/tomorrow -> tomorrow 18:00;
+    ``明天付30000`` -> tomorrow + amount; ``2026-08-18`` etc. Deterministic;
+    returns (None, None) when nothing usable."""
+    from datetime import datetime as _dt, timedelta as _td
+    from decimal import Decimal as _Dec, InvalidOperation as _Invalid
+
+    lowered = text.lower()
+    now = _dt.now()
+    # Find an amount first.
+    amount = None
+    import re as _re
+    m = _re.search(r"(\d[\d,]*)", text.replace("，", ","))
+    if m:
+        try:
+            v = _Dec(m.group(1).replace(",", ""))
+            if v > 0:
+                amount = v
+        except _Invalid:
+            amount = None
+    # Absolute date.
+    try:
+        return _dt.strptime(text.strip(), "%Y-%m-%d").replace(hour=18), amount
+    except ValueError:
+        pass
+    base = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    if "周五" in text or "friday" in lowered or "fri" in lowered:
+        days = (4 - now.weekday()) % 7
+        if days == 0:
+            days = 7
+        return base + _td(days=days), amount
+    if "明天" in text or "tomorrow" in lowered:
+        return base + _td(days=1), amount
+    if "后天" in text:
+        return base + _td(days=2), amount
+    return None, None
 
 
 async def _handle_copilot_ask_question(update, context, locale):

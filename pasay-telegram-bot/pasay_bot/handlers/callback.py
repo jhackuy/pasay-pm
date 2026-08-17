@@ -66,6 +66,7 @@ from pasay_bot.keyboards import (
     ACTION_METHOD,
     ACTION_NAV,
     ACTION_OPS_NAV,
+    back_home_keyboard,
     ACTION_PAGE,
     ACTION_PROP_ARCHIVE,
     ACTION_QUICK_UNIT_VIEW,
@@ -80,6 +81,9 @@ from pasay_bot.keyboards import (
     ACTION_SEC_FOLLOWUP_CONTACT,
     ACTION_SEC_FOLLOWUP_PAYMENT,
     ACTION_SEC_FOLLOWUP_SNOOZE,
+    ACTION_SEC_FOLLOWUP_NO_ANSWER,
+    ACTION_SEC_FOLLOWUP_PROMISE,
+    ACTION_SEC_FOLLOWUP_WRONG_NUMBER,
     ACTION_TASK_COMPLETE,
     ACTION_TASK_DETAIL,
     ACTION_TASK_SNOOZE,
@@ -173,6 +177,14 @@ async def _answer(update: Update, text: str, *, durable: bool = False, keyboard=
         return
     try:
         await cq.answer(text)
+        try:
+            from pasay_bot.state.latency import current_phase
+
+            probe = current_phase()
+            if probe is not None:
+                probe.mark_ack()
+        except Exception:  # noqa: BLE001 - profiling never breaks ACK
+            pass
         return
     except Exception:  # noqa: BLE001 - already answered / query invalid
         pass
@@ -196,15 +208,27 @@ async def _answer(update: Update, text: str, *, durable: bool = False, keyboard=
 
 
 async def _ack_working(update: Update, locale: str):
-    """Acknowledge the click with a visible 'processing…' status right before
-    a slow backend operation.
+    """Acknowledge the click with a visible 'processing…' status before a
+    backend operation that will take a moment (007A §A5). The result card is
+    then rendered by mutating the tapped message, so the user always sees
+    处理中 -> result and never "did my tap register?". Fast read/nav handlers
+    deliberately do NOT use this — they ACK instantly with ``_ack_fast``."""
+    await _answer(update, t("common.working", locale))
 
-    This is normally the FIRST (and only) answerCallbackQuery for the click:
-    it clears the Telegram client spinner within milliseconds and shows the
-    processing toast at the same time. The final result is then rendered by
-    mutating the tapped message, so the user always sees 处理中 -> result and
-    never "did my tap register?".
-    """
+
+async def _ack_fast(update: Update, locale: str):
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007A §A4: FAST deterministic ACK for
+    read/nav/detail callbacks — answers EMPTY (clears the client spinner
+    immediately, no ``处理中`` toast) because the result render is fast and
+    never needs a processing hint."""
+    await _answer(update, "")
+
+
+async def _ack_processing(update: Update, locale: str):
+    """Show the ``⏳ 处理中...`` toast ONLY for operations expected to exceed
+    ~0.8–1s (007A §A5): slow financial writes / backend-heavy confirms. The
+    toast never replaces the real result and never lingers — the handler
+    renders the outcome onto the tapped message right after."""
     await _answer(update, t("common.working", locale))
 
 
@@ -276,6 +300,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     locale = locale_for_chat(
         update.effective_chat.type if update.effective_chat else None, role
     )
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A: bind a phase probe so the shared
+    # backend/render/edit helpers record their stage times and this callback
+    # is profiled (callback_ack_ms/backend_fetch_ms/render_ms/telegram_edit_ms).
+    from pasay_bot.state.latency import PhaseProbe, bind_phase
+
+    probe = PhaseProbe()
+    bind_phase(probe)
     outcome, detail = "ok", ""
     try:
         await _dispatch_callback(update, context, parsed, role, locale)
@@ -293,13 +324,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tracker = context.bot_data.get("latency")
         if tracker is not None:
             try:
-                tracker.record(
+                tracker.record_phases(
                     "callback", action,
-                    (time.monotonic() - started) * 1000,
+                    callback_ack_ms=probe.callback_ack_ms,
+                    backend_fetch_ms=probe.backend_fetch_ms,
+                    render_ms=probe.render_ms,
+                    telegram_edit_ms=probe.telegram_edit_ms,
+                    total_ms=(time.monotonic() - started) * 1000,
                     outcome=outcome, detail=detail,
                 )
             except Exception:  # noqa: BLE001 - instrumentation never breaks UX
                 pass
+        try:
+            from pasay_bot.state.latency import bind_phase as _unbind
+
+            _unbind(None)
+        except Exception:  # noqa: BLE001 - cleanup never breaks UX
+            pass
 
 
 async def _dispatch_callback(
@@ -408,6 +449,16 @@ async def _dispatch_callback(
     elif action == ACTION_SEC_FOLLOWUP_CONTACT:
         # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §4: ✅ 已联系租客 (Secretary DM).
         await _handle_sec_followup_contact(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_SEC_FOLLOWUP_NO_ANSWER:
+        # PASAY-AI-EMPLOYEE-FOUNDATION-007 §16.2: 📵 未接听 records an attempt
+        # (never "contacted") and schedules the next follow-up.
+        await _handle_sec_followup_no_answer(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_SEC_FOLLOWUP_PROMISE:
+        # §16/§17: 📅 承诺付款 -> ask the promised date to capture a promise.
+        await _handle_sec_followup_promise(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_SEC_FOLLOWUP_WRONG_NUMBER:
+        # §16.3: 📞 号码错误 -> WRONG_NUMBER + a resolver issue for a new phone.
+        await _handle_sec_followup_wrong_number(update, context, ref, nonce, ts, role, locale)
     elif action == ACTION_SEC_FOLLOWUP_PAYMENT:
         # §5: 💰 已收款 -> existing record-payment flow.
         await _handle_sec_followup_payment(update, context, ref, nonce, ts, role, locale)
@@ -433,9 +484,9 @@ async def _handle_nav(update, context, entity, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    # B11: the entry-level ack already removed the spinner; show a durable
-    # "processing" status while the page data loads from the backend.
-    await _ack_working(update, locale)
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A: deterministic nav is a FAST path —
+    # ACK instantly (no "处理中" toast); the page render is the result.
+    await _ack_fast(update, locale)
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
     if entity == "properties":
@@ -465,7 +516,7 @@ async def _handle_page(update, context, entity, ref, role, locale):
         page = 1
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
-    await _ack_working(update, locale)
+    await _ack_fast(update, locale)
     if entity == "prop":
         await pages.show_properties(context, chat_id, None, locale, page=page, message_id=message_id)
     elif entity == "ovd":
@@ -808,7 +859,7 @@ async def _confirm_rent_entry(update, context, nonce, ts, role, locale):
         return
     payload = _payload(conv)
     can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)
-    await _ack_working(update, locale)
+    await _ack_processing(update, locale)
 
     # Idempotency: done/in_flight replay without touching the API, so a second
     # click after a successful write never re-writes.
@@ -943,7 +994,7 @@ async def _confirm_income(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     income_id = int(ref)
-    await _ack_working(update, locale)
+    await _ack_processing(update, locale)
     key = f"ik:cnf:inc:{income_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="income", resource=str(income_id))
     if status == "done":
@@ -996,7 +1047,7 @@ async def _handle_reverse(update, context, ref, nonce, ts, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     income_id = int(ref)
-    await _ack_working(update, locale)
+    await _ack_processing(update, locale)
     key = f"ik:rv:{income_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="income", resource=str(income_id))
     if status == "done":
@@ -1119,7 +1170,7 @@ async def _handle_quick_unit_view(update, context, ref, role, locale):
         days=row.get("days"),
         open_maintenance=row.get("open_maintenance"),
     )
-    kb = home_keyboard(locale)
+    kb = back_home_keyboard("properties", locale)
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,
@@ -1368,6 +1419,24 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     except PasayApiError:
         tenants = []
     tenant = next((tn for tn in tenants if tn.id == getattr(active, "tenant_id", None)), None) if active else None
+
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §12: never hand a collection job to the
+    # Secretary without real execution materials. If the tenant phone is
+    # missing or WRONG_NUMBER, BLOCK the assignment (a blocked issue is left on
+    # the task for self-healing) and show a NO-DEAD-END warning (§1), NOT a DM.
+    available_phone = ""
+    contact_status = ""
+    if tenant is not None:
+        available_phone = (tenant.phone or "").strip() or (tenant.secondary_phone or "").strip()
+        contact_status = (tenant.contact_status or "").strip()
+    if not available_phone or contact_status == "WRONG_NUMBER":
+        blocked = await _block_followup_on_missing_phone(
+            context, tenant, unit, unit_code, available_phone, contact_status,
+            update, role, locale,
+        )
+        if blocked:
+            return
+
     overdue_ctx = await _load_rent_followup_ctx(api, unit_code)
     # 2) confirm the follow-up task exists (dedupe with the auto RENT_OVERDUE
     #    of the same lease so the board never holds two copies of one item).
@@ -1392,6 +1461,7 @@ async def _handle_rent_followup(update, context, ref, role, locale):
         unit_label=unit_code,
         locale=locale_for(Role.SECRETARY) if not locale or locale == "bi" else locale,
         tenant_name=getattr(tenant, "full_name", "") if tenant else "",
+        tenant_phone=available_phone,
         outstanding=overdue_ctx["amount"],
         unpaid_periods=overdue_ctx["periods"],
         overdue_days=overdue_ctx["days"],
@@ -1416,6 +1486,75 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     await _answer(update, t("v2.followup_assigned_toast", locale))
     # Re-render the group Rent detail card in place as 🟡 (NOT executed).
     await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=False)
+
+
+async def _block_followup_on_missing_phone(
+    context, tenant, unit, unit_code: str, available_phone: str,
+    contact_status: str, update, role, locale: str,
+) -> bool:
+    """PASAY-AI-EMPLOYEE-FOUNDATION-007 §8/§12: block a rent-follow-up when the
+    execution phone is missing/invalid. Leaves a blocked issue on the task (so
+    self-healing can resume it) and sends a NO-DEAD-END warning (§1) — the
+    Owner gets exactly what's missing, why it matters, how to fix it, and the
+    shortest input example. Returns True when handled (do NOT send the DM)."""
+    api = context.bot_data["api_client"]
+    user = update.effective_user
+    client_role = role_for_telegram_id(user.id if user else None)
+    # Only the Owner/manager can be told to supply the phone; a Secretary who
+    # taps 催租 on a phone-less unit also gets the actionable hint (no fake DM).
+    missing = not available_phone
+    invalid = contact_status == "WRONG_NUMBER"
+    fix_cmd = f"{unit_code} 租客电话 09XXXXXXXXX"
+    if missing:
+        title = f"{unit_code} 缺少租客电话"
+        why = "无法把催租任务交给 Secretary。"
+    else:
+        title = f"{unit_code} 租客电话无效"
+        why = "号码已确认无效，无法联系租客。"
+    text = (
+        f"⚠️ <b>{H.escape(title)}</b>\n\n"
+        f"{H.escape(why)}\n\n"
+        f"直接发送：\n<code>{H.escape(fix_cmd)}</code>\n\n"
+        f"补充后系统会自动继续催租任务。"
+    )
+    # Leave a blocked marker on the active rent task for the resolver, so the
+    # moment the phone is supplied the follow-up auto-resumes.
+    try:
+        leases = await api.get_leases()
+        active = next((l for l in leases if l.unit_id == unit.id and l.status == "active"), None)
+        lease_id = active.id if active else None
+        existing_tasks = await api.get_operational_tasks()
+        task = next(
+            (t for t in existing_tasks
+             if t.lease_id == lease_id
+             and str(t.task_type or "").upper() in ("RENT_OVERDUE", "FOLLOWUP")
+             and str(t.status or "").upper() in ("PENDING", "IN_PROGRESS")),
+            None,
+        )
+        if task is not None:
+            details = dict(task.details or {})
+            details["blocked"] = {
+                "issue_type": "TENANT_PHONE_MISSING" if missing else "TENANT_PHONE_INVALID",
+                "entity": f"tenant:{tenant.id if tenant else '?'}",
+                "field": "phone",
+                "blocked_action": "assign_to_secretary",
+                "risk_level": "low",
+                "suggested_fix": fix_cmd,
+                "resume_ref": "assign_to_secretary",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "resolved_at": None,
+            }
+            await api.update_operational_task(task.id, details=details)
+    except PasayApiError:
+        pass  # the warning message still delivers even if the marker fails
+    if update.effective_chat:
+        await update.effective_chat.send_message(
+            H.truncate(text), parse_mode=HTML,
+            reply_markup=home_keyboard(locale_for_chat(update.effective_chat.type, client_role)),
+        )
+    else:
+        await _answer(update, H.escape("缺少租客电话"), durable=True)
+    return True
 
 
 async def _load_rent_followup_ctx(api, unit_code: str) -> dict:
@@ -1571,7 +1710,7 @@ async def _handle_sec_followup_contact(update, context, ref, nonce, ts, role, lo
     if status == "in_flight":
         await _answer(update, t("common.processing", locale), durable=True)
         return
-    await _ack_working(update, locale)
+    await _ack_processing(update, locale)
     try:
         task = await api.complete_operational_task(task_id)
     except (PasayApiPermissionError, PasayApiError) as exc:
@@ -1659,6 +1798,135 @@ async def _handle_sec_followup_snooze(update, context, ref, nonce, ts, role, loc
         text=H.truncate(text),
         parse_mode=HTML,
         reply_markup=snooze_preset_keyboard(task_id, locale),
+    )
+
+
+async def _handle_sec_followup_no_answer(update, context, ref, nonce, ts, role, locale):
+    """📵 未接听 (PASAY-AI-EMPLOYEE-FOUNDATION-007 §16.2): a REAL attempt is
+    recorded but this is NOT a successful contact — it must never move
+    last_follow_up / mark 🟡->✅. It increments an attempt counter on the task
+    and routes through the snooze machinery so the next follow-up is scheduled.
+    """
+    if role != Role.SECRETARY:
+        await _answer(update, t("v2.sec_not_secretary", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    api = context.bot_data["api_client"]
+    store = context.bot_data["store"]
+    try:
+        task = await api.get_operational_task(task_id)
+        details = dict(task.details or {})
+        attempts = int(details.get("attempts") or 0) + 1
+        details["attempts"] = attempts
+        details["last_attempt"] = datetime.now(timezone.utc).isoformat()
+        details["last_attempt_outcome"] = "no_answer"
+        await api.update_operational_task(task_id, details=details)
+    except (PasayApiError, ValueError):
+        pass
+    await _answer(update, t("v2.sec_no_answer_recorded", locale), durable=True)
+    text = H.escape(t("ops.snooze_title", locale))
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=snooze_preset_keyboard(task_id, locale),
+    )
+
+
+async def _handle_sec_followup_promise(update, context, ref, nonce, ts, role, locale):
+    """📅 承诺付款 (PASAY-AI-EMPLOYEE-FOUNDATION-007 §17): starts a payment-
+    promise capture. Asks the Secretary when the tenant promised to pay; the
+    reply is parsed (e.g. ``周五`` / ``明天付30000``) and confirmed before the
+    structured promise is recorded. Dead-end never fires — the ask shows intent."""
+    if role != Role.SECRETARY:
+        await _answer(update, t("v2.sec_not_secretary", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    store = context.bot_data["store"]
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    store.save_conversation(
+        chat_id, user_id, "sec_promise",
+        {"task_id": task_id}, nonce=nonce,
+    )
+    # Also allow a bare inline capture via the message text.
+    await _answer(update, t("v2.sec_promise_ask", locale))
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=chat_id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(t("v2.sec_promise_ask_card", locale)),
+        parse_mode=HTML,
+        reply_markup=home_keyboard(locale),
+    )
+
+
+async def _handle_sec_followup_wrong_number(update, context, ref, nonce, ts, role, locale):
+    """📞 号码错误 (PASAY-AI-EMPLOYEE-FOUNDATION-007 §16.3): immediately sets the
+    tenant contact_status to WRONG_NUMBER, leaves a resolver issue on the task
+    and shows the actionable NO-DEAD-END reply that a NEW phone auto-resumes."""
+    if role != Role.SECRETARY:
+        await _answer(update, t("v2.sec_not_secretary", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    api = context.bot_data["api_client"]
+    # Resolve the tenant from the task.
+    tenant_id = None
+    unit_code = ""
+    try:
+        task = await api.get_operational_task(task_id)
+        details = dict(task.details or {})
+        unit_code = str(details.get("unit_number") or "")
+        lease_id = getattr(task, "lease_id", None)
+        if lease_id is not None:
+            leases = await api.get_leases()
+            active = next((l for l in leases if l.id == lease_id), None)
+            if active is not None:
+                tenant_id = active.tenant_id
+        if tenant_id is None and unit_code:
+            # The task may not carry a lease (created before lease linkage);
+            # resolve the tenant via the unit -> active lease -> tenant.
+            unit_key = unit_code.split("-")[-1]
+            units = await api.get_units()
+            unit = next((u for u in units if (u.unit_number or "").split("-")[-1] == unit_key), None)
+            if unit is not None:
+                leases = await api.get_leases()
+                active = next((l for l in leases if l.unit_id == unit.id and l.status == "active"), None)
+                if active is not None:
+                    tenant_id = active.tenant_id
+    except PasayApiError:
+        pass
+    if tenant_id is not None:
+        try:
+            await api.update_tenant(tenant_id, contact_status="WRONG_NUMBER")
+        except PasayApiError:
+            pass
+    fix_cmd = f"{unit_code} 租客电话 09XXXXXXXXX"
+    await _answer(update, t("v2.sec_wrong_number_recorded", locale), durable=True)
+    text = (
+        f"⚠️ <b>{H.escape(t('v2.sec_wrong_number_title', locale, unit=H.escape(unit_code)))}</b>\n\n"
+        f"{H.escape(t('v2.sec_wrong_number_why', locale))}\n\n"
+        f"直接发送：\n<code>{H.escape(fix_cmd)}</code>\n\n"
+        f"{H.escape(t('v2.sec_wrong_number_after', locale))}"
+    )
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=home_keyboard(locale),
     )
 
 
@@ -2566,11 +2834,16 @@ async def _handle_home_nav(update, context, sub, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    await _ack_working(update, locale)
+    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A/§D: Today/Refresh are fast reads —
+    # fast ACK, no "处理中" toast.
+    await _ack_fast(update, locale)
     message_id = update.callback_query.message.message_id
     chat_id = update.effective_chat.id
     if sub == "today":
-        await pages.show_quick_tasks(context, chat_id, role, locale, message_id=message_id)
+        # PASAY-AI-EMPLOYEE-FOUNDATION-007A §D: Today = the SAME digest builder
+        # + renderer as the scheduled Daily Digest (business dedup, HUMAN/SYSTEM
+        # filter, language). Never the separate quick-tasks path.
+        await pages.show_today_digest(context, chat_id, role, locale, message_id=message_id)
     elif sub == "refresh":
         await pages.show_home(context, chat_id, role, locale, message_id=message_id)
     elif sub == "unpaid":
@@ -2844,7 +3117,7 @@ async def _handle_task_complete(update, context, ref, role, locale):
         return
     task_id = int(ref)
     api = context.bot_data["api_client"]
-    await _ack_working(update, locale)
+    await _ack_processing(update, locale)
     try:
         task = await api.complete_operational_task(task_id)
     except PasayApiPermissionError:
