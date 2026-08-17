@@ -69,6 +69,15 @@ class AuditAction(str, Enum):
     promise_missed_refollow = "promise_missed_refollow"
     action_assigned = "action_assigned"
     rent_followup_sent = "rent_followup_sent"
+    # REPAIR-AI-EMPLOYEE-WORKFLOW-008A (appended only): Repair Operation
+    # lifecycle audit actions (operation / versioned proposal / verification).
+    repair_created = "repair_created"
+    proposal_submitted = "proposal_submitted"
+    proposal_approved = "proposal_approved"
+    proposal_rejected = "proposal_rejected"
+    repair_completed_pending_verification = "repair_completed_pending_verification"
+    repair_closed_after_verification = "repair_closed_after_verification"
+    repair_cancelled = "repair_cancelled"
 
 
 class AuditLog(AuditMixin, Base):
