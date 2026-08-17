@@ -333,6 +333,12 @@ def _payable_expense_rows(
                 label_by_unit[u.id] = label
     rows = []
     for e in expenses:
+        waiting_days = 0
+        if e.approved_at is not None:
+            try:
+                waiting_days = max((now.date() - e.approved_at.date()).days, 0)
+            except (TypeError, ValueError):
+                waiting_days = 0
         rows.append(
             {
                 "kind": "payable_expense",
@@ -342,6 +348,9 @@ def _payable_expense_rows(
                 "amount": _d2(e.amount),
                 "status": e.status.value,
                 "expense_date": e.expense_date.isoformat(),
+                # ZERO-LEARNING-004 §6: the SAME waiting-day fact the task rows
+                # carry, so the To-pay section is the single representation.
+                "waiting_days": waiting_days,
                 "has_receipt": e.receipt_attachment_id is not None,
             }
         )
@@ -553,6 +562,11 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
                     "unit_code": label,
                     "status": "overdue_rent",
                     "amount": _d2(lease.monthly_rent) * len(overdue),
+                    # ZERO-LEARNING-004 §1: the Properties index expresses the
+                    # exception in WORDS (``Rent overdue 104d · 3 periods``) —
+                    # the period count comes from the SAME truth source as the
+                    # RENT_OVERDUE generator, never a renderer-side guess.
+                    "unpaid_periods": len(overdue),
                     "days": max((today - oldest_due).days, 0),
                     "open_maintenance": maintenance_open,
                 }

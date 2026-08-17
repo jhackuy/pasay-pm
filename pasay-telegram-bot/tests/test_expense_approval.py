@@ -125,11 +125,12 @@ def test_expense_cards_never_show_internal_enums():
     assert "Unit 1" not in approval_no_loc
     assert "Unit" not in approval_no_loc
 
-    # Unknown status never renders as a raw enum in the detail card.
+    # Unknown status never renders as a raw enum in the detail card; the
+    # compact detail ends with a plain human state phrase (no `状态：` form row).
     unknown = Expense.from_dict(expense.as_dict() | {"status": "APPROVAL_PENDING"})
     detail_unknown = cards.expense_detail_card(unknown, "zh", location="Pasay Premier Residences · Unit 16B")
     assert "APPROVAL_PENDING" not in detail_unknown
-    assert "状态：—" in detail_unknown
+    assert "状态：" not in detail_unknown
 
     approved = Expense.from_dict(expense.as_dict() | {"status": "approved"})
     result = cards.expense_result_card(approved, "zh")
@@ -264,7 +265,7 @@ def test_expense_detail_callback(make_app):
     _seed_pending_expense(env)
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, _detail_data(), bot=env.bot)])
     edit = env.bot.last_edit()
-    assert "💳 支出详情" in edit["text"]
+    assert "💸" in edit["text"] and "E5" in edit["text"]
     assert "Pasay Premier Residences · 16B" in edit["text"]
     labels = [b.text for b in _buttons(edit["reply_markup"])]
     # V2 amount-aware approve button (Approve ₱5,000) + Reject.
@@ -276,7 +277,7 @@ def test_expense_detail_callback(make_app):
     labels = [b.text for b in _buttons(env.bot.last_edit()["reply_markup"])]
     assert "✅ 批准" not in labels
     assert "❌ 拒绝" not in labels
-    assert "🏠 首页" in labels
+    assert "🏠 Home" in labels
 
 
 def test_todo_page_human_readable_no_internal_enums(make_app):

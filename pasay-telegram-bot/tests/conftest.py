@@ -845,6 +845,14 @@ class FakeBackend:
                     (u.get("unit_number", "") for u in self.units if u["id"] == exp.get("unit_id")),
                     "",
                 )
+                waiting_days = 0
+                approved_at = exp.get("approved_at")
+                if approved_at:
+                    try:
+                        from datetime import date as _d, datetime as _dt
+                        waiting_days = max((_d.today() - _dt.fromisoformat(str(approved_at)[:10]).date()).days, 0)
+                    except (ValueError, TypeError):
+                        waiting_days = 0
                 rows.append(
                     {
                         "kind": "payable_expense",
@@ -855,6 +863,7 @@ class FakeBackend:
                         "amount": exp.get("amount"),
                         "status": "approved",
                         "expense_date": exp.get("expense_date"),
+                        "waiting_days": waiting_days,
                         "has_receipt": exp.get("receipt_attachment_id") is not None,
                     }
                 )
@@ -871,6 +880,10 @@ class FakeBackend:
             return httpx.Response(200, json=[])
         if path == "/operations/digest" and method == "GET":
             return httpx.Response(200, json=self.digest)
+        if path == "/operations/remind-owner-target" and method == "GET":
+            # ZERO-LEARNING-004 §4: the canonical Owner DM target for a REAL
+            # Remind-Owner private message.
+            return httpx.Response(200, json={"telegram_chat_id": str(OWNER_ID)})
         if path == "/operations/tasks" and method == "POST":
             payload = body or {}
             self._next_v2_task_id += 1

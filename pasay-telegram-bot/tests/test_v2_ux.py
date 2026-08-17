@@ -348,18 +348,23 @@ def test_properties_quick_view_group_bilingual(make_app):
     send = env.bot.last_send()
     text = send["text"]
     assert "Properties / 房源 · 4" in text  # frozen: title carries the unit count
-    # frozen high-density index: one line per unit with rent/maint/lease chips.
-    assert "1680　💰⚠️　🔧1" in text     # overdue rent + 1 open maintenance
-    assert "1805" in text and "📄⚠️" in text  # lease expiring
-    assert "2208" in text and "💰✅" in text and "📄✅" in text  # paid + lease ok
-    assert "2106　VACANT / 空置" in text
+    # ZERO-LEARNING-004 §1: exceptions are expressed in WORDS, normal units
+    # collapse to OK — no 💰⚠️ / 📄✅ / 🔧0 chips.
+    assert "1680 · Rent overdue 12d" in text     # overdue rent + 1 open repair
+    assert "Repair 1 open" in text
+    assert "1805 · Lease expires in 28d" in text  # lease expiring
+    assert "2208 · OK" in text                    # paid/healthy -> OK
+    assert "2106 · Vacant" in text
+    for banned in ("💰⚠️", "📄✅", "📄⚠️", "🔧0", "👁"):
+        assert banned not in text
     # no tenant / deposit / contract detail is expanded on the index page.
     assert "Juan" not in text and "deposit" not in text.lower()
-    # The index now carries per-unit Quick View entries + the archive deep link
-    # as INLINE buttons (the persistent reply keyboard stays pinned separately).
+    # The index now carries SHORT per-unit buttons (bare unit code) + the
+    # compact archive deep link as INLINE buttons.
     inline_labels = _inline_labels(send["reply_markup"])
-    assert "👁 1680" in inline_labels and "👁 1805" in inline_labels
-    assert "📄 Property Archive" in inline_labels
+    assert "1680" in inline_labels and "1805" in inline_labels
+    assert "📄 Archive" in inline_labels
+    assert not any("👁" in lbl for lbl in inline_labels)
     assert set(inline_labels) != set(V2_LABELS)  # inline, not the reply menu
     assert _copilot_calls(env) == []
 

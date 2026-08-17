@@ -213,25 +213,27 @@ def test_fixed_keyboard_is_identical_and_english_for_all_roles(make_app):
 
 
 def test_properties_index_one_unit_per_line_and_no_expansion(make_app):
-    """Section 二/三: high-density index, one line per unit, no tenant/deposit/
-    full-contract expansion, and per-unit Quick View + archive inline buttons."""
+    """Section 二/三 + ZERO-LEARNING-004 §1: high-density index, exceptions in
+    WORDS, normal units OK, no 💰⚠️ / 📄✅ / 🔧0 / 👁, per-unit SHORT buttons."""
     env = make_app(backend=ConvergeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
     send = env.bot.last_send()
     text = send["text"]
     assert "Properties · 2" in text or "房源 · 2" in text
-    assert "1680　💰⚠️　🔧1" in text  # overdue + 1 open maintenance
-    assert "1702" in text and ("VACANT" in text or "空置" in text)
+    assert "1680 · 逾期租金" in text or "1680 · Rent overdue" in text  # overdue + 1 open repair
+    assert "维修 1" in text or "Repair 1" in text
+    assert "1702 · 空置" in text or "1702 · Vacant" in text
     assert text.count("\n\n") <= 3  # compact, high-density (not a tall card)
-    for banned in BANNED_TEXT:
+    for banned in BANNED_TEXT + ("💰⚠️", "📄✅", "🔧0", "👁"):
         assert banned not in text
     inline = _inline_labels(send["reply_markup"])
 
     def has(label):
         return any(label in lbl for lbl in inline)
 
-    assert has("👁 1680") and has("👁 1702")
-    assert has("📄 Property Archive")
+    assert has("1680") and has("1702")
+    assert not any("👁" in lbl for lbl in inline)
+    assert has("📄 Archive")
     # no expansion of full tenant / deposit / contract on the index screen
     assert "deposit" not in text.lower() and "tenant" not in text.lower()
 
@@ -356,20 +358,24 @@ def test_secretary_remind_owner_waits_payment_sends_exactly_one(make_app):
         [make_callback_update(SECRETARY_ID, GROUP_CHAT_ID, remind_cb,
                               message_id=detail["message_id"], bot=env.bot)],
     )
-    # Exactly one new reminder message.
+    # Exactly one new reminder message — a REAL private DM to the Owner
+    # (ZERO-LEARNING-004 §4), never a group re-post.
     assert len(env.bot.sends()) == sends_before + 1
-    reminder = env.bot.sends()[-1]["text"]
-    assert "🔔 Payment Reminder" in reminder
+    dm = env.bot.sends()[-1]
+    assert dm["chat_id"] == OWNER_ID
+    reminder = dm["text"]
+    assert "Payment Reminder" in reminder
     assert "1680" in reminder and ("2,500" in reminder or "2500" in reminder)
-    assert "Approved 2026-08-15" in reminder
+    # The DM speaks the OWNER's language (zh private chat).
+    assert "批准于 2026-08-15" in reminder or "Approved 2026-08-15" in reminder
     for banned in BANNED_TEXT:
         assert banned not in reminder
-    # Same-day repeat tap -> no second send ("already reminded").
+    # Same-day repeat tap -> no second DM ("already reminded").
     sends_after_first = len(env.bot.sends())
     run_updates(
         env,
         [make_callback_update(SECRETARY_ID, GROUP_CHAT_ID, remind_cb,
-                              message_id=detail["message_id"], bot=env.bot)],
+                              message_id=detail["message_id"], update_id=77, bot=env.bot)],
     )
     assert len(env.bot.sends()) == sends_after_first  # deduped, no new send
 

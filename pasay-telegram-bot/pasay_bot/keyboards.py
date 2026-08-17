@@ -1768,25 +1768,40 @@ def tasks_quick_keyboard(data, locale: str = "bi") -> InlineKeyboardMarkup:
 # data (mirrors the copilot WHY index pattern).
 
 
+def _short_unit_code(unit: str) -> str:
+    """ZERO-LEARNING-004 §1/§7: strip the property prefix for BUTTON labels
+    (``DEV-BAY-1608`` -> ``1608``) — the list above already shows the full
+    code, and a short tappable id fits narrow phones."""
+    s = str(unit or "").strip()
+    if "-" in s:
+        return s.split("-")[-1]
+    return s
+
+
 def properties_quick_keyboard(rows, locale: str = "bi") -> InlineKeyboardMarkup:
-    """🏠 Properties Quick View inline buttons: one ``👁 1608`` entry per unit
-    (opens the unit Quick View) + a ``📄 Property Archive`` deep link. The
-    persistent reply keyboard stays pinned client-side."""
+    """🏠 Properties Quick View inline buttons (ZERO-LEARNING-004 §1.2): one
+    SHORT ``1608`` entry per unit, two per row (fallback one per row handled
+    by Telegram), then a compact ``📄 Archive`` deep link. No ``👁`` prefix —
+    the list above already names each unit and the tap target is obvious."""
     kb: list[list[InlineKeyboardButton]] = []
+    row_batch: list[InlineKeyboardButton] = []
     for i, row in enumerate(rows, start=1):
         unit = str(row.get("unit_code") or row.get("property_code") or "")
-        kb.append(
-            [
-                InlineKeyboardButton(
-                    f"👁 {unit}",
-                    callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
-                )
-            ]
+        row_batch.append(
+            InlineKeyboardButton(
+                _short_unit_code(unit) or str(i),
+                callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
+            )
         )
+        if len(row_batch) == 2:
+            kb.append(row_batch)
+            row_batch = []
+    if row_batch:
+        kb.append(row_batch)
     kb.append(
         [
             InlineKeyboardButton(
-                t("v2.property_archive", locale),
+                t("v2.property_archive_short", locale),
                 callback_data=encode(ACTION_PROP_ARCHIVE),
             )
         ]
@@ -1795,16 +1810,16 @@ def properties_quick_keyboard(rows, locale: str = "bi") -> InlineKeyboardMarkup:
 
 
 def rent_quick_keyboard(overdue_rows, locale: str = "bi") -> InlineKeyboardMarkup:
-    """💰 Rent Quick View overdue actions: one ``1680 Follow up`` button per
-    overdue row (opens the Rent detail card), then Home. No repeated generic
-    ``Done / Detail`` buttons — each row is a distinct unit."""
+    """💰 Rent Quick View overdue actions (ZERO-LEARNING-004 §7): one SHORT
+    ``1680 · Follow up`` button per overdue row (opens the Rent detail card),
+    then Home — the full property code stays in the list text above."""
     kb: list[list[InlineKeyboardButton]] = []
     for i, row in enumerate(overdue_rows, start=1):
         unit = str(row.get("unit") or row.get("unit_code") or "")
         kb.append(
             [
                 InlineKeyboardButton(
-                    f"{unit} {t('v2.rent_followup', locale)}",
+                    f"{_short_unit_code(unit)} · {t('v2.rent_followup', locale)}",
                     callback_data=encode(ACTION_RENT_QUICK_DETAIL, "ovd", str(i)),
                 )
             ]

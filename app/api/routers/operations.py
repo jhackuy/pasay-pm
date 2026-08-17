@@ -719,6 +719,39 @@ def quick_unit_timeline(
     return quick_svc.build_unit_timeline(db, unit_id)
 
 
+@router.get("/remind-owner-target")
+def remind_owner_target(
+    db: Session = Depends(get_db),
+    _: User = Depends(manager_or_admin),
+):
+    """ZERO-LEARNING-004 §4: the canonical HUMAN Owner's Telegram DM target.
+
+    🔔 Remind Owner is a REAL action: the bot DMs the Owner (private chat)
+    and only marks the reminder delivered AFTER the DM succeeds. This endpoint
+    resolves the Owner's telegram chat id from the canonical human identity
+    (admin role + active Telegram binding), so the bot never hardcodes a
+    chat id and never falls back to the group.
+
+    Returns ``{"telegram_chat_id": "5177241442"}`` or 404 when no Owner with a
+    Telegram destination exists (fail closed — the caller must NOT report the
+    reminder as delivered)."""
+    from app.models.user import User, UserRole
+
+    owner = (
+        db.query(User)
+        .filter(
+            User.role == UserRole.admin,
+            User.is_active.is_(True),
+            User.telegram_chat_id.isnot(None),
+        )
+        .order_by(User.id)
+        .first()
+    )
+    if owner is None or not str(owner.telegram_chat_id).strip():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No Owner Telegram destination configured")
+    return {"telegram_chat_id": str(owner.telegram_chat_id).strip()}
+
+
 @router.get("/digest")
 def daily_digest(
     db: Session = Depends(get_db),

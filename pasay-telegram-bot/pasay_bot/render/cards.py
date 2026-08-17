@@ -1049,6 +1049,36 @@ def _expense_purpose_text(expense) -> str | None:
     return None
 
 
+# ZERO-LEARNING-004 §5: business-category words that are NOT vendor names.
+# Legacy imports stored the purpose in the payee column (e.g. E7/E8:
+# category='??', payee='Repair') — such a payee must never be presented as a
+# real vendor. Only a distinct vendor name (e.g. 'Fix-It Co') renders.
+_PAYEE_PURPOSE_SENTINELS = frozenset({
+    "repair", "maintenance", "water", "electricity", "rent", "cleaning",
+    "other", "维修", "水费", "电费", "物业费", "网费", "清洁", "其他",
+})
+
+
+def _expense_display_payee(expense) -> str | None:
+    """Real payee for display; None means 'Not recorded / 未登记'.
+
+    A payee that is missing, the '-' unknown-vendor sentinel, identical to
+    the purpose, or a business-category word is NOT a real vendor and never
+    renders as the payee (the purpose fallback must never be re-labelled as a
+    vendor)."""
+    raw = getattr(expense, "payee", None)
+    text = _clean_free_text(raw)
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in _PAYEE_PURPOSE_SENTINELS:
+        return None
+    purpose = _expense_purpose_text(expense)
+    if purpose and lowered == " ".join(str(purpose).lower().split()):
+        return None
+    return text
+
+
 def expense_approval_card(
     expense: Expense, locale: str = "zh", location: str = "",
 ) -> str:
@@ -1116,54 +1146,63 @@ def expense_detail_card(
     expense: Expense, locale: str = "zh", location: str = "",
     waiting_days: int = 0,
 ) -> str:
-    """Human-readable expense detail (CONVERGENCE-003 §4.3): property/unit,
-    category/purpose, amount, approved date, waiting days, status. Receipt
-    presence is shown as a label; raw attachment ids stay internal."""
-    lines = [f"<b>{H.escape(t('expense.detail_title', locale))}</b>"]
-    loc = _expense_location(expense, location)
-    if loc:
-        lines.append(loc)
-    purpose = _expense_purpose_text(expense)
+    """Human-readable expense detail (ZERO-LEARNING-004 §5): what this money
+    is, how much, how long it has waited, and the state — NOT an ERP field
+    form. One compact block:
+
+        💸 E7 · DEV-BAY-1680
+
+        Repair · ₱7,000
+        Approved Aug 15 · Waiting 2d
+        Payee: Not recorded
+        Receipt: None
+
+    The payee line only renders when a REAL vendor exists (``Fix-It Co``);
+    otherwise ``Not recorded / 未登记`` — the purpose is never re-labelled as
+    the payee. Raw attachment ids stay internal."""
+    expense_id = getattr(expense, "id", None)
+    id_part = f"E{int(expense_id)}" if expense_id is not None else ""
+    title_parts = [x for x in (id_part, location) if x]
+    lines = [f"💸 <b>{H.escape(' · '.join(title_parts))}</b>", ""]
+    purpose = _expense_purpose_text(expense) or t("expense.purpose_unspecified", locale)
     lines.append(
-        f"{H.escape(t('expense.purpose', locale))}："
-        f"{H.escape(purpose or t('expense.purpose_unspecified', locale))}"
+        f"{H.escape(purpose)} · <b>{H.money(expense.amount)}</b>"
     )
-    if expense.description:
-        lines.append(H.escape(expense.description))
-    lines.append(f"{H.escape(t('expense.payee', locale))}：{H.escape(expense.payee or '-')}")
-    lines.append(f"{H.escape(t('rent.amount', locale))}：<b>{H.money(expense.amount)}</b>")
-    lines.append(
-        f"{H.escape(t('expense.date', locale))}：{H.format_date(expense.expense_date)}"
-    )
-    if expense.due_date:
-        lines.append(
-            f"{H.escape(t('expense.due_date', locale))}：{H.format_date(expense.due_date)}"
-        )
     if getattr(expense, "approved_at", None):
         approved = str(expense.approved_at)[:10]
-        lines.append(
-            H.escape(_bi_value(
-                locale,
-                f"Approved {approved}",
-                f"批准于 {approved}",
-            ))
+        waiting = (
+            f" · {H.escape(_bi_value(locale, f'Waiting {waiting_days}d', f'等待 {waiting_days} 天'))}"
+            if waiting_days
+            else ""
         )
-        if waiting_days:
-            lines.append(
-                H.escape(_bi_value(
-                    locale,
-                    f"Waiting {waiting_days}d",
-                    f"已等待 {waiting_days} 天",
-                ))
-            )
+        lines.append(
+            H.escape(_bi_value(locale, f"Approved {approved}", f"批准于 {approved}")) + waiting
+        )
+    payee = _expense_display_payee(expense)
+    if payee:
+        lines.append(
+            H.escape(_bi_value(locale, f"Payee: {payee}", f"收款方：{payee}"))
+        )
+    else:
+        lines.append(
+            H.escape(_bi_value(locale, "Payee: Not recorded", "收款方：未登记"))
+        )
     lines.append(
-        f"{H.escape(t('ops.status', locale))}：{_expense_status_label(expense.status, locale)}"
+        H.escape(_bi_value(
+            locale,
+            "Receipt: Yes" if expense.receipt_attachment_id else "Receipt: None",
+            "凭证：有" if expense.receipt_attachment_id else "凭证：无",
+        ))
     )
-    lines.append(
-        H.escape(t("expense.receipt_present", locale))
-        if expense.receipt_attachment_id
-        else H.escape(t("expense.receipt_missing", locale))
-    )
+    status = (expense.status or "").lower()
+    if status == "approved":
+        lines.append(H.escape(_bi_value(locale, "Waiting for payment", "等待付款")))
+    elif status == "paid":
+        lines.append(H.escape(_bi_value(locale, "Paid", "已付款")))
+    elif status == "pending":
+        lines.append(H.escape(_bi_value(locale, "Pending approval", "待批准")))
+    elif status in ("rejected", "reversed"):
+        lines.append(H.escape(_bi_value(locale, "Closed", "已关闭")))
     return "\n".join(lines)
 
 
@@ -1447,20 +1486,20 @@ def home_summary_card(
         lines.append(H.escape(_bi_value(locale, f"Expected {H.money(expected)}", f"本月应收 {H.money(expected)}")))
     lines.append(H.escape(_bi_value(locale, f"Collected {H.money(collected)}", f"本月已收 {H.money(collected)}")))
     if outstanding is not None:
-        lines.append(H.escape(_bi_value(locale, f"Outstanding {H.money(outstanding)}", f"本月未收 {H.money(outstanding)}")))
+        lines.append(H.escape(_bi_value(locale, f"This month outstanding {H.money(outstanding)}", f"本月未收 {H.money(outstanding)}")))
     if total_arrears is not None:
-        lines.append(H.escape(_bi_value(locale, f"Arrears {H.money(total_arrears)}", f"历史累计欠租 {H.money(total_arrears)}")))
-    lines.append(H.escape(_bi_value(locale, f"Overdue {overdue_count}", f"逾期数量 {overdue_count}")))
+        lines.append(H.escape(_bi_value(locale, f"Total arrears {H.money(total_arrears)}", f"历史累计欠租 {H.money(total_arrears)}")))
+    lines.append(H.escape(_bi_value(locale, f"Overdue rents {overdue_count}", f"逾期租金 {overdue_count}")))
     if expiring_count:
-        lines.append(H.escape(_bi_value(locale, f"Expiring {expiring_count}", f"合同即将到期 {expiring_count}")))
+        lines.append(H.escape(_bi_value(locale, f"Leases expiring {expiring_count}", f"合同到期 {expiring_count}")))
     if vacant_count:
-        lines.append(H.escape(_bi_value(locale, f"Vacant {vacant_count}", f"空置数量 {vacant_count}")))
+        lines.append(H.escape(_bi_value(locale, f"Vacant {vacant_count}", f"空置 {vacant_count}")))
     if payable_count:
-        lines.append(H.escape(_bi_value(locale, f"To pay {payable_count}", f"待付款支出 {payable_count}")))
+        lines.append(H.escape(_bi_value(locale, f"Expenses to pay {payable_count}", f"待付款 {payable_count}")))
     if maintenance_open:
         lines.append(H.escape(_bi_value(locale, f"Maintenance {maintenance_open}", f"未完成维修 {maintenance_open}")))
     if today_count:
-        lines.append(H.escape(_bi_value(locale, f"Today {today_count}", f"今日需要处理 {today_count}")))
+        lines.append(H.escape(_bi_value(locale, f"Today's actions {today_count}", f"今日待办 {today_count}")))
     return "\n".join(lines)
 
 
@@ -1920,9 +1959,10 @@ def remind_owner_card(
     waiting_days: int = 0,
     locale: str = "bi",
 ) -> str:
-    """🔔 Payment Reminder card (section 六): property/unit + purpose + amount +
-    approved date + waiting duration + the owner call-to-action. Bilingual in
-    groups. Only real fields are shown — placeholders never render."""
+    """🔔 Payment Reminder DM (ZERO-LEARNING-004 §4): property/unit + purpose +
+    amount + approved date + waiting duration + who requested the Owner's
+    attention. Bilingual in groups / owner-language in the Owner's private
+    chat. Only real fields are shown — placeholders never render."""
     header = H.escape(t("v2.remind_owner_title", locale))
     lines = [f"<b>{header}</b>", ""]
     if unit_label:
@@ -1936,7 +1976,9 @@ def remind_owner_card(
     lines.append(
         H.escape(t("v2.remind_owner_waiting", locale, days=int(waiting_days)))
     )
-    lines.append(H.escape(t("v2.remind_owner_to", locale)))
+    lines.append(
+        H.escape(_bi_value(locale, "Secretary requested your attention.", "秘书提醒您处理。"))
+    )
     return "\n".join(lines)
 
 
@@ -1960,22 +2002,23 @@ def quick_unit_view_card(
         lines.append(H.escape(t("v2.rent_vacant", locale)))
         return "\n".join(lines)
     s = str(status or "normal").lower()
-    lines.append(_bi_line(locale, "🟢 Occupied", "🟢 已出租"))
+    lines.append(_bi_line(locale, "Occupied", "已出租"))
     if s in ("paid", "rent_paid"):
-        lines.append(_bi_line(locale, "💰 Rent ✅ · Paid", "💰 Rent ✅ · 已收"))
+        lines.append(_bi_line(locale, "Rent paid", "租金已收"))
     else:
         lines.append(H.escape(t("v2.rent_overdue", locale, days=int(days or 0))))
-    lines.append(
-        _bi_line(
-            locale,
-            f"🔧 Maintenance · {int(open_maintenance or 0)} open",
-            f"🔧 维修 · {int(open_maintenance or 0)} 项处理中",
+    if int(open_maintenance or 0):
+        lines.append(
+            _bi_line(
+                locale,
+                f"Repair {int(open_maintenance)} open",
+                f"维修 {int(open_maintenance)} 项",
+            )
         )
-    )
     if s == "lease_expiring":
-        lines.append(_bi_line(locale, f"📄 Lease · Expiring in {int(days or 0)}d", f"📄 合同 · 还有 {int(days or 0)} 天到期"))
+        lines.append(_bi_line(locale, f"Lease expires in {int(days or 0)}d", f"租约还有 {int(days or 0)} 天到期"))
     else:
-        lines.append(_bi_line(locale, "📄 Lease · OK", "📄 合同 · 正常"))
+        lines.append(_bi_line(locale, "Lease OK", "租约正常"))
     return "\n".join(lines)
 
 
@@ -1995,30 +2038,46 @@ def property_archive_card(locale: str = "bi", *, link: str = "") -> str:
     return "\n".join(lines)
 
 
-def _v2_property_label(row: dict, locale: str) -> tuple[str, str]:
-    """High-density one-line-per-unit index row (frozen design):
+def _v2_property_label(row: dict, locale: str) -> str:
+    """ZERO-LEARNING-004 §1: one unit line where the EXCEPTION is expressed in
+    WORDS and a normal unit collapses to ``OK``:
 
-    ``🟢 1608　💰✅　🔧1　📄✅`` (occupied) / ``⚪ 1702　VACANT`` (vacant).
+      vacant:        ``2308 · Vacant · 空置``
+      overdue rent:  ``1608 · Rent overdue 104d · 3 periods · 逾期租金 104 天 · 3 期``
+      expiring:      ``1203 · Lease expires in 18d · 租约还有 18 天到期``
+      open repair:   appends ``· Repair 1 open · 维修 1 项处理中``
+      normal/paid:   ``1203 · OK``
 
-    The emoji is the occupancy marker (🟢 occupied / lease active, ⚪ vacant);
-    the trailing chips are rent state (💰✅/💰⚠️), open maintenance count
-    (🔧N) and lease state (📄✅/📄⚠️). ``VACANT`` renders as the compact
-    vacant phrase; a unit is never expanded into tenant/deposit/contract detail
-    on this index page."""
+    No ``💰⚠️`` / ``📄✅`` / ``🔧0`` chips — an icon never carries the only
+    meaning, and zero-maintenance is never shown. ``unpaid_periods`` comes
+    from the backend (the SAME truth source as the RENT_OVERDUE generator)."""
     status = str(row.get("status") or "normal").lower()
     unit = H.escape(str(row.get("unit_code") or row.get("property_code") or ""))
-    emoji = "🟢" if status != "vacant" else "⚪"
+    en_parts = [unit]
+    zh_parts = [unit]
     if status == "vacant":
-        return emoji, f"{unit}　{_bi_header(locale, 'VACANT', '空置')}"
-    chips = [x for x in (
-        _v2_rent_chip(status),
-        _v2_maintenance_chip(row.get("open_maintenance")),
-        _v2_lease_chip(status, row.get("days")),
-    ) if x]
-    # A fully paid unit needs at least an occupancy/rent marker so the row is
-    # never spuriously blank.
-    line = f"{unit}" + (f"　{'　'.join(chips)}" if chips else "")
-    return emoji, line
+        en_parts.append("Vacant")
+        zh_parts.append("空置")
+    elif status == "overdue_rent":
+        days = int(row.get("days") or 0)
+        en_parts.append(f"Rent overdue {days}d")
+        zh_parts.append(f"逾期租金 {days} 天")
+        periods = row.get("unpaid_periods")
+        if periods:
+            en_parts.append(f"{int(periods)} periods")
+            zh_parts.append(f"{int(periods)} 期")
+    elif status == "lease_expiring":
+        days = int(row.get("days") or 0)
+        en_parts.append(f"Lease expires in {days}d")
+        zh_parts.append(f"租约还有 {days} 天到期")
+    else:  # normal / paid -> collapse to OK
+        en_parts.append("OK")
+        zh_parts.append("OK")
+    repair = int(row.get("open_maintenance") or 0)
+    if repair:
+        en_parts.append(f"Repair {repair} open")
+        zh_parts.append(f"维修 {repair} 项")
+    return _bi_value(locale, " · ".join(en_parts), " · ".join(zh_parts))
 
 
 _TASK_TITLE_SENTINEL_RE = re.compile(
@@ -2218,8 +2277,7 @@ def properties_quick_card(data, locale: str = "bi") -> str:
     rate = (occupied / total * 100) if total else 0
     blocks.append(_properties_summary_line(locale, total, occupied, vacant, rate))
     for row in rows:
-        emoji, line = _v2_property_label(row, locale)
-        blocks.append(f"{emoji} {line}")
+        blocks.append(_v2_property_label(row, locale))
     return "\n\n".join(blocks)
 
 
@@ -2242,33 +2300,51 @@ def _properties_summary_line(locale: str, total: int, occupied: int, vacant: int
 
 def _payable_expense_line(row: dict, locale: str) -> str:
     """One payable (APPROVED, unpaid) expense row with a stable visible
-    identity: ``💸 E{id} · unit · purpose · amount`` (plain text, never a
-    Telegram ``#E{id}`` hashtag). The database expense id is the stable
-    identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3), so same-day /
-    same-amount expenses stay distinguishable. CONVERGENCE-003 §10: no
-    trailing status word — the section header already says 待付款/Approved."""
+    identity: ``💸 E{id} · unit · purpose · amount · waiting Nd`` (plain text,
+    never a Telegram ``#E{id}`` hashtag). The database expense id is the
+    stable identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3), so same-day /
+    same-amount expenses stay distinguishable. ZERO-LEARNING-004 §6: the row
+    carries the SAME waiting-day fact as the task rows (single
+    representation)."""
     expense_id = row.get("expense_id")
     id_part = f"E{int(expense_id)}" if expense_id is not None else ""
     unit = H.escape(str(row.get("unit") or ""))
     purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
+    waiting = row.get("waiting_days")
     parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>") if x]
+    if waiting is not None:
+        parts.append(H.escape(t("v2.waiting_days", locale, days=int(waiting))))
     return "💸 " + " · ".join(parts)
 
 
 def tasks_quick_card(data, locale: str = "bi") -> str:
-    """✅ Tasks quick view: active tasks grouped by status, plus the Owner's
-    payable APPROVED expenses (PASAY-V2-EXPENSE-PAYABLE-TASK-006).
+    """✅ Tasks quick view: ONE representation per business item
+    (ZERO-LEARNING-004 §6).
 
-    Payable expenses use the plain-text ``E{id}`` (never the ``#E{id}``
-    hashtag) as the stable identity so same-day / same-amount records stay
-    distinguishable. When payable rows exist the card never shows the empty
-    state."""
+    Payable APPROVED expenses form the ``💸 To pay`` group (E{id} · unit ·
+    purpose · amount · waiting Nd) and are then EXCLUDED from the Pending
+    group — an expense never appears twice on the same first screen. Only the
+    Pending / In-progress operational tasks that are NOT already covered by
+    the To-pay group render below."""
     tasks = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
     payable = [
         t_ for t_ in tasks if str(t_.get("kind") or "") == "payable_expense"
     ]
-    operational = [t_ for t_ in tasks if t_ not in payable]
+    payable_expense_ids = {
+        p.get("expense_id") for p in payable if p.get("expense_id") is not None
+    }
+
+    def _covered_by_payable(t_) -> bool:
+        # An APPROVAL_PENDING / PAYMENT_PENDING operational task that mirrors
+        # a payable expense is the SAME business item — drop it from Pending.
+        if str(t_.get("task_type") or "").upper() not in (
+            "APPROVAL_PENDING", "PAYMENT_PENDING",
+        ):
+            return False
+        return t_.get("expense_id") in payable_expense_ids
+
+    operational = [t_ for t_ in tasks if t_ not in payable and not _covered_by_payable(t_)]
     pending = [
         t_ for t_ in operational
         if str(t_.get("status") or "").upper() == "PENDING"
@@ -2283,7 +2359,7 @@ def tasks_quick_card(data, locale: str = "bi") -> str:
         blocks.append(H.escape(t("v2.empty", locale)))
         return "\n".join(blocks)
     if payable:
-        subtitle = t("v2.payable_expenses", locale, count=len(payable))
+        subtitle = _bi_value(locale, f"To pay {len(payable)}", f"待付款 {len(payable)}")
         blocks.append(f"💸 <b>{H.escape(subtitle)}</b>")
         blocks.extend(_payable_expense_line(p_, locale) for p_ in payable)
     if pending:

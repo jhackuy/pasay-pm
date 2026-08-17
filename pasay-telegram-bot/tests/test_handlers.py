@@ -148,7 +148,7 @@ def test_overdue_escape_and_action_buttons(make_app):
     buttons = [b for row in kb.inline_keyboard for b in row]
     # 2 items x (记一笔 + 详情) + home button (B7)
     assert len(buttons) == 5
-    assert "🏠 首页" in [b.text for b in buttons]
+    assert any("Home" in b.text for b in buttons)  # ZERO-LEARNING-004: single Home name
 
 
 # --- confirm flows ---

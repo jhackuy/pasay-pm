@@ -252,6 +252,10 @@ def test_remind_owner_same_day_dedup(make_app):
                               message_id=detail["message_id"], bot=env.bot)],
     )
     assert len(env.bot.sends()) == sends_before + 1
+    # ZERO-LEARNING-004 §4: the ONE send is a REAL private DM to the OWNER.
+    dm = env.bot.sends()[-1]
+    assert dm["chat_id"] == OWNER_ID
+    assert "Secretary requested your attention" in dm["text"] or "秘书提醒您处理" in dm["text"]
     # same-day second tap -> no new send, visible "already" feedback
     after = len(env.bot.sends())
     run_updates(

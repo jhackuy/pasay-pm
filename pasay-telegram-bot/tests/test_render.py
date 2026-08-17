@@ -322,4 +322,4 @@ def test_copilot_today_keyboard_has_why_and_ask():
     buttons = [b.text for row in kb.inline_keyboard for b in row]
     assert "1 为什么?" in buttons and "2 为什么?" in buttons and "3 为什么?" in buttons
     assert "问运营助手" in buttons
-    assert "🏠 首页" in buttons
+    assert any("Home" in lbl for lbl in buttons)  # ZERO-LEARNING-004: single Home name

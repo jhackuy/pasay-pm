@@ -1408,11 +1408,21 @@ async def _reminded_today(context, expense_id: int) -> bool:
 
 
 async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
-    """🔔 Remind Owner on a waiting-payment expense (CONVERGENCE-003 §4.4):
-    one tap -> ONE real reminder message with full context; the same-day rule
-    is enforced by a persistent daily mark, so a repeat tap today answers
-    "Already reminded today / 今日已提醒" instead of duplicating. The expense
-    detail card is re-rendered with the button flipped to ``✅ Reminded``."""
+    """🔔 Remind Owner (ZERO-LEARNING-004 §4): a REAL action.
+
+    The tap must result in an actual PRIVATE message to the HUMAN Owner:
+    1. resolve the Owner's Telegram DM target (canonical identity, never a
+       hardcoded chat id);
+    2. bot sends the reminder DM to the Owner's private chat (NOT a repeat
+       message in the group);
+    3. ONLY after the DM succeeds is the reminder recorded (daily dedup mark)
+       and the group card flipped to ``✅ Reminded``;
+    4. any failure (recipient resolution / forbidden / timeout / Telegram
+       error) does NOT record success: the group answers ``⚠️ Reminder
+       failed`` and the button stays ``🔔 Remind``.
+
+    The persistent same-day dedup is kept (one real DM per expense per PH day).
+    """
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
@@ -1444,7 +1454,9 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
         return
     location = await _expense_location(update, context, expense)
     unit_label = location or ""
-    purpose = cards._expense_purpose_text(expense) or t("v2.expense_other", locale)
+    # The DM speaks the OWNER's language (private chat), not the group locale.
+    owner_locale = locale_for_chat("private", Role.OWNER)
+    purpose = cards._expense_purpose_text(expense) or t("v2.expense_other", owner_locale)
     approved_date = getattr(expense, "approved_at", None) or ""
     if approved_date:
         approved_date = str(approved_date)[:10]
@@ -1455,23 +1467,45 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
             waiting_days = max((_date.today() - _date.fromisoformat(approved_date)).days, 0)
         except ValueError:
             waiting_days = 0
-    text = cards.remind_owner_card(
+    dm_text = cards.remind_owner_card(
         unit_label=unit_label,
         purpose=purpose,
         amount=expense.amount,
         approved_date=approved_date,
         waiting_days=waiting_days,
-        locale=locale,
+        locale=owner_locale,
     )
+    # Step 1: resolve the REAL Owner DM target (fail closed -> NO success).
+    try:
+        owner_chat_id = await api.get_owner_dm_chat_id()
+    except PasayApiError as exc:
+        logger.warning("remind owner target resolution failed: %s", exc.detail)
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("v2.remind_owner_failed", locale), durable=True)
+        return
+    try:
+        owner_chat_id_int = int(owner_chat_id)
+    except (TypeError, ValueError):
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("v2.remind_owner_failed", locale), durable=True)
+        return
+    # Step 2: send the DM to the Owner's PRIVATE chat.
+    try:
+        await update.get_bot().send_message(
+            owner_chat_id_int,
+            H.truncate(dm_text),
+            parse_mode=HTML,
+        )
+    except Exception as exc:  # noqa: BLE001 - any delivery failure is a real failure
+        logger.warning("remind owner DM to %s failed: %s", owner_chat_id, exc)
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("v2.remind_owner_failed", locale), durable=True)
+        return
+    # Step 3: DM succeeded -> record the delivered reminder.
     guard.settle(key, {"expense_id": expense_id}, resource=str(expense_id))
     store.mark_daily(mark_key)
-    await update.get_bot().send_message(
-        update.effective_chat.id,
-        H.truncate(text),
-        parse_mode=HTML,
-    )
     await _answer(update, t("v2.remind_owner_sent", locale))
-    # Flip the tapped card's Remind button to ✅ Reminded (message mutation).
+    # Step 4: flip the group card to ✅ Reminded (message mutation).
     await _render_expense_detail_in_place(update, context, expense_id, locale, reminded_today=True)
 
 

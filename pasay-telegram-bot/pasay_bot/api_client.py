@@ -1065,6 +1065,17 @@ class PasayApiClient:
         data = await self._request("POST", f"/operations/tasks/{task_id}/acknowledge")
         return OperationalTask.from_dict(data["task"])
 
+    async def get_owner_dm_chat_id(self) -> str:
+        """ZERO-LEARNING-004 §4: resolve the canonical HUMAN Owner's Telegram
+        private-chat id for a REAL Remind-Owner DM. Raises PasayApiError when
+        no Owner Telegram destination is configured (the caller must then NOT
+        report the reminder as delivered)."""
+        data = await self._request("GET", "/operations/remind-owner-target")
+        chat_id = str((data or {}).get("telegram_chat_id") or "").strip()
+        if not chat_id:
+            raise PasayApiError(None, "No Owner Telegram destination configured")
+        return chat_id
+
     # --- PASAY-V2-FOUNDATION-001: conversation-driven task create/update ---
     async def create_operational_task(
         self,
