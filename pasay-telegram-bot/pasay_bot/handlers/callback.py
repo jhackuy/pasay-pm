@@ -64,8 +64,13 @@ from pasay_bot.keyboards import (
     ACTION_NAV,
     ACTION_OPS_NAV,
     ACTION_PAGE,
+    ACTION_PROP_ARCHIVE,
+    ACTION_QUICK_UNIT_VIEW,
+    ACTION_REMIND_OWNER,
     ACTION_RENT,
     ACTION_REVERSE,
+    ACTION_RENT_FOLLOWUP,
+    ACTION_RENT_QUICK_DETAIL,
     ACTION_RENT_STATUS_SELECT,
     ACTION_RENT_HISTORY_SELECT,
     ACTION_REPAIR_COMPLETE_CANDIDATE,
@@ -106,6 +111,7 @@ from pasay_bot.keyboards import (
     now_ts,
     ops_back_keyboard,
     payment_method_keyboard,
+    rent_detail_keyboard,
     retry_confirm_keyboard,
     snooze_preset_keyboard,
     task_action_keyboard,
@@ -379,6 +385,16 @@ async def _dispatch_callback(
         await _handle_copilot_snooze_pick(update, context, entity, ref, nonce, ts, role, locale)
     elif action == ACTION_COPILOT_ASSIGNEE_PICK:
         await _handle_copilot_assignee_pick(update, context, entity, ref, nonce, ts, role, locale)
+    elif action == ACTION_QUICK_UNIT_VIEW:
+        await _handle_quick_unit_view(update, context, ref, role, locale)
+    elif action == ACTION_PROP_ARCHIVE:
+        await _handle_prop_archive(update, context, role, locale)
+    elif action == ACTION_RENT_QUICK_DETAIL:
+        await _handle_rent_quick_detail(update, context, ref, role, locale)
+    elif action == ACTION_RENT_FOLLOWUP:
+        await _handle_rent_followup(update, context, ref, role, locale)
+    elif action == ACTION_REMIND_OWNER:
+        await _handle_remind_owner(update, context, ref, nonce, ts, role, locale)
     else:
         logger.warning("unknown callback action=%r data=%r", action, update.callback_query.data)
         await _answer(update, t("common.invalid", locale))
@@ -1036,6 +1052,300 @@ async def _handle_detail(update, context, entity, ref, role, locale):
                     home_keyboard(locale))
         return
     await _answer(update, t("common.invalid", locale))
+
+
+# --- TELEGRAM-OPS-UX-CONVERGENCE-001: Properties / Rent / Remind actions ----
+
+async def _handle_quick_unit_view(update, context, ref, role, locale):
+    """👁 1608 on the Properties index -> the unit's Quick View."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    index = int(ref)
+    api = context.bot_data["api_client"]
+    try:
+        rows = await api.get_quick_properties()
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    if index < 1 or index > len(rows):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    row = rows[index - 1]
+    unit_code = str(row.get("unit_code") or "")
+    vacant = (str(row.get("status") or "").lower() == "vacant")
+    text = cards.quick_unit_view_card(
+        unit_label=unit_code,
+        locale=locale,
+        vacant=vacant,
+        status=str(row.get("status") or "normal"),
+        amount=row.get("amount"),
+        days=row.get("days"),
+        open_maintenance=row.get("open_maintenance"),
+    )
+    kb = home_keyboard(locale)
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
+
+
+async def _handle_prop_archive(update, context, role, locale):
+    """📄 Property Archive: surface the private archive channel link (index
+    stays in the group; the full archive lives in the channel)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    settings = context.bot_data["settings"]
+    archive_id = str(getattr(settings, "archive_chat_id", "") or "").strip()
+    if archive_id:
+        # -100xxx -> c/xxx ; a bare group/supergroup id also maps to c/.
+        if archive_id.startswith("-100"):
+            cid = archive_id[4:]
+        elif archive_id.startswith("-"):
+            cid = archive_id[1:]
+        else:
+            cid = archive_id
+        link = f"https://t.me/c/{cid}"
+    else:
+        link = ""
+    text = cards.property_archive_card(locale, link=link)
+    kb = home_keyboard(locale) if link else None
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
+
+
+async def _handle_rent_quick_detail(update, context, ref, role, locale):
+    """1680 Follow up (on the Rent quick view) -> the unit's rent detail."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    index = int(ref)
+    api = context.bot_data["api_client"]
+    try:
+        data = await api.get_quick_rent()
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    overdue = data.get("overdue") or []
+    if index < 1 or index > len(overdue):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    row = overdue[index - 1]
+    unit_code = str(row.get("unit") or row.get("unit_code") or "")
+    unit_id = await _resolve_unit_id(update, context, unit_code)
+    text = await _render_rent_detail_text(api, unit_code, unit_id, row, locale)
+    kb = rent_detail_keyboard(unit_id, locale) if unit_id else home_keyboard(locale)
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
+
+
+async def _resolve_unit_id(update, context, unit_code: str):
+    """Resolve a unit_id from a display unit number; None when not resolvable
+    (the detail still renders, just without the write buttons)."""
+    if not unit_code:
+        return None
+    # Strip a property prefix like BAY-1608 down to the bare number search too.
+    candidates = [unit_code]
+    if "-" in unit_code:
+        candidates.append(unit_code.split("-")[-1])
+    try:
+        units = await context.bot_data["api_client"].get_units()
+    except PasayApiError:
+        return None
+    for c in candidates:
+        for u in units:
+            if (u.unit_number or "").lower() == c.lower():
+                return u.id
+    return None
+
+
+async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
+    """Rent detail text from the quick-rent row + per-unit page data (tenant,
+    outstanding, unpaid periods, overdue days, last follow-up)."""
+    last_followup = ""
+    tenant_name = ""
+    vacant = False
+    if unit_id:
+        try:
+            unit = await api.get_unit(unit_id)
+            leases = await api.get_leases()
+            tenants = await api.get_tenants()
+            active = next(
+                (l for l in leases if l.unit_id == unit_id and l.status == "active"), None
+            )
+            if active is None:
+                vacant = True
+            elif unit.status == "vacant":
+                vacant = True
+            else:
+                tenant = next((tn for tn in tenants if tn.id == active.tenant_id), None)
+                tenant_name = tenant.full_name if tenant else ""
+        except PasayApiError:
+            pass
+    outstanding = row.get("amount") if row.get("amount") is not None else row.get("outstanding")
+    overdue_days = row.get("overdue_days")
+    if overdue_days is None:
+        overdue_days = row.get("days") or 0
+    return cards.rent_detail_card(
+        unit_label=unit_code,
+        locale=locale,
+        tenant_name=tenant_name,
+        outstanding=outstanding,
+        unpaid_periods=1,
+        overdue_days=int(overdue_days or 0),
+        last_followup=last_followup,
+        vacant=vacant,
+    )
+
+
+async def _handle_rent_followup(update, context, ref, role, locale):
+    """📞 Follow up on the Rent detail: prefer an existing task (dedupe) over
+    a duplicate; otherwise create one through the existing task API. The
+    backend dedupe_key guarantees at most one active follow-up per unit, so a
+    repeat tap can never create a second task."""
+    if not has_permission(role, PERMISSION_OPERATIONS):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    unit_id = int(ref)
+    api = context.bot_data["api_client"]
+    try:
+        units = await api.get_units()
+    except PasayApiError:
+        await _answer(update, t("common.unexpected", locale), durable=True)
+        return
+    unit = next((u for u in units if u.id == unit_id), None)
+    if unit is None:
+        await _answer(update, t("common.invalid", locale))
+        return
+    dedupe_key = f"rent-followup:unit:{unit_id}"
+    try:
+        await api.create_operational_task(
+            task_type="RENT_OVERDUE",
+            title=f"Collect rent · {unit.unit_number}",
+            description=f"Collect overdue rent for {unit.unit_number}.",
+            property_id=getattr(unit, "property_id", None),
+            due_at=None,
+            next_action="Follow up with tenant to collect overdue rent.",
+            next_check_at=None,
+            dedupe_key=dedupe_key,
+            status="PENDING",
+        )
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    await _answer(update, t("v2.followup_created", locale))
+    # Re-render the detail card (message mutation) so the user stays in place.
+    await _reopen_rent_detail(update, context, unit_id, locale)
+
+
+async def _reopen_rent_detail(update, context, unit_id, locale):
+    try:
+        api = context.bot_data["api_client"]
+        unit = await api.get_unit(unit_id)
+        leases = await api.get_leases()
+        tenants = await api.get_tenants()
+        active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
+        tenant_name = ""
+        if active is not None and unit.status != "vacant":
+            tenant = next((tn for tn in tenants if tn.id == active.tenant_id), None)
+            tenant_name = tenant.full_name if tenant else ""
+        unit_code = unit.unit_number
+        row = {"amount": None, "overdue_days": 0}
+        text = await _render_rent_detail_text(
+            api, unit_code, unit_id, row, locale
+        )
+        kb = rent_detail_keyboard(unit_id, locale)
+        await edit_message_text_or_send(
+            update.get_bot(),
+            chat_id=update.effective_chat.id,
+            message_id=update.callback_query.message.message_id,
+            text=H.truncate(text),
+            parse_mode=HTML,
+            reply_markup=kb,
+        )
+    except Exception:
+        pass  # best-effort; the toast already reported the outcome
+
+
+async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
+    """🔔 Remind Owner on a waiting-payment expense: one tap -> one reminder
+    message with full context. Idempotency-guarded so a single tap never fans
+    out several copies (TELEGRAM-OPS-UX-CONVERGENCE-001 §6)."""
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    expense_id = int(ref)
+    api = context.bot_data["api_client"]
+    guard = context.bot_data["idempotency"]
+    key = f"ik:rmo:{expense_id}:{nonce or '0'}"
+    status = guard.acquire(key, kind="remind_owner", resource=str(expense_id))
+    if status == "done":
+        await _answer(update, t("v2.remind_owner_sent", locale))
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale), durable=True)
+        return
+    await _ack_working(update, locale)
+    try:
+        expense = await api.get_expense(expense_id)
+    except PasayApiError as exc:
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    location = await _expense_location(update, context, expense)
+    unit_label = location or ""
+    purpose = cards._expense_purpose_text(expense) or t("v2.expense_other", locale)
+    approved_date = getattr(expense, "approved_at", None) or ""
+    if approved_date:
+        approved_date = str(approved_date)[:10]
+    waiting_days = 0
+    if approved_date:
+        try:
+            from datetime import date as _date
+            waiting_days = max((_date.today() - _date.fromisoformat(approved_date)).days, 0)
+        except ValueError:
+            waiting_days = 0
+    text = cards.remind_owner_card(
+        unit_label=unit_label,
+        purpose=purpose,
+        amount=expense.amount,
+        approved_date=approved_date,
+        waiting_days=waiting_days,
+        locale=locale,
+    )
+    guard.settle(key, {"expense_id": expense_id}, resource=str(expense_id))
+    await update.get_bot().send_message(
+        update.effective_chat.id,
+        H.truncate(text),
+        parse_mode=HTML,
+    )
+    await _answer(update, t("v2.remind_owner_sent", locale))
 
 
 # --- V1.3 expense approval (exa / exr / exd) --------------------------------

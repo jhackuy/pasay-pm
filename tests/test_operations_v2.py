@@ -226,6 +226,25 @@ def test_quick_properties_anomaly_first(client, db_session, admin_headers):
     assert rows[0]["status"] == "overdue_rent"  # due day 5, now Aug 20 -> overdue
 
 
+def test_quick_properties_open_maintenance_chip(client, db_session, admin_headers):
+    """TELEGRAM-OPS-UX-CONVERGENCE-001 §2: every unit row carries the
+    ``open_maintenance`` count (open PENDING/IN_PROGRESS AC_MAINTENANCE tasks
+    for its lease), which the bot renders as the 🔧N chip. A completed task is
+    not counted."""
+    lease, _ = _seed_lease(db_session)
+    _make_task(db_session, task_type=OperationalTaskType.AC_MAINTENANCE,
+               status=OperationalTaskStatus.PENDING, lease_id=lease.id, dedupe_key="m1")
+    _make_task(db_session, task_type=OperationalTaskType.AC_MAINTENANCE,
+               status=OperationalTaskStatus.IN_PROGRESS, lease_id=lease.id, dedupe_key="m2")
+    _make_task(db_session, task_type=OperationalTaskType.AC_MAINTENANCE,
+               status=OperationalTaskStatus.COMPLETED, lease_id=lease.id, dedupe_key="m3")
+    resp = client.get(f"{API}/operations/quick/properties", headers=admin_headers)
+    assert resp.status_code == 200
+    rows = resp.json()
+    row = next(r for r in rows if r["unit_code"] == "1680")
+    assert row["open_maintenance"] == 2  # PENDING + IN_PROGRESS, not COMPLETED
+
+
 def test_quick_rent_and_expense_shapes(client, db_session, admin_headers):
     _seed_lease(db_session)
     rent = client.get(f"{API}/operations/quick/rent", headers=admin_headers)

@@ -75,10 +75,10 @@ class V2FakeBackend(FakeBackend):
         super().__init__()
         self.quick_properties = [
             {"unit_code": "1680", "status": "overdue_rent",
-             "amount": "75000.00", "days": 12},
-            {"unit_code": "1805", "status": "lease_expiring", "days": 28},
-            {"unit_code": "2208", "status": "paid"},
-            {"unit_code": "2106", "status": "vacant"},
+             "amount": "75000.00", "days": 12, "open_maintenance": 1},
+            {"unit_code": "1805", "status": "lease_expiring", "days": 28, "open_maintenance": 0},
+            {"unit_code": "2208", "status": "paid", "open_maintenance": 0},
+            {"unit_code": "2106", "status": "vacant", "open_maintenance": 0},
         ]
         self.quick_tasks = [
             {"task_id": 1, "property_code": "1680", "title": "Rent",
@@ -199,6 +199,12 @@ def _labels(kb):
     if kb is None or kb.__class__.__name__ != "ReplyKeyboardMarkup":
         return []
     return [b.text for row in kb.keyboard for b in row]
+
+
+def _inline_labels(kb):
+    if kb is None or kb.__class__.__name__ != "InlineKeyboardMarkup":
+        return []
+    return [b.text for row in kb.inline_keyboard for b in row]
 
 
 def _reply_sends(env):
@@ -341,11 +347,20 @@ def test_properties_quick_view_group_bilingual(make_app):
     )
     send = env.bot.last_send()
     text = send["text"]
-    assert "Properties / 房源" in text
-    assert "Rent ₱75,000 overdue" in text
-    assert "租金 ₱75,000 逾期" in text
-    assert "Vacant" in text and "空置" in text
-    assert _labels(send["reply_markup"]) == V2_LABELS
+    assert "Properties / 房源 · 4" in text  # frozen: title carries the unit count
+    # frozen high-density index: one line per unit with rent/maint/lease chips.
+    assert "1680　💰⚠️　🔧1" in text     # overdue rent + 1 open maintenance
+    assert "1805" in text and "📄⚠️" in text  # lease expiring
+    assert "2208" in text and "💰✅" in text and "📄✅" in text  # paid + lease ok
+    assert "2106　VACANT / 空置" in text
+    # no tenant / deposit / contract detail is expanded on the index page.
+    assert "Juan" not in text and "deposit" not in text.lower()
+    # The index now carries per-unit Quick View entries + the archive deep link
+    # as INLINE buttons (the persistent reply keyboard stays pinned separately).
+    inline_labels = _inline_labels(send["reply_markup"])
+    assert "👁 1680" in inline_labels and "👁 1805" in inline_labels
+    assert "📄 Property Archive" in inline_labels
+    assert set(inline_labels) != set(V2_LABELS)  # inline, not the reply menu
     assert _copilot_calls(env) == []
 
 

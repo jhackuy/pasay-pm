@@ -448,7 +448,15 @@ def find_similar_paid_expenses(
 
 
 def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[dict]:
-    """One row per active unit: abnormal first (overdue > expiring > vacant)."""
+    """One row per active unit: abnormal first (overdue > expiring > vacant).
+
+    Each row carries the chips the high-density Properties index needs:
+    - ``status``: overdue_rent / lease_expiring / vacant / normal / paid (drives
+      the rent + lease chips in the renderer).
+    - ``open_maintenance``: count of open (PENDING/IN_PROGRESS) maintenance
+      tasks for the unit's active lease (drives the 🔧N chip).
+    - ``days`` / ``amount``: overdue days / outstanding amount as before.
+    """
     now = now or datetime.now(timezone.utc)
     today = now.date()
     units = (
@@ -480,13 +488,45 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
         ):
             confirmed_by_lease.setdefault(income.lease_id, []).append(income)
 
+    # Open maintenance count per lease (🔧 chip). Maintenance tasks are
+    # lease-scoped; open = PENDING or IN_PROGRESS.
+    open_maintenance_by_lease: dict[int, int] = {}
+    if leases:
+        lease_ids = [l.id for l in leases]
+        open_tasks = (
+            db.query(OperationalTask.lease_id)
+            .filter(
+                OperationalTask.lease_id.in_(lease_ids),
+                OperationalTask.task_type == OperationalTaskType.AC_MAINTENANCE,
+                OperationalTask.status.in_(
+                    [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+                ),
+            )
+            .all()
+        )
+        for (lease_id,) in open_tasks:
+            open_maintenance_by_lease[lease_id] = (
+                open_maintenance_by_lease.get(lease_id, 0) + 1
+            )
+
     rows: list[dict] = []
     for unit in units:
         label = _unit_label(db, unit) or unit.unit_number
         lease = lease_by_unit.get(unit.id)
+        maintenance_open = (
+            open_maintenance_by_lease.get(lease.id, 0) if lease is not None else 0
+        )
         if lease is None:
             status = "vacant" if unit.status == UnitStatus.vacant else "normal"
-            rows.append({"unit_code": label, "status": status, "amount": None, "days": None})
+            rows.append(
+                {
+                    "unit_code": label,
+                    "status": status,
+                    "amount": None,
+                    "days": None,
+                    "open_maintenance": maintenance_open,
+                }
+            )
             continue
         periods = _lease_periods(lease)
         due_periods = [(m, due) for m, due in periods if due <= today]
@@ -500,6 +540,7 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
                     "status": "overdue_rent",
                     "amount": _d2(lease.monthly_rent) * len(overdue),
                     "days": max((today - oldest_due).days, 0),
+                    "open_maintenance": maintenance_open,
                 }
             )
             continue
@@ -511,6 +552,7 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
                     "status": "lease_expiring",
                     "amount": None,
                     "days": days_to_end,
+                    "open_maintenance": maintenance_open,
                 }
             )
             continue
@@ -520,6 +562,7 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
                 "status": "paid",
                 "amount": None,
                 "days": None,
+                "open_maintenance": maintenance_open,
             }
         )
     order = {"overdue_rent": 0, "lease_expiring": 1, "vacant": 2, "normal": 3, "paid": 4}

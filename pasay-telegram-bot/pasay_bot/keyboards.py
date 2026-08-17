@@ -77,6 +77,18 @@ ACTION_COPILOT_RECOMMEND_BACK = "cpr"   # cp_recommend_back (return to TODAY)
 ACTION_COPILOT_SNOOZE_PICK = "csp"      # cp_snooze_pick (edit due preset)
 ACTION_COPILOT_ASSIGNEE_PICK = "cap"    # cp_assignee_pick (edit who)
 
+# TELEGRAM-OPS-UX-CONVERGENCE-001: Quick View action buttons (deterministic,
+# index-based so no internal unit/expense id ever travels in callback_data).
+# ``qvv`` opens a unit Quick View from the Properties index (ref = 1-based row
+# into the re-fetched quick-properties list); ``par`` deep-links the property
+# archive channel; ``rnq`` opens the Rent detail card for one overdue row;
+# ``rfu`` is a rent follow-up (entity = unit id); ``rmo`` reminds the Owner.
+ACTION_QUICK_UNIT_VIEW = "qvv"
+ACTION_PROP_ARCHIVE = "par"
+ACTION_RENT_QUICK_DETAIL = "rnq"
+ACTION_RENT_FOLLOWUP = "rfu"
+ACTION_REMIND_OWNER = "rmo"
+
 # --- Fixed bottom Reply Keyboard (single source of truth) -------------------
 # Exact button label -> deterministic route. These labels are UI commands,
 # NOT natural language: the text-message handler must exact-match them and
@@ -1695,3 +1707,118 @@ def tasks_quick_keyboard(data, locale: str = "bi") -> InlineKeyboardMarkup:
         ]
     )
     return InlineKeyboardMarkup(kb)
+
+
+# --- TELEGRAM-OPS-UX-CONVERGENCE-001: Quick View action buttons --------------
+# All refs are 1-based row indexes resolved by re-fetching the deterministic
+# quick-view payload, so no internal unit/expense id ever travels in callback
+# data (mirrors the copilot WHY index pattern).
+
+
+def properties_quick_keyboard(rows, locale: str = "bi") -> InlineKeyboardMarkup:
+    """🏠 Properties Quick View inline buttons: one ``👁 1608`` entry per unit
+    (opens the unit Quick View) + a ``📄 Property Archive`` deep link. The
+    persistent reply keyboard stays pinned client-side."""
+    kb: list[list[InlineKeyboardButton]] = []
+    for i, row in enumerate(rows, start=1):
+        unit = str(row.get("unit_code") or row.get("property_code") or "")
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    f"👁 {unit}",
+                    callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
+                )
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("v2.property_archive", locale),
+                callback_data=encode(ACTION_PROP_ARCHIVE),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def rent_quick_keyboard(overdue_rows, locale: str = "bi") -> InlineKeyboardMarkup:
+    """💰 Rent Quick View overdue actions: one ``1680 Follow up`` button per
+    overdue row (opens the Rent detail card), then Home. No repeated generic
+    ``Done / Detail`` buttons — each row is a distinct unit."""
+    kb: list[list[InlineKeyboardButton]] = []
+    for i, row in enumerate(overdue_rows, start=1):
+        unit = str(row.get("unit") or row.get("unit_code") or "")
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    f"{unit} {t('v2.rent_followup', locale)}",
+                    callback_data=encode(ACTION_RENT_QUICK_DETAIL, "ovd", str(i)),
+                )
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
+def rent_detail_keyboard(unit_id: int, locale: str = "bi") -> InlineKeyboardMarkup:
+    """💰 Rent detail card actions: follow up + record payment + history. The
+    record-payment button routes into the existing deterministic rent-collect
+    path; follow-up prefers an existing task (dedupe) over a duplicate."""
+    kb: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                t("v2.rent_followup", locale),
+                callback_data=encode(ACTION_RENT_FOLLOWUP, "r", str(unit_id)),
+            ),
+            InlineKeyboardButton(
+                t("v2.rent_record_payment", locale),
+                callback_data=encode(ACTION_RENT, "go", str(unit_id)),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                t("v2.rent_history", locale),
+                callback_data=encode(ACTION_DETAIL, "unit", str(unit_id)),
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            ),
+        ],
+    ]
+    return InlineKeyboardMarkup(kb)
+
+
+def expense_remind_keyboard(
+    expense_id: int, locale: str = "bi", *, nonce: str = "", ts=None,
+) -> InlineKeyboardMarkup:
+    """💸 Expense waiting-payment actions: ``🔔 Remind Owner`` (one
+    deterministic tap -> one reminder message) + back Home. A fresh nonce per
+    rendered card keeps each tap a distinct callback; the handler guards
+    rapid repeats so a single gesture never fans out multiple messages."""
+    if not nonce:
+        nonce = new_nonce()
+    if ts is None:
+        ts = now_ts()
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("v2.remind_owner", locale),
+                    callback_data=encode(
+                        ACTION_REMIND_OWNER, "exp", str(expense_id), nonce=nonce, ts=ts
+                    ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+                )
+            ],
+        ]
+    )

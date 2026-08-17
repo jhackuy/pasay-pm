@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
-from telegram import Chat, Update
+from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import PasayApiError
@@ -22,6 +22,8 @@ from pasay_bot.keyboards import (
     ACTION_COPILOT_ASK,
     ACTION_COPILOT_NAV,
     ACTION_COPILOT_WHY,
+    ACTION_EXPENSE_DETAIL,
+    ACTION_REMIND_OWNER,
     OPS_OVERVIEW,
     OPS_SECTION_ALL,
     OPS_SECTION_NEXT7,
@@ -31,6 +33,7 @@ from pasay_bot.keyboards import (
     copilot_why_keyboard,
     copilot_today_keyboard,
     dashboard_keyboard,
+    encode,
     error_keyboard,
     home_keyboard,
     home_summary_keyboard,
@@ -41,6 +44,9 @@ from pasay_bot.keyboards import (
     pending_page_keyboard,
     property_list_keyboard,
     property_pagination_keyboard,
+    properties_quick_keyboard,
+    rent_quick_keyboard,
+    expense_remind_keyboard,
     tasks_quick_keyboard,
     todo_keyboard,
     unit_list_keyboard,
@@ -603,13 +609,35 @@ async def _quick_view(
 
 
 async def show_quick_properties(context, chat_id, role, locale: str, message_id=None):
-    """🏠 Properties Quick View (deterministic, no LLM)."""
-    await _quick_view(
-        context, chat_id, role, locale, message_id,
-        lambda api: api.get_quick_properties(),
-        cards.properties_quick_card,
-        "properties",
-    )
+    """🏠 Properties Quick View (deterministic, no LLM): high-density index
+    with one line per unit and a per-unit ``👁`` entry + ``📄 Property Archive``
+    inline button (TELEGRAM-OPS-UX-CONVERGENCE-001 §2/§3)."""
+    api = context.bot_data["api_client"]
+    try:
+        data = await api.get_quick_properties()
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    except Exception as exc:  # noqa: BLE001 - user-visible fallback
+        logger.warning("quick view properties failed: %s", exc)
+        await _render(context, chat_id, message_id, _load_error("properties", locale),
+                      error_keyboard("home", locale))
+        return
+    rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
+    text = cards.properties_quick_card(data, locale)
+    if rows:
+        await _render(
+            context, chat_id, message_id, text,
+            keyboard=properties_quick_keyboard(rows, locale),
+        )
+    else:
+        await _render(
+            context, chat_id, message_id, text,
+            reply_keyboard=(reply_keyboard(role) if role else None),
+        )
+    if role:
+        _mark_menu_initialized(context, chat_id)
 
 
 async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None):
@@ -658,23 +686,84 @@ async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None)
 
 
 async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
-    """💰 Rent Quick View (deterministic, no LLM)."""
-    await _quick_view(
-        context, chat_id, role, locale, message_id,
-        lambda api: api.get_quick_rent(),
-        cards.rent_quick_card,
-        "rent",
-    )
+    """💰 Rent Quick View (deterministic, no LLM). Keeps the high-density
+    stats + overdue list and adds one ``Follow up`` inline button per overdue
+    unit -> the Rent detail card (TELEGRAM-OPS-UX-CONVERGENCE-001 §7)."""
+    api = context.bot_data["api_client"]
+    try:
+        data = await api.get_quick_rent()
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    except Exception as exc:  # noqa: BLE001 - user-visible fallback
+        logger.warning("quick view rent failed: %s", exc)
+        await _render(context, chat_id, message_id, _load_error("rent", locale),
+                      error_keyboard("home", locale))
+        return
+    data = data or {}
+    overdue = data.get("overdue") or []
+    text = cards.rent_quick_card(data, locale)
+    if overdue:
+        await _render(
+            context, chat_id, message_id, text,
+            keyboard=rent_quick_keyboard(overdue, locale),
+        )
+    else:
+        await _render(
+            context, chat_id, message_id, text,
+            reply_keyboard=(reply_keyboard(role) if role else None),
+        )
+    if role:
+        _mark_menu_initialized(context, chat_id)
 
 
 async def show_quick_expense(context, chat_id, role, locale: str, message_id=None):
-    """💸 Expense Quick View (deterministic, no LLM)."""
-    await _quick_view(
-        context, chat_id, role, locale, message_id,
-        lambda api: api.get_quick_expense(),
-        cards.expense_quick_card,
-        "expense",
-    )
+    """💸 Expense Quick View (deterministic, no LLM). High-density business
+    list (Category/Purpose) with a ``🔔 Remind Owner`` entry per waiting-
+    payment (APPROVED unpaid) row so the Secretary can push the payment
+    forward (TELEGRAM-OPS-UX-CONVERGENCE-001 §6/§9)."""
+    api = context.bot_data["api_client"]
+    try:
+        data = await api.get_quick_expense()
+    except PasayApiError as exc:
+        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
+                      error_keyboard("home", locale))
+        return
+    except Exception as exc:  # noqa: BLE001 - user-visible fallback
+        logger.warning("quick view expense failed: %s", exc)
+        await _render(context, chat_id, message_id, _load_error("expense", locale),
+                      error_keyboard("home", locale))
+        return
+    data = data or {}
+    text = cards.expense_quick_card(data, locale)
+    payable = data.get("payable") or []
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for row in payable:
+        expense_id = row.get("expense_id")
+        if expense_id is None:
+            continue
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{t('expense.view_detail', locale)}",
+                    callback_data=encode(ACTION_EXPENSE_DETAIL, str(int(expense_id))),
+                ),
+                InlineKeyboardButton(
+                    t("v2.remind_owner", locale),
+                    callback_data=encode(ACTION_REMIND_OWNER, "exp", str(int(expense_id))),
+                ),
+            ]
+        )
+    if kb_rows:
+        await _render(context, chat_id, message_id, text, keyboard=InlineKeyboardMarkup(kb_rows))
+    else:
+        await _render(
+            context, chat_id, message_id, text,
+            reply_keyboard=(reply_keyboard(role) if role else None),
+        )
+    if role:
+        _mark_menu_initialized(context, chat_id)
 
 
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

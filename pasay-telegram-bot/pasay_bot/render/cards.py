@@ -1743,29 +1743,204 @@ def _v2_section(status_key: str, locale: str, emoji: str) -> str:
     return f"{emoji} <b>{H.escape(header)}</b>"
 
 
+def _v2_rent_chip(status: str) -> str:
+    """Rent chip: ``💰✅`` when the unit's rent is paid/current, ``💰⚠️`` when
+    overdue. ``None`` (no active lease / vacant) -> no chip. Never renders a
+    raw status enum."""
+    s = str(status or "").lower()
+    if s == "paid":
+        return "💰✅"
+    if s == "overdue_rent":
+        return "💰⚠️"
+    return ""
+
+
+def _v2_lease_chip(status: str, days) -> str:
+    """Lease chip: ``📄✅`` when the active lease is healthy, ``📄⚠️`` when it is
+    expiring (within the 30-day window). Vacant / no lease -> no chip."""
+    s = str(status or "").lower()
+    if s == "paid":
+        return "📄✅"
+    if s == "lease_expiring":
+        return "📄⚠️"
+    return ""
+
+
+def _v2_maintenance_chip(count) -> str:
+    """Maintenance chip: ``🔧N`` for open maintenance count > 0, else ``🔧0``.
+    Only rendered for leased/occupied rows (vacant rows keep the row sparse)."""
+    try:
+        n = int(count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return f"🔧{n}"
+
+
+def _v2_is_zero(value) -> bool:
+    """True for missing/empty/zero amounts (handles Decimal, float and str)."""
+    if value is None or value == "":
+        return True
+    try:
+        return Decimal(str(value)) == 0
+    except Exception:
+        return False
+
+
+def _v2_title(locale: str, key: str, emoji: str) -> str:
+    return f"{emoji} <b>{H.escape(_bi_header(locale, t(key, 'en'), t(key, 'zh')))}</b>"
+
+
+# --- TELEGRAM-OPS-UX-CONVERGENCE-001: rent detail + remind-owner cards ------
+
+def rent_detail_card(
+    *,
+    unit_label: str,
+    locale: str = "bi",
+    tenant_name: str = "",
+    outstanding=None,
+    unpaid_periods: int = 0,
+    overdue_days: int = 0,
+    last_followup: str = "",
+    vacant: bool = False,
+) -> str:
+    """💰 Rent detail card for one overdue/collectible unit. Compact: title +
+    tenant + outstanding + unpaid periods + overdue days + last follow-up. Only
+    the fields that are real are shown; ``vacant`` shows the vacant line. The
+    buttons (Follow up / Record payment / History) ride on the keyboard, never
+    in the text."""
+    title = H.escape(t("v2.rent_detail_title", locale, unit=H.escape(unit_label)))
+    lines = [f"<b>{title}</b>"]
+    if vacant:
+        lines.append(H.escape(t("v2.rent_vacant", locale)))
+        return "\n".join(lines)
+    if tenant_name:
+        lines.append(H.escape(t("v2.rent_tenant", locale, tenant=H.escape(tenant_name))))
+    if outstanding is not None:
+        lines.append(
+            f"{H.escape(t('v2.rent_detail_outstanding', locale, amount=H.money(outstanding)))}"
+        )
+    if unpaid_periods > 0:
+        lines.append(
+            H.escape(t("v2.rent_unpaid_periods", locale, count=int(unpaid_periods)))
+        )
+    if overdue_days >= 0:
+        lines.append(
+            H.escape(t("v2.rent_overdue", locale, days=int(overdue_days)))
+        )
+    if last_followup:
+        lines.append(H.escape(t("v2.rent_last_followup", locale, date=H.escape(last_followup))))
+    else:
+        lines.append(H.escape(t("v2.rent_no_last_followup", locale)))
+    return "\n".join(lines)
+
+
+def remind_owner_card(
+    *,
+    unit_label: str = "",
+    purpose: str = "",
+    amount=None,
+    approved_date: str = "",
+    waiting_days: int = 0,
+    locale: str = "bi",
+) -> str:
+    """🔔 Payment Reminder card (section 六): property/unit + purpose + amount +
+    approved date + waiting duration + the owner call-to-action. Bilingual in
+    groups. Only real fields are shown — placeholders never render."""
+    header = H.escape(t("v2.remind_owner_title", locale))
+    lines = [f"<b>{header}</b>", ""]
+    if unit_label:
+        lines.append(H.escape(unit_label))
+    if purpose:
+        lines.append(H.escape(purpose))
+    if amount is not None:
+        lines.append(f"<b>{H.money(amount)}</b>")
+    if approved_date:
+        lines.append(H.escape(t("v2.remind_owner_approved", locale, date=H.escape(approved_date))))
+    lines.append(
+        H.escape(t("v2.remind_owner_waiting", locale, days=int(waiting_days)))
+    )
+    lines.append(H.escape(t("v2.remind_owner_to", locale)))
+    return "\n".join(lines)
+
+
+def quick_unit_view_card(
+    *,
+    unit_label: str,
+    locale: str = "bi",
+    vacant: bool = False,
+    status: str = "normal",
+    amount=None,
+    days=None,
+    open_maintenance: int = 0,
+) -> str:
+    """🏠 Property Quick View for one unit (frozen §3): occupancy + rent +
+    lease + maintenance, compact, no tenant/deposit/contract expansion. The
+    ``📄 Property Archive`` button and Rent/Maintenance entries ride on the
+    keyboard; this card only summarises the unit state."""
+    emoji = "⚪" if vacant else "🟢"
+    lines = [f"🏠 <b>{emoji} {H.escape(unit_label)}</b>"]
+    if vacant:
+        lines.append(H.escape(t("v2.rent_vacant", locale)))
+        return "\n".join(lines)
+    s = str(status or "normal").lower()
+    lines.append(_bi_line(locale, "🟢 Occupied", "🟢 已出租"))
+    if s in ("paid", "rent_paid"):
+        lines.append(_bi_line(locale, "💰 Rent ✅ · Paid", "💰 Rent ✅ · 已收"))
+    else:
+        lines.append(H.escape(t("v2.rent_overdue", locale, days=int(days or 0))))
+    lines.append(
+        _bi_line(
+            locale,
+            f"🔧 Maintenance · {int(open_maintenance or 0)} open",
+            f"🔧 维修 · {int(open_maintenance or 0)} 项处理中",
+        )
+    )
+    if s == "lease_expiring":
+        lines.append(_bi_line(locale, f"📄 Lease · Expiring in {int(days or 0)}d", f"📄 合同 · 还有 {int(days or 0)} 天到期"))
+    else:
+        lines.append(_bi_line(locale, "📄 Lease · OK", "📄 合同 · 正常"))
+    return "\n".join(lines)
+
+
+def property_archive_card(locale: str = "bi", *, link: str = "") -> str:
+    """📄 Property Archive link card: the group is the index, the archive
+    channel holds the full archive. When a configurable link exists it is
+    surfaced as a tappable deep link; otherwise a short hint with no dead
+    placeholder."""
+    en = "Full property files live in the Property Archive channel."
+    zh = "完整房产档案存放在 Property Archive 频道。"
+    lines = [
+        f"<b>{H.escape(t('v2.property_archive', locale))}</b>",
+        _bi_line(locale, en, zh),
+    ]
+    if link:
+        lines.append(f'<a href="{H.escape(link)}">{H.escape(link)}</a>')
+    return "\n".join(lines)
+
+
 def _v2_property_label(row: dict, locale: str) -> tuple[str, str]:
-    """(emoji, rendered line) for one property quick-view row."""
+    """High-density one-line-per-unit index row (frozen design):
+
+    ``🟢 1608　💰✅　🔧1　📄✅`` (occupied) / ``⚪ 1702　VACANT`` (vacant).
+
+    The emoji is the occupancy marker (🟢 occupied / lease active, ⚪ vacant);
+    the trailing chips are rent state (💰✅/💰⚠️), open maintenance count
+    (🔧N) and lease state (📄✅/📄⚠️). ``VACANT`` renders as the compact
+    vacant phrase; a unit is never expanded into tenant/deposit/contract detail
+    on this index page."""
     status = str(row.get("status") or "normal").lower()
     unit = H.escape(str(row.get("unit_code") or row.get("property_code") or ""))
-    amount = H.money(row.get("amount")) if row.get("amount") is not None else ""
-    days = row.get("days")
-    if days is None:
-        days = row.get("due_days")
-    if status == "overdue_rent":
-        en = t("v2.status.overdue_rent", "en", amount=amount)
-        zh = t("v2.status.overdue_rent", "zh", amount=amount)
-    elif status == "lease_expiring":
-        en = t("v2.status.lease_expiring", "en", days=days or 0)
-        zh = t("v2.status.lease_expiring", "zh", days=days or 0)
-    elif status in ("paid", "rent_paid"):
-        en, zh = t("v2.status.rent_paid", "en"), t("v2.status.rent_paid", "zh")
-    elif status == "vacant":
-        en, zh = t("v2.status.vacant", "en"), t("v2.status.vacant", "zh")
-    else:
-        en, zh = t("v2.status.normal", "en"), t("v2.status.normal", "zh")
-    emoji = _V2_STATUS_EMOJI.get(status, "🔵")
-    line = _bi_line(locale, f"{unit} · {en}" if unit else en,
-                    f"{unit} · {zh}" if unit else zh)
+    emoji = "🟢" if status != "vacant" else "⚪"
+    if status == "vacant":
+        return emoji, f"{unit}　{_bi_header(locale, 'VACANT', '空置')}"
+    chips = [x for x in (
+        _v2_rent_chip(status),
+        _v2_maintenance_chip(row.get("open_maintenance")),
+        _v2_lease_chip(status, row.get("days")),
+    ) if x]
+    # A fully paid unit needs at least an occupancy/rent marker so the row is
+    # never spuriously blank.
+    line = f"{unit}" + (f"　{'　'.join(chips)}" if chips else "")
     return emoji, line
 
 
@@ -1900,24 +2075,26 @@ def _v2_is_zero(value) -> bool:
         return False
 
 
-def _v2_title(locale: str, key: str, emoji: str) -> str:
-    return f"{emoji} <b>{H.escape(_bi_header(locale, t(key, 'en'), t(key, 'zh')))}</b>"
-
-
 def properties_quick_card(data, locale: str = "bi") -> str:
-    """🏠 Properties quick view: occupancy summary + one line per unit.
+    """🏠 Properties quick view: occupancy summary + one high-density line per
+    unit.
 
     Deterministic summary (no LLM): total / occupied (rented) / vacant /
     occupancy rate derived from each unit row's status. ``vacant`` marks an
     empty unit; every other status (overdue_rent / lease_expiring / normal /
     paid) implies an active lease, i.e. occupied/rented. Rent delinquency is
-    NOT counted as a separate property stat — it stays a per-unit status only."""
+    NOT counted as a separate property stat — it stays a per-unit chip only.
+
+    The title carries the unit count (``🏠 Properties · 12``)."""
     rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
-    blocks = [_v2_title(locale, "v2.properties_title", "🏠")]
+    total = len(rows)
+    header = _bi_header(
+        locale, t("v2.properties_title", "en"), t("v2.properties_title", "zh")
+    )
+    blocks = [f"🏠 <b>{H.escape(header)}{(' · ' + str(total)) if total else ''}</b>"]
     if not rows:
         blocks.append(H.escape(t("v2.empty", locale)))
         return "\n".join(blocks)
-    total = len(rows)
     vacant = sum(1 for r in rows if str(r.get("status") or "normal").lower() == "vacant")
     occupied = total - vacant
     rate = (occupied / total * 100) if total else 0
