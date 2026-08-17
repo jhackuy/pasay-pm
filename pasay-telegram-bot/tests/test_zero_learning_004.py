@@ -122,13 +122,23 @@ def test_properties_never_renders_chip_codes(make_app):
     text = env.bot.last_send()["text"]
     for banned in BANNED_CHIPS:
         assert banned not in text
-    # exceptions in words (zh owner chat)
-    assert "1680 · 逾期租金 104 天" in text or "1680 · Rent overdue 104d" in text
-    assert "3 期" in text or "3 periods" in text
-    assert "维修 1" in text or "Repair 1" in text
-    assert "1203 · OK" in text  # paid/healthy -> OK
-    assert "1805 · 租约还有 18 天到期" in text or "1805 · Lease expires in 18d" in text
-    assert "2308 · 空置" in text or "2308 · Vacant" in text
+    # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §1: ONE traffic light per unit,
+    # exception in words, SHORT unit id, red-first order. zh owner chat.
+    assert "🔴 1680 · 欠租104天" in text or "🔴 1680 · Rent overdue 104d" in text
+    assert "3期" in text or "3 period(s)" in text
+    assert "待修1项" in text or "Repair 1" in text
+    assert "🟢 1203 · OK" in text       # paid/healthy -> OK
+    assert "🟡 1805 · 合同18天到期" in text or "🟡 1805 · Lease expires in 18d" in text
+    assert "🟡 2308 · 空置" in text or "🟡 2308 · Vacant" in text
+    # Each unit row carries exactly ONE light (the summary line above carries a
+    # separate 🔴 need-action count). Split into blocks: block0 = header,
+    # block1 = summary, the rest are per-unit rows.
+    blocks = [b for b in text.split("\n\n") if b]
+    row_blocks = blocks[2:]
+    row_text = "\n".join(row_blocks)
+    assert row_text.count("🔴") == 1 and row_text.count("🟢") == 1 and row_text.count("🟡") == 2
+    # Red-first ordering: 1680 (🔴) appears before 1805/2308 (🟡) before 1203 (🟢).
+    assert text.index("🔴 1680") < text.index("🟡 1805") < text.index("🟢 1203")
 
 
 def test_properties_short_unit_buttons_two_per_row(make_app):

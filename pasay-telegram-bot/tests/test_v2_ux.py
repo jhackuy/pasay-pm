@@ -348,14 +348,14 @@ def test_properties_quick_view_group_bilingual(make_app):
     send = env.bot.last_send()
     text = send["text"]
     assert "Properties / 房源 · 4" in text  # frozen: title carries the unit count
-    # ZERO-LEARNING-004 §1: exceptions are expressed in WORDS, normal units
-    # collapse to OK — no 💰⚠️ / 📄✅ / 🔧0 chips.
-    assert "1680 · Rent overdue 12d" in text     # overdue rent + 1 open repair
-    assert "Repair 1 open" in text
-    assert "1805 · Lease expires in 28d" in text  # lease expiring
-    assert "2208 · OK" in text                    # paid/healthy -> OK
-    assert "2106 · Vacant" in text
-    for banned in ("💰⚠️", "📄✅", "📄⚠️", "🔧0", "👁"):
+    # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §1: ONE traffic light per unit,
+    # exceptions in WORDS, normal units OK, no 💰⚠️ / 📄✅ / 🔧0 / 👁 chips.
+    assert "🔴 1680 · Rent overdue 12d" in text or "🔴 1680 · 欠租12天" in text
+    assert "Repair 1" in text or "待修1项" in text
+    assert "🟡 1805 · Lease expires in 28d" in text or "🟡 1805 · 合同28天到期" in text
+    assert "🟢 2208 · OK" in text                    # paid/healthy -> OK
+    assert "🟡 2106 · Vacant" in text or "🟡 2106 · 空置" in text
+    for banned in ("💰⚠️", "📄✅", "📄⚠️", "🔧0", "👁", "⚪", "🔵"):
         assert banned not in text
     # no tenant / deposit / contract detail is expanded on the index page.
     assert "Juan" not in text and "deposit" not in text.lower()
@@ -370,14 +370,14 @@ def test_properties_quick_view_group_bilingual(make_app):
 
 
 def test_properties_quick_view_occupancy_summary(make_app):
-    """PASAY-V2-OWNER-SECRETARY-JOURNEY-AUDIT-006 (Journey A): the 🏠 Properties
-    quick view must show the occupancy summary (total / occupied / vacant /
-    occupancy rate) above the unit list, and rent delinquency is never mixed
-    into it. 4 fixture units (3 leased of any status + 1 vacant) -> 75%."""
+    """TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §1.5: the 🏠 Properties quick view
+    shows a compact bilingual summary above the unit list — total / occupied /
+    vacant / 🔴 need-action. 4 fixture units (3 leased of any status + 1 vacant
+    with 1 overdue) -> occupied 3, vacant 1, need action 1."""
     env = make_app(backend=V2FakeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
     text = env.bot.last_send()["text"]
-    assert "总计 4" in text and "已出租 3" in text and "空置 1" in text and "出租率 75%" in text
+    assert "总计 4" in text and "已出租 3" in text and "空置 1" in text and "待处理 1" in text
     # Occupancy stats must NOT quote the overdue rent amount (no delinquency mix).
     assert "租金 ₱75,000" not in text.split("📊")[0]
     assert _copilot_calls(env) == []

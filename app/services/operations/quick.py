@@ -279,9 +279,28 @@ def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int
     re-derive the same business fact itself."""
     unit = unit_number_by_lease.get(task.lease_id)
     details = task.details or {}
+    task_type = task.task_type.value
+    # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §11: for RENT_OVERDUE follow-up tasks
+    # the visible amount must be the TOTAL ARREARS (monthly × uncovered
+    # periods), NEVER a bare monthly rent. ``_rent_task_details`` historically
+    # wrote ``amount=monthly_rent`` and ``total_outstanding=<total>``; the old
+    # ``amount or total_outstanding`` order surfaced the monthly rent on the
+    # Tasks board. Fixed by preferring ``total_outstanding`` for rent arrears
+    # tasks (stale DB rows included), while expense/other task types keep the
+    # plain ``amount``.
+    if task_type in ("RENT_OVERDUE", "FOLLOWUP", "RENT_DUE"):
+        arrears_raw = (
+            details.get("total_outstanding")
+            or details.get("arrears")
+            or details.get("amount")
+        )
+        amount = _d2(arrears_raw) if arrears_raw is not None else None
+    else:
+        amount_raw = details.get("amount") or details.get("total_outstanding")
+        amount = _d2(amount_raw) if amount_raw is not None else None
     return {
         "id": task.id,
-        "task_type": task.task_type.value,
+        "task_type": task_type,
         "title": task.title,
         "status": task.status.value,
         "property_code": unit or details.get("unit_number"),
@@ -292,13 +311,17 @@ def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int
         "context": task.context,
         "source_event": task.source_event,
         # CONVERGENCE-003 §8: truthful business context (never raw sentinels).
-        "amount": _d2(details.get("amount") or details.get("total_outstanding"))
-        if (details.get("amount") or details.get("total_outstanding")) is not None
-        else None,
+        "amount": amount,
         "purpose": _clean_text(details.get("category")) or _clean_text(details.get("payee")),
         "expense_id": details.get("expense_id"),
         "period": details.get("period"),
         "unpaid_periods": len(details["periods"]) if isinstance(details.get("periods"), list) else None,
+        # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §13: surface the real follow-up
+        # state so the Tasks board can show "秘书跟进中" (🟡) vs "需要催租"
+        # (🔴) for the SAME rent item — the assignment is a real fact, not a
+        # status guessed by the renderer.
+        "followup_assigned": bool(details.get("assigned_to")),
+        "followup_executed": task.status.value == "COMPLETED",
     }
 
 
@@ -650,9 +673,12 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
         .filter(Unit.id.in_([l.unit_id for l in leases]))
         .all()
     }
-    # CONVERGENCE-003 §5/§7: the last follow-up timestamp per lease — the
-    # newest operational task the business created for the lease (a rent
-    # follow-up is expressed as an operational task, never only a chat line).
+    # CONVERGENCE-003 §5/§7 + TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2.5/§4:
+    # the "last follow-up" timestamp per lease is when the Secretary ACTUALLY
+    # contacted the tenant — i.e. the latest ``completed_at`` of a rent
+    # follow-up task. Merely ASSIGNING the follow-up (Owner tap -> Secretary
+    # DM) must NOT move this date; only a real execution (Secretary confirms)
+    # does. A never-completed task therefore never hides an older truth.
     followup_by_lease: dict[int, str] = {}
     if leases:
         followup_tasks = (
@@ -663,12 +689,16 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
                     [OperationalTaskType.RENT_OVERDUE, OperationalTaskType.FOLLOWUP]
                 ),
             )
-            .order_by(OperationalTask.created_at.desc(), OperationalTask.id.desc())
+            .order_by(OperationalTask.completed_at.desc().nulls_last(),
+                      OperationalTask.id.desc())
             .all()
         )
         for ft in followup_tasks:
-            if ft.lease_id is not None and ft.lease_id not in followup_by_lease:
-                followup_by_lease[ft.lease_id] = ft.created_at.isoformat()
+            if ft.lease_id is None or ft.lease_id in followup_by_lease:
+                continue
+            stamp = ft.completed_at if ft.completed_at is not None else None
+            if stamp is not None:
+                followup_by_lease[ft.lease_id] = stamp.isoformat()
     overdue_rows: list[dict] = []
     outstanding = Decimal("0.00")
     expected_rent = Decimal("0.00")

@@ -884,6 +884,11 @@ class FakeBackend:
             # ZERO-LEARNING-004 §4: the canonical Owner DM target for a REAL
             # Remind-Owner private message.
             return httpx.Response(200, json={"telegram_chat_id": str(OWNER_ID)})
+        if path == "/operations/secretary-target" and method == "GET":
+            # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2.2/§9: the canonical
+            # Secretary DM target for a REAL 催租 assign-to-Secretary message.
+            return httpx.Response(200, json={"telegram_chat_id": str(SECRETARY_ID),
+                                             "principal_id": 2})
         if path == "/operations/tasks" and method == "POST":
             payload = body or {}
             self._next_v2_task_id += 1
@@ -912,7 +917,7 @@ class FakeBackend:
                 "completed_at": None,
                 "completed_by": None,
                 "dedupe_key": payload.get("dedupe_key"),
-                "details": {},
+                "details": payload.get("details") or {},
             }
             existing = next(
                 (t for t in self.operational_tasks if t.get("dedupe_key") == payload.get("dedupe_key")),

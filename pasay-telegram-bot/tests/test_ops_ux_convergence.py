@@ -213,18 +213,20 @@ def test_fixed_keyboard_is_identical_and_english_for_all_roles(make_app):
 
 
 def test_properties_index_one_unit_per_line_and_no_expansion(make_app):
-    """Section 二/三 + ZERO-LEARNING-004 §1: high-density index, exceptions in
-    WORDS, normal units OK, no 💰⚠️ / 📄✅ / 🔧0 / 👁, per-unit SHORT buttons."""
+    """Section 二/三 + ZERO-LEARNING-004 §1 + TELEGRAM-OPS-REAL-WORLD-CLOSURE-005
+    §1: high-density index, ONE traffic light per unit, exceptions in WORDS,
+    normal units OK, no 💰⚠️ / 📄✅ / 🔧0 / 👁, per-unit SHORT buttons."""
     env = make_app(backend=ConvergeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
     send = env.bot.last_send()
     text = send["text"]
     assert "Properties · 2" in text or "房源 · 2" in text
-    assert "1680 · 逾期租金" in text or "1680 · Rent overdue" in text  # overdue + 1 open repair
-    assert "维修 1" in text or "Repair 1" in text
-    assert "1702 · 空置" in text or "1702 · Vacant" in text
+    assert "🔴 1680" in text  # overdue + 1 open repair -> red
+    assert "欠租12天" in text or "Rent overdue 12d" in text
+    assert "待修1项" in text or "Repair 1" in text
+    assert "🟡 1702" in text and ("空置" in text or "Vacant" in text)  # vacant -> yellow
     assert text.count("\n\n") <= 3  # compact, high-density (not a tall card)
-    for banned in BANNED_TEXT + ("💰⚠️", "📄✅", "🔧0", "👁"):
+    for banned in BANNED_TEXT + ("💰⚠️", "📄✅", "🔧0", "👁", "⚪", "🔵"):
         assert banned not in text
     inline = _inline_labels(send["reply_markup"])
 

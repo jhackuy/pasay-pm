@@ -549,7 +549,18 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "dedupe_key": f"lease:{lease.id}:RENT_OVERDUE",
                     "details": _rent_task_details(
                         lease, unit, tenant,
-                        {"periods": [m for m, _ in overdue], "total_outstanding": str(amount)},
+                        {
+                            "periods": [m for m, _ in overdue],
+                            "total_outstanding": str(amount),
+                            # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §11: ``amount``
+                            # must be the TOTAL arrears (monthly × uncovered
+                            # periods), never a bare monthly rent. Previously
+                            # ``_rent_task_details`` left ``amount=monthly_rent``
+                            # and only ``total_outstanding`` carried the total,
+                            # which made the Tasks board read a single month's
+                            # rent instead of the sum.
+                            "amount": str(amount),
+                        },
                     ),
                 },
                 # AI-OPS-FOUNDATION-001 §2: a later pass that finds MORE overdue

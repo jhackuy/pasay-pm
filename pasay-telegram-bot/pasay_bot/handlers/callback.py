@@ -77,6 +77,9 @@ from pasay_bot.keyboards import (
     ACTION_RENT_STATUS_SELECT,
     ACTION_RENT_HISTORY_SELECT,
     ACTION_REPAIR_COMPLETE_CANDIDATE,
+    ACTION_SEC_FOLLOWUP_CONTACT,
+    ACTION_SEC_FOLLOWUP_PAYMENT,
+    ACTION_SEC_FOLLOWUP_SNOOZE,
     ACTION_TASK_COMPLETE,
     ACTION_TASK_DETAIL,
     ACTION_TASK_SNOOZE,
@@ -117,6 +120,8 @@ from pasay_bot.keyboards import (
     payment_method_keyboard,
     rent_detail_keyboard,
     retry_confirm_keyboard,
+    secretary_followup_done_keyboard,
+    secretary_followup_keyboard,
     snooze_preset_keyboard,
     task_action_keyboard,
 )
@@ -135,6 +140,7 @@ from pasay_bot.roles import (
     Role,
     has_permission,
     has_read_permission,
+    locale_for,
     locale_for_chat,
     role_for_telegram_id,
 )
@@ -399,6 +405,15 @@ async def _dispatch_callback(
         await _handle_rent_followup(update, context, ref, role, locale)
     elif action == ACTION_REMIND_OWNER:
         await _handle_remind_owner(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_SEC_FOLLOWUP_CONTACT:
+        # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §4: ✅ 已联系租客 (Secretary DM).
+        await _handle_sec_followup_contact(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_SEC_FOLLOWUP_PAYMENT:
+        # §5: 💰 已收款 -> existing record-payment flow.
+        await _handle_sec_followup_payment(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_SEC_FOLLOWUP_SNOOZE:
+        # §6: ⏰ 稍后处理 -> existing snooze machinery.
+        await _handle_sec_followup_snooze(update, context, ref, nonce, ts, role, locale)
     elif action == ACTION_ACK:
         # CONVERGENCE-003 §1.5: ✅ Acknowledge on a proactive reminder card.
         await _handle_ack(update, context, ref, role, locale)
@@ -1249,6 +1264,9 @@ async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
             last_followup = str(raw_followup)[:16].replace("T", " ")
         except Exception:  # noqa: BLE001
             last_followup = str(raw_followup)[:16]
+    followup_status = ""
+    if not vacant:
+        followup_status = await _followup_status_for_unit(api, unit_id, unit_code, locale)
     return cards.rent_detail_card(
         unit_label=unit_code,
         locale=locale,
@@ -1258,28 +1276,60 @@ async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
         overdue_days=int(overdue_days or 0),
         last_followup=last_followup,
         vacant=vacant,
+        followup_status=followup_status,
     )
 
 
-async def _followed_up_today(context, unit_id: int) -> bool:
-    """Bot-local same-day follow-up mark (SQLite, restart-safe)."""
+async def _followup_status_for_unit(api, unit_id, unit_code, locale):
+    """Resolve the real-world follow-up state for a unit's Rent detail card
+    (§7): ``🟡 已交秘书跟进`` when a follow-up task is assigned to the Secretary,
+    ``✅ 今日已催`` when already executed, else empty (🔴 pending)."""
     try:
-        from pasay_bot.state.store import ph_local_date
-        return context.bot_data["store"].is_marked_daily(
-            f"followup:{unit_id}:{ph_local_date()}"
-        )
-    except Exception:  # noqa: BLE001 - dedup is best-effort, never fatal
-        return False
+        tasks = await api.get_operational_tasks()
+    except PasayApiError:
+        return ""
+    lease_id = None
+    try:
+        leases = await api.get_leases()
+        active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
+        if active is not None:
+            lease_id = active.id
+    except PasayApiError:
+        pass
+    unit_key = str(unit_code).split("-")[-1]
+    for t_ in tasks:
+        if str(t_.task_type or "").upper() not in ("RENT_OVERDUE", "FOLLOWUP"):
+            continue
+        details = t_.details or {}
+        if lease_id is not None and t_.lease_id != lease_id:
+            if str(details.get("unit_number") or "").split("-")[-1] != unit_key:
+                continue
+        elif lease_id is None and str(details.get("unit_number") or "").split("-")[-1] != unit_key:
+            continue
+        if str(t_.status or "").upper() == "COMPLETED":
+            return cards.followup_status_text(details, locale, executed_daily=True)
+        if details.get("assigned_to"):
+            return cards.followup_status_text(details, locale)
+    return ""
 
 
 async def _handle_rent_followup(update, context, ref, role, locale):
-    """📞 Follow up on the Rent detail (CONVERGENCE-003 §5):
-    - same-day follow-ups never duplicate: the bot keeps a persistent
-      ``followup:{unit_id}:{ph_date}`` mark AND the backend task dedupe_key
-      guarantees at most one active follow-up per unit.
-    - the created task carries the OVERDUE truth (unit, amount, periods,
-      overdue days, next action) — it must never read as ``due in 0d``.
-    - the detail card is re-rendered in place with the real Last follow-up."""
+    """📞 催租 — TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2/§8/§9.
+
+    A tap only ASSIGNS the collection to the Secretary; it never marks it done.
+    Sequence (all mandatory):
+      1. resolve the REAL Secretary DM target (canonical human identity);
+      2. confirm the follow-up task exists (FOLLOWUP/RENT_OVERDUE, dedupe by
+         lease so the auto RENT_OVERDUE and this task are ONE item);
+      3. BOT SENDS A REAL PRIVATE DM to the Secretary with the collection card;
+      4. ONLY after the DM succeeds is the task marked assigned and the group
+         card flipped to ``🟡 已交秘书跟进``;
+      5. DM failure (recipient / forbidden / timeout / network) leaves it
+         ``🔴 需要催租`` — never a fake success.
+    last_follow_up_at is NEVER changed here (the Secretary has not contacted
+    the tenant yet). If the same-day EXECUTED mark is set, no second follow-up
+    is created.
+    """
     if not has_permission(role, PERMISSION_OPERATIONS):
         await _answer(update, t("common.no_permission", locale))
         return
@@ -1287,15 +1337,16 @@ async def _handle_rent_followup(update, context, ref, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     unit_id = int(ref)
+    api = context.bot_data["api_client"]
     store = context.bot_data["store"]
     from pasay_bot.state.store import ph_local_date
 
-    mark_key = f"followup:{unit_id}:{ph_local_date()}"
+    # Same-day EXECUTED dedup: the rent was already actually followed-up.
     if await _followed_up_today(context, unit_id):
         await _answer(update, t("v2.followup_already_today", locale), durable=True)
         await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=True)
         return
-    api = context.bot_data["api_client"]
+    # 1) resolve the unit + real overdue context.
     try:
         units = await api.get_units()
     except PasayApiError:
@@ -1305,55 +1356,310 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     if unit is None:
         await _answer(update, t("common.invalid", locale))
         return
-    # Real overdue context for the follow-up task title/details (never a fake
-    # "due in 0d" — the action deadline is TODAY because the rent is overdue).
     unit_code = unit.unit_number
-    overdue_amount = None
-    unpaid_periods = 0
-    overdue_days = 0
+    try:
+        leases = await api.get_leases()
+    except PasayApiError:
+        leases = []
+    active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
+    lease_id = getattr(active, "id", None) if active else None
+    try:
+        tenants = await api.get_tenants()
+    except PasayApiError:
+        tenants = []
+    tenant = next((tn for tn in tenants if tn.id == getattr(active, "tenant_id", None)), None) if active else None
+    overdue_ctx = await _load_rent_followup_ctx(api, unit_code)
+    # 2) confirm the follow-up task exists (dedupe with the auto RENT_OVERDUE
+    #    of the same lease so the board never holds two copies of one item).
+    try:
+        task = await _resolve_rent_followup_task(api, unit, lease_id, overdue_ctx)
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    if task is None:
+        await _answer(update, t("common.unexpected", locale), durable=True)
+        return
+    # 3) resolve the REAL Secretary DM target (fail closed, §9).
+    try:
+        sec_chat_id, _sec_principal = await api.get_secretary_dm_chat_id()
+        sec_chat_id_int = int(sec_chat_id)
+    except (PasayApiError, TypeError, ValueError):
+        logger.warning("rent followup secretary target resolution failed unit=%s", unit_id)
+        await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
+        return
+    # 4) build + send the Secretary DM card (§3).
+    dm_text = cards.secretary_followup_card(
+        unit_label=unit_code,
+        locale=locale_for(Role.SECRETARY) if not locale or locale == "bi" else locale,
+        tenant_name=getattr(tenant, "full_name", "") if tenant else "",
+        outstanding=overdue_ctx["amount"],
+        unpaid_periods=overdue_ctx["periods"],
+        overdue_days=overdue_ctx["days"],
+        last_followup=overdue_ctx["last_followup"],
+    )
+    dm_kb = secretary_followup_keyboard(task.id, unit_id, locale_for(Role.SECRETARY))
+    try:
+        await update.get_bot().send_message(
+            sec_chat_id_int, H.truncate(dm_text), parse_mode=HTML, reply_markup=dm_kb,
+        )
+    except Exception as exc:  # noqa: BLE001 - any delivery failure is real
+        logger.warning("rent followup DM to secretary %s failed: %s", sec_chat_id, exc)
+        await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
+        return
+    # 5) DM succeeded -> record the assignment (only now does it become 🟡).
+    try:
+        await _mark_rent_followup_assigned(api, task, sec_principal_id=_sec_principal)
+    except PasayApiError:
+        # The DM went out; assignment recording is best-effort but we still
+        # surface the assigned state on the group card.
+        pass
+    await _answer(update, t("v2.followup_assigned_toast", locale))
+    # Re-render the group Rent detail card in place as 🟡 (NOT executed).
+    await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=False)
+
+
+async def _load_rent_followup_ctx(api, unit_code: str) -> dict:
+    """Real rent truth for the follow-up card/task (amount / periods / days /
+    last executed follow-up), from the SAME quick-rent source the Rent detail
+    uses. Never re-derived by the renderer (§3)."""
+    amount = None
+    periods = 0
+    days = 0
+    last_followup = ""
     try:
         rent_data = await api.get_quick_rent()
         row = next(
             (r for r in (rent_data.get("overdue") or [])
-             if str(r.get("unit") or r.get("unit_code") or "") == unit_code),
+             if str(r.get("unit") or r.get("unit_code") or "") in (unit_code, unit_code.split("-")[-1])),
             None,
         )
         if row is not None:
-            overdue_amount = row.get("amount")
-            unpaid_periods = int(row.get("unpaid_periods") or 0)
-            overdue_days = int(row.get("overdue_days") or 0)
+            amount = row.get("amount")
+            periods = int(row.get("unpaid_periods") or 0)
+            days = int(row.get("overdue_days") or 0)
+            raw = row.get("last_followup_at")
+            if raw:
+                try:
+                    last_followup = str(raw)[:16].replace("T", " ")
+                except Exception:  # noqa: BLE001
+                    last_followup = str(raw)[:16]
     except PasayApiError:
         pass
-    amount_part = f"₱{overdue_amount}" if overdue_amount is not None else ""
-    periods_part = f"{unpaid_periods} period(s)" if unpaid_periods else ""
-    overdue_part = f"overdue {overdue_days}d" if overdue_days else ""
+    return {"amount": amount, "periods": periods, "days": days,
+            "last_followup": last_followup}
+
+
+async def _resolve_rent_followup_task(api, unit, lease_id, overdue_ctx):
+    """Find the active rent follow-up task for this unit/lease or create it.
+    Dedupe key aligns with the scheduler's ``lease:{lease_id}:RENT_OVERDUE`` so
+    the auto-generated overdue task and this human follow-up are ONE business
+    item (§13). Returns the OperationalTask or None on hard failure.
+
+    A task that is already active (PENDING or IN_PROGRESS) is reused — tapping
+    催租 again must never produce a second active follow-up for the same lease.
+    """
+    unit_code = unit.unit_number
+    if lease_id is not None:
+        try:
+            existing = await api.get_operational_tasks()
+            for t in existing:
+                if t.lease_id != lease_id:
+                    continue
+                if str(t.task_type or "").upper() not in ("RENT_OVERDUE", "FOLLOWUP"):
+                    continue
+                if str(t.status or "").upper() in ("PENDING", "IN_PROGRESS"):
+                    return t
+        except PasayApiError:
+            pass  # fall through to create
+    amount = overdue_ctx["amount"]
     title = f"Collect overdue rent · {unit_code}"
-    description = " · ".join(
-        x for x in (amount_part, periods_part, overdue_part) if x
-    ) or f"Collect overdue rent for {unit_code}."
-    dedupe_key = f"rent-followup:unit:{unit_id}"
+    parts = []
+    if amount is not None:
+        parts.append(H.money(amount))
+    if overdue_ctx["periods"]:
+        parts.append(f"{overdue_ctx['periods']} period(s)")
+    if overdue_ctx["days"]:
+        parts.append(f"overdue {overdue_ctx['days']}d")
+    description = " · ".join(parts) or f"Collect overdue rent for {unit_code}."
+    lease_key = f"lease:{lease_id}:RENT_OVERDUE" if lease_id else f"rent-followup:unit:{unit.id}"
+    return await api.create_operational_task(
+        task_type="RENT_OVERDUE",
+        title=title,
+        description=description,
+        property_id=getattr(unit, "property_id", None),
+        due_at=None,  # never "due in 0d" for an overdue item
+        next_action="Follow up with tenant to collect overdue rent.",
+        next_check_at=None,
+        dedupe_key=lease_key,
+        status="PENDING",
+        details=_rent_followup_details(unit.unit_number, amount, overdue_ctx["periods"]),
+    )
+
+
+def _rent_followup_details(unit_number, amount, periods) -> dict:
+    """Structured follow-up truth for the task's JSONB ``details`` (§11/§18):
+    the TOTAL arrears (never a bare monthly rent), the unpaid period count,
+    the unit id, and empty assignment/execution slots to be filled by real
+    actions."""
+    return {
+        "unit_number": unit_number,
+        "amount": str(amount) if amount is not None else None,
+        "total_outstanding": str(amount) if amount is not None else None,
+        "periods": [],
+        "unpaid_periods": int(periods or 0),
+        "assigned_to": None,
+        "assigned_at": None,
+        "executed_by": None,
+        "executed_at": None,
+    }
+
+
+async def _mark_rent_followup_assigned(api, task, sec_principal_id=None):
+    """Record the REAL assignment on the follow-up task: details.assigned_to /
+    assigned_at. The task stays PENDING (so the Secretary can complete it via
+    the existing PENDING->COMPLETED path); the 🟡 assigned state is carried by
+    the details, never by a status flip that would block the confirm. last
+    follow_up_at is untouched."""
+    details = dict(getattr(task, "details", None) or {})
+    details["assigned_to"] = sec_principal_id if sec_principal_id is not None else "secretary"
+    details["assigned_at"] = datetime.now(timezone.utc).isoformat()
+    await api.update_operational_task(
+        task.id,
+        next_action="Secretary to contact tenant for overdue rent.",
+        details=details,
+    )
+
+
+async def _followed_up_today(context, unit_id: int) -> bool:
+    """Bot-local same-day executed mark (SQLite, restart-safe). Set ONLY when
+    the Secretary actually confirms ``✅ 已联系租客`` — never on the Owner tap."""
     try:
-        task = await api.create_operational_task(
-            task_type="RENT_OVERDUE",
-            title=title,
-            description=description,
-            property_id=getattr(unit, "property_id", None),
-            due_at=None,  # never "due in 0d" for an overdue item
-            next_action="Follow up with tenant to collect overdue rent.",
-            next_check_at=None,
-            dedupe_key=dedupe_key,
-            status="PENDING",
+        from pasay_bot.state.store import ph_local_date
+        return context.bot_data["store"].is_marked_daily(
+            f"followup:{unit_id}:{ph_local_date()}"
         )
-    except PasayApiError as exc:
-        if getattr(exc, "detail", "") and "duplicate" in str(exc.detail).lower():
-            pass  # an active follow-up already exists — treat as success
-        else:
-            await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
-            return
-    store.mark_daily(mark_key)
-    await _answer(update, t("v2.followup_created", locale))
-    # Re-render the detail card (message mutation) with the REAL state.
-    await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=True)
+    except Exception:  # noqa: BLE001 - dedup is best-effort, never fatal
+        return False
+
+
+async def _handle_sec_followup_contact(update, context, ref, nonce, ts, role, locale):
+    """✅ 已联系租客 (Secretary DM, §4): the ONLY action that reflects real
+    contact. Records follow_up_at / executed actor / audit by completing the
+    follow-up task (backend sets completed_by + task_completed audit)."""
+    if role != Role.SECRETARY:
+        await _answer(update, t("v2.sec_not_secretary", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    api = context.bot_data["api_client"]
+    store = context.bot_data["store"]
+    from pasay_bot.state.store import ph_local_date
+
+    unit_id = await _unit_id_for_followup_task(context, task_id)
+    if unit_id is not None and await _followed_up_today(context, unit_id):
+        await _answer(update, t("v2.sec_dm_already_today", locale), durable=True)
+        await _edit_secretary_done(update, unit_id, locale)
+        return
+    guard = context.bot_data["idempotency"]
+    key = f"ik:sfc:{task_id}:{nonce or '0'}"
+    status = guard.acquire(key, kind="sec_followup_contact", resource=str(task_id))
+    if status == "done":
+        await _answer(update, t("v2.sec_confirm_toast", locale))
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale), durable=True)
+        return
+    await _ack_working(update, locale)
+    try:
+        task = await api.complete_operational_task(task_id)
+    except (PasayApiPermissionError, PasayApiError) as exc:
+        guard.fail(key, resource=str(task_id))
+        await _answer(update, f"⚠️ {H.escape(getattr(exc, 'detail', '') or '')}", durable=True)
+        return
+    guard.settle(key, {"task_id": task_id}, resource=str(task_id))
+    if unit_id is not None:
+        store.mark_daily(f"followup:{unit_id}:{ph_local_date()}")
+    await _answer(update, t("v2.sec_confirm_toast", locale))
+    await _edit_secretary_done(update, unit_id, locale)
+    # Owners see the real state on their next refresh — no group spam (§4.2).
+
+
+async def _unit_id_for_followup_task(context, task_id: int) -> int | None:
+    """Best-effort unit id for a follow-up task (to gate the same-day dedup).
+    Prefers the lease's unit; falls back to the task details.unit_number."""
+    try:
+        api = context.bot_data["api_client"]
+        task = await api.get_operational_task(task_id)
+        lease_id = getattr(task, "lease_id", None)
+        if lease_id is not None:
+            leases = await api.get_leases()
+            match = next((l for l in leases if l.id == lease_id), None)
+            if match is not None:
+                return match.unit_id
+        # Fall back to the unit_number stored on the task details.
+        unit_num = ((getattr(task, "details", None) or {}).get("unit_number") or "").strip()
+        if unit_num:
+            units = await api.get_units()
+            for u in units:
+                if (u.unit_number or "").split("-")[-1] == unit_num.split("-")[-1]:
+                    return u.id
+    except Exception:  # noqa: BLE001 - dedup is best-effort
+        return None
+    return None
+
+
+async def _edit_secretary_done(update, unit_id, locale):
+    """Edit the Secretary's DM card in place to the executed state (§4.1)."""
+    try:
+        text = cards.secretary_followup_card(
+            unit_label="", locale=locale, done=True,
+        )
+        await update.get_bot().edit_message_text(
+            H.truncate(text), chat_id=update.effective_chat.id,
+            message_id=update.callback_query.message.message_id,
+            parse_mode=HTML, reply_markup=secretary_followup_done_keyboard(locale),
+        )
+    except Exception:  # noqa: BLE001 - best-effort in-place update
+        pass
+
+
+async def _handle_sec_followup_payment(update, context, ref, nonce, ts, role, locale):
+    """💰 已收款 (Secretary DM, §5): a SHORTCUT into the EXISTING record-payment
+    flow — never a forced PAID. Routes to the deterministic rent-collect path
+    for the unit. The actual financial state is decided by the existing
+    RENT-008 / payment-confirmation / Owner-approval rules."""
+    if role != Role.SECRETARY:
+        await _answer(update, t("v2.sec_not_secretary", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    unit_id = int(ref)
+    # Reuse the existing record-payment entry point (ACTION_RENT -> _handle_rent).
+    await _handle_rent(update, context, "go", str(unit_id), role, locale)
+
+
+async def _handle_sec_followup_snooze(update, context, ref, nonce, ts, role, locale):
+    """⏰ 稍后处理 (Secretary DM, §6): reuses the EXISTING snooze machinery —
+    never marks the task as contacted, just reschedules it."""
+    if role != Role.SECRETARY:
+        await _answer(update, t("v2.sec_not_secretary", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    text = H.escape(t("ops.snooze_title", locale))
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=snooze_preset_keyboard(task_id, locale),
+    )
 
 
 async def _reopen_rent_detail(update, context, unit_id, locale, followed_up_today: bool = False):

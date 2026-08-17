@@ -268,10 +268,12 @@ def test_remind_owner_same_day_dedup(make_app):
     assert "今日已提醒" in answer or "already reminded" in answer.lower()
 
 
-def test_rent_followup_updates_last_followup_and_dedups(make_app):
-    """§5.2/§5.3: Follow up re-renders the detail with the REAL Last follow-up
-    and flips the button to ✅ Followed up; a second tap the same day is
-    deduped and no duplicate task is created."""
+def test_rent_followup_assigns_to_secretary_via_real_dm(make_app):
+    """TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2/§4/§7: Owner tapping 📞 催租 only
+    ASSIGNS to the Secretary — it must send a real DM to the Secretary's
+    private chat, flip the group card to 🟡 已交秘书跟进 (NOT ✅), and NOT move
+    Last follow-up (the tenant was not contacted). Only the Secretary's real
+    `✅ 已联系租客` confirmation later produces ✅."""
     env = make_app(backend=C3Backend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     send = env.bot.last_send()
@@ -284,31 +286,64 @@ def test_rent_followup_updates_last_followup_and_dedups(make_app):
     )
     detail = env.bot.edits()[-1]
     # detail shows the truth: 3 unpaid periods, amount, overdue days
-    assert "3" in detail["text"] and "₱75,000" in detail["text"] or "75000" in detail["text"]
+    assert "3" in detail["text"] and ("₱75,000" in detail["text"] or "75000" in detail["text"])
     follow_cb = next(
         d for d in _inline_data(detail["reply_markup"]) if d.split(":")[1] == "rfu"
     )
+    sends_before = len(env.bot.sends())
     run_updates(
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, follow_cb,
                               message_id=detail["message_id"], bot=env.bot)],
     )
+    # The group card is re-rendered as ASSIGNED (🟡), never executed (✅).
     after = env.bot.edits()[-1]
-    # Last follow-up now shows a real time (never "none" right after)
-    assert "Last follow-up" in after["text"] or "最近催租" in after["text"]
-    assert "none" not in after["text"] and "无" not in after["text"]
     labels = _inline_labels(after["reply_markup"])
-    assert any("今日已催" in l or "Followed up" in l for l in labels)
-    # same-day second tap -> deduped toast, no duplicate task create
-    task_creates = env.backend.count_calls("POST", "/operations/tasks")
+    assert not any("今日已催" in l or "Followed up" in l for l in labels)
+    assert "已交秘书" in after["text"] or "Assigned to Secretary" in after["text"]
+    # A REAL DM was sent to the Secretary's PRIVATE chat (the assigned card).
+    assert len(env.bot.sends()) == sends_before + 1
+    dm = env.bot.sends()[-1]
+    assert dm["chat_id"] == SECRETARY_ID
+    assert "1680" in dm["text"] and "75,000" in dm["text"]
+    # The Secretary was NOT falsely marked as having already executed it.
+    from pasay_bot.state.store import ph_local_date
+    assert not env.store.is_marked_daily(f"followup:{9}:{ph_local_date()}")
+    # Last follow-up in group text does NOT jump to a fake "just now": the
+    # quick-rent truth for the unit still shows the real prior contact.
+    assert "Last follow-up" in after["text"] or "最近催租" in after["text"]
+
+
+def test_rent_followup_dm_failure_stays_pending(make_app):
+    """§9: if the Secretary DM fails, the system must NOT mark it assigned — the
+    group stays 🔴 需要催租 and answers ⚠️ 无法通知秘书."""
+    env = make_app(backend=C3Backend())
+    env.backend.fail_status["/operations/secretary-target"] = 500
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    send = env.bot.last_send()
+    detail_cb = next(d for d in _inline_data(send["reply_markup"]) if d.split(":")[1] == "rnq")
+    run_updates(
+        env,
+        [make_callback_update(OWNER_ID, OWNER_ID, detail_cb,
+                              message_id=send["message_id"], bot=env.bot)],
+    )
+    detail = env.bot.edits()[-1]
+    follow_cb = next(d for d in _inline_data(detail["reply_markup"]) if d.split(":")[1] == "rfu")
+    sends_before = len(env.bot.sends())
     run_updates(
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, follow_cb,
-                              message_id=detail["message_id"], update_id=43, bot=env.bot)],
+                              message_id=detail["message_id"], bot=env.bot)],
     )
-    answer = env.bot.last_answer()["text"] or ""
-    assert "今日已催" in answer or "already followed" in answer.lower()
-    assert env.backend.count_calls("POST", "/operations/tasks") == task_creates
+    # No DM was sent to the Secretary (Resolution failed).
+    assert len(env.bot.sends()) == sends_before
+    # The group card was not flipped to an assigned/executed state, so the
+    # follow-up stays 🔴 需要催租 — a failure can never fake an assignment.
+    assert not any("已交秘书" in (ed["text"] or "") for ed in env.bot.edits())
+    assert not any("已联系租客" in (ed["text"] or "") for ed in env.bot.edits())
+    # The follow-up task was also NOT recorded as assigned.
+    calls = [c for c in env.backend.calls if c[0] == "PATCH"]
+    assert not any("/operations/tasks/" in p for _, p, _ in calls)
 
 
 def test_bilingual_missing_or_identical_translation_never_duplicates():

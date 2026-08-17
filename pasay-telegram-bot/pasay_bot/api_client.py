@@ -1076,6 +1076,19 @@ class PasayApiClient:
             raise PasayApiError(None, "No Owner Telegram destination configured")
         return chat_id
 
+    async def get_secretary_dm_chat_id(self) -> tuple[str, int | None]:
+        """TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2.2: resolve the canonical HUMAN
+        Secretary's Telegram private-chat id + principal id for a REAL
+        ``📞 催租`` assign-to-Secretary DM. Raises PasayApiError when no
+        Secretary Telegram destination is configured (the caller must then NOT
+        mark the follow-up as assigned)."""
+        data = await self._request("GET", "/operations/secretary-target")
+        chat_id = str((data or {}).get("telegram_chat_id") or "").strip()
+        principal_id = (data or {}).get("principal_id")
+        if not chat_id:
+            raise PasayApiError(None, "No Secretary Telegram destination configured")
+        return chat_id, (int(principal_id) if principal_id is not None else None)
+
     # --- PASAY-V2-FOUNDATION-001: conversation-driven task create/update ---
     async def create_operational_task(
         self,

@@ -752,6 +752,59 @@ def remind_owner_target(
     return {"telegram_chat_id": str(owner.telegram_chat_id).strip()}
 
 
+@router.get("/secretary-target")
+def secretary_target(
+    db: Session = Depends(get_db),
+    _: User = Depends(manager_or_admin),
+):
+    """TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2.2/§9: resolve the canonical HUMAN
+    Secretary's Telegram DM target for a real ``📞 催租`` assign-to-Secretary DM.
+
+    Exactly mirrors ``/remind-owner-target``: the bot DMs the Secretary
+    (private chat) and only marks the follow-up "assigned" AFTER the DM
+    succeeds. The recipient is resolved from the canonical human identity —
+    the designated Secretary assignee (``OPERATIONS_SECRETARY_ASSIGNEE``) or,
+    failing that, the active manager user with a Telegram binding — never a
+    hard-coded chat id and never the group.
+
+    Returns ``{"telegram_chat_id": "1083657401"}`` or 404 when no Secretary
+    with a Telegram destination exists (fail closed — the caller must NOT
+    report the follow-up as assigned)."""
+    from app.services.identity import resolve_telegram_destination
+    from app.services.operations.config import SECRETARY_ASSIGNEE_ID
+
+    preferred_id = SECRETARY_ASSIGNEE_ID
+    for candidate_id in [preferred_id, None]:
+        if candidate_id is not None:
+            cand = db.get(User, candidate_id)
+        else:
+            # Fall back to the lowest-id active manager with a Telegram binding.
+            cand = (
+                db.query(User)
+                .filter(
+                    User.role == UserRole.manager,
+                    User.is_active.is_(True),
+                    User.telegram_chat_id.isnot(None),
+                )
+                .order_by(User.id)
+                .first()
+            )
+        if cand is None or not cand.is_active:
+            continue
+        try:
+            chat_id = resolve_telegram_destination(db, cand.id)
+        except LookupError:
+            # Fall back to the legacy chat-id when no canonical endpoint exists.
+            legacy = str(cand.telegram_chat_id or "").strip()
+            if not legacy:
+                continue
+            chat_id = legacy
+        if chat_id:
+            return {"telegram_chat_id": str(chat_id).strip(),
+                    "principal_id": cand.id}
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "No Secretary Telegram destination configured")
+
+
 @router.get("/digest")
 def daily_digest(
     db: Session = Depends(get_db),

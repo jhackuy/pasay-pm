@@ -92,6 +92,14 @@ ACTION_REMIND_OWNER = "rmo"
 ACTION_ACK = "ack"                  # ✅ Acknowledge on a proactive reminder
 ACTION_EXPENSE_OPEN = "exo"         # E{id} Open on the Expense list
 ACTION_EXPENSE_BACK = "exb"         # ◀ Back on the Expense detail -> list
+# TELEGRAM-OPS-REAL-WORLD-CLOSURE-005: Secretary private-chat rent follow-up
+# card actions. ``sfc`` ✅ 已联系租客 (only the Secretary's real confirmation
+# moves 🟡 -> ✅), ``sfp`` 💰 已收款 (enters the existing record-payment flow),
+# ``sfs`` ⏰ 稍后处理 (enters the existing snooze). ``ref`` is the follow-up
+# task id (digits) for contact/snooze, and the unit id for the payment action.
+ACTION_SEC_FOLLOWUP_CONTACT = "sfc"   # ✅ 已联系租客
+ACTION_SEC_FOLLOWUP_PAYMENT = "sfp"   # 💰 已收款
+ACTION_SEC_FOLLOWUP_SNOOZE = "sfs"    # ⏰ 稍后处理
 
 # --- Fixed bottom Reply Keyboard (single source of truth) -------------------
 # Exact button label -> deterministic route. These labels are UI commands,
@@ -1894,4 +1902,54 @@ def expense_remind_keyboard(
                 )
             ],
         ]
+    )
+
+
+# --- TELEGRAM-OPS-REAL-WORLD-CLOSURE-005: Secretary DM follow-up card --------
+
+def secretary_followup_keyboard(task_id: int, unit_id: int, locale: str = "bi") -> InlineKeyboardMarkup:
+    """Secretary private-chat collection card: exactly the three REAL execution
+    actions (§3.1):
+    - ``✅ 已联系租客``   ACTION_SEC_FOLLOWUP_CONTACT — the ONLY path 🟡 -> ✅
+    - ``💰 已收款``      ACTION_SEC_FOLLOWUP_PAYMENT — enters record-payment flow
+    - ``⏰ 稍后处理``     ACTION_SEC_FOLLOWUP_SNOOZE  — enters the existing snooze
+
+    Buttons stay SHORT (one language) — never a bilingual button label."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    t("v2.sec_dm_contact_btn", locale),
+                    callback_data=encode(
+                        ACTION_SEC_FOLLOWUP_CONTACT, "sec", str(task_id),
+                        nonce=new_nonce(), ts=now_ts(),
+                    ),
+                ),
+                InlineKeyboardButton(
+                    t("v2.sec_dm_payment_btn", locale),
+                    callback_data=encode(
+                        ACTION_SEC_FOLLOWUP_PAYMENT, "sec", str(unit_id),
+                        nonce=new_nonce(), ts=now_ts(),
+                    ),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    t("v2.sec_dm_snooze_btn", locale),
+                    callback_data=encode(
+                        ACTION_SEC_FOLLOWUP_SNOOZE, "sec", str(task_id),
+                        nonce=new_nonce(), ts=now_ts(),
+                    ),
+                ),
+            ],
+        ]
+    )
+
+
+def secretary_followup_done_keyboard(locale: str = "bi") -> InlineKeyboardMarkup:
+    """Secretary DM card after ``✅ 已联系租客`` (§4.1): the card is DONE — no
+    repeat execution button, so a same-day re-tap cannot create a second real
+    follow-up. There is nothing further to action in the private chat."""
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t("v2.sec_dm_done_card", locale), callback_data="_")]]
     )

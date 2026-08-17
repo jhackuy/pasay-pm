@@ -1794,15 +1794,56 @@ def copilot_notify_retry_card(locale: str = "zh") -> str:
 # --- PASAY-V2-FOUNDATION-001: Quick Views / bilingual cards -----------------
 # All V2 cards are deterministic (never call an LLM). Group mode renders
 # every visible line English + 中文; private chats use the role language.
-
+#
+# TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §1: the Properties index carries ONE
+# traffic-light per unit, and ONLY the three allowed colours. 🟢 normal,
+# 🟡 needs attention (vacant / lease expiring), 🔴 needs action (rent overdue
+# / open maintenance). Vacant is a non-urgent warning (🟡), never a green
+# occupancy state — an operator should still notice it. When several states
+# coexist the RENDERER must pick the highest severity once (see
+# ``_property_traffic_light``); this map only scores a single status.
 _V2_STATUS_EMOJI = {
     "overdue_rent": "🔴",
     "lease_expiring": "🟡",
     "paid": "🟢",
     "rent_paid": "🟢",
-    "vacant": "⚪",
-    "normal": "🔵",
+    "vacant": "🟡",
+    "normal": "🟢",
+    "overdue": "🔴",
 }
+
+# Severity order (large = more severe). Used to collapse a unit with several
+# exception states down to its single worst traffic light (§1.2).
+_PROPERTY_TRAFFIC_ORDER = {
+    "overdue_rent": 3,
+    "overdue": 3,
+    "lease_expiring": 2,
+    "vacant": 1,
+    "paid": 0,
+    "rent_paid": 0,
+    "normal": 0,
+}
+
+
+def _property_traffic_light(status: str) -> str:
+    """The ONE visible traffic light for a Property row (§1.1/§1.2).
+
+    Only ``🟢`` / ``🟡`` / ``🔴`` are ever produced. The incoming ``status``
+    field is a single label; if it does not map to a colour it defaults to
+    🟢 (a healthy/unknown unit is not falsely alarmed)."""
+    light = _V2_STATUS_EMOJI.get(str(status or "").lower())
+    if light in ("🟢", "🟡", "🔴"):
+        return light
+    return "🟢"
+
+
+def _short_unit_label(value: str, locale: str) -> str:
+    """§1.4: strip any property prefix so the overview always shows the short
+    room number (``DEV-BAY-1680`` -> ``1680``), matching the button labels."""
+    s = str(value or "").strip()
+    if "-" in s:
+        s = s.split("-")[-1]
+    return s or str(value or "")
 
 
 def _bi_line(locale: str, en: str, zh: str) -> str:
@@ -1902,6 +1943,7 @@ def rent_detail_card(
     overdue_days: int = 0,
     last_followup: str = "",
     vacant: bool = False,
+    followup_status: str = "",
 ) -> str:
     """💰 Rent detail card for one overdue/collectible unit. Compact: title +
     tenant + outstanding + unpaid periods + overdue days + last follow-up. Only
@@ -1909,10 +1951,16 @@ def rent_detail_card(
     buttons (Follow up / Record payment / History) ride on the keyboard, never
     in the text.
 
+    ``followup_status`` (§7), when provided, renders the real-world follow-up
+    state as its own line (``🟡 已交秘书跟进`` / ``✅ 今日已催``) — a button tap
+    never fabricates this; only the Secretary's real confirmation does.
+
     CONVERGENCE-003 §6: fields render as ONE bilingual line
     (``Outstanding ₱75,000 · 未付 ₱75,000``) — never two duplicated lines."""
     title = H.escape(t("v2.rent_detail_title", locale, unit=H.escape(unit_label)))
     lines = [f"<b>{title}</b>"]
+    if followup_status:
+        lines.append(f"{H.escape(followup_status)}")
     if vacant:
         lines.append(H.escape(t("v2.rent_vacant", locale)))
         return "\n".join(lines)
@@ -1982,6 +2030,75 @@ def remind_owner_card(
     return "\n".join(lines)
 
 
+def secretary_followup_card(
+    *,
+    unit_label: str,
+    locale: str = "bi",
+    tenant_name: str = "",
+    outstanding=None,
+    unpaid_periods: int = 0,
+    overdue_days: int = 0,
+    last_followup: str = "",
+    done: bool = False,
+) -> str:
+    """Secretary private-chat collection task card (§3). Built ONLY from the
+    real rent truth source (quick-rent row + unit/lease/tenant) — the amount,
+    period count and overdue days are never re-derived by the renderer. When
+    ``done`` the card shows the executed state and the buttons go away."""
+    if done:
+        lines = [
+            f"<b>{H.escape(t('v2.sec_dm_contact_recorded', locale))}</b>",
+        ]
+        if unit_label:
+            lines.append(H.escape(unit_label))
+        lines.append(H.escape(t("v2.sec_dm_already_today", locale)))
+        return "\n".join(lines)
+    title = H.escape(t("v2.sec_dm_title", locale,
+                       unit=H.escape(unit_label) if unit_label else ""))
+    lines = [f"🔴 <b>{title}</b>", ""]
+    if tenant_name:
+        lines.append(H.escape(t("v2.sec_dm_tenant", locale, tenant=H.escape(tenant_name))))
+    if outstanding is not None:
+        lines.append(H.escape(t("v2.sec_dm_outstanding", locale, amount=H.money(outstanding))))
+    if unpaid_periods:
+        lines.append(H.escape(t("v2.sec_dm_periods", locale, count=int(unpaid_periods))))
+    if overdue_days:
+        lines.append(H.escape(t("v2.sec_dm_overdue", locale, days=int(overdue_days))))
+    if last_followup:
+        lines.append(H.escape(t("v2.sec_dm_last", locale, date=H.escape(last_followup))))
+    else:
+        lines.append(H.escape(t("v2.sec_dm_last_none", locale)))
+    lines.append("")
+    lines.append(H.escape(t("v2.sec_dm_body", locale)))
+    if outstanding is not None and _dec(outstanding) > 0:
+        lines.append(H.escape(t("v2.sec_dm_redirect_payment", locale)))
+    return "\n".join(lines)
+
+
+def followup_status_text(details: dict, locale: str, *, executed_daily: bool = False) -> str:
+    """TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §7: one human state for a rent
+    follow-up, used on the group Rent detail / Tasks row. The state mirrors
+    reality, never the button click alone:
+    🔴 需要催租 -> 🟡 已交秘书跟进 -> ✅ 今日已催 (only a real Secretary confirm)."""
+    if executed_daily:
+        return _bi_value(
+            locale,
+            t("v2.followup_status_executed", "en"),
+            t("v2.followup_status_executed", "zh"),
+        )
+    if details and details.get("assigned_to"):
+        return _bi_value(
+            locale,
+            t("v2.followup_status_assigned", "en"),
+            t("v2.followup_status_assigned", "zh"),
+        )
+    return _bi_value(
+        locale,
+        t("v2.followup_status_pending", "en"),
+        t("v2.followup_status_pending", "zh"),
+    )
+
+
 def quick_unit_view_card(
     *,
     unit_label: str,
@@ -2039,44 +2156,54 @@ def property_archive_card(locale: str = "bi", *, link: str = "") -> str:
 
 
 def _v2_property_label(row: dict, locale: str) -> str:
-    """ZERO-LEARNING-004 §1: one unit line where the EXCEPTION is expressed in
-    WORDS and a normal unit collapses to ``OK``:
+    """ZERO-LEARNING-004 §1 + TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §1: one unit
+    line with a SINGLE traffic-light + the exception expressed in WORDS:
 
-      vacant:        ``2308 · Vacant · 空置``
-      overdue rent:  ``1608 · Rent overdue 104d · 3 periods · 逾期租金 104 天 · 3 期``
-      expiring:      ``1203 · Lease expires in 18d · 租约还有 18 天到期``
-      open repair:   appends ``· Repair 1 open · 维修 1 项处理中``
-      normal/paid:   ``1203 · OK``
+      overdue rent:  ``🔴 1680 · Rent overdue 104d / 欠租104天 · 3期``
+      vacant:        ``🟡 2308 · Vacant / 空置``
+      expiring:      ``🟡 1203 · Lease expires in 18d / 合同18天到期``
+      open repair:   any light + appends ``· Repair 1 / 待修1项`` (🟡/🔴
+                     upgrade: an open repair is an action item -> 🔴)
+      normal/paid:   ``🟢 1203 · OK``
 
-    No ``💰⚠️`` / ``📄✅`` / ``🔧0`` chips — an icon never carries the only
-    meaning, and zero-maintenance is never shown. ``unpaid_periods`` comes
-    from the backend (the SAME truth source as the RENT_OVERDUE generator)."""
+    Exactly ONE light is shown (``_property_traffic_light``): the highest
+    severity among the property's flags. ``unpaid_periods`` comes from the
+    backend (the SAME truth source as the RENT_OVERDUE generator). The unit
+    id is the SHORT room number (§1.4), never ``DEV-BAY-1680``. No
+    ``💰⚠️`` / ``📄✅`` / ``🔧0`` / ``👁`` icon-password chips."""
     status = str(row.get("status") or "normal").lower()
-    unit = H.escape(str(row.get("unit_code") or row.get("property_code") or ""))
-    en_parts = [unit]
-    zh_parts = [unit]
+    unit = _short_unit_label(
+        row.get("unit_code") or row.get("property_code") or "", locale
+    )
+    light = _property_traffic_light(status)
+    # §1.2: open repair is a current action item -> escalate the light to 🔴
+    # unless an even-worse overdue state already dominates it.
+    repair = int(row.get("open_maintenance") or 0)
+    if repair and status not in ("overdue_rent", "overdue"):
+        light = "🔴"
+    en_parts = [f"{light} {unit}"]
+    zh_parts = [f"{light} {unit}"]
     if status == "vacant":
         en_parts.append("Vacant")
         zh_parts.append("空置")
-    elif status == "overdue_rent":
+    elif status in ("overdue_rent", "overdue"):
         days = int(row.get("days") or 0)
         en_parts.append(f"Rent overdue {days}d")
-        zh_parts.append(f"逾期租金 {days} 天")
+        zh_parts.append(f"欠租{days}天")
         periods = row.get("unpaid_periods")
         if periods:
-            en_parts.append(f"{int(periods)} periods")
-            zh_parts.append(f"{int(periods)} 期")
+            en_parts.append(f"{int(periods)}期")
+            zh_parts.append(f"{int(periods)}期")
     elif status == "lease_expiring":
         days = int(row.get("days") or 0)
         en_parts.append(f"Lease expires in {days}d")
-        zh_parts.append(f"租约还有 {days} 天到期")
+        zh_parts.append(f"合同{days}天到期")
     else:  # normal / paid -> collapse to OK
         en_parts.append("OK")
         zh_parts.append("OK")
-    repair = int(row.get("open_maintenance") or 0)
     if repair:
-        en_parts.append(f"Repair {repair} open")
-        zh_parts.append(f"维修 {repair} 项")
+        en_parts.append(f"Repair {repair}")
+        zh_parts.append(f"待修{repair}项")
     return _bi_value(locale, " · ".join(en_parts), " · ".join(zh_parts))
 
 
@@ -2140,11 +2267,15 @@ def _v2_task_line(task: dict, locale: str, emoji: str) -> str:
         if periods:
             en_parts.append(f"{int(periods)} period(s)")
             zh_parts.append(f"{int(periods)}期")
+        if task.get("followup_assigned"):
+            en_parts.append(t("v2.followup_in_progress", "en"))
+            zh_parts.append(t("v2.followup_in_progress", "zh"))
     else:
         en_parts.append(title)
         zh_parts.append(title)
     overdue_days = task.get("overdue_days")
     due_days = task.get("due_in_days")
+    is_rent_action = task_type in ("RENT_OVERDUE", "FOLLOWUP")
     waiting = task.get("waiting_days")
     if waiting is None and task_type in ("PAYMENT_PENDING", "APPROVAL_PENDING") and overdue_days is not None:
         waiting = overdue_days  # an approved-but-unpaid expense "waits", it does not overduplicate
@@ -2154,7 +2285,14 @@ def _v2_task_line(task: dict, locale: str, emoji: str) -> str:
     elif overdue_days is not None:
         en_parts.append(t("v2.overdue_days", "en", days=overdue_days))
         zh_parts.append(t("v2.overdue_days", "zh", days=overdue_days))
-    elif due_days is not None:
+    elif is_rent_action:
+        # TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §12: an overdue-rent follow-up
+        # must NEVER read ``due in 0d``. The action deadline is TODAY, not a
+        # calendar due date, so when no real overdue count is available we say
+        # the truthful "follow up today" instead of a misleading due-date.
+        en_parts.append(t("v2.action_today", "en"))
+        zh_parts.append(t("v2.action_today", "zh"))
+    elif due_days is not None and int(due_days) > 0:
         en_parts.append(t("v2.due_in_days", "en", days=due_days))
         zh_parts.append(t("v2.due_in_days", "zh", days=due_days))
     elif task.get("due_at"):
@@ -2253,16 +2391,15 @@ def _v2_is_zero(value) -> bool:
 
 
 def properties_quick_card(data, locale: str = "bi") -> str:
-    """🏠 Properties quick view: occupancy summary + one high-density line per
-    unit.
+    """🏠 Properties quick view: occupancy summary + ONE high-density line per
+    unit, ordered by severity (§1.3: 🔴 first, then 🟡, then 🟢) so the Owner
+    sees problem units first.
 
-    Deterministic summary (no LLM): total / occupied (rented) / vacant /
-    occupancy rate derived from each unit row's status. ``vacant`` marks an
-    empty unit; every other status (overdue_rent / lease_expiring / normal /
-    paid) implies an active lease, i.e. occupied/rented. Rent delinquency is
-    NOT counted as a separate property stat — it stays a per-unit chip only.
-
-    The title carries the unit count (``🏠 Properties · 12``)."""
+    §1.1/§1.2: each row shows exactly ONE traffic light (🟢/🟡/🔴) as the
+    severity, with the concrete business fact in words. §1.4: the unit id is
+    the SHORT room number. §1.5: the top summary is compact and bilingual in
+    groups (``6 occupied · 1 vacant · 4 need action``). The title carries the
+    unit count (``🏠 Properties · 7``)."""
     rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
     total = len(rows)
     header = _bi_header(
@@ -2274,28 +2411,48 @@ def properties_quick_card(data, locale: str = "bi") -> str:
         return "\n".join(blocks)
     vacant = sum(1 for r in rows if str(r.get("status") or "normal").lower() == "vacant")
     occupied = total - vacant
-    rate = (occupied / total * 100) if total else 0
-    blocks.append(_properties_summary_line(locale, total, occupied, vacant, rate))
-    for row in rows:
+
+    def _row_light(r) -> str:
+        light = _property_traffic_light(str(r.get("status") or "normal").lower())
+        if int(r.get("open_maintenance") or 0) and light != "🔴":
+            light = "🔴"
+        return light
+
+    ordered = sorted(
+        rows,
+        key=lambda r: (_PROPERTY_TRAFFIC_ORDER.get(r.get("status", ""), 0),
+                       str(r.get("unit_code") or r.get("property_code") or "")),
+        reverse=True,
+    )
+    need_action = sum(1 for r in rows if _row_light(r) == "🔴")
+    want_attention = sum(1 for r in rows if _row_light(r) == "🟡")
+    blocks.append(_properties_summary_line(locale, total, occupied, vacant, need_action, want_attention))
+    for row in ordered:
         blocks.append(_v2_property_label(row, locale))
     return "\n\n".join(blocks)
 
 
-def _properties_summary_line(locale: str, total: int, occupied: int, vacant: int, rate) -> str:
-    """One compact occupancy summary line, bilingual in groups."""
-    en = (
-        f"{H.escape(t('properties.total', 'en'))} {total} · "
-        f"{H.escape(t('properties.occupied', 'en'))} {occupied} · "
-        f"{H.escape(t('properties.vacant', 'en'))} {vacant} · "
-        f"{H.escape(t('properties.occupancy_rate', 'en'))} {rate:.0f}%"
-    )
-    zh = (
-        f"{H.escape(t('properties.total', 'zh'))} {total} · "
-        f"{H.escape(t('properties.occupied', 'zh'))} {occupied} · "
-        f"{H.escape(t('properties.vacant', 'zh'))} {vacant} · "
-        f"{H.escape(t('properties.occupancy_rate', 'zh'))} {rate:.0f}%"
-    )
-    return f"📊 {_bi_line(locale, en, zh)}"
+def _properties_summary_line(
+    locale: str, total, occupied, vacant, need_action, want_attention,
+) -> str:
+    """§1.5: one compact bilingual occupancy+attention summary line. No long
+    duplicated sentences, no whole-line English-then-Chinese repetition."""
+    en_parts = [f"{t('properties.total', 'en')} {total}",
+                f"{t('properties.occupied', 'en')} {occupied}"]
+    zh_parts = [f"{t('properties.total', 'zh')} {total}",
+                f"{t('properties.occupied', 'zh')} {occupied}"]
+    if vacant:
+        en_parts.append(f"{t('properties.vacant', 'en')} {vacant}")
+        zh_parts.append(f"{t('properties.vacant', 'zh')} {vacant}")
+    if need_action:
+        en_parts.append(f"🔴 {t('properties.need_action', 'en')} {need_action}")
+        zh_parts.append(f"🔴 {t('properties.need_action', 'zh')} {need_action}")
+    elif want_attention:
+        en_parts.append(f"🟡 {t('properties.want_attention', 'en')} {want_attention}")
+        zh_parts.append(f"🟡 {t('properties.want_attention', 'zh')} {want_attention}")
+    en_line = " · ".join(en_parts)
+    zh_line = " · ".join(zh_parts)
+    return f"📊 {_bi_value(locale, H.escape(en_line), H.escape(zh_line))}"
 
 
 def _payable_expense_line(row: dict, locale: str) -> str:
@@ -2354,6 +2511,15 @@ def tasks_quick_card(data, locale: str = "bi") -> str:
         if str(t_.get("status") or "").upper() in ("IN_PROGRESS", "IN PROGRESS")
     ]
     other = [t_ for t_ in operational if t_ not in pending and t_ not in in_progress]
+    # §13: a rent follow-up already ASSIGNED to the Secretary is NOT a red
+    # pending item — it is a 🟡 in-progress item ("秘书跟进中"), the same
+    # business action shown once, in its real state.
+    assigned_followups = [
+        t_ for t_ in pending
+        if str(t_.get("task_type") or "").upper() in ("RENT_OVERDUE", "FOLLOWUP")
+        and t_.get("followup_assigned")
+    ]
+    pending = [t_ for t_ in pending if t_ not in assigned_followups]
     blocks = [_v2_title(locale, "v2.tasks_title", "✅")]
     if not tasks:
         blocks.append(H.escape(t("v2.empty", locale)))
@@ -2365,9 +2531,10 @@ def tasks_quick_card(data, locale: str = "bi") -> str:
     if pending:
         blocks.append(_v2_section("v2.status.pending", locale, "🔴"))
         blocks.extend(_v2_task_line(t_, locale, "🔴") for t_ in pending)
-    if in_progress:
+    if assigned_followups or in_progress:
         blocks.append(_v2_section("v2.status.in_progress", locale, "🟡"))
         blocks.extend(_v2_task_line(t_, locale, "🟡") for t_ in in_progress)
+        blocks.extend(_v2_task_line(t_, locale, "🟡") for t_ in assigned_followups)
     for t_ in other:
         blocks.append(_v2_task_line(t_, locale, "📋"))
     return "\n\n".join(blocks)
