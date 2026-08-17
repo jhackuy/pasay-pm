@@ -194,6 +194,37 @@ class RecurringRule(AuditMixin, SoftDeleteMixin, Base):
     details: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
 
 
+class ReminderDailyDedup(AuditMixin, Base):
+    """Persistent same-day reminder dedupe (TELEGRAM-OPS-UX-CONVERGENCE-003 §1.4).
+
+    One row per ``(business key, recipient, PH local date, reminder type)``:
+    the unique ``dedupe_key`` index makes the enqueue atomic
+    (INSERT ... ON CONFLICT DO NOTHING), survives runtime restarts and is safe
+    under concurrent workers — the DB is the only source of truth, never
+    Python memory.
+
+    The business key is the task's ``dedupe_key`` (e.g. ``lease:3:RENT_DUE:
+    2026-08``) — the STABLE business identity — so even a task row that is
+    re-created by a later scheduler pass cannot re-send within the same
+    Philippines natural day.
+    """
+
+    __tablename__ = "reminder_daily_dedup"
+    __table_args__ = (
+        Index("uq_reminder_daily_dedup_key", "dedupe_key", unique=True),
+        Index("ix_reminder_daily_dedup_date", "local_date"),
+    )
+
+    dedupe_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    task_id: Mapped[int | None] = mapped_column(
+        ForeignKey("operational_tasks.id"), nullable=True, index=True
+    )
+    recipient: Mapped[str] = mapped_column(String(200), nullable=False)
+    # Philippines operational local date "YYYY-MM-DD" (UTC+8, no DST).
+    local_date: Mapped[str] = mapped_column(String(10), nullable=False)
+    reminder_type: Mapped[str] = mapped_column(String(50), nullable=False)
+
+
 class NotificationStatus(str, Enum):
     PENDING = "PENDING"
     SENT = "SENT"

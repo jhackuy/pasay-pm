@@ -267,7 +267,8 @@ def test_expense_detail_callback(make_app):
     assert "💳 支出详情" in edit["text"]
     assert "Pasay Premier Residences · 16B" in edit["text"]
     labels = [b.text for b in _buttons(edit["reply_markup"])]
-    assert "✅ 批准" in labels and "❌ 拒绝" in labels
+    # V2 amount-aware approve button (Approve ₱5,000) + Reject.
+    assert any("Approve" in lbl for lbl in labels) and "Reject" in labels
 
     # after approval, the detail card no longer offers approve/reject
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, _expense_data(), update_id=3, bot=env.bot)])

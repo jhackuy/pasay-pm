@@ -9,8 +9,21 @@ import json
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+# CONVERGENCE-003 §1.6: the daily dedupe boundary is the PHILIPPINES
+# operational date (Asia/Manila, UTC+8, no DST), never the UTC date — a UTC
+# date flip must not cause two sends on one PH day.
+PH_TZ = ZoneInfo("Asia/Manila")
+
+
+def ph_local_date(now: datetime | None = None) -> str:
+    """'YYYY-MM-DD' of the Philippines operational day."""
+    now = now or datetime.now(PH_TZ)
+    return now.astimezone(PH_TZ).date().isoformat()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -57,6 +70,13 @@ CREATE TABLE IF NOT EXISTS known_groups (
   chat_id      TEXT PRIMARY KEY,
   title        TEXT NOT NULL DEFAULT '',
   first_seen   TEXT NOT NULL
+);
+-- CONVERGENCE-003: persistent same-day action marks (remind owner / rent
+-- follow-up / next_check reminders). SQLite PRIMARY KEY makes the mark
+-- atomic; the key embeds the PH local date so a restart can never re-fire.
+CREATE TABLE IF NOT EXISTS daily_marks (
+  key        TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL
 );
 """
 
@@ -269,6 +289,33 @@ class StateStore:
             self._conn.commit()
 
     # --- PASAY-V2-FOUNDATION-001: known group registry (daily digest) --------
+    # --- CONVERGENCE-003: persistent same-day marks -------------------------
+    def mark_daily(self, key: str) -> bool:
+        """Atomically claim a same-day mark; True = first time today.
+
+        The caller embeds the Philippines local date in ``key`` (e.g.
+        ``remind_owner:12:2026-08-17``). The SQLite PRIMARY KEY makes the
+        insert atomic — a restart or a second tap cannot re-fire.
+        """
+        now = int(time.time())
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO daily_marks (key, created_at) VALUES (?, ?)",
+                    (key, str(now)),
+                )
+                self._conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def is_marked_daily(self, key: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM daily_marks WHERE key=?", (key,)
+            ).fetchone()
+        return row is not None
+
     def remember_group(self, chat_id: Any, title: str = "") -> None:
         now = int(time.time())
         with self._lock:

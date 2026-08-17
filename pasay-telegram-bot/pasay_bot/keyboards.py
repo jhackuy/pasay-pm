@@ -88,6 +88,10 @@ ACTION_PROP_ARCHIVE = "par"
 ACTION_RENT_QUICK_DETAIL = "rnq"
 ACTION_RENT_FOLLOWUP = "rfu"
 ACTION_REMIND_OWNER = "rmo"
+# CONVERGENCE-003: short deterministic actions.
+ACTION_ACK = "ack"                  # ✅ Acknowledge on a proactive reminder
+ACTION_EXPENSE_OPEN = "exo"         # E{id} Open on the Expense list
+ACTION_EXPENSE_BACK = "exb"         # ◀ Back on the Expense detail -> list
 
 # --- Fixed bottom Reply Keyboard (single source of truth) -------------------
 # Exact button label -> deterministic route. These labels are UI commands,
@@ -304,29 +308,24 @@ def _candidate_selector_keyboard(
 
 
 def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
-    """Minimal fallback for the ☰ 更多 page (V1.3): infrequent actions that no
-    longer live on the primary bottom navigation. The six-grid is gone; the
-    persistent reply keyboard is the primary nav."""
-    kb = [
+    """Minimal fallback actions for the legacy ☰ 更多 page (CONVERGENCE-003
+    §2.3): the Operations Assistant and the first-level menu grid are gone —
+    navigation is the fixed Reply Keyboard only. Two situational actions:
+    ⚠️ Today (needs-action list) and 🔄 Refresh."""
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                t("nav.rent", locale), callback_data=encode(ACTION_NAV, "rent")
-            ),
-            InlineKeyboardButton(
-                t("nav.overdue", locale), callback_data=encode(ACTION_NAV, "overdue")
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                t("nav.copilot", locale),
-                callback_data=encode(ACTION_COPILOT_NAV, "today"),
-            ),
-            InlineKeyboardButton(
-                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
-            ),
-        ],
-    ]
-    return InlineKeyboardMarkup(kb)
+            [
+                InlineKeyboardButton(
+                    t("home.today_button", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "today"),
+                ),
+                InlineKeyboardButton(
+                    t("home.refresh_button", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "refresh"),
+                ),
+            ]
+        ]
+    )
 
 
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
@@ -1375,6 +1374,69 @@ def expense_detail_keyboard(
     return InlineKeyboardMarkup(kb)
 
 
+def expense_open_keyboard(
+    expense_id: int,
+    *,
+    status: str,
+    locale: str = "bi",
+    has_receipt: bool = False,
+    reminded_today: bool = False,
+) -> InlineKeyboardMarkup:
+    """CONVERGENCE-003 §4.3 Expense Detail actions — SHORT mobile buttons:
+    ``🔔 Remind | ✅ Paid`` (APPROVED unpaid), ``📎 Receipt | ◀ Back`` and
+    ``🏠 Home``. Once reminded today the Remind button flips to
+    ``✅ Reminded`` (still tappable -> 'already reminded' toast). PENDING
+    keeps approve/reject for the Owner; PAID/closed only Back + Home."""
+    kb: list[list[InlineKeyboardButton]] = []
+    status = (status or "").lower()
+    if status == "pending":
+        nonce, ts = new_nonce(), now_ts()
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    _approve_button_label(locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+                InlineKeyboardButton(
+                    _reject_button_label(locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=nonce, ts=ts
+                    ),
+                ),
+            ]
+        )
+    elif status == "approved":
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("v2.remind_owner_short", locale) if not reminded_today
+                    else t("v2.reminded_short", locale),
+                    callback_data=encode(ACTION_REMIND_OWNER, "exp", str(expense_id)),
+                ),
+                InlineKeyboardButton(
+                    t("expense.pay_now_short", locale),
+                    callback_data=encode(
+                        ACTION_EXPENSE_PAY, str(expense_id), "", nonce=new_nonce(), ts=now_ts()
+                    ),
+                ),
+            ]
+        )
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("common.back_short", locale),
+                callback_data=encode(ACTION_EXPENSE_BACK),
+            ),
+            InlineKeyboardButton(
+                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(kb)
+
+
 def expense_result_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
     """Result card (approved/rejected): back home; nothing else to do."""
     return InlineKeyboardMarkup(
@@ -1515,30 +1577,21 @@ def expense_edit_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def home_summary_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
-    """Home summary actions (P0 spec): view unpaid / approvals / expiring
-    contracts / maintenance. These are action buttons, not a second nav."""
+    """CONVERGENCE-003 §2.2 Home situational actions (never a second
+    navigation): ⚠️ Today (今日处理) + 🔄 Refresh. The fixed Reply Keyboard is
+    the ONLY first-level navigation."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    t("home.view_unpaid", locale),
-                    callback_data=encode(ACTION_HOME_NAV, "unpaid"),
+                    t("home.today_button", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "today"),
                 ),
                 InlineKeyboardButton(
-                    t("home.view_approvals", locale),
-                    callback_data=encode(ACTION_HOME_NAV, "approvals"),
+                    t("home.refresh_button", locale),
+                    callback_data=encode(ACTION_HOME_NAV, "refresh"),
                 ),
-            ],
-            [
-                InlineKeyboardButton(
-                    t("home.view_contracts", locale),
-                    callback_data=encode(ACTION_HOME_NAV, "contracts"),
-                ),
-                InlineKeyboardButton(
-                    t("home.view_maintenance", locale),
-                    callback_data=encode(ACTION_HOME_NAV, "maintenance"),
-                ),
-            ],
+            ]
         ]
     )
 
@@ -1766,14 +1819,19 @@ def rent_quick_keyboard(overdue_rows, locale: str = "bi") -> InlineKeyboardMarku
     return InlineKeyboardMarkup(kb)
 
 
-def rent_detail_keyboard(unit_id: int, locale: str = "bi") -> InlineKeyboardMarkup:
+def rent_detail_keyboard(unit_id: int, locale: str = "bi", *, followed_up_today: bool = False) -> InlineKeyboardMarkup:
     """💰 Rent detail card actions: follow up + record payment + history. The
     record-payment button routes into the existing deterministic rent-collect
-    path; follow-up prefers an existing task (dedupe) over a duplicate."""
+    path; follow-up prefers an existing task (dedupe) over a duplicate.
+
+    CONVERGENCE-003 §5.2: after a successful same-day follow-up the Follow-up
+    button flips to the short state ``✅ Followed up`` (still tappable ->
+    'already followed up today' toast)."""
     kb: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                t("v2.rent_followup", locale),
+                t("v2.rent_followed_short", locale) if followed_up_today
+                else t("v2.rent_followup", locale),
                 callback_data=encode(ACTION_RENT_FOLLOWUP, "r", str(unit_id)),
             ),
             InlineKeyboardButton(

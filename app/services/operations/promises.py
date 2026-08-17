@@ -90,6 +90,20 @@ def _enqueue_reminder(
         return False
     if recipient is None:
         return False
+    # CONVERGENCE-003 §1.4: a promise follow-up is a PROACTIVE reminder — the
+    # same business object + recipient + PH day + type is sent at most once
+    # per day even if the scheduler scans again before the next follow_up_at.
+    from app.services.operations.daily_dedup import claim_daily_dedup
+
+    if not claim_daily_dedup(
+        db,
+        business_key=task.dedupe_key,
+        task_id=task.id,
+        recipient=recipient,
+        reminder_type=task.task_type.value,
+        now=now,
+    ):
+        return False
     details = task.details or {}
     payload = {
         "task_id": task.id,

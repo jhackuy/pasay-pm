@@ -438,6 +438,17 @@ STRINGS: dict[str, dict[str, str]] = {
         'home.view_approvals': '查看待审批',
         'home.view_contracts': '合同到期',
         'home.view_maintenance': '维修事项',
+        # CONVERGENCE-003 §2.2: Home = Operations Overview (10 numbers).
+        'home.expected': '本月应收',
+        'home.outstanding': '本月未收',
+        'home.total_arrears': '历史累计欠租',
+        'home.overdue_units': '逾期数量',
+        'home.expiring': '合同即将到期',
+        'home.vacant_units': '空置数量',
+        'home.payable_expenses': '待付款支出',
+        'home.today_tasks': '今日需要处理',
+        'home.today_button': '⚠️ Today',
+        'home.refresh_button': '🔄 Refresh',
         'pagination.footer': '第 {page}/{total} 页 · 共 {count} 条',
         'page.prev': '◀️ 上一页',
         'page.next': '▶️ 下一页',
@@ -461,10 +472,15 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.status.normal': '正常',
         'v2.overdue_days': '逾期 {days} 天',
         'v2.due_in_days': '还有 {days} 天到期',
+        'v2.waiting_days': '等待 {days} 天',
         'v2.next': '下一步：{next}',
         'v2.check_at': '{date} 检查',
         'v2.rent_overdue_section': '逾期租金',
         'v2.outstanding_total': '未收总额：{amount}',
+        # CONVERGENCE-003 §9: the two outstanding numbers must never both be
+        # called "Outstanding" — this-month vs historical arrears.
+        'v2.rent_month_outstanding': '本月未收',
+        'v2.rent_total_arrears': '历史累计欠租',
         'v2.rent_no_overdue': '无逾期租金',
         'v2.rent_expected': '本月应收 {amount}',
         'v2.rent_collected': '已收 {amount}',
@@ -489,26 +505,36 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.help': '直接告诉我发生了什么，或者你想查什么。\n按钮：Properties · Tasks · Rent · Expense',
         # TELEGRAM-OPS-UX-CONVERGENCE-001: Quick View action labels + Remind.
         'v2.property_archive': '📄 Property Archive',
-        'v2.rent_followup': 'Follow up',
-        'v2.rent_record_payment': '💰 Record payment',
-        'v2.rent_history': '📜 History',
+        'v2.rent_followup': '📞 催租',
+        'v2.rent_record_payment': '💰 收租',
+        'v2.rent_history': '📜 记录',
         'v2.remind_owner': '🔔 Remind Owner',
+        # CONVERGENCE-003 §10: SHORT mobile buttons (never truncated).
+        'v2.rent_followed_short': '✅ 今日已催',
+        'v2.remind_owner_short': '🔔 提醒',
+        'v2.reminded_short': '✅ 已提醒',
+        'expense.pay_now_short': '✅ 已付',
+        'common.back_short': '◀ 返回',
         'v2.remind_owner_sent': '已提醒 Owner 处理该付款。',
         'v2.remind_owner_title': '🔔 Payment Reminder / 付款提醒',
         'v2.remind_owner_to': 'Owner，请处理付款。',
-        'v2.remind_owner_waiting': 'Waiting Owner payment · {days} days',
-        'v2.remind_owner_approved': 'Approved {date}',
-        'v2.rent_no_last_followup': 'Last follow-up: none',
-        'v2.rent_last_followup': 'Last follow-up: {date}',
-        'v2.rent_unpaid_periods': 'Unpaid periods: {count}',
-        'v2.rent_detail_outstanding': 'Outstanding: {amount}',
-        'v2.rent_overdue': 'Overdue: {days} days',
+        'v2.remind_owner_waiting': '等待 Owner 付款 {days} 天',
+        'v2.remind_owner_approved': '批准于 {date}',
+        'v2.rent_no_last_followup': '最近催租：无',
+        'v2.rent_last_followup': '最近催租：{date}',
+        'v2.rent_unpaid_periods': '未付期数：{count}',
+        'v2.rent_detail_outstanding': '未付：{amount}',
+        'v2.rent_overdue': '逾期：{days} 天',
         'v2.rent_detail_title': '💰 {unit}',
-        'v2.rent_tenant': 'Tenant: {tenant}',
-        'v2.rent_vacant': 'Vacant / 空置',
+        'v2.rent_tenant': '租客：{tenant}',
+        'v2.rent_vacant': '空置',
         'v2.followup_already_task': '已存在跟进任务，不重复创建。',
         'v2.followup_created': '已创建跟进任务。',
         'v2.followup_denied_other_unit': '该跟进需要 owner / secretary 身份。',
+        # CONVERGENCE-003 §1.5/§4.4/§5.2 same-day feedback.
+        'v2.acknowledged_card': '✅ 已处理，今日不再提醒。',
+        'v2.followup_already_today': '今日已催，无需重复',
+        'v2.remind_owner_already': '今日已提醒',
         'v2.event.repair_reported': '已登记维修',
         'v2.event.repair_in_progress': '维修处理中',
         'v2.repair_waiting': '等待安排维修。',
@@ -949,6 +975,17 @@ STRINGS: dict[str, dict[str, str]] = {
         'home.view_approvals': 'View approvals',
         'home.view_contracts': 'Expiring contracts',
         'home.view_maintenance': 'Maintenance',
+        # CONVERGENCE-003 §2.2: Home = Operations Overview (10 numbers).
+        'home.expected': 'Expected this month',
+        'home.outstanding': 'Outstanding this month',
+        'home.total_arrears': 'Total overdue arrears',
+        'home.overdue_units': 'Overdue units',
+        'home.expiring': 'Contracts expiring',
+        'home.vacant_units': 'Vacant units',
+        'home.payable_expenses': 'Expenses awaiting payment',
+        'home.today_tasks': 'Needs action today',
+        'home.today_button': '⚠️ Today',
+        'home.refresh_button': '🔄 Refresh',
         'pagination.footer': 'Page {page}/{total} · {count} items',
         'page.prev': '◀️ Prev',
         'page.next': 'Next ▶️',
@@ -972,10 +1009,15 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.status.normal': 'Normal',
         'v2.overdue_days': 'overdue {days}d',
         'v2.due_in_days': 'due in {days}d',
+        'v2.waiting_days': 'waiting {days}d',
         'v2.next': 'Next: {next}',
         'v2.check_at': 'Check {date}',
         'v2.rent_overdue_section': 'Overdue rent',
         'v2.outstanding_total': 'Outstanding total: {amount}',
+        # CONVERGENCE-003 §9: the two outstanding numbers must never both be
+        # called "Outstanding" — this-month vs historical arrears.
+        'v2.rent_month_outstanding': 'This month outstanding',
+        'v2.rent_total_arrears': 'Total overdue arrears',
         'v2.rent_no_overdue': 'No overdue rent',
         'v2.rent_expected': 'Expected {amount}',
         'v2.rent_collected': 'Collected {amount}',
@@ -1002,10 +1044,16 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.help': 'Just tell me what happened or what you need.\nButtons: Properties · Tasks · Rent · Expense',
         # TELEGRAM-OPS-UX-CONVERGENCE-001: Quick View action labels + Remind.
         'v2.property_archive': '📄 Property Archive',
-        'v2.rent_followup': 'Follow up',
-        'v2.rent_record_payment': '💰 Record payment',
+        'v2.rent_followup': '📞 Follow up',
+        'v2.rent_record_payment': '💰 Collect',
         'v2.rent_history': '📜 History',
         'v2.remind_owner': '🔔 Remind Owner',
+        # CONVERGENCE-003 §10: SHORT mobile buttons (never truncated).
+        'v2.rent_followed_short': '✅ Followed up',
+        'v2.remind_owner_short': '🔔 Remind',
+        'v2.reminded_short': '✅ Reminded',
+        'expense.pay_now_short': '✅ Paid',
+        'common.back_short': '◀ Back',
         'v2.remind_owner_sent': 'Reminder sent to Owner about this payment.',
         'v2.remind_owner_title': '🔔 Payment Reminder / 付款提醒',
         'v2.remind_owner_to': 'Owner, please process the payment.',
@@ -1022,6 +1070,10 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.followup_already_task': 'A follow-up task already exists; not duplicated.',
         'v2.followup_created': 'Follow-up task created.',
         'v2.followup_denied_other_unit': 'This follow-up needs owner / secretary access.',
+        # CONVERGENCE-003 §1.5/§4.4/§5.2 same-day feedback.
+        'v2.acknowledged_card': '✅ Acknowledged — no more reminders today.',
+        'v2.followup_already_today': 'Already followed up today',
+        'v2.remind_owner_already': 'Already reminded today',
         'v2.event.repair_reported': 'Repair reported',
         'v2.event.repair_in_progress': 'Repair in progress',
         'v2.repair_waiting': 'Waiting for repair arrangement.',
@@ -1035,7 +1087,15 @@ STRINGS: dict[str, dict[str, str]] = {
 
 def t(key: str, locale: str = "zh", **kwargs) -> str:
     if locale == "bi":
-        return _render("en", key, **kwargs) + "\n" + _render("zh", key, **kwargs)
+        en_line = _render("en", key, **kwargs)
+        zh_line = _render("zh", key, **kwargs)
+        # CONVERGENCE-003 §6: a missing OR identical translation must never
+        # duplicate the English line (the zh table used to carry English
+        # copies for several v2.rent_* keys, printing e.g. "Overdue: 104 days"
+        # twice). English renders exactly once when zh is unavailable.
+        if not zh_line or zh_line == key or zh_line == en_line:
+            return en_line
+        return en_line + "\n" + zh_line
     return _render(locale, key, **kwargs)
 
 

@@ -264,7 +264,9 @@ def test_expense_safe_purpose_fallback_never_shows_placeholder(make_app):
 
 def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
     """Section 七/八: overdue rows on the Rent quick view have a Follow up
-    button that opens a Rent detail with Follow-up / Record payment / History."""
+    button that opens a Rent detail with Follow-up / Record payment / History
+    (CONVERGENCE-003 §10: short buttons — zh Owner private chat uses the
+    compact Chinese labels)."""
     env = make_app(backend=ConvergeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     send = env.bot.last_send()
@@ -273,7 +275,8 @@ def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
     def has(label):
         return any(label in lbl for lbl in inline)
 
-    assert has("1680 Follow up")
+    assert has("1680")
+    assert any("催租" in lbl or "Follow up" in lbl for lbl in inline)
     # Tap the follow-up -> Rent detail card with the 3 actions.
     data = _inline_data(send["reply_markup"])
     followup_cb = next(d for d in data if d.split(":")[1] == "rnq")
@@ -283,15 +286,16 @@ def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
     )
     detail_edit = env.bot.edits()[-1]
     detail_text = detail_edit["text"]
-    assert "1680" in detail_text and "Outstanding" in detail_text
+    assert "1680" in detail_text
+    assert "未付" in detail_text or "Outstanding" in detail_text
     detail_labels = _inline_labels(detail_edit["reply_markup"])
 
     def has_detail(label):
         return any(label in lbl for lbl in detail_labels)
 
-    assert has_detail("Follow up")
-    assert has_detail("💰 Record payment")
-    assert has_detail("📜 History")
+    assert any("催租" in lbl or "Follow up" in lbl for lbl in detail_labels)
+    assert any("收租" in lbl or "Collect" in lbl for lbl in detail_labels)
+    assert any("记录" in lbl or "History" in lbl for lbl in detail_labels)
 
 
 def test_rent_overdue_followup_edits_in_place_not_new_message(make_app):
@@ -312,9 +316,11 @@ def test_rent_overdue_followup_edits_in_place_not_new_message(make_app):
 
 
 def test_secretary_remind_owner_waits_payment_sends_exactly_one(make_app):
-    """Section 六/九: a waiting-payment expense gives the Secretary a working
-    🔔 Remind Owner action that sends exactly one reminder message with full
-    context (property/unit, purpose, amount, approved date, waiting)."""
+    """CONVERGENCE-003 §4.2/§4.4: the Expense LIST carries one short
+    ``E{id} · Open`` button per payable row (list = reading); the Remind
+    action lives on the DETAIL card and sends exactly one reminder message
+    with full context. A second tap the same day is deduped
+    ("Already reminded today / 今日已提醒")."""
     env = make_app(backend=ConvergeBackend())
     run_updates(
         env,
@@ -326,14 +332,29 @@ def test_secretary_remind_owner_waits_payment_sends_exactly_one(make_app):
     def has(label):
         return any(label in lbl for lbl in inline)
 
-    assert has("🔔 Remind Owner")
+    # The list must NOT carry the long per-row Remind buttons any more.
+    assert has("E1 · Open")
+    assert has("E2 · Open")
+    assert not any("Remind Owner" in lbl for lbl in inline)
     data = _inline_data(send["reply_markup"])
-    remind_cb = next(d for d in data if d.split(":")[1] == "rmo")
+    open_cb = next(d for d in data if d.split(":")[1] == "exo")
+    run_updates(
+        env,
+        [make_callback_update(SECRETARY_ID, GROUP_CHAT_ID, open_cb,
+                              message_id=send["message_id"], bot=env.bot)],
+    )
+    detail = env.bot.edits()[-1]
+    detail_labels = _inline_labels(detail["reply_markup"])
+    assert any("提醒" in lbl or "Remind" in lbl for lbl in detail_labels)
+
+    remind_cb = next(
+        d for d in _inline_data(detail["reply_markup"]) if d.split(":")[1] == "rmo"
+    )
     sends_before = len(env.bot.sends())
     run_updates(
         env,
         [make_callback_update(SECRETARY_ID, GROUP_CHAT_ID, remind_cb,
-                              message_id=send["message_id"], bot=env.bot)],
+                              message_id=detail["message_id"], bot=env.bot)],
     )
     # Exactly one new reminder message.
     assert len(env.bot.sends()) == sends_before + 1
@@ -343,6 +364,14 @@ def test_secretary_remind_owner_waits_payment_sends_exactly_one(make_app):
     assert "Approved 2026-08-15" in reminder
     for banned in BANNED_TEXT:
         assert banned not in reminder
+    # Same-day repeat tap -> no second send ("already reminded").
+    sends_after_first = len(env.bot.sends())
+    run_updates(
+        env,
+        [make_callback_update(SECRETARY_ID, GROUP_CHAT_ID, remind_cb,
+                              message_id=detail["message_id"], bot=env.bot)],
+    )
+    assert len(env.bot.sends()) == sends_after_first  # deduped, no new send
 
 
 def test_property_archive_link_present(make_app):

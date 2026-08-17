@@ -75,6 +75,8 @@ class ExpenseBase(BaseModel):
     # routes to this user after approval instead of always the Owner.
     payer_user_id: int | None = None
 
+
+class ExpenseCreate(ExpenseBase):
     @field_validator("category")
     @classmethod
     def _category_meaningful(cls, value: str) -> str:
@@ -86,10 +88,6 @@ class ExpenseBase(BaseModel):
         # `-` stays allowed: it is the bot's established DB-NOT-NULL "unknown
         # vendor" sentinel and is never rendered as a purpose.
         return _meaningful_label(value, field_name="payee", allow_dash=True)
-
-
-class ExpenseCreate(ExpenseBase):
-    pass
 
 
 class ExpenseUpdate(BaseModel):

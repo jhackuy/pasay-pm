@@ -384,7 +384,9 @@ def test_rent_quick_view_owner_chinese(make_app):
     text = env.bot.last_send()["text"]
     assert "逾期租金" in text
     assert "₱75,000" in text
-    assert "未收总额：₱99,000" in text
+    # CONVERGENCE-003 §9: distinct labels — this-month outstanding vs arrears.
+    assert "本月未收 ₱99,000" in text
+    assert "历史累计欠租 ₱99,000" in text
     assert "overdue 12d" not in text  # owner private chat is Chinese-first
 
 
@@ -408,11 +410,11 @@ def test_rent_quick_view_month_statistics(make_app):
     text = env.bot.last_send()["text"]
     assert "本月应收 ₱150,000" in text
     assert "已收 ₱51,000" in text
-    assert "未收 ₱99,000" in text
+    assert "本月未收 ₱99,000" in text
     assert "收缴率 34%" in text
     assert "未缴房间 2 间" in text
-    # The overdue aggregate line stays too.
-    assert "未收总额：₱99,000" in text
+    # The overdue aggregate line stays too (distinct label, §9).
+    assert "历史累计欠租 ₱99,000" in text
 
 
 def test_expense_quick_view_shows_amounts(make_app):

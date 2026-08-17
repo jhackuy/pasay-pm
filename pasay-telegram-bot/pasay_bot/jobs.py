@@ -64,12 +64,20 @@ async def _send_next_check_reminders(
     app: Application, api: PasayApiClient, store: StateStore
 ) -> None:
     """Active tasks whose next_check_at is due get a bilingual reminder card.
-    The backend remains the source of truth; this job only reads."""
+    The backend remains the source of truth; this job only reads.
+
+    CONVERGENCE-003 §1.3/§1.4: the job may scan as often as the scheduler
+    wants, but the SAME task + group chat + PH local date is pushed at most
+    once per Philippines natural day — the SQLite ``daily_marks`` table makes
+    the dedupe persistent and restart-safe."""
     try:
         tasks = await api.get_quick_tasks()
     except PasayApiError as exc:
         logger.debug("next_check scan failed: %s", exc)
         return
+    from pasay_bot.state.store import ph_local_date
+
+    local_date = ph_local_date()
     now = datetime.now(timezone.utc)
     due = [
         t for t in tasks
@@ -84,6 +92,10 @@ async def _send_next_check_reminders(
     for task in due:
         text = cards.task_event_card("updated", task, _digest_locale())
         for group in groups:
+            # Same-day dedupe per (task, group chat): one push per PH day.
+            mark_key = f"next_check:{task.get('id')}:{group['chat_id']}:{local_date}"
+            if not store.mark_daily(mark_key):
+                continue
             try:
                 await app.bot.send_message(group["chat_id"], text, parse_mode="HTML")
             except Exception as exc:  # noqa: BLE001

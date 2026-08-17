@@ -1114,9 +1114,11 @@ def expense_result_card(expense: Expense, locale: str = "zh", location: str = ""
 
 def expense_detail_card(
     expense: Expense, locale: str = "zh", location: str = "",
+    waiting_days: int = 0,
 ) -> str:
-    """Human-readable expense detail. Receipt presence is shown as a label;
-    raw attachment ids stay internal."""
+    """Human-readable expense detail (CONVERGENCE-003 §4.3): property/unit,
+    category/purpose, amount, approved date, waiting days, status. Receipt
+    presence is shown as a label; raw attachment ids stay internal."""
     lines = [f"<b>{H.escape(t('expense.detail_title', locale))}</b>"]
     loc = _expense_location(expense, location)
     if loc:
@@ -1137,6 +1139,23 @@ def expense_detail_card(
         lines.append(
             f"{H.escape(t('expense.due_date', locale))}：{H.format_date(expense.due_date)}"
         )
+    if getattr(expense, "approved_at", None):
+        approved = str(expense.approved_at)[:10]
+        lines.append(
+            H.escape(_bi_value(
+                locale,
+                f"Approved {approved}",
+                f"批准于 {approved}",
+            ))
+        )
+        if waiting_days:
+            lines.append(
+                H.escape(_bi_value(
+                    locale,
+                    f"Waiting {waiting_days}d",
+                    f"已等待 {waiting_days} 天",
+                ))
+            )
     lines.append(
         f"{H.escape(t('ops.status', locale))}：{_expense_status_label(expense.status, locale)}"
     )
@@ -1402,22 +1421,46 @@ def unit_timeline_card(timeline: dict, unit_number: str, locale: str = "zh") -> 
 
 def home_summary_card(
     *,
+    expected=None,
     collected,
-    unpaid_count: int,
-    pending_approvals: int,
-    expiring_contracts: int,
-    maintenance_open: int,
+    outstanding=None,
+    total_arrears=None,
+    overdue_count: int = 0,
+    expiring_count: int = 0,
+    vacant_count: int = 0,
+    payable_count: int = 0,
+    maintenance_open: int = 0,
+    today_count: int = 0,
     locale: str = "zh",
 ) -> str:
-    """P0 spec home: operational summary only (no second navigation)."""
+    """CONVERGENCE-003 §2.2 Home = Telegram lightweight Operations Overview.
+
+    Ten deterministic numbers: this month expected / collected / outstanding,
+    historical total arrears, overdue units, expiring contracts, vacant units,
+    expenses awaiting payment, open maintenance, and items needing action
+    today. No first-level menu buttons live on the card (the fixed Reply
+    Keyboard carries navigation); only the two situational actions (⚠️ Today /
+    🔄 Refresh) ride on the keyboard.
+    """
     lines = ["<b>Pasay Property</b>"]
-    lines.append(
-        f"{H.escape(t('home.collected', locale))}：<b>{H.money(collected)}</b>"
-    )
-    lines.append(H.escape(t("home.unpaid_count", locale, count=unpaid_count)))
-    lines.append(H.escape(t("home.pending_approvals", locale, count=pending_approvals)))
-    lines.append(H.escape(t("home.expiring_contracts", locale, count=expiring_contracts)))
-    lines.append(H.escape(t("home.maintenance_open", locale, count=maintenance_open)))
+    if expected is not None:
+        lines.append(H.escape(_bi_value(locale, f"Expected {H.money(expected)}", f"本月应收 {H.money(expected)}")))
+    lines.append(H.escape(_bi_value(locale, f"Collected {H.money(collected)}", f"本月已收 {H.money(collected)}")))
+    if outstanding is not None:
+        lines.append(H.escape(_bi_value(locale, f"Outstanding {H.money(outstanding)}", f"本月未收 {H.money(outstanding)}")))
+    if total_arrears is not None:
+        lines.append(H.escape(_bi_value(locale, f"Arrears {H.money(total_arrears)}", f"历史累计欠租 {H.money(total_arrears)}")))
+    lines.append(H.escape(_bi_value(locale, f"Overdue {overdue_count}", f"逾期数量 {overdue_count}")))
+    if expiring_count:
+        lines.append(H.escape(_bi_value(locale, f"Expiring {expiring_count}", f"合同即将到期 {expiring_count}")))
+    if vacant_count:
+        lines.append(H.escape(_bi_value(locale, f"Vacant {vacant_count}", f"空置数量 {vacant_count}")))
+    if payable_count:
+        lines.append(H.escape(_bi_value(locale, f"To pay {payable_count}", f"待付款支出 {payable_count}")))
+    if maintenance_open:
+        lines.append(H.escape(_bi_value(locale, f"Maintenance {maintenance_open}", f"未完成维修 {maintenance_open}")))
+    if today_count:
+        lines.append(H.escape(_bi_value(locale, f"Today {today_count}", f"今日需要处理 {today_count}")))
     return "\n".join(lines)
 
 
@@ -1725,8 +1768,14 @@ _V2_STATUS_EMOJI = {
 
 def _bi_line(locale: str, en: str, zh: str) -> str:
     """One visible business line: English + 中文 in group mode; single
-    language otherwise. Callers escape HTML before passing fragments in."""
+    language otherwise. Callers escape HTML before passing fragments in.
+
+    CONVERGENCE-003 §6: when the zh fragment is identical to the en fragment
+    it is rendered ONCE — a missing/English-identical translation never
+    duplicates a line (e.g. a unit-only task row must not print twice)."""
     if locale == "bi":
+        if zh == en or not zh:
+            return en
         return f"{en}\n{zh}"
     return en if locale == "en" else zh
 
@@ -1734,7 +1783,19 @@ def _bi_line(locale: str, en: str, zh: str) -> str:
 def _bi_header(locale: str, en: str, zh: str) -> str:
     """Compact one-line bilingual header, e.g. 'Pending / 未完成'."""
     if locale == "bi":
+        if zh == en or not zh:
+            return en
         return f"{en} / {zh}"
+    return en if locale == "en" else zh
+
+
+def _bi_value(locale: str, en: str, zh: str) -> str:
+    """Compact one-line bilingual VALUE, e.g. 'Outstanding ₱75,000 · 未付
+    ₱75,000' (CONVERGENCE-003 §6.1) — one line, never two."""
+    if locale == "bi":
+        if zh == en or not zh:
+            return en
+        return f"{en} · {zh}"
     return en if locale == "en" else zh
 
 
@@ -1807,30 +1868,46 @@ def rent_detail_card(
     tenant + outstanding + unpaid periods + overdue days + last follow-up. Only
     the fields that are real are shown; ``vacant`` shows the vacant line. The
     buttons (Follow up / Record payment / History) ride on the keyboard, never
-    in the text."""
+    in the text.
+
+    CONVERGENCE-003 §6: fields render as ONE bilingual line
+    (``Outstanding ₱75,000 · 未付 ₱75,000``) — never two duplicated lines."""
     title = H.escape(t("v2.rent_detail_title", locale, unit=H.escape(unit_label)))
     lines = [f"<b>{title}</b>"]
     if vacant:
         lines.append(H.escape(t("v2.rent_vacant", locale)))
         return "\n".join(lines)
     if tenant_name:
-        lines.append(H.escape(t("v2.rent_tenant", locale, tenant=H.escape(tenant_name))))
-    if outstanding is not None:
         lines.append(
-            f"{H.escape(t('v2.rent_detail_outstanding', locale, amount=H.money(outstanding)))}"
+            H.escape(_bi_value(locale, f"Tenant: {tenant_name}", f"租客：{tenant_name}"))
+        )
+    if outstanding is not None:
+        money = H.money(outstanding)
+        lines.append(
+            H.escape(_bi_value(locale, f"Outstanding {money}", f"未付 {money}"))
         )
     if unpaid_periods > 0:
         lines.append(
-            H.escape(t("v2.rent_unpaid_periods", locale, count=int(unpaid_periods)))
+            H.escape(_bi_value(
+                locale,
+                f"Unpaid periods: {int(unpaid_periods)}",
+                f"未付期数：{int(unpaid_periods)}",
+            ))
         )
     if overdue_days >= 0:
         lines.append(
-            H.escape(t("v2.rent_overdue", locale, days=int(overdue_days)))
+            H.escape(_bi_value(
+                locale,
+                f"Overdue {int(overdue_days)}d",
+                f"逾期 {int(overdue_days)} 天",
+            ))
         )
     if last_followup:
-        lines.append(H.escape(t("v2.rent_last_followup", locale, date=H.escape(last_followup))))
+        lines.append(
+            H.escape(_bi_value(locale, f"Last follow-up: {last_followup}", f"最近催租：{last_followup}"))
+        )
     else:
-        lines.append(H.escape(t("v2.rent_no_last_followup", locale)))
+        lines.append(H.escape(_bi_value(locale, "Last follow-up: none", "最近催租：无")))
     return "\n".join(lines)
 
 
@@ -1962,19 +2039,60 @@ def _clean_task_title(value) -> str:
 
 
 def _v2_task_line(task: dict, locale: str, emoji: str) -> str:
-    """One active-task row: unit · title · due/overdue · next action."""
+    """One active-task row: unit · title · due/overdue · next action.
+
+    CONVERGENCE-003 §5.3/§8: rows carry the REAL business context so two
+    identical-looking reminders stay distinguishable and an overdue rent item
+    never reads as ``due in 0d``:
+    - payable/approval expenses: ``💸 E{id} · unit · purpose · ₱amount ·
+      waiting Nd``
+    - overdue rent: ``🔴 unit · ₱amount · N period(s) · overdue Nd`` + the
+      next action line (the ACTION deadline, never the rent due date)."""
     unit = H.escape(str(task.get("property_code") or task.get("unit_code") or ""))
     title = H.escape(_clean_task_title(task.get("title")) or t("ops.task", locale))
+    task_type = str(task.get("task_type") or "").upper()
     en_parts: list[str] = []
     zh_parts: list[str] = []
+    # Stable business identity: expense tasks carry E{id}, rent tasks the
+    # unit — a human can tell E7 apart from E8 without reading the title.
+    expense_id = task.get("expense_id")
+    if expense_id is not None:
+        id_part = f"E{int(expense_id)}"
+        en_parts.append(id_part)
+        zh_parts.append(id_part)
     if unit:
         en_parts.append(unit)
         zh_parts.append(unit)
-    en_parts.append(title)
-    zh_parts.append(title)
+    if task_type in ("PAYMENT_PENDING", "APPROVAL_PENDING"):
+        purpose = H.escape(_clean_free_text(task.get("purpose")) or "")
+        amount = task.get("amount")
+        if purpose:
+            en_parts.append(purpose)
+            zh_parts.append(purpose)
+        if amount is not None:
+            en_parts.append(H.money(amount))
+            zh_parts.append(H.money(amount))
+    elif task_type == "RENT_OVERDUE":
+        amount = task.get("amount")
+        periods = task.get("unpaid_periods")
+        if amount is not None:
+            en_parts.append(H.money(amount))
+            zh_parts.append(H.money(amount))
+        if periods:
+            en_parts.append(f"{int(periods)} period(s)")
+            zh_parts.append(f"{int(periods)}期")
+    else:
+        en_parts.append(title)
+        zh_parts.append(title)
     overdue_days = task.get("overdue_days")
     due_days = task.get("due_in_days")
-    if overdue_days is not None:
+    waiting = task.get("waiting_days")
+    if waiting is None and task_type in ("PAYMENT_PENDING", "APPROVAL_PENDING") and overdue_days is not None:
+        waiting = overdue_days  # an approved-but-unpaid expense "waits", it does not overduplicate
+    if waiting is not None:
+        en_parts.append(t("v2.waiting_days", "en", days=int(waiting)))
+        zh_parts.append(t("v2.waiting_days", "zh", days=int(waiting)))
+    elif overdue_days is not None:
         en_parts.append(t("v2.overdue_days", "en", days=overdue_days))
         zh_parts.append(t("v2.overdue_days", "zh", days=overdue_days))
     elif due_days is not None:
@@ -2124,17 +2242,17 @@ def _properties_summary_line(locale: str, total: int, occupied: int, vacant: int
 
 def _payable_expense_line(row: dict, locale: str) -> str:
     """One payable (APPROVED, unpaid) expense row with a stable visible
-    identity: ``💸 E{id} · unit · purpose · amount · Approved`` (plain text,
-    never a Telegram ``#E{id}`` hashtag). The database expense id is the
-    stable identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3), so same-day /
-    same-amount expenses stay distinguishable."""
+    identity: ``💸 E{id} · unit · purpose · amount`` (plain text, never a
+    Telegram ``#E{id}`` hashtag). The database expense id is the stable
+    identity (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §3), so same-day /
+    same-amount expenses stay distinguishable. CONVERGENCE-003 §10: no
+    trailing status word — the section header already says 待付款/Approved."""
     expense_id = row.get("expense_id")
     id_part = f"E{int(expense_id)}" if expense_id is not None else ""
     unit = H.escape(str(row.get("unit") or ""))
     purpose = _v2_expense_purpose(row, locale)
     amount = H.money(row.get("amount"))
-    status = H.escape(_expense_status_label(row.get("status"), locale))
-    parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>", status) if x]
+    parts = [x for x in (id_part, unit, purpose, f"<b>{amount}</b>") if x]
     return "💸 " + " · ".join(parts)
 
 
@@ -2211,8 +2329,15 @@ def rent_quick_card(data, locale: str = "bi") -> str:
             zh = f"{unit} · {amount} · " + t("v2.overdue_days", "zh", days=days or 0)
             blocks.append("🔴 " + _bi_line(locale, en, zh))
     if outstanding is not None:
+        # CONVERGENCE-003 §9: ``outstanding_total`` is the HISTORICAL arrears
+        # sum (never the current-month number) — labelled distinctly from the
+        # current-month ``outstanding_rent`` in the stats block above.
         blocks.append(
-            H.escape(t("v2.outstanding_total", locale, amount=H.money(outstanding)))
+            H.escape(_bi_value(
+                locale,
+                f"Total overdue arrears {H.money(outstanding)}",
+                f"历史累计欠租 {H.money(outstanding)}",
+            ))
         )
     return "\n\n".join(blocks)
 
@@ -2231,8 +2356,15 @@ def _rent_month_stats(
         en_parts.append(t("v2.rent_collected", "en", amount=H.money(collected)))
         zh_parts.append(t("v2.rent_collected", "zh", amount=H.money(collected)))
     if outstanding is not None:
-        en_parts.append(t("v2.rent_outstanding", "en", amount=H.money(outstanding)))
-        zh_parts.append(t("v2.rent_outstanding", "zh", amount=H.money(outstanding)))
+        # CONVERGENCE-003 §9: this month's gap is labelled "This month
+        # outstanding · 本月未收" — never plain "Outstanding" (which is the
+        # historical arrears total at the bottom of the card).
+        en_parts.append(
+            f"{H.escape(t('v2.rent_month_outstanding', 'en'))} {H.money(outstanding)}"
+        )
+        zh_parts.append(
+            f"{H.escape(t('v2.rent_month_outstanding', 'zh'))} {H.money(outstanding)}"
+        )
     if rate is not None:
         en_parts.append(t("v2.rent_collection_rate", "en", rate=_pct(rate)))
         zh_parts.append(t("v2.rent_collection_rate", "zh", rate=_pct(rate)))

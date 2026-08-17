@@ -64,15 +64,18 @@ def _expected_due(iso: str) -> str:
 
 
 def _open_followup_confirm(env):
-    """TODAY -> [1 为什么?] -> WHY -> [📞 安排秘书跟进] -> confirmation card."""
-    # PASAY-V2-FOUNDATION-001: /copilot is pruned; open TODAY via the
-    # dashboard "更多" fallback's 🤖 运营助手 nav button.
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "更多", bot=env.bot)])
-    dashboard = env.bot.last_send()
-    copilot_btn = _find_button(dashboard["reply_markup"], "🤖 运营助手")
+    """TODAY -> [1 为什么?] -> WHY -> [📞 安排秘书跟进] -> confirmation card.
+
+    CONVERGENCE-003 §2.3: the Operations Assistant is no longer a MENU page
+    entry, so TODAY is entered through its deterministic callback (the same
+    route any retained/pinned entry or future NL wiring uses)."""
+    from pasay_bot.keyboards import ACTION_COPILOT_NAV, encode, new_nonce, now_ts
+
     run_updates(
         env,
-        [make_callback_update(OWNER_ID, OWNER_ID, copilot_btn.callback_data, bot=env.bot)],
+        [make_callback_update(OWNER_ID, OWNER_ID,
+                              encode(ACTION_COPILOT_NAV, "today", nonce=new_nonce(), ts=now_ts()),
+                              bot=env.bot)],
     )
     today = env.bot.last_edit()
     why_btn = _find_button(today["reply_markup"], "1 为什么?")
@@ -318,12 +321,13 @@ def test_copilot_followup_confirm_flow(make_app):
 def test_copilot_snooze_entry_preset_and_execute(make_app):
     env = make_app()
     backend = env.backend
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "更多", bot=env.bot)])
-    dashboard = env.bot.last_send()
-    copilot_btn = _find_button(dashboard["reply_markup"], "🤖 运营助手")
+    from pasay_bot.keyboards import ACTION_COPILOT_NAV, encode, new_nonce, now_ts
+
     run_updates(
         env,
-        [make_callback_update(OWNER_ID, OWNER_ID, copilot_btn.callback_data, bot=env.bot)],
+        [make_callback_update(OWNER_ID, OWNER_ID,
+                              encode(ACTION_COPILOT_NAV, "today", nonce=new_nonce(), ts=now_ts()),
+                              bot=env.bot)],
     )
     today = env.bot.last_edit()
     why_btn = _find_button(today["reply_markup"], "2 为什么?")  # task item
@@ -454,12 +458,13 @@ def test_copilot_notify_retry_409_human_card(make_app):
 
 def test_copilot_why_suggestions_owner_only_and_forged_confirm_refused(make_app):
     env = make_app()
-    run_updates(env, [make_text_update(SECRETARY_ID, SECRETARY_ID, "更多", bot=env.bot)])
-    dashboard = env.bot.last_send()
-    copilot_btn = _find_button(dashboard["reply_markup"], "🤖 Operations Assistant")
+    from pasay_bot.keyboards import ACTION_COPILOT_NAV, encode, new_nonce, now_ts
+
     run_updates(
         env,
-        [make_callback_update(SECRETARY_ID, SECRETARY_ID, copilot_btn.callback_data, bot=env.bot)],
+        [make_callback_update(SECRETARY_ID, SECRETARY_ID,
+                              encode(ACTION_COPILOT_NAV, "today", nonce=new_nonce(), ts=now_ts()),
+                              bot=env.bot)],
     )
     today = env.bot.last_edit()
     why_btn = today["reply_markup"].inline_keyboard[0][0]  # secretary locale: "1 Why?"

@@ -115,9 +115,9 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
         elif route == "pending":
             await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
         elif route == "more":
-            await pages.show_dashboard(
-                context, chat_id, locale, role=role,
-                message_id=message_id, fallback_inline=True,
+            # CONVERGENCE-003 §2.1: "☰ 更多" (legacy) opens the ONE Home.
+            await pages.show_home(
+                context, chat_id, role, locale, message_id=message_id
             )
         elif route == "tenants":
             await context.bot.send_message(

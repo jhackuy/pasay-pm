@@ -870,8 +870,12 @@ def test_reconciliation_approval_pending_cancelled_when_rejected(db_session, mon
 
 
 def test_reconciliation_rent_due_completes_when_covered(db_session, monkeypatch):
+    # Lease starting this month (due 13th, inside the 3-day advance window):
+    # NO overdue periods, so the scheduler creates RENT_DUE (not RENT_OVERDUE).
+    # CONVERGENCE-003 §1.2: when overdue periods exist the RENT_DUE is skipped
+    # (RENT_OVERDUE supersedes it), so this fixture must be overdue-free.
     _seed_default_assignee(db_session, monkeypatch)
-    _seed_lease(db_session, due_day=13)  # Aug 13 inside the 3-day advance window
+    _seed_lease(db_session, start="2026-08-01", due_day=13)
     db_session.commit()
     run_scheduler_once(db_session, now=NOW)
     task = db_session.query(OperationalTask).filter_by(

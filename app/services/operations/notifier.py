@@ -197,22 +197,38 @@ def process_notifications_once(
 def _claim_row(db: Session, outbox_id: int, *, now: datetime) -> NotificationOutbox | None:
     """Atomic claim + validation in ONE transaction (COMMITs before returning).
 
-    Snooze-redelivery rows: locks the TASK row first (lock order task -> outbox,
-    matching the API transition path) and re-validates the reminder against the
-    CURRENT task state; stale rows are DROPPED here, before any send. The claim
-    itself is a conditional UPDATE (status=PENDING + claim lease), so concurrent
-    workers cannot double-claim a live row.
+    Send-time guard (TELEGRAM-OPS-UX-CONVERGENCE-003 §1.5): for EVERY outbox
+    row that references a task, the TASK row is locked first (lock order task
+    -> outbox, matching the API transition path) and the reminder is only
+    valid while the task is still PENDING. A task that was completed /
+    cancelled / superseded / acknowledged (IN_PROGRESS) between enqueue and
+    send makes the row stale — it is DROPPED here, before any send, so a
+    resolved business item is never re-reminded ("Completed/Paid/Collected ->
+    permanently stop").
+
+    Snooze-redelivery rows additionally re-validate the reminder generation
+    and the snooze window against the CURRENT task state (V1.2.2 hardening).
+    The claim itself is a conditional UPDATE (status=PENDING + claim lease),
+    so concurrent workers cannot double-claim a live row.
     """
     row = db.get(NotificationOutbox, outbox_id)
     if row is None or row.status != NotificationStatus.PENDING:
         db.rollback()
         return None
-    if is_snooze_redelivery_key(row.dedupe_key):
+    if row.task_id is not None:
         task = _lock_task(db, row.task_id)
-        if not _redelivery_still_valid(db, row, task, now):
-            _drop_stale_row(db, row, now=now)
+        if task is None or task.status != OperationalTaskStatus.PENDING:
+            _drop_stale_row(
+                db, row, now=now,
+                reason="task no longer PENDING (completed/cancelled/acknowledged)",
+            )
             db.commit()
             return None
+        if is_snooze_redelivery_key(row.dedupe_key):
+            if not _redelivery_still_valid(db, row, task, now):
+                _drop_stale_row(db, row, now=now)
+                db.commit()
+                return None
     res = db.execute(
         update(NotificationOutbox)
         .where(
@@ -281,7 +297,9 @@ def _dedupe_generation(dedupe_key: str | None) -> int | None:
         return None
 
 
-def _drop_stale_row(db: Session, row: NotificationOutbox, *, now: datetime) -> None:
+def _drop_stale_row(
+    db: Session, row: NotificationOutbox, *, now: datetime, reason: str = "task no longer warrants the snoozed reminder"
+) -> None:
     old = serialize_row(row)
     res = db.execute(
         update(NotificationOutbox)
@@ -301,7 +319,7 @@ def _drop_stale_row(db: Session, row: NotificationOutbox, *, now: datetime) -> N
             actor_id=None,  # system / notifier guard
             changed_fields={
                 "status": ["PENDING", "DROPPED"],
-                "reason": "task no longer warrants the snoozed reminder",
+                "reason": reason,
             },
             old_value=old,
             new_value=serialize_row(row),

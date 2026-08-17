@@ -1058,6 +1058,13 @@ class PasayApiClient:
         data = await self._request("POST", f"/operations/tasks/{task_id}/cancel")
         return OperationalTask.from_dict(data["task"])
 
+    async def acknowledge_operational_task(self, task_id: int) -> OperationalTask:
+        """CONVERGENCE-003 §1.5: ✅ Acknowledge — PENDING -> IN_PROGRESS, stops
+        same-day proactive reminders. Idempotent (repeat tap returns the
+        current task)."""
+        data = await self._request("POST", f"/operations/tasks/{task_id}/acknowledge")
+        return OperationalTask.from_dict(data["task"])
+
     # --- PASAY-V2-FOUNDATION-001: conversation-driven task create/update ---
     async def create_operational_task(
         self,

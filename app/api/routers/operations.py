@@ -393,6 +393,70 @@ def cancel_task(
     return TaskActionOut(task=current, detail="Task already cancelled")
 
 
+@router.post("/tasks/{task_id}/acknowledge", response_model=TaskActionOut)
+def acknowledge_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """✅ Acknowledge (TELEGRAM-OPS-UX-CONVERGENCE-003 §1.5): one tap on the
+    reminder card stops today's proactive reminders for this business item.
+
+    PENDING -> IN_PROGRESS (the product rule: "in progress -> stop the
+    corresponding reminders"; the notifier send-time guard drops any pending
+    outbox row for a non-PENDING task, so no further reminder can reach
+    Telegram). ``next_action``/``next_check_at`` get deterministic defaults
+    when the task never carried them (the V2 transition rule requires both
+    for IN_PROGRESS). Idempotent: a repeat tap on an already-acknowledged
+    task returns the current state.
+    """
+    task = _get_task_or_404(db, task_id)
+    _require_access(task, user)
+    now = datetime.now(timezone.utc)
+    if task.status != OperationalTaskStatus.PENDING:
+        return TaskActionOut(task=task, detail="Task already acknowledged")
+    next_action = task.next_action or f"Acknowledged: {task.title}"
+    next_check_at = task.next_check_at or (now + timedelta(days=1))
+    old = serialize_row(task)
+    result = db.execute(
+        update(OperationalTask)
+        .where(OperationalTask.id == task_id, OperationalTask.status == OperationalTaskStatus.PENDING)
+        .values(
+            status=OperationalTaskStatus.IN_PROGRESS,
+            next_action=next_action,
+            next_check_at=next_check_at,
+            reminder_generation=OperationalTask.reminder_generation + 1,
+            updated_by=user.id,
+            updated_at=now,
+        ),
+        execution_options={"synchronize_session": False},
+    )
+    if result.rowcount == 1:
+        db.refresh(task)
+        record_audit(
+            db,
+            table_name="operational_tasks",
+            record_id=task.id,
+            action="task_acknowledged",
+            actor_id=user.id,
+            changed_fields={
+                "status": ["PENDING", "IN_PROGRESS"],
+                "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
+            },
+            old_value=old,
+            new_value=serialize_row(task),
+        )
+        suppress_pending_redeliveries(
+            db, task_id, actor_id=user.id, reason="task_acknowledged", now=now
+        )
+        db.commit()
+        db.refresh(task)
+        return TaskActionOut(task=task, detail="Task acknowledged")
+    db.rollback()
+    current = _get_task_or_404(db, task_id)
+    return TaskActionOut(task=current, detail="Task already acknowledged")
+
+
 # ---------------------------------------------------------------------------
 # PASAY-V2-FOUNDATION-001: conversation-driven task updates / creation
 # ---------------------------------------------------------------------------

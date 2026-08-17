@@ -271,20 +271,34 @@ def _agent_scope(query, user: User):
 
 
 def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int, str]) -> dict:
-    """One active-task row in the shape the bot cards expect."""
+    """One active-task row in the shape the bot cards expect.
+
+    CONVERGENCE-003 §8: rows also carry the business context the cards need to
+    distinguish identical-looking reminders (payable amount, purpose, unit,
+    expense id, unpaid periods, total outstanding) — a renderer never has to
+    re-derive the same business fact itself."""
     unit = unit_number_by_lease.get(task.lease_id)
+    details = task.details or {}
     return {
         "id": task.id,
         "task_type": task.task_type.value,
         "title": task.title,
         "status": task.status.value,
-        "property_code": unit or (task.details or {}).get("unit_number"),
+        "property_code": unit or details.get("unit_number"),
         "due_at": task.due_at.isoformat() if task.due_at else None,
         "next_action": task.next_action,
         "next_check_at": task.next_check_at.isoformat() if task.next_check_at else None,
         "completion_condition": task.completion_condition,
         "context": task.context,
         "source_event": task.source_event,
+        # CONVERGENCE-003 §8: truthful business context (never raw sentinels).
+        "amount": _d2(details.get("amount") or details.get("total_outstanding"))
+        if (details.get("amount") or details.get("total_outstanding")) is not None
+        else None,
+        "purpose": _clean_text(details.get("category")) or _clean_text(details.get("payee")),
+        "expense_id": details.get("expense_id"),
+        "period": details.get("period"),
+        "unpaid_periods": len(details["periods"]) if isinstance(details.get("periods"), list) else None,
     }
 
 
@@ -622,6 +636,25 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
         .filter(Unit.id.in_([l.unit_id for l in leases]))
         .all()
     }
+    # CONVERGENCE-003 §5/§7: the last follow-up timestamp per lease — the
+    # newest operational task the business created for the lease (a rent
+    # follow-up is expressed as an operational task, never only a chat line).
+    followup_by_lease: dict[int, str] = {}
+    if leases:
+        followup_tasks = (
+            db.query(OperationalTask)
+            .filter(
+                OperationalTask.lease_id.in_([l.id for l in leases]),
+                OperationalTask.task_type.in_(
+                    [OperationalTaskType.RENT_OVERDUE, OperationalTaskType.FOLLOWUP]
+                ),
+            )
+            .order_by(OperationalTask.created_at.desc(), OperationalTask.id.desc())
+            .all()
+        )
+        for ft in followup_tasks:
+            if ft.lease_id is not None and ft.lease_id not in followup_by_lease:
+                followup_by_lease[ft.lease_id] = ft.created_at.isoformat()
     overdue_rows: list[dict] = []
     outstanding = Decimal("0.00")
     expected_rent = Decimal("0.00")
@@ -655,7 +688,13 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
                 "unit": _unit_label(db, unit) or unit.unit_number,
                 "unit_code": _unit_label(db, unit) or unit.unit_number,
                 "amount": total,
+                # CONVERGENCE-003 §7: the SAME truth source as the RENT_OVERDUE
+                # task generator (len(overdue) uncovered periods) — the bot's
+                # Rent detail must never hardcode its own period count.
+                "unpaid_periods": len(overdue),
+                "monthly_rent": _d2(lease.monthly_rent),
                 "overdue_days": max((today - oldest_due).days, 0),
+                "last_followup_at": followup_by_lease.get(lease.id),
             }
         )
     overdue_rows.sort(key=lambda r: r["overdue_days"], reverse=True)

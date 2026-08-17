@@ -55,6 +55,9 @@ class AuditAction(str, Enum):
     # AI-OPS-FOUNDATION-001 §8: an unresolved promise/follow-up escalated to
     # the Owner per policy (deterministic, system-triggered).
     task_escalated = "task_escalated"
+    # TELEGRAM-OPS-UX-CONVERGENCE-003 §1.5: the human tapped ✅ Acknowledge on
+    # a proactive reminder (PENDING -> IN_PROGRESS, reminders stop for today).
+    task_acknowledged = "task_acknowledged"
 
 
 class AuditLog(AuditMixin, Base):

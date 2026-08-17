@@ -36,6 +36,7 @@ from pasay_bot.handlers.commands import (
     show_operations_section,
 )
 from pasay_bot.keyboards import (
+    ACTION_ACK,
     ACTION_CANCEL,
     ACTION_CONFIRM,
     ACTION_COPILOT_ASK,
@@ -52,9 +53,11 @@ from pasay_bot.keyboards import (
     ACTION_EDIT,
     ACTION_AI_CHOICE,
     ACTION_EXPENSE_APPROVE,
+    ACTION_EXPENSE_BACK,
     ACTION_EXPENSE_CREATE,
     ACTION_EXPENSE_DETAIL,
     ACTION_EXPENSE_EDIT,
+    ACTION_EXPENSE_OPEN,
     ACTION_EXPENSE_PAY,
     ACTION_EXPENSE_PAY_CONFIRM,
     ACTION_EXPENSE_REJECT,
@@ -101,6 +104,7 @@ from pasay_bot.keyboards import (
     expense_confirm_keyboard,
     expense_detail_keyboard,
     expense_edit_keyboard,
+    expense_open_keyboard,
     expense_pay_confirm_keyboard,
     expense_pay_result_keyboard,
     expense_result_keyboard,
@@ -395,6 +399,16 @@ async def _dispatch_callback(
         await _handle_rent_followup(update, context, ref, role, locale)
     elif action == ACTION_REMIND_OWNER:
         await _handle_remind_owner(update, context, ref, nonce, ts, role, locale)
+    elif action == ACTION_ACK:
+        # CONVERGENCE-003 §1.5: ✅ Acknowledge on a proactive reminder card.
+        await _handle_ack(update, context, ref, role, locale)
+    elif action == ACTION_EXPENSE_OPEN:
+        # CONVERGENCE-003 §4.3: E{id} Open on the Expense list -> detail.
+        # The expense id rides in `entity` (mirrors ACTION_EXPENSE_DETAIL).
+        await _handle_expense_detail(update, context, entity, role, locale)
+    elif action == ACTION_EXPENSE_BACK:
+        # CONVERGENCE-003 §4.3: ◀ Back on the Expense detail -> list.
+        await _handle_expense_back(update, context, role, locale)
     else:
         logger.warning("unknown callback action=%r data=%r", action, update.callback_query.data)
         await _answer(update, t("common.invalid", locale))
@@ -420,7 +434,10 @@ async def _handle_nav(update, context, entity, role, locale):
     elif entity == "pending":
         await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
     else:  # home / menu
-        await show_dashboard(context, chat_id, locale, message_id=message_id)
+        # CONVERGENCE-003 §2.1: EVERY 🏠 Home callback lands on the ONE Home
+        # renderer (the Operations Overview). The legacy dashboard is never
+        # reachable from a Home button.
+        await pages.show_home(context, chat_id, role, locale, message_id=message_id)
 
 
 async def _handle_page(update, context, entity, ref, role, locale):
@@ -1017,8 +1034,9 @@ async def _handle_cancel(update, context, locale):
         store.delete_conversation(chat_id, user_id)
         await _edit(update, H.escape(t("rent.cancelled", locale)), home_keyboard(locale))
     else:
-        await show_dashboard(
-            context, chat_id, locale,
+        # CONVERGENCE-003 §2.1: cancel with no write state lands on the ONE Home.
+        await pages.show_home(
+            context, chat_id, role, locale,
             message_id=update.callback_query.message.message_id,
         )
     await _answer(update, t("rent.cancelled", locale))
@@ -1184,7 +1202,12 @@ async def _resolve_unit_id(update, context, unit_code: str):
 
 async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
     """Rent detail text from the quick-rent row + per-unit page data (tenant,
-    outstanding, unpaid periods, overdue days, last follow-up)."""
+    outstanding, unpaid periods, overdue days, last follow-up).
+
+    CONVERGENCE-003 §7: the counts come from the backend quick-rent row
+    (``unpaid_periods`` = the SAME len(overdue) the RENT_OVERDUE task generator
+    uses) — the renderer never computes its own arrears fact, so Tasks and
+    Rent detail can never disagree (3 periods / 1 period bug)."""
     last_followup = ""
     tenant_name = ""
     vacant = False
@@ -1209,23 +1232,54 @@ async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
     overdue_days = row.get("overdue_days")
     if overdue_days is None:
         overdue_days = row.get("days") or 0
+    unpaid_periods = row.get("unpaid_periods")
+    if unpaid_periods is None:
+        # Legacy fallback: derive from amount ÷ monthly rent (truthful, never
+        # a hardcoded 1).
+        try:
+            from decimal import Decimal as _D
+            monthly = _D(str(row.get("monthly_rent") or "0"))
+            amt = _D(str(outstanding or "0"))
+            unpaid_periods = int((amt / monthly).to_integral_value()) if monthly > 0 else 0
+        except Exception:  # noqa: BLE001 - never crash the detail card
+            unpaid_periods = 0
+    raw_followup = row.get("last_followup_at")
+    if raw_followup:
+        try:
+            last_followup = str(raw_followup)[:16].replace("T", " ")
+        except Exception:  # noqa: BLE001
+            last_followup = str(raw_followup)[:16]
     return cards.rent_detail_card(
         unit_label=unit_code,
         locale=locale,
         tenant_name=tenant_name,
         outstanding=outstanding,
-        unpaid_periods=1,
+        unpaid_periods=int(unpaid_periods or 0),
         overdue_days=int(overdue_days or 0),
         last_followup=last_followup,
         vacant=vacant,
     )
 
 
+async def _followed_up_today(context, unit_id: int) -> bool:
+    """Bot-local same-day follow-up mark (SQLite, restart-safe)."""
+    try:
+        from pasay_bot.state.store import ph_local_date
+        return context.bot_data["store"].is_marked_daily(
+            f"followup:{unit_id}:{ph_local_date()}"
+        )
+    except Exception:  # noqa: BLE001 - dedup is best-effort, never fatal
+        return False
+
+
 async def _handle_rent_followup(update, context, ref, role, locale):
-    """📞 Follow up on the Rent detail: prefer an existing task (dedupe) over
-    a duplicate; otherwise create one through the existing task API. The
-    backend dedupe_key guarantees at most one active follow-up per unit, so a
-    repeat tap can never create a second task."""
+    """📞 Follow up on the Rent detail (CONVERGENCE-003 §5):
+    - same-day follow-ups never duplicate: the bot keeps a persistent
+      ``followup:{unit_id}:{ph_date}`` mark AND the backend task dedupe_key
+      guarantees at most one active follow-up per unit.
+    - the created task carries the OVERDUE truth (unit, amount, periods,
+      overdue days, next action) — it must never read as ``due in 0d``.
+    - the detail card is re-rendered in place with the real Last follow-up."""
     if not has_permission(role, PERMISSION_OPERATIONS):
         await _answer(update, t("common.no_permission", locale))
         return
@@ -1233,6 +1287,14 @@ async def _handle_rent_followup(update, context, ref, role, locale):
         await _answer(update, t("common.invalid", locale))
         return
     unit_id = int(ref)
+    store = context.bot_data["store"]
+    from pasay_bot.state.store import ph_local_date
+
+    mark_key = f"followup:{unit_id}:{ph_local_date()}"
+    if await _followed_up_today(context, unit_id):
+        await _answer(update, t("v2.followup_already_today", locale), durable=True)
+        await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=True)
+        return
     api = context.bot_data["api_client"]
     try:
         units = await api.get_units()
@@ -1243,28 +1305,58 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     if unit is None:
         await _answer(update, t("common.invalid", locale))
         return
+    # Real overdue context for the follow-up task title/details (never a fake
+    # "due in 0d" — the action deadline is TODAY because the rent is overdue).
+    unit_code = unit.unit_number
+    overdue_amount = None
+    unpaid_periods = 0
+    overdue_days = 0
+    try:
+        rent_data = await api.get_quick_rent()
+        row = next(
+            (r for r in (rent_data.get("overdue") or [])
+             if str(r.get("unit") or r.get("unit_code") or "") == unit_code),
+            None,
+        )
+        if row is not None:
+            overdue_amount = row.get("amount")
+            unpaid_periods = int(row.get("unpaid_periods") or 0)
+            overdue_days = int(row.get("overdue_days") or 0)
+    except PasayApiError:
+        pass
+    amount_part = f"₱{overdue_amount}" if overdue_amount is not None else ""
+    periods_part = f"{unpaid_periods} period(s)" if unpaid_periods else ""
+    overdue_part = f"overdue {overdue_days}d" if overdue_days else ""
+    title = f"Collect overdue rent · {unit_code}"
+    description = " · ".join(
+        x for x in (amount_part, periods_part, overdue_part) if x
+    ) or f"Collect overdue rent for {unit_code}."
     dedupe_key = f"rent-followup:unit:{unit_id}"
     try:
-        await api.create_operational_task(
+        task = await api.create_operational_task(
             task_type="RENT_OVERDUE",
-            title=f"Collect rent · {unit.unit_number}",
-            description=f"Collect overdue rent for {unit.unit_number}.",
+            title=title,
+            description=description,
             property_id=getattr(unit, "property_id", None),
-            due_at=None,
+            due_at=None,  # never "due in 0d" for an overdue item
             next_action="Follow up with tenant to collect overdue rent.",
             next_check_at=None,
             dedupe_key=dedupe_key,
             status="PENDING",
         )
     except PasayApiError as exc:
-        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
-        return
+        if getattr(exc, "detail", "") and "duplicate" in str(exc.detail).lower():
+            pass  # an active follow-up already exists — treat as success
+        else:
+            await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+            return
+    store.mark_daily(mark_key)
     await _answer(update, t("v2.followup_created", locale))
-    # Re-render the detail card (message mutation) so the user stays in place.
-    await _reopen_rent_detail(update, context, unit_id, locale)
+    # Re-render the detail card (message mutation) with the REAL state.
+    await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=True)
 
 
-async def _reopen_rent_detail(update, context, unit_id, locale):
+async def _reopen_rent_detail(update, context, unit_id, locale, followed_up_today: bool = False):
     try:
         api = context.bot_data["api_client"]
         unit = await api.get_unit(unit_id)
@@ -1277,10 +1369,21 @@ async def _reopen_rent_detail(update, context, unit_id, locale):
             tenant_name = tenant.full_name if tenant else ""
         unit_code = unit.unit_number
         row = {"amount": None, "overdue_days": 0}
+        try:
+            rent_data = await api.get_quick_rent()
+            found = next(
+                (r for r in (rent_data.get("overdue") or [])
+                 if str(r.get("unit") or r.get("unit_code") or "") == unit_code),
+                None,
+            )
+            if found is not None:
+                row = found
+        except PasayApiError:
+            pass
         text = await _render_rent_detail_text(
             api, unit_code, unit_id, row, locale
         )
-        kb = rent_detail_keyboard(unit_id, locale)
+        kb = rent_detail_keyboard(unit_id, locale, followed_up_today=followed_up_today)
         await edit_message_text_or_send(
             update.get_bot(),
             chat_id=update.effective_chat.id,
@@ -1293,15 +1396,36 @@ async def _reopen_rent_detail(update, context, unit_id, locale):
         pass  # best-effort; the toast already reported the outcome
 
 
+async def _reminded_today(context, expense_id: int) -> bool:
+    """Bot-local same-day Remind-Owner mark (SQLite, restart-safe)."""
+    try:
+        from pasay_bot.state.store import ph_local_date
+        return context.bot_data["store"].is_marked_daily(
+            f"remind_owner:{expense_id}:{ph_local_date()}"
+        )
+    except Exception:  # noqa: BLE001 - dedup is best-effort, never fatal
+        return False
+
+
 async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
-    """🔔 Remind Owner on a waiting-payment expense: one tap -> one reminder
-    message with full context. Idempotency-guarded so a single tap never fans
-    out several copies (TELEGRAM-OPS-UX-CONVERGENCE-001 §6)."""
+    """🔔 Remind Owner on a waiting-payment expense (CONVERGENCE-003 §4.4):
+    one tap -> ONE real reminder message with full context; the same-day rule
+    is enforced by a persistent daily mark, so a repeat tap today answers
+    "Already reminded today / 今日已提醒" instead of duplicating. The expense
+    detail card is re-rendered with the button flipped to ``✅ Reminded``."""
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
     expense_id = int(ref)
     api = context.bot_data["api_client"]
+    store = context.bot_data["store"]
+    from pasay_bot.state.store import ph_local_date
+
+    mark_key = f"remind_owner:{expense_id}:{ph_local_date()}"
+    if await _reminded_today(context, expense_id):
+        await _answer(update, t("v2.remind_owner_already", locale), durable=True)
+        await _render_expense_detail_in_place(update, context, expense_id, locale, reminded_today=True)
+        return
     guard = context.bot_data["idempotency"]
     key = f"ik:rmo:{expense_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="remind_owner", resource=str(expense_id))
@@ -1340,12 +1464,45 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
         locale=locale,
     )
     guard.settle(key, {"expense_id": expense_id}, resource=str(expense_id))
+    store.mark_daily(mark_key)
     await update.get_bot().send_message(
         update.effective_chat.id,
         H.truncate(text),
         parse_mode=HTML,
     )
     await _answer(update, t("v2.remind_owner_sent", locale))
+    # Flip the tapped card's Remind button to ✅ Reminded (message mutation).
+    await _render_expense_detail_in_place(update, context, expense_id, locale, reminded_today=True)
+
+
+async def _handle_ack(update, context, ref, role, locale):
+    """✅ Acknowledge on a proactive reminder card (CONVERGENCE-003 §1.5):
+    mark the task IN_PROGRESS via the backend (which stops same-day reminders
+    — the notifier drops any further outbox row for a non-PENDING task), then
+    edit the reminder message in place to the acknowledged state. Idempotent."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    if not ref.isdigit():
+        await _answer(update, t("common.invalid", locale))
+        return
+    task_id = int(ref)
+    api = context.bot_data["api_client"]
+    try:
+        await api.acknowledge_operational_task(task_id)
+    except PasayApiError as exc:
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        return
+    text = H.escape(t("v2.acknowledged_card", locale))
+    await edit_message_text_or_send(
+        update.get_bot(),
+        chat_id=update.effective_chat.id,
+        message_id=update.callback_query.message.message_id,
+        text=text,
+        parse_mode=HTML,
+        reply_markup=None,
+    )
+    await _answer(update, t("v2.acknowledged_card", locale))
 
 
 # --- V1.3 expense approval (exa / exr / exd) --------------------------------
@@ -1520,27 +1677,53 @@ async def _handle_expense_reject(update, context, expense_id_raw, nonce, ts, rol
 
 
 async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
-    """[📎 查看凭证/详情]: human-readable detail. Approve/reject stay on the
-    card while the expense is still pending AND the user is the Owner."""
+    """[Open / 查看详情] (CONVERGENCE-003 §4.3): ACK -> edit in place ->
+    Expense Detail (property, category/purpose, amount, approved date, waiting
+    days, status) with SHORT operation buttons (🔔 Remind / ✅ Paid / ◀ Back /
+    🏠 Home). Approve/reject stay while the expense is still pending AND the
+    user is the Owner. The backend read is fixed for legacy `??` categories —
+    it must never 500."""
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
     if not expense_id_raw.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
-    api = context.bot_data["api_client"]
     await _ack_working(update, locale)
+    expense_id = int(expense_id_raw)
+    await _render_expense_detail_in_place(update, context, expense_id, locale)
+
+
+async def _render_expense_detail_in_place(
+    update, context, expense_id: int, locale: str, role=None, reminded_today: bool = False,
+):
+    """Shared Expense-detail renderer: fetch -> detail card -> short buttons."""
+    if role is None:
+        user = update.effective_user
+        role = role_for_telegram_id(user.id if user else None)
+    api = context.bot_data["api_client"]
     try:
-        expense = await api.get_expense(int(expense_id_raw))
+        expense = await api.get_expense(expense_id)
     except PasayApiError as exc:
         await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
         return
     location = await _expense_location(update, context, expense)
-    text = cards.expense_detail_card(expense, locale, location=location)
-    still_pending = (
-        role == Role.OWNER and (expense.status or "").lower() == "pending"
+    text = cards.expense_detail_card(
+        expense, locale, location=location,
+        waiting_days=_expense_waiting_days(expense),
     )
-    kb = expense_detail_keyboard(expense.id, still_pending=still_pending, locale=locale)
+    status = (expense.status or "").lower()
+    if status == "pending" and role == Role.OWNER:
+        kb = expense_detail_keyboard(expense.id, still_pending=True, locale=locale,
+                                     amount=expense.amount)
+    else:
+        kb = expense_open_keyboard(
+            expense.id,
+            status=status,
+            locale=locale,
+            has_receipt=bool(expense.receipt_attachment_id),
+            reminded_today=reminded_today or await _reminded_today(context, expense.id),
+        )
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,
@@ -1548,6 +1731,30 @@ async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
         text=H.truncate(text),
         parse_mode=HTML,
         reply_markup=kb,
+    )
+
+
+def _expense_waiting_days(expense) -> int:
+    """Days since approval (0 when not approved yet / unparseable)."""
+    approved_date = getattr(expense, "approved_at", None) or ""
+    if not approved_date:
+        return 0
+    try:
+        from datetime import date as _date
+        return max((_date.today() - _date.fromisoformat(str(approved_date)[:10])).days, 0)
+    except (ValueError, TypeError):
+        return 0
+
+
+async def _handle_expense_back(update, context, role, locale):
+    """◀ Back on the Expense detail -> re-render the Expense Quick View in
+    place (no new junk message)."""
+    if not has_read_permission(role):
+        await _answer(update, t("common.no_permission", locale))
+        return
+    message_id = update.callback_query.message.message_id
+    await pages.show_quick_expense(
+        context, update.effective_chat.id, role, locale, message_id=message_id
     )
 
 
@@ -2013,21 +2220,25 @@ async def _handle_ai_choice(update, context, entity, ref, nonce, ts, role, local
 
 
 async def _handle_home_nav(update, context, sub, role, locale):
-    """Home summary action buttons (P0 spec): deterministic page routes."""
+    """Home situational actions (CONVERGENCE-003 §2.2): ⚠️ Today opens the
+    needs-action list, 🔄 Refresh re-renders Home in place. No navigation
+    grid — the fixed Reply Keyboard is the only navigation."""
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
     await _ack_working(update, locale)
     message_id = update.callback_query.message.message_id
     chat_id = update.effective_chat.id
-    if sub == "unpaid":
+    if sub == "today":
+        await pages.show_quick_tasks(context, chat_id, role, locale, message_id=message_id)
+    elif sub == "refresh":
+        await pages.show_home(context, chat_id, role, locale, message_id=message_id)
+    elif sub == "unpaid":
         await pages.show_rent(context, chat_id, locale, message_id=message_id)
-    elif sub == "approvals":
+    elif sub == "approvals" or sub == "maintenance":
         await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
     elif sub == "contracts":
         await pages.show_contracts_page(context, chat_id, locale, message_id=message_id)
-    elif sub == "maintenance":
-        await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
     else:
         await _answer(update, t("common.invalid", locale))
 

@@ -728,9 +728,9 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif route == "pending":
         await pages.show_todo(context, chat_id, role, locale)
     elif route == "more":
-        await pages.show_dashboard(
-            context, chat_id, locale, role=role, fallback_inline=True
-        )
+        # CONVERGENCE-003 §2.1: "更多" (legacy alias) lands on the ONE Home
+        # (Operations Overview) — the legacy dashboard is never a route.
+        await pages.show_home(context, chat_id, role, locale)
     elif route == "menu":
         # PASAY-V2-FOUNDATION-001: "menu"/"home"/"start" words open the short
         # greeting (never the old full dashboard).

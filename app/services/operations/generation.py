@@ -116,6 +116,18 @@ def _notification_message(task: OperationalTask) -> str:
     return "\n".join(lines)
 
 
+def _ack_reply_markup(task_id: int) -> dict:
+    """Inline keyboard for a proactive reminder (CONVERGENCE-003 §1.5): one
+    short ``✅ Acknowledge`` action (callback ``v1:ack:t:<task_id>``). Tapping
+    marks the task IN_PROGRESS via the backend acknowledge endpoint, which
+    stops same-day reminders. The label is deliberately short for mobile."""
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Acknowledge", "callback_data": f"v1:ack:t:{task_id}"}]
+        ]
+    }
+
+
 def _expense_reply_markup(expense_id: int, has_receipt: bool) -> dict:
     """Inline keyboard dict for an expense notification (V1.3): approve/reject
     callbacks use the bot's v1:exa/exr:<id>:<nonce>:<ts> slot layout (the
@@ -194,14 +206,21 @@ def _refresh_active_task(
     actor_id: int | None,
     notification_message: str | None,
     reply_markup: dict | None,
+    proactive: bool = False,
 ) -> tuple[OperationalTask, bool]:
     """Remind/update the SAME logical task (dedupe_key match) instead of
     creating a duplicate active task (AI-OPS-FOUNDATION-001 §2: one business
     issue = one active task; a new reminder updates/reminds the same task).
 
     Only reminder-relevant fields are refreshed; status/assignee never change
-    here. The reminder generation is bumped and a fresh notification row is
-    enqueued so the human is reminded with the CURRENT facts.
+    here.
+
+    CONVERGENCE-003 §1.3/§1.5 daily cadence: for PROACTIVE reminders still
+    PENDING, every scheduler pass attempts ONE logical reminder (generation
+    bumped) and the persistent daily dedupe decides whether today's slot is
+    still free — same-day repeat scans are suppressed, while the NEXT
+    Philippines day (item still incomplete) is allowed exactly one fresh
+    reminder. Acknowledged (IN_PROGRESS) tasks never get another reminder.
     """
     old = serialize_row(task)
     changed = False
@@ -219,28 +238,38 @@ def _refresh_active_task(
         if getattr(task, key, None) != value:
             setattr(task, key, value)
             changed = True
-    if not changed:
+    wants_reminder = proactive and task.status == OperationalTaskStatus.PENDING
+    if not changed and not wants_reminder:
         return task, False
     task.reminder_generation = (task.reminder_generation or 0) + 1
     task.updated_at = now
     db.flush()
-    record_audit(
-        db,
-        table_name="operational_tasks",
-        record_id=task.id,
-        action="task_reminded",
-        actor_id=actor_id,  # None = system / scheduler
-        changed_fields={
-            "title": [old.get("title"), task.title],
-            "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
-        },
-        old_value=old,
-        new_value=serialize_row(task),
-    )
+    if changed or wants_reminder:
+        record_audit(
+            db,
+            table_name="operational_tasks",
+            record_id=task.id,
+            action="task_reminded",
+            actor_id=actor_id,  # None = system / scheduler
+            changed_fields={
+                "title": [old.get("title"), task.title],
+                "reminder_generation": [old.get("reminder_generation", 0), task.reminder_generation],
+            },
+            old_value=old,
+            new_value=serialize_row(task),
+        )
+    # A proactive reminder fires only while the task is still PENDING
+    # (acknowledged/in-progress items never get another reminder), and the
+    # daily dedupe decides whether today's slot is still free.
+    should_enqueue = wants_reminder or (changed and not proactive)
+    if not should_enqueue:
+        return task, False
     enqueued = _enqueue_for_task(
         db, task,
         notification_message=notification_message,
         reply_markup=reply_markup,
+        proactive=wants_reminder,
+        now=now,
     )
     return task, enqueued
 
@@ -251,6 +280,8 @@ def _enqueue_for_task(
     *,
     notification_message: str | None = None,
     reply_markup: dict | None = None,
+    proactive: bool = False,
+    now: datetime | None = None,
 ) -> bool:
     """Outbox row for one new task (same transaction). Returns True when
     enqueued, False when no recipient is resolvable.
@@ -263,6 +294,15 @@ def _enqueue_for_task(
     The dedupe key embeds the reminder generation so a refreshed reminder
     (task_reminded) is a NEW logical notification even though the outbox
     ``uq_notification_outbox_dedupe`` index would otherwise swallow it.
+
+    ``proactive=True`` (scheduler-generated reminders) additionally claims the
+    persistent DAILY dedupe slot (TELEGRAM-OPS-UX-CONVERGENCE-003 §1.4): the
+    same business object + recipient + PH local date + reminder type is sent
+    at most once per Philippines natural day — a high-frequency scheduler scan
+    never becomes high-frequency sending. Human-confirmed actions
+    (``create_operational_task``) are reactive, not proactive, and pass False.
+    ``now`` is the pass timestamp (same one the scheduler used); the PH local
+    date is derived from it so a test or replay pass dedupes consistently.
     """
     try:
         recipient = resolve_recipient(db, task.assigned_user_id)
@@ -272,6 +312,18 @@ def _enqueue_for_task(
         return False
     if recipient is None:
         return False
+    if proactive:
+        from app.services.operations.daily_dedup import claim_daily_dedup
+
+        if not claim_daily_dedup(
+            db,
+            business_key=task.dedupe_key,
+            task_id=task.id,
+            recipient=recipient,
+            reminder_type=task.task_type.value,
+            now=now,
+        ):
+            return False  # already reminded today -> high-frequency scan, no send
     details = task.details or {}
     payload = {
         "task_id": task.id,
@@ -287,6 +339,10 @@ def _enqueue_for_task(
     }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
+    elif proactive:
+        # CONVERGENCE-003 §1.5: proactive reminder cards carry a short
+        # ✅ Acknowledge action so the human can stop same-day reminders.
+        payload["reply_markup"] = _ack_reply_markup(task.id)
     generation = task.reminder_generation or 0
     return enqueue_notification(
         db,
@@ -307,6 +363,7 @@ def _register_task(
     notification_message: str | None = None,
     reply_markup: dict | None = None,
     refresh_on_conflict: bool = False,
+    proactive: bool = False,
 ) -> tuple[OperationalTask | None, bool, bool]:
     """Create task + audit(task_created) + outbox in one transaction.
 
@@ -318,6 +375,11 @@ def _register_task(
     ``dedupe_key`` already exists, the existing task is REFRESHED in place
     (task_reminded + new notification) instead of returning None — one
     business issue keeps exactly one active task while reminders stay current.
+
+    ``proactive`` (default False) marks scheduler-generated reminders: the
+    enqueue also claims the persistent daily dedupe slot, so the same business
+    object + recipient + PH date + type is sent at most once per day even when
+    a later scheduler pass refreshes the task (CONVERGENCE-003 §1.3/§1.4).
 
     Returns ``(task_or_None, notification_enqueued, is_new)`` where ``is_new``
     is False for a no-op or in-place refresh (the caller must not count it as
@@ -342,6 +404,7 @@ def _register_task(
                 actor_id=actor_id,
                 notification_message=notification_message,
                 reply_markup=reply_markup,
+                proactive=proactive,
             )
             return refreshed, enqueued, False
     task = _insert_task_on_conflict_do_nothing(db, fields=fields)
@@ -359,6 +422,8 @@ def _register_task(
         db, task,
         notification_message=notification_message,
         reply_markup=reply_markup,
+        proactive=proactive,
+        now=now,
     ), True
 
 
@@ -491,6 +556,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 # periods refreshes the SAME logical task (updated periods/total,
                 # fresh reminder) instead of creating a second active task.
                 refresh_on_conflict=True,
+                proactive=True,
             )
             if task is not None:
                 created += 1 if is_new else 0
@@ -498,6 +564,15 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 _supersede_rent_due(db, lease.id, now)
 
         for month, due in upcoming:
+            # TELEGRAM-OPS-UX-CONVERGENCE-003 §1.2 (P0 root cause): a lease
+            # that ALREADY has overdue periods must NOT create RENT_DUE tasks
+            # for upcoming periods. The RENT_OVERDUE task supersedes every
+            # PENDING RENT_DUE of the lease in the same pass
+            # (``_supersede_rent_due``), so re-creating RENT_DUE produced a
+            # create -> supersede -> create loop that enqueued and sent ONE
+            # reminder per worker pass (the observed per-minute spam).
+            if overdue:
+                continue
             task, enqueued, is_new = _register_task(
                 db,
                 now=now,
@@ -517,6 +592,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "details": _rent_task_details(lease, unit, tenant, {"period": month}),
                 },
                 refresh_on_conflict=True,
+                proactive=True,
             )
             if task is not None:
                 created += 1 if is_new else 0
@@ -547,6 +623,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 "dedupe_key": f"lease:{lease.id}:LEASE_EXPIRING",
                 "details": {"lease_id": lease.id, "end_date": lease.end_date.isoformat()},
             },
+            proactive=True,
         )
         if task is not None:
             created += 1 if is_new else 0
@@ -587,6 +664,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             reply_markup=_expense_reply_markup(
                 expense.id, has_receipt=bool(expense.receipt_attachment_id)
             ),
+            proactive=True,
         )
         if task is not None:
             created += 1 if is_new else 0
@@ -631,6 +709,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             reply_markup=_expense_reply_markup(
                 expense.id, has_receipt=bool(expense.receipt_attachment_id)
             ),
+            proactive=True,
         )
         if task is not None:
             created += 1 if is_new else 0
@@ -666,6 +745,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "agent_id": settlement.agent_id,
                 },
             },
+            proactive=True,
         )
         if task is not None:
             created += 1 if is_new else 0
@@ -698,6 +778,7 @@ def generate_rule_task(db: Session, rule, *, now: datetime) -> tuple[Operational
             "dedupe_key": f"recurring:{rule.id}:{period_key}",
             "details": details,
         },
+        proactive=True,
     )
     if task is not None:
         rule.next_run_at = advance_next_run(rule, rule.next_run_at)

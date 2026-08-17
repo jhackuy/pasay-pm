@@ -23,6 +23,8 @@ from pasay_bot.keyboards import (
     ACTION_COPILOT_NAV,
     ACTION_COPILOT_WHY,
     ACTION_EXPENSE_DETAIL,
+    ACTION_EXPENSE_OPEN,
+    ACTION_NAV,
     ACTION_REMIND_OWNER,
     OPS_OVERVIEW,
     OPS_SECTION_ALL,
@@ -380,7 +382,8 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML, reply_markup=home_keyboard(locale),
         )
         return
-    await show_dashboard(context, chat_id, locale, role=role)
+    # CONVERGENCE-003 §2.1: /cancel with no conversation lands on the ONE Home.
+    await show_home(context, chat_id, role, locale)
 
 
 # --- page builders ---
@@ -481,16 +484,24 @@ async def show_dashboard(
 
 
 async def show_home(context, chat_id, role, locale: str, message_id=None):
-    """P0 home: operational summary only (no second navigation)."""
+    """CONVERGENCE-003 §2.2 Home: the ONE Telegram Operations Overview.
+
+    Ten deterministic numbers (expected / collected / outstanding this month,
+    historical arrears, overdue units, expiring contracts, vacant units,
+    expenses awaiting payment, open maintenance, needs-action today). No
+    second navigation: the fixed Reply Keyboard is the navigation, and the
+    card carries only the situational ⚠️ Today / 🔄 Refresh buttons."""
     api = context.bot_data["api_client"]
     month = _current_month()
-    expenses, incomes, overdue, leases, units, tasks = await asyncio.gather(
+    expenses, incomes, overdue, leases, units, tasks, quick_exp, quick_rent = await asyncio.gather(
         api.list_expenses(),
         api.list_incomes(),
         api.get_overdue_rents(),
         api.get_leases(),
         api.get_units(),
         api.get_operational_tasks(status="PENDING"),
+        api.get_quick_expense(),
+        api.get_quick_rent(),
         return_exceptions=True,
     )
     fin = None
@@ -507,16 +518,13 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
             await _send_persistent_menu(context, chat_id, role, locale)
         return
     expenses_list = [] if isinstance(expenses, Exception) else expenses
-    incomes_list = [] if isinstance(incomes, Exception) else incomes
     overdue_list = [] if isinstance(overdue, Exception) else overdue
     leases_list = [] if isinstance(leases, Exception) else leases
     units_list = [] if isinstance(units, Exception) else units
     tasks_list = [] if isinstance(tasks, Exception) else tasks
+    quick_exp_data = {} if isinstance(quick_exp, Exception) else (quick_exp or {})
+    quick_rent_data = {} if isinstance(quick_rent, Exception) else (quick_rent or {})
 
-    pending_approvals = sum(
-        1 for e in expenses_list if (e.status or "").lower() == "pending"
-    ) + sum(1 for i in incomes_list if i.status == "pending")
-    unpaid_count = len(overdue_list)
     today = date.today()
     expiring_contracts = sum(
         1
@@ -525,23 +533,27 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
         and l.end_date >= today
         and (l.end_date - today).days <= EXPIRING_CONTRACT_DAYS
     )
-    maintenance_open = sum(
-        1
-        for tk in tasks_list
-        if _is_maintenance_task(tk)
-    )
+    vacant_count = sum(1 for u in units_list if u.status == "vacant")
+    maintenance_open = sum(1 for tk in tasks_list if _is_maintenance_task(tk))
+    payable_count = len(quick_exp_data.get("payable") or [])
+    total_arrears = quick_rent_data.get("outstanding_total")
     text = cards.home_summary_card(
+        expected=fin.expected_rent_total,
         collected=fin.collected_rent,
-        unpaid_count=unpaid_count,
-        pending_approvals=pending_approvals,
-        expiring_contracts=expiring_contracts,
+        outstanding=fin.outstanding_rent,
+        total_arrears=total_arrears,
+        overdue_count=len(overdue_list),
+        expiring_count=expiring_contracts,
+        vacant_count=vacant_count,
+        payable_count=payable_count,
         maintenance_open=maintenance_open,
+        today_count=len(tasks_list),
         locale=locale,
     )
     if message_id:
         # Telegram cannot attach a ReplyKeyboardMarkup via editMessageText;
         # the persistent menu stays visible from the last send, and the
-        # message carries the summary action buttons instead.
+        # message carries the situational action buttons instead.
         await _render(context, chat_id, message_id, text, home_summary_keyboard(locale))
     else:
         await _send(
@@ -738,6 +750,10 @@ async def show_quick_expense(context, chat_id, role, locale: str, message_id=Non
     data = data or {}
     text = cards.expense_quick_card(data, locale)
     payable = data.get("payable") or []
+    # CONVERGENCE-003 §4.2/§10: the LIST is for reading — one short
+    # ``E{id} Open`` button per payable row (the actions live on the DETAIL
+    # card). Never the long ``View details 查看详情 / Remind Owner 提醒老板``
+    # labels that got truncated to ``Remin...`` on narrow phones.
     kb_rows: list[list[InlineKeyboardButton]] = []
     for row in payable:
         expense_id = row.get("expense_id")
@@ -746,16 +762,19 @@ async def show_quick_expense(context, chat_id, role, locale: str, message_id=Non
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    f"{t('expense.view_detail', locale)}",
-                    callback_data=encode(ACTION_EXPENSE_DETAIL, str(int(expense_id))),
-                ),
-                InlineKeyboardButton(
-                    t("v2.remind_owner", locale),
-                    callback_data=encode(ACTION_REMIND_OWNER, "exp", str(int(expense_id))),
-                ),
+                    f"E{int(expense_id)} · Open",
+                    callback_data=encode(ACTION_EXPENSE_OPEN, str(int(expense_id))),
+                )
             ]
         )
     if kb_rows:
+        kb_rows.append(
+            [
+                InlineKeyboardButton(
+                    t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
+                )
+            ]
+        )
         await _render(context, chat_id, message_id, text, keyboard=InlineKeyboardMarkup(kb_rows))
     else:
         await _render(
