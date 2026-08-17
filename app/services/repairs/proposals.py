@@ -100,12 +100,43 @@ def submit_proposal(
     )
     db.add(proposal)
     db.flush()
+    # Submitting the next proposal resolves the earlier requote work entry: the
+    # old "get another quote" task completes (008A-F gate B §3.3) so it leaves
+    # the Secretary queue and stops reminding, while this new proposal waits on
+    # owner approval. The requote goes COMPLETED; history stays in repair_actions.
+    if next_version > 1:
+        from app.services.repairs.delivery import close_requote_projection
+        close_requote_projection(db, repair, now=now)
+        _complete_prior_requote_actions(db, repair.id, now=now)
     # Repair waits on owner approval for this candidate (never closes).
     repair.status = RepairOperationStatus.WAITING_APPROVAL
     repair.next_action = f"Proposal V{next_version} awaits owner decision."
     repair.waiting_on = "owner"
     repair.updated_at = now
     return proposal, next_version
+
+
+def _complete_prior_requote_actions(db: Session, repair_id: int, *, now: datetime) -> None:
+    """Complete active REQUOTE repair_actions once a newer proposal is submitted
+    (they are superseded by the new candidate). History is preserved (Q row left
+    as COMPLETED, never deleted)."""
+    from app.models.repair import RepairAction, RepairActionStatus
+
+    actions = (
+        db.query(RepairAction)
+        .filter(
+            RepairAction.repair_id == repair_id,
+            RepairAction.action_kind == "REQUOTE",
+            RepairAction.status.in_(
+                [RepairActionStatus.PENDING, RepairActionStatus.IN_PROGRESS]
+            ),
+        )
+        .all()
+    )
+    for action in actions:
+        action.status = RepairActionStatus.COMPLETED
+        action.resolved_at = now
+        action.updated_at = now
 
 
 def reject_proposal(

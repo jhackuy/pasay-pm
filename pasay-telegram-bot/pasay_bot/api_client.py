@@ -837,6 +837,7 @@ class RepairOperation:
     proposals: list = None  # type: ignore[assignment]
     actions: list = None  # type: ignore[assignment]
     expense_ids: list = None  # type: ignore[assignment]
+    timeline: list = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.proposals is None:
@@ -845,6 +846,8 @@ class RepairOperation:
             self.actions = []
         if self.expense_ids is None:
             self.expense_ids = []
+        if self.timeline is None:
+            self.timeline = []
 
     @classmethod
     def from_dict(cls, d: dict) -> "RepairOperation":
@@ -874,6 +877,7 @@ class RepairOperation:
             proposals=[RepairProposal.from_dict(p) for p in (d.get("proposals") or [])],
             actions=[RepairAction.from_dict(a) for a in (d.get("actions") or [])],
             expense_ids=list(d.get("expense_ids") or []),
+            timeline=list(d.get("timeline") or []),
         )
 
 

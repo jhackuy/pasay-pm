@@ -144,6 +144,10 @@ def ensure_requote_action(
     action = _action_on_conflict_do_nothing(db, fields=fields)
     if action is None:
         existing = get_active_action(db, repair.id, dedupe_key)
+        # Idempotent re-ensure: make sure the Secretary work-entry projection is
+        # present (dedup guarantees one task) even if an earlier attempt failed
+        # to project it.
+        _project_action(db, repair, existing, now=now, actor_id=actor_id)
         return existing, False
     # Reflect on the repair row so Telegram/Mini App read real business state.
     repair.next_action = action.title
@@ -153,7 +157,22 @@ def ensure_requote_action(
     repair.next_check_at = now
     repair.updated_at = now
     db.flush()
+    _project_action(db, repair, action, now=now, actor_id=actor_id)
     return action, True
+
+
+def _project_action(db, repair, action, *, now=None, actor_id=None):
+    """Project an active action into the Secretary's existing work queue (008A-F
+    Gate B). Lazy import keeps this module free of a generation dependency at
+    import time. The authoritative fact stays ``repair_actions``; the
+    ``operational_tasks`` row is the human-visible projection."""
+    from app.services.repairs.delivery import project_requote_to_task
+
+    if action is None:
+        return None, False
+    if action.action_kind == ACTION_REQUOTE:
+        return project_requote_to_task(db, repair, action, now=now, actor_id=actor_id)
+    return None, False
 
 
 def ensure_record_result_action(

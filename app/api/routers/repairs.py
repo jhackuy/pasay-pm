@@ -128,8 +128,10 @@ def get_repair_detail(
     _scope_guard(repair, user)
     proposals = prop_svc.list_proposals(db, repair.id)
     actions = continuation.resolve_actions(db, repair.id)
+    from app.services.repairs.timeline import build_timeline
+
     base = RepairDetailOut.model_validate(repair).model_dump(
-        exclude={"proposals", "actions", "evidence", "expense_ids"}
+        exclude={"proposals", "actions", "evidence", "expense_ids", "timeline"}
     )
     return RepairDetailOut(
         **base,
@@ -137,6 +139,7 @@ def get_repair_detail(
         actions=actions,
         evidence=repair.evidence or {},
         expense_ids=[p.expense_id for p in proposals if p.expense_id],
+        timeline=build_timeline(db, repair, proposals, actions),
     )
 
 

@@ -130,6 +130,9 @@ class RepairDetailOut(RepairOut):
     actions: list[RepairActionOut] = []
     evidence: Optional[dict] = None
     expense_ids: list[int] = []
+    # 008A-F Gate C: ready-to-render ordered human history (Reject != Close,
+    # Paid != Close, Verified -> Close are all visible as real timeline steps).
+    timeline: list[dict] = []
 
 
 class RepairListOut(BaseModel):
