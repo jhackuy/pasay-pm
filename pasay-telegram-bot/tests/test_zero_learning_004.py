@@ -308,9 +308,13 @@ def test_tasks_payable_appears_once_not_in_pending(make_app):
     text = env.bot.last_send()["text"]
     # E7 appears EXACTLY ONCE (the To-pay group), never again under Pending
     assert text.count("E7") == 1
-    # the To-pay section shows the single representation with waiting days
+    # the To-pay section shows the single representation (both payable expenses).
     assert "To pay 2" in text or "待付款 2" in text
-    assert "waiting 2d" in text or "等待 2 天" in text
+    # ...with the SAME waiting-days count the FakeBackend derives from the real
+    # wall-clock today vs approved_at (date-robust, never a hardcoded number).
+    from datetime import date as _d, datetime as _dt
+    expected_days = max((_d.today() - _dt.fromisoformat(str(ZLBackend().expenses[0]["approved_at"])[:10]).date()).days, 0)
+    assert f"等待 {expected_days} 天" in text or f"waiting {expected_days}d" in text
     # the RENT_OVERDUE operational task still renders under Pending
     assert "3期" in text or "3 periods" in text
     assert "逾期 104 天" in text or "overdue 104d" in text
