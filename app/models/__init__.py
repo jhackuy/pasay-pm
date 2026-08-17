@@ -38,6 +38,14 @@ from app.models.operations import (
     RecurringRule,
 )
 from app.models.property import Property, Unit, UnitLifecycleEvent, UnitStatus
+from app.models.repair import (
+    RepairAction,
+    RepairActionStatus,
+    RepairOperation,
+    RepairOperationStatus,
+    RepairProposal,
+    RepairProposalStatus,
+)
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.tenant import Tenant, TenantContactStatus
 from app.models.user import User, UserRole
@@ -76,6 +84,12 @@ __all__ = [
     "Property",
     "Recurrence",
     "RecurringRule",
+    "RepairAction",
+    "RepairActionStatus",
+    "RepairOperation",
+    "RepairOperationStatus",
+    "RepairProposal",
+    "RepairProposalStatus",
     "SoftDeleteMixin",
     "Task",
     "TaskPriority",

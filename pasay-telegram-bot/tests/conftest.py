@@ -366,6 +366,13 @@ class FakeBackend:
         self.auth_info = {"id": 7, "username": "ana", "role": "admin", "is_active": True}
         self._copilot_proposal_seq = 100
         self._copilot_execute_task_id = 77
+        # REPAIR-AI-EMPLOYEE-WORKFLOW-008A: repair operations + proposals + actions.
+        self.repairs: list[dict] = []
+        self.repair_proposals: list[dict] = []
+        self.repair_actions: list[dict] = []
+        self._next_repair_id = 1000
+        self._next_repair_proposal_id = 2000
+        self._next_repair_action_id = 3000
 
     def add_income(self, status="pending", lease_id=1, amount="55000.00",
                    received_date="2026-08-10", payment_method="Bank",
@@ -485,6 +492,24 @@ class FakeBackend:
 
     def _get_income(self, income_id):
         return next((i for i in self.incomes if i["id"] == income_id), None)
+
+    # --- REPAIR-AI-EMPLOYEE-WORKFLOW-008A helpers ---
+    def _latest_proposal(self, repair_id):
+        props = [p for p in self.repair_proposals if p["repair_id"] == repair_id]
+        if not props:
+            return None
+        return max(props, key=lambda p: p["version"])
+
+    def _repair_detail(self, repair):
+        rid = repair["id"]
+        props = [p for p in self.repair_proposals if p["repair_id"] == rid]
+        actions = [a for a in self.repair_actions if a["repair_id"] == rid]
+        return {
+            **repair,
+            "proposals": sorted(props, key=lambda p: p["version"]),
+            "actions": actions,
+            "expense_ids": [p["expense_id"] for p in props if p["expense_id"]],
+        }
 
     def count_calls(self, method: str, path: str) -> int:
         return sum(1 for m, p, _ in self.calls if m == method and p == path)
@@ -1057,6 +1082,155 @@ class FakeBackend:
                 }
             )
             return httpx.Response(200, json={"task": task, "detail": "Task updated"})
+
+        # --- REPAIR-AI-EMPLOYEE-WORKFLOW-008A: Repair Operation fast path ---
+        if path == "/repairs" and method == "GET":
+            return httpx.Response(200, json={"items": self.repairs, "total": len(self.repairs)})
+        if path == "/repairs" and method == "POST":
+            payload = body or {}
+            rid = self._next_repair_id
+            self._next_repair_id += 1
+            row = {
+                "id": rid,
+                "merchant_id": payload.get("merchant_id"),
+                "property_id": payload.get("property_id"),
+                "unit_id": payload.get("unit_id"),
+                "issue": payload.get("issue", ""),
+                "issue_description": payload.get("issue_description"),
+                "created_source": payload.get("created_source", "manual"),
+                "reported_by": payload.get("reported_by"),
+                "assignee_user_id": payload.get("assignee_user_id"),
+                "status": "OPEN",
+                "next_action": "Awaiting a solution proposal or a work plan.",
+                "waiting_on": None,
+                "blocked_reason": None,
+                "next_check_at": None,
+                "closure_criteria": payload.get("closure_criteria"),
+                "verified_by": None,
+                "verified_at": None,
+                "verification_result": None,
+                "closed_at": None,
+                "closure_reason": None,
+                "operational_task_id": None,
+                "created_at": "2026-08-17T08:00:00Z",
+                "proposals": [],
+                "actions": [],
+                "expense_ids": [],
+            }
+            self.repairs.append(row)
+            return httpx.Response(201, json=row)
+        if path.startswith("/repairs/") and method == "GET":
+            rid = int(path.split("/")[2])
+            repair = next((r for r in self.repairs if r["id"] == rid), None)
+            if repair is None:
+                return httpx.Response(404, json={"detail": "Repair not found"})
+            return httpx.Response(200, json=self._repair_detail(repair))
+        if path.startswith("/repairs/") and path.endswith("/proposals") and method == "POST":
+            rid = int(path.split("/")[2])
+            repair = next((r for r in self.repairs if r["id"] == rid), None)
+            if repair is None:
+                return httpx.Response(404, json={"detail": "Repair not found"})
+            payload = body or {}
+            version = 1 + len([p for p in self.repair_proposals if p["repair_id"] == rid])
+            pid = self._next_repair_proposal_id
+            self._next_repair_proposal_id += 1
+            prop = {
+                "id": pid,
+                "repair_id": rid,
+                "version": version,
+                "vendor": payload.get("vendor"),
+                "source": payload.get("source"),
+                "description": payload.get("description"),
+                "amount": str(payload.get("amount", "0")),
+                "submitted_by": 1,
+                "submitted_at": "2026-08-17T08:00:00Z",
+                "status": "PENDING",
+                "decision_by": None,
+                "decision_at": None,
+                "rejection_reason": None,
+                "expense_id": None,
+            }
+            self.repair_proposals.append(prop)
+            repair["status"] = "WAITING_APPROVAL"
+            repair["next_action"] = f"Proposal V{version} awaits owner decision."
+            repair["waiting_on"] = "owner"
+            return httpx.Response(201, json=self._repair_detail(repair))
+        if path.startswith("/repairs/") and path.endswith("/decide") and method == "POST":
+            rid = int(path.split("/")[2])
+            repair = next((r for r in self.repairs if r["id"] == rid), None)
+            if repair is None:
+                return httpx.Response(404, json={"detail": "Repair not found"})
+            payload = body or {}
+            decision = payload.get("decision", "")
+            prop = self._latest_proposal(rid)
+            if prop is None:
+                return httpx.Response(404, json={"detail": "Repair has no proposals"})
+            if decision == "reject":
+                prop["status"] = "REJECTED"
+                prop["rejection_reason"] = payload.get("reason")
+                prop["decision_at"] = "2026-08-17T08:05:00Z"
+                repair["status"] = "WAITING_HUMAN"
+                repair["next_action"] = "Get another quote — repair stays open."
+                repair["waiting_on"] = "secretary"
+                # AI requote action (dedup: one PER (repair, rejected version)).
+                dedupe = f"repair:{rid}:requote:v{prop['version']}"
+                if not any(a.get("dedupe_key") == dedupe and a.get("status") in ("PENDING", "IN_PROGRESS")
+                           for a in self.repair_actions):
+                    self.repair_actions.append({
+                        "id": self._next_repair_action_id,
+                        "repair_id": rid,
+                        "action_kind": "REQUOTE",
+                        "title": f"Get another quote for repair R-{rid}",
+                        "description": "Owner rejected the quote.",
+                        "status": "PENDING",
+                        "assigned_user_id": None,
+                        "due_at": None,
+                        "next_check_at": None,
+                        "dedupe_key": dedupe,
+                        "source_event": f"proposal_rejected:v{prop['version']}",
+                        "resolved_at": None,
+                        "resolved_by": None,
+                        "created_at": "2026-08-17T08:05:00Z",
+                    })
+                    self._next_repair_action_id += 1
+            elif decision == "approve":
+                prop["status"] = "APPROVED"
+                prop["decision_at"] = "2026-08-17T08:05:00Z"
+                repair["status"] = "WAITING_PAYMENT"
+                repair["next_action"] = "Quote approved; the linked expense awaits payment."
+                repair["waiting_on"] = "payer"
+            return httpx.Response(200, json=self._repair_detail(repair))
+        if path.startswith("/repairs/") and path.endswith("/pay-expense") and method == "POST":
+            rid = int(path.split("/")[2])
+            repair = next((r for r in self.repairs if r["id"] == rid), None)
+            if repair is None:
+                return httpx.Response(404, json={"detail": "Repair not found"})
+            if repair["status"] == "WAITING_PAYMENT":
+                repair["status"] = "VERIFYING"
+                repair["next_action"] = "Expense paid. The repair now needs real-world verification before it can close."
+                repair["waiting_on"] = "secretary"
+            return httpx.Response(200, json=self._repair_detail(repair))
+        if path.startswith("/repairs/") and path.endswith("/record-result") and method == "POST":
+            rid = int(path.split("/")[2])
+            repair = next((r for r in self.repairs if r["id"] == rid), None)
+            if repair is None:
+                return httpx.Response(404, json={"detail": "Repair not found"})
+            repair["status"] = "VERIFYING"
+            repair["next_action"] = "Awaiting verification: confirm the problem is actually fixed before closing."
+            repair["waiting_on"] = "secretary"
+            return httpx.Response(200, json=self._repair_detail(repair))
+        if path.startswith("/repairs/") and path.endswith("/verify") and method == "POST":
+            rid = int(path.split("/")[2])
+            repair = next((r for r in self.repairs if r["id"] == rid), None)
+            if repair is None:
+                return httpx.Response(404, json={"detail": "Repair not found"})
+            repair["status"] = "CLOSED"
+            repair["next_action"] = "Repair closed."
+            repair["waiting_on"] = None
+            repair["verified_at"] = "2026-08-17T08:10:00Z"
+            repair["closure_reason"] = (body or {}).get("closure_signal", "HUMAN_CONFIRMED")
+            repair["closed_at"] = "2026-08-17T08:10:00Z"
+            return httpx.Response(200, json=self._repair_detail(repair))
 
         return httpx.Response(404, json={"detail": f"no route {method} {path}"})
 

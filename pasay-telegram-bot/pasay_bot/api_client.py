@@ -722,10 +722,163 @@ class CopilotExecute:
         )
 
 
+@dataclass
+class RepairProposal:
+    """One versioned solution candidate (PENDING/APPROVED/REJECTED/SUPERSEDED).
+    Fully decoupled from the Repair Operation — rejecting a proposal never
+    rejects the repair."""
+
+    id: int
+    repair_id: int = 0
+    version: int = 1
+    vendor: Optional[str] = None
+    source: Optional[str] = None
+    description: Optional[str] = None
+    amount: Decimal = Decimal("0")
+    submitted_by: Optional[int] = None
+    submitted_at: Optional[str] = None
+    status: str = "PENDING"
+    decision_by: Optional[int] = None
+    decision_at: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    expense_id: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RepairProposal":
+        return cls(
+            id=int(d.get("id") or 0),
+            repair_id=int(d.get("repair_id") or 0),
+            version=int(d.get("version") or 1),
+            vendor=d.get("vendor"),
+            source=d.get("source"),
+            description=d.get("description"),
+            amount=_to_decimal(d.get("amount")),
+            submitted_by=d.get("submitted_by"),
+            submitted_at=d.get("submitted_at"),
+            status=d.get("status") or "PENDING",
+            decision_by=d.get("decision_by"),
+            decision_at=d.get("decision_at"),
+            rejection_reason=d.get("rejection_reason"),
+            expense_id=int(d["expense_id"]) if d.get("expense_id") is not None else None,
+        )
+
+
+@dataclass
+class RepairAction:
+    """One idempotent AI-employee action (the single most important next step
+    a human must do now). status PENDING/IN_PROGRESS/COMPLETED/CANCELLED."""
+
+    id: int
+    repair_id: int = 0
+    action_kind: str = ""
+    title: str = ""
+    description: Optional[str] = None
+    status: str = "PENDING"
+    assigned_user_id: Optional[int] = None
+    due_at: Optional[str] = None
+    next_check_at: Optional[str] = None
+    dedupe_key: str = ""
+    source_event: Optional[str] = None
+    resolved_at: Optional[str] = None
+    resolved_by: Optional[int] = None
+    created_at: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RepairAction":
+        return cls(
+            id=int(d.get("id") or 0),
+            repair_id=int(d.get("repair_id") or 0),
+            action_kind=d.get("action_kind") or "",
+            title=d.get("title") or "",
+            description=d.get("description"),
+            status=d.get("status") or "PENDING",
+            assigned_user_id=int(d["assigned_user_id"]) if d.get("assigned_user_id") is not None else None,
+            due_at=d.get("due_at"),
+            next_check_at=d.get("next_check_at"),
+            dedupe_key=d.get("dedupe_key") or "",
+            source_event=d.get("source_event"),
+            resolved_at=d.get("resolved_at"),
+            resolved_by=int(d["resolved_by"]) if d.get("resolved_by") is not None else None,
+            created_at=d.get("created_at"),
+        )
+
+
+@dataclass
+class RepairOperation:
+    """The REAL-world repair problem (008A). ``status`` is one of
+    OPEN/IN_PROGRESS/WAITING_HUMAN/WAITING_VENDOR/WAITING_APPROVAL/
+    WAITING_PAYMENT/VERIFYING/CLOSED/CANCELLED. The derived fields
+    ``next_action``/``waiting_on``/``blocked_reason`` are the single source
+    both Telegram and the Mini App read — never chat copy."""
+
+    id: int
+    merchant_id: Optional[int] = None
+    property_id: Optional[int] = None
+    unit_id: Optional[int] = None
+    issue: str = ""
+    issue_description: Optional[str] = None
+    created_source: str = "manual"
+    reported_by: Optional[int] = None
+    assignee_user_id: Optional[int] = None
+    status: str = "OPEN"
+    next_action: Optional[str] = None
+    waiting_on: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    next_check_at: Optional[str] = None
+    closure_criteria: Optional[str] = None
+    verified_by: Optional[int] = None
+    verified_at: Optional[str] = None
+    verification_result: Optional[str] = None
+    closed_at: Optional[str] = None
+    closure_reason: Optional[str] = None
+    operational_task_id: Optional[int] = None
+    created_at: Optional[str] = None
+
+    proposals: list = None  # type: ignore[assignment]
+    actions: list = None  # type: ignore[assignment]
+    expense_ids: list = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.proposals is None:
+            self.proposals = []
+        if self.actions is None:
+            self.actions = []
+        if self.expense_ids is None:
+            self.expense_ids = []
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RepairOperation":
+        return cls(
+            id=int(d.get("id") or 0),
+            merchant_id=d.get("merchant_id"),
+            property_id=d.get("property_id"),
+            unit_id=d.get("unit_id"),
+            issue=d.get("issue") or "",
+            issue_description=d.get("issue_description"),
+            created_source=d.get("created_source") or "manual",
+            reported_by=d.get("reported_by"),
+            assignee_user_id=d.get("assignee_user_id"),
+            status=d.get("status") or "OPEN",
+            next_action=d.get("next_action"),
+            waiting_on=d.get("waiting_on"),
+            blocked_reason=d.get("blocked_reason"),
+            next_check_at=d.get("next_check_at"),
+            closure_criteria=d.get("closure_criteria"),
+            verified_by=d.get("verified_by"),
+            verified_at=d.get("verified_at"),
+            verification_result=d.get("verification_result"),
+            closed_at=d.get("closed_at"),
+            closure_reason=d.get("closure_reason"),
+            operational_task_id=d.get("operational_task_id"),
+            created_at=d.get("created_at"),
+            proposals=[RepairProposal.from_dict(p) for p in (d.get("proposals") or [])],
+            actions=[RepairAction.from_dict(a) for a in (d.get("actions") or [])],
+            expense_ids=list(d.get("expense_ids") or []),
+        )
+
 
 class PasayApiError(Exception):
     """API failure with an optional backend ``error_code``.
-
     The backend surfaces fail-closed copilot rejections as a structured 409
     ``{"message": ..., "error_code": ...}``. The bot maps ``error_code`` to
     human strings (never showing the raw code).
@@ -1528,3 +1681,149 @@ class PasayApiClient:
     async def reverse_income(self, income_id: int) -> Income:
         data = await self._request("POST", f"/incomes/{income_id}/reverse")
         return Income.from_dict(data)
+
+    # --- REPAIR-AI-EMPLOYEE-WORKFLOW-008A: Repair Operation fast path --------
+    async def list_repairs(self) -> list[RepairOperation]:
+        """GET /repairs — all Repair Operations (backend filters per role)."""
+        data = await self._request("GET", "/repairs")
+        payload = data.get("items", data) if isinstance(data, dict) else data
+        return [RepairOperation.from_dict(d) for d in (payload or [])]
+
+    async def get_repair(self, repair_id: int) -> RepairOperation:
+        """GET /repairs/{id} — full Repair Operation detail (Issue/Operation,
+        Proposals, Expenses, Actions, Verification). Telegram and the Mini App
+        read REAL business state from here — never chat copy."""
+        data = await self._request("GET", f"/repairs/{repair_id}")
+        return RepairOperation.from_dict(data)
+
+    async def create_repair(
+        self,
+        *,
+        issue: str,
+        issue_description: Optional[str] = None,
+        property_id: Optional[int] = None,
+        unit_id: Optional[int] = None,
+        merchant_id: Optional[int] = None,
+        closure_criteria: Optional[str] = None,
+        assignee_user_id: Optional[int] = None,
+        created_source: str = "telegram",
+    ) -> RepairOperation:
+        """POST /repairs — create a new OPEN Repair Operation (the real problem)."""
+        body: dict[str, Any] = {"issue": issue, "created_source": created_source}
+        if issue_description:
+            body["issue_description"] = issue_description
+        if property_id is not None:
+            body["property_id"] = property_id
+        if unit_id is not None:
+            body["unit_id"] = unit_id
+        if merchant_id is not None:
+            body["merchant_id"] = merchant_id
+        if closure_criteria:
+            body["closure_criteria"] = closure_criteria
+        if assignee_user_id is not None:
+            body["assignee_user_id"] = assignee_user_id
+        data = await self._request("POST", "/repairs", json=body, timeout=15.0)
+        return RepairOperation.from_dict(data)
+
+    async def submit_repair_proposal(
+        self,
+        repair_id: int,
+        *,
+        amount: Any,
+        vendor: Optional[str] = None,
+        source: Optional[str] = None,
+        description: Optional[str] = None,
+        submit_as_expense: bool = False,
+    ) -> RepairOperation:
+        """POST /repairs/{id}/proposals — submit the NEXT versioned quote (V1,
+        V2, ...). If ``submit_as_expense`` a linked Expense is created too."""
+        body: dict[str, Any] = {"amount": str(_to_decimal(amount))}
+        if vendor:
+            body["vendor"] = vendor
+        if source:
+            body["source"] = source
+        if description:
+            body["description"] = description
+        body["submit_as_expense"] = bool(submit_as_expense)
+        data = await self._request(
+            "POST", f"/repairs/{repair_id}/proposals", json=body, timeout=15.0
+        )
+        return RepairOperation.from_dict(data)
+
+    async def decide_repair_proposal(
+        self,
+        repair_id: int,
+        *,
+        decision: str,
+        reason: Optional[str] = None,
+        version: Optional[int] = None,
+        proposal_id: Optional[int] = None,
+        expense_id: Optional[int] = None,
+    ) -> RepairOperation:
+        """POST /repairs/{id}/decide — Owner APPROVE/REJECT a proposal version.
+        Rejecting a proposal does NOT close the repair (it stays alive for a
+        requote); approving moves it to WAITING_PAYMENT."""
+        body: dict[str, Any] = {"decision": decision}
+        if reason:
+            body["reason"] = reason
+        if version is not None:
+            body["version"] = version
+        if proposal_id is not None:
+            body["proposal_id"] = proposal_id
+        if expense_id is not None:
+            body["expense_id"] = expense_id
+        data = await self._request(
+            "POST", f"/repairs/{repair_id}/decide", json=body, timeout=15.0
+        )
+        return RepairOperation.from_dict(data)
+
+    async def pay_repair_expense(self, repair_id: int, expense_id: int) -> RepairOperation:
+        """POST /repairs/{id}/pay-expense — mark the linked expense PAID. The
+        repair advances at most to VERIFYING and is NEVER closed by payment."""
+        data = await self._request(
+            "POST", f"/repairs/{repair_id}/pay-expense", json={"expense_id": expense_id},
+            timeout=15.0,
+        )
+        return RepairOperation.from_dict(data)
+
+    async def record_repair_result(
+        self,
+        repair_id: int,
+        *,
+        verification_result: Optional[str] = None,
+        source: Optional[str] = None,
+        evidence_ids: Optional[list[int]] = None,
+    ) -> RepairOperation:
+        """POST /repairs/{id}/record-result — a human confirms the REAL repair
+        work is done; the repair moves to VERIFYING (not closed)."""
+        body: dict[str, Any] = {}
+        if verification_result:
+            body["verification_result"] = verification_result
+        if source:
+            body["source"] = source
+        if evidence_ids:
+            body["evidence_ids"] = evidence_ids
+        data = await self._request(
+            "POST", f"/repairs/{repair_id}/record-result", json=body, timeout=15.0
+        )
+        return RepairOperation.from_dict(data)
+
+    async def verify_and_close_repair(
+        self,
+        repair_id: int,
+        *,
+        verification_result: Optional[str] = None,
+        closure_signal: str = "HUMAN_CONFIRMED",
+        source: Optional[str] = None,
+    ) -> RepairOperation:
+        """POST /repairs/{id}/verify — explicit verification CLOSES the repair
+        (the only path into CLOSED)."""
+        body: dict[str, Any] = {"closure_signal": closure_signal}
+        if verification_result:
+            body["verification_result"] = verification_result
+        if source:
+            body["source"] = source
+        data = await self._request(
+            "POST", f"/repairs/{repair_id}/verify", json=body, timeout=15.0
+        )
+        return RepairOperation.from_dict(data)
