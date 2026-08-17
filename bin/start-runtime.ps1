@@ -1,16 +1,18 @@
 # start-runtime.ps1 - canonical pasay runtime (re)start for the Windows node.
 #
-# Starts (idempotently) exactly ONE of each:
-#   - Backend API            (uvicorn app.main:app on 127.0.0.1:8001)
-#   - Telegram bot poller    (pasay_bot.main)
-#   - Operations worker      (bin/run-operations-worker.py --interval 60)
-# all from the pinned runtime worktree, so a normal deploy/restart brings the
-# whole probe-up set back up together and never spawns a duplicate worker.
+# This is the ONLY production start entry. It is a thin launcher: it validates
+# the pinned runtime worktree, records the LIVE_RUNTIME_SHA proof, then hands
+# ALL lifecycle ownership (exactly-one API / poller / worker, stale-PID
+# recovery, concurrent-start protection, real readiness) to the canonical
+# Python owner ``bin/pasay_runtime.py bootstrap``.
 #
-# Fail-closed:
-#   - refuses to run from a dirty worktree (deployed tree must be the pinned commit)
-#   - idempotent: never starts a second API / bot / worker (skips any already live),
-#     so there is always exactly one of each.
+# Rationale (WINDOWS-RUNTIME-SINGLETON-PERSISTENCE-007B): the previous guard
+# scanned ``Get-CimInstance Win32_Process.CommandLine`` to avoid duplicates, but
+# on the canonical Windows node that call can be denied, so it silently treated
+# every run as "nothing running" and spawned a second Telegram poller (the 409
+# root cause). Singleton ownership is now enforced by atomic O_EXCL lock files
+# in the owner — not by a process scan — so a duplicate bootstrap always
+# converges to the same single runtime.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File bin/start-runtime.ps1
@@ -20,18 +22,16 @@ $Repo     = 'D:\AI-Review\pasay-pm'
 $RT       = Join-Path $Repo 'worktrees\BOT-V1-USABLE-001-RUNTIME'
 $Runtime  = Join-Path $Repo '.runtime'
 $AppPy    = Join-Path $Repo '.venv\Scripts\python.exe'
-$BotPy    = Join-Path $Repo 'pasay-telegram-bot\.venv\Scripts\python.exe'
+$Owner    = Join-Path $Repo 'bin\pasay_runtime.py'
 
 if (-not (Test-Path -LiteralPath $RT)) { Write-Error "runtime worktree missing: $RT"; exit 1 }
 if (-not (Test-Path -LiteralPath $AppPy)) { Write-Error "app venv missing: $AppPy"; exit 1 }
-if (-not (Test-Path -LiteralPath $BotPy)) { Write-Error "bot venv missing: $BotPy"; exit 1 }
+if (-not (Test-Path -LiteralPath $Owner)) { Write-Error "canonical owner missing: $Owner"; exit 1 }
 New-Item -ItemType Directory -Force -Path $Runtime | Out-Null
 
-# Load config from the runtime worktree .env into this process so the worker's
-# config module (os.getenv for OPERATIONS_DEFAULT_ASSIGNEE / DATABASE_URL /
-# TELEGRAM_BOT_TOKEN) and the API/bot resolve them even when launched from a
-# clean context (Scheduled Task / Startup, which has no pre-set vars). Secrets
-# are never printed — mirror of bin/start-native-bot.ps1.
+# Load config from the runtime worktree .env into this process so the owner and
+# the components resolve them even when launched from a clean context (Scheduled
+# Task / Startup). Secrets are never printed.
 $EnvFile = Join-Path $RT '.env'
 if (-not (Test-Path -LiteralPath $EnvFile)) { $EnvFile = Join-Path $Repo '.env' }
 if (Test-Path -LiteralPath $EnvFile) {
@@ -44,9 +44,8 @@ if (Test-Path -LiteralPath $EnvFile) {
     }
 }
 
-# The runtime worktree HEAD is the LIVE_RUNTIME_SHA. The deploy step checks it
-# out to the final commit; this script records it and refuses to start from a
-# dirty worktree (deployed tree must be exactly the pinned commit).
+# The runtime worktree HEAD is the LIVE_RUNTIME_SHA. Record it + refuse to boot
+# from a dirty worktree (deployed tree must be exactly the pinned commit).
 $head = (& git -C $RT rev-parse HEAD).Trim()
 $statusLines = @(& git -C $RT status --porcelain)
 if ($statusLines.Count -gt 0) {
@@ -57,119 +56,10 @@ Write-Output "runtime worktree HEAD=$head (LIVE_RUNTIME_SHA)"
 $proof = @{ live_runtime_sha = $head; captured_at = (Get-Date -Format o) }
 $proof | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Runtime 'runtime-version-proof.json')
 
-function Test-ProcessAlive([int]$ProcessId) {
-    if (-not $ProcessId -or -not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { return $false }
-    return $true
-}
-function Get-PidFile([string]$Name) {
-    $f = Join-Path $Runtime $Name
-    if (Test-Path -LiteralPath $f) { return ([int](Get-Content $f -Raw -ErrorAction SilentlyContinue).Trim()) }
-    return 0
-}
-
-# --- determine already-running services to stay idempotent (never two of one kind) ---------
-# Authoritative no-duplicate guard: match by live command line (robust even when
-# a prior instance was launched without a pid file), falling back to pid files.
-$running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'python' })
-function Have-Cmd([string]$re) {
-    foreach ($r in $running) { if ($r.CommandLine -match $re) { return $true } }
-    return $false
-}
-
-# API: nothing else may already listen on 8001.
-$existingApi = Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue
-if (($existingApi)) {
-    Write-Output "API already running (listener pid=$($existingApi[0].OwningProcess)); skipping."
-    $apiStarted = $false
-} else {
-    $apiStarted = $true
-}
-
-# Bot: skip if a pasay_bot.main poller is already alive.
-$botStarted = -not (Have-Cmd 'pasay_bot\.main')
-
-# Worker: skip if an operations worker loop is already alive (idempotent lone worker).
-$workerStarted = -not (Have-Cmd 'run-operations-worker\.py')
-
-# --- start missing services -----------------------------------------------------------------
-if ($apiStarted) {
-    $out = Join-Path $Runtime 'api_runtime.log'
-    $err = Join-Path $Runtime 'api_runtime.log.err'
-    $p = Start-Process -FilePath $AppPy `
-        -ArgumentList '-m','uvicorn','app.main:app','--host','127.0.0.1','--port','8001' `
-        -WorkingDirectory $RT -RedirectStandardOutput $out -RedirectStandardError $err `
-        -WindowStyle Hidden -PassThru
-    Set-Content -LiteralPath (Join-Path $Runtime 'api_runtime.pid') -Value $p.Id
-    Write-Output "api started pid=$($p.Id)"
-}
-
-if ($botStarted) {
-    $out = Join-Path $Runtime 'bot_runtime.log'
-    $err = Join-Path $Runtime 'bot_runtime.log.err'
-    $env:PYTHONPATH = "$RT\pasay-telegram-bot"
-    $p = Start-Process -FilePath $BotPy `
-        -ArgumentList '-u','-m','pasay_bot.main' `
-        -WorkingDirectory (Join-Path $RT 'pasay-telegram-bot') `
-        -RedirectStandardOutput $out -RedirectStandardError $err `
-        -WindowStyle Hidden -PassThru
-    Set-Content -LiteralPath (Join-Path $Runtime 'bot_runtime.pid') -Value $p.Id
-    Write-Output "bot started pid=$($p.Id)"
-}
-
-if ($workerStarted) {
-    $out = Join-Path $Runtime 'worker_runtime.log'
-    $err = Join-Path $Runtime 'worker_runtime.log.err'
-    $p = Start-Process -FilePath $AppPy `
-        -ArgumentList (Join-Path $RT 'bin\run-operations-worker.py'), '--interval','60' `
-        -WorkingDirectory $RT -RedirectStandardOutput $out -RedirectStandardError $err `
-        -WindowStyle Hidden -PassThru
-    Set-Content -LiteralPath (Join-Path $Runtime 'worker_runtime.pid') -Value $p.Id
-    Write-Output "worker started pid=$($p.Id)"
-}
-
-# --- verify ---------------------------------------------------------------------------------
-# Readiness gate (fail-closed): the launcher must return a clear success/failure
-# within a finite time. It refuses to report success for a partial runtime, and
-# specifically flags the P0 failure mode (Telegram getUpdates 409 Conflict from
-# a duplicate bot poller) so it can never be mistaken for a healthy bot.
-Start-Sleep -Seconds 6
-$apiNow = Get-NetTCPConnection -LocalPort 8001 -State Listen -ErrorAction SilentlyContinue
-$wPid = Get-PidFile 'worker_runtime.pid'
-$bPid = Get-PidFile 'bot_runtime.pid'
-$apiOk    = [bool]$apiNow
-$workerOk = Test-ProcessAlive $wPid
-$botOk    = Test-ProcessAlive $bPid
-$botPolling = $false
-$botOut = Join-Path $Runtime 'bot_runtime.log'
-if (Test-Path -LiteralPath $botOut) {
-    $botPolling = [bool](Select-String -LiteralPath $botOut -Pattern 'starting polling' -Quiet -ErrorAction SilentlyContinue)
-}
-$botConflict = $false
-$botErr = Join-Path $Runtime 'bot_runtime.log.err'
-if (Test-Path -LiteralPath $botErr) {
-    $botConflict = [bool](Select-String -LiteralPath $botErr -Pattern 'Conflict|terminated by other getUpdates' -Quiet -ErrorAction SilentlyContinue)
-}
-
-Write-Output ""
-Write-Output "--- verify ---"
-Write-Output ("API  listener : " + $(if ($apiNow) { "pid=$($apiNow[0].OwningProcess)" } else { 'NONE' }))
-Write-Output ("WORKER pid    : " + $(if ($workerOk) { "$wPid (alive)" } else { 'NONE' }))
-Write-Output ("BOT   pid     : " + $(if ($botOk) { "$bPid (alive)" } else { 'NONE' }))
-Write-Output ("BOT   polling : " + $(if ($botPolling) { 'yes' } else { 'not-yet/unknown' }))
-if ($botConflict) { Write-Output "BOT   CONFLICT: telegram getUpdates Conflict detected (duplicate consumer)" }
-Write-Output "--- worker_runtime.log tail ---"
-Get-Content (Join-Path $Runtime 'worker_runtime.log') -Tail 10 -ErrorAction SilentlyContinue
-Write-Output "--- worker_runtime.log.err tail ---"
-Get-Content (Join-Path $Runtime 'worker_runtime.log.err') -Tail 10 -ErrorAction SilentlyContinue
-if ($botConflict) {
-    Write-Output "--- bot_runtime.log.err tail ---"
-    Get-Content $botErr -Tail 12 -ErrorAction SilentlyContinue
-}
-
-# Fail closed: a partial runtime is not success.
-if (-not $apiOk)     { Write-Error "READINESS_FAILED: API not listening on 127.0.0.1:8001"; exit 1 }
-if (-not $workerOk)  { Write-Error "READINESS_FAILED: operations worker not alive"; exit 1 }
-if (-not $botOk)     { Write-Error "READINESS_FAILED: bot poller not alive"; exit 1 }
-if ($botConflict)    { Write-Error "READINESS_FAILED: bot hit Telegram getUpdates Conflict (duplicate consumer)"; exit 1 }
-Write-Output "READINESS_OK: 1 API + 1 bot poller + 1 operations worker"
-exit 0
+# Delegate ALL lifecycle ownership to the canonical Python owner. The owner is
+# idempotent: if a live canonical runtime already owns the unit, this is a
+# no-op (never spawns a duplicate poller / worker / API).
+& $AppPy $Owner bootstrap
+$exit = $LASTEXITCODE
+Write-Output "canonical owner exit=$exit"
+exit $exit
