@@ -855,52 +855,252 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
     }
 
 
-def build_digest(db: Session, user: User, *, now: datetime | None = None) -> dict:
-    """Daily Active Tasks Digest: pending / in_progress / recently_completed."""
-    now = now or datetime.now(timezone.utc)
-    query = _agent_scope(db.query(OperationalTask), user)
-    pending = (
-        query.filter(OperationalTask.status == OperationalTaskStatus.PENDING)
-        .order_by(OperationalTask.due_at)
+_LEASE_EXPIRY_DIGEST_WINDOW_DAYS = 30
+_DIGEST_ACT_MAX = 8
+_DIGEST_UPCOMING_MAX = 5
+_DIGEST_DONE_MAX = 3
+
+
+def _digest_unit_label(db: Session, lease: Lease) -> str:
+    """Short unit label for a lease (the stable business display identity)."""
+    unit = (
+        db.query(Unit).filter(Unit.id == lease.unit_id).first()
+        if lease.unit_id is not None
+        else None
+    )
+    return _unit_label(db, unit) or (unit.unit_number if unit else str(lease.unit_id))
+
+
+def _overdue_rent_digest_rows(db: Session, *, now: datetime) -> list[dict]:
+    """🔴 ACT-NOW overdue-rent items built from the SAME real truth source as the
+    Rent Quick View (TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §7 / §11): one item per
+    lease that has overdue uncovered periods, carrying the TOTAL arrears
+    (monthly × uncovered periods), the uncovered-period count and the overdue
+    days. Never a monthly rent in place of the outstanding and never the
+    operational_tasks table."""
+    today = now.date()
+    leases = (
+        db.query(Lease)
+        .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
         .all()
     )
-    in_progress = (
-        query.filter(OperationalTask.status == OperationalTaskStatus.IN_PROGRESS)
-        .order_by(OperationalTask.next_check_at, OperationalTask.due_at)
-        .all()
-    )
-    recently = (
-        query.filter(
-            OperationalTask.status == OperationalTaskStatus.COMPLETED,
-            OperationalTask.completed_at >= now - timedelta(days=1),
+    if not leases:
+        return []
+    confirmed_by_lease: dict[int, list[Income]] = {}
+    for income in (
+        db.query(Income)
+        .filter(
+            Income.lease_id.in_([l.id for l in leases]),
+            Income.status == IncomeStatus.confirmed,
         )
-        .order_by(OperationalTask.completed_at.desc())
-        .limit(20)
+        .all()
+    ):
+        confirmed_by_lease.setdefault(income.lease_id, []).append(income)
+    rows: list[dict] = []
+    for lease in leases:
+        periods = _lease_periods(lease)
+        due_periods = [(m, due) for m, due in periods if due <= today]
+        if not due_periods:
+            continue
+        covered = _covered_periods(lease, periods, confirmed_by_lease.get(lease.id, []))
+        overdue = [(m, due) for m, due in due_periods if m not in covered]
+        if not overdue:
+            continue
+        oldest_due = overdue[0][1]
+        rows.append(
+            {
+                "business_dedupe_key": f"lease:{lease.id}:RENT_OVERDUE",
+                "kind": "rent_overdue",
+                "unit": _digest_unit_label(db, lease),
+                "amount": _d2(Decimal(str(lease.monthly_rent)) * len(overdue)),
+                "unpaid_periods": len(overdue),
+                "overdue_days": max((today - oldest_due).days, 0),
+                "lease_id": lease.id,
+                "sort_severity": 1,
+                "sort_anchor": max((today - oldest_due).days, 0),
+                "sort_tie": -lease.id,
+            }
+        )
+    return rows
+
+
+def _lease_expiring_digest_rows(db: Session, *, now: datetime) -> list[dict]:
+    """🟡 UPCOMING lease-expiry items: active leases whose end date falls
+    inside the near-term window (>= today). The user action is to prepare the
+    renewal / handover — never the same bucket as an overdue rent chase."""
+    today = now.date()
+    window_end = today + timedelta(days=_LEASE_EXPIRY_DIGEST_WINDOW_DAYS)
+    leases = (
+        db.query(Lease)
+        .filter(
+            Lease.status == LeaseStatus.active,
+            Lease.deleted_at.is_(None),
+            Lease.end_date >= today,
+            Lease.end_date <= window_end,
+        )
+        .order_by(Lease.end_date, Lease.id)
         .all()
     )
-    lease_ids = {
-        t.lease_id
-        for t in list(pending) + list(in_progress) + list(recently)
-        if t.lease_id is not None
-    }
-    unit_number_by_lease: dict[int, str] = {}
+    rows = []
+    for lease in leases:
+        rows.append(
+            {
+                "business_dedupe_key": f"lease:{lease.id}:LEASE_EXPIRING",
+                "kind": "lease_expiring",
+                "unit": _digest_unit_label(db, lease),
+                "days_to_expiry": max((lease.end_date - today).days, 0),
+                "lease_id": lease.id,
+                "sort_severity": 2,
+                "sort_anchor": max((lease.end_date - today).days, 0),
+                "sort_tie": lease.id,
+            }
+        )
+    return rows
+
+
+def _human_completion_kind(task: OperationalTask) -> str:
+    """User-visible label for a genuinely HUMAN-completed task."""
+    if task.task_type in (OperationalTaskType.FOLLOWUP, OperationalTaskType.RENT_OVERDUE):
+        return "rent_followup"
+    if task.task_type == OperationalTaskType.PAYMENT_PENDING:
+        return "expense_paid"
+    if task.task_type == OperationalTaskType.APPROVAL_PENDING:
+        return "expense_approved"
+    if task.task_type == OperationalTaskType.AC_MAINTENANCE:
+        return "maintenance"
+    return "generic"
+
+
+def _human_done_digest_rows(db: Session, *, now: datetime) -> list[dict]:
+    """✅ DONE-TODAY items: only tasks completed by a REAL human principal today
+    (``completed_by IS NOT NULL``) — never a scheduler auto-completion, a
+    supersede, a reconcile, a generator replacement or a duplicate-cleanup
+    (those leave ``completed_by`` NULL). Deduped by the stable business key so
+    repeated rows for the same fact collapse to one."""
+    from app.services.operations.daily_dedup import philippines_local_date
+
+    ph_today = philippines_local_date(now)
+    day_start = datetime.fromisoformat(f"{ph_today}T00:00:00+08:00").astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    commits = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.status == OperationalTaskStatus.COMPLETED,
+            OperationalTask.completed_by.isnot(None),
+            OperationalTask.completed_at.isnot(None),
+            OperationalTask.completed_at >= day_start,
+            OperationalTask.completed_at < day_end,
+        )
+        .order_by(OperationalTask.completed_at.desc(), OperationalTask.id.desc())
+        .all()
+    )
+    # Unit labels for every lease referenced by a completion.
+    lease_ids = {t.lease_id for t in commits if t.lease_id is not None}
+    label_by_lease: dict[int, str] = {}
     if lease_ids:
-        leases = db.query(Lease).filter(Lease.id.in_(lease_ids)).all()
-        units = {
-            u.id: u
-            for u in db.query(Unit)
-            .filter(Unit.id.in_([l.unit_id for l in leases]))
-            .all()
+        for lease in (
+            db.query(Lease).filter(Lease.id.in_(lease_ids)).all()
+        ):
+            label_by_lease[lease.id] = _digest_unit_label(db, lease)
+    rows: list[dict] = []
+    seen_keys: set[str] = set()
+    for t in commits:
+        key = t.dedupe_key or (
+            f"committed:{t.task_type.value}:"
+            f"{t.lease_id or t.source_id or t.id}"
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        details = t.details or {}
+        amount = None
+        expense_id = details.get("expense_id")
+        if expense_id is not None:
+            amount = details.get("amount")
+        item: dict = {
+            "business_dedupe_key": key,
+            "kind": _human_completion_kind(t),
+            "unit": label_by_lease.get(t.lease_id, ""),
+            "expense_id": expense_id,
+            "amount": _d2(amount) if amount is not None else None,
+            "completed_at": t.completed_at.isoformat() if t.completed_at else None,
         }
-        for lease in leases:
-            unit = units.get(lease.unit_id)
-            label = _unit_label(db, unit)
-            if label:
-                unit_number_by_lease[lease.id] = label
+        rows.append(item)
+    return rows
+
+
+def build_digest(db: Session, user: User, *, now: datetime | None = None) -> dict:
+    """Daily Tasks Digest — the three-section human-action view.
+
+    The digest answers ONE question: **what does someone need to do today?**
+    It is NOT a dump of the ``operational_tasks`` table.
+
+    Sections (deterministic, language-agnostic data):
+    - ``act_now``   (🔴): real current human actions — overdue rent (total
+      arrears truth) + approved-but-unpaid expenses. One row per business
+      object at most (deduped by the stable business key).
+    - ``upcoming``  (🟡): near-term lease expiries (watch, do not chase).
+    - ``done_today``(✅): tasks completed by a REAL human today only. System
+      auto-completions (scheduler / supersede / reconcile / generator
+      replacement / duplicate cleanup) never appear — those leave
+      ``completed_by`` NULL.
+
+    The legacy ``pending / in_progress / recently_completed`` keys are
+    preserved for the greeting counter and old callers; ``recently_completed``
+    now holds the same filtered, deduped human rows so a duplicate-completed
+    history can never flood the UI.
+    """
+    now = now or datetime.now(timezone.utc)
+    overdue = _overdue_rent_digest_rows(db, now=now)
+    payable = [
+        {
+            **{k: v for k, v in r.items() if k != "unit_code"},
+            "sort_anchor": -(r.get("waiting_days") or 0),
+            "sort_tie": r["expense_id"],
+        }
+        for r in _payable_expense_rows(db, now=now)
+    ]
+    # --- 🔴 ACT NOW: overdue rents (severity = more days first), then payable
+    # expenses (more waiting first); deterministic stable tie-breakers only. ---
+    act_now = sorted(
+        overdue + payable,
+        key=lambda r: (
+            0 if r.get("kind") == "rent_overdue" else 1,  # rents before expenses
+            -r.get("sort_anchor", 0),  # largest overdue/waiting first
+            -r.get("sort_tie", 0) if r.get("kind") == "rent_overdue" else r.get("sort_tie", 0),
+        ),
+    )
+    upcoming = _lease_expiring_digest_rows(db, now=now)
+    done_today = _human_done_digest_rows(db, now=now)
+
+    act_hidden = max(len(act_now) - _DIGEST_ACT_MAX, 0)
+    upcoming_hidden = max(len(upcoming) - _DIGEST_UPCOMING_MAX, 0)
+    done_hidden = max(len(done_today) - _DIGEST_DONE_MAX, 0)
+
     return {
-        "pending": [_task_row(db, t, unit_number_by_lease) for t in pending],
-        "in_progress": [_task_row(db, t, unit_number_by_lease) for t in in_progress],
+        "act_now": act_now[:_DIGEST_ACT_MAX],
+        "upcoming": upcoming[:_DIGEST_UPCOMING_MAX],
+        "done_today": done_today[:_DIGEST_DONE_MAX],
+        "hidden": {
+            "act_now": act_hidden,
+            "upcoming": upcoming_hidden,
+            "done_today": done_hidden,
+        },
+        "counts": {
+            "act_now": len(act_now),
+            "upcoming": len(upcoming),
+            "done_today": len(done_today),
+        },
+        # Legacy keys (greeting counter + old callers): semantic, deduped.
+        "pending": [
+            {"id": (-i), "task_type": r["kind"].upper(), "title": r["kind"],
+             "status": "PENDING"}
+            for i, r in enumerate(act_now)
+        ],
+        "in_progress": [],
         "recently_completed": [
-            _task_row(db, t, unit_number_by_lease) for t in recently
+            {"id": (-i), "task_type": r["kind"].upper(), "title": r["kind"],
+             "status": "COMPLETED", "completed_by": 1}
+            for i, r in enumerate(done_today)
         ],
     }

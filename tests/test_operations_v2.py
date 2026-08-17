@@ -452,7 +452,13 @@ def test_quick_expense_payable_and_paid_sections_clean_and_disjoint(
 
 
 def test_digest_structure(client, db_session, admin_headers):
-    lease, _ = _seed_lease(db_session)
+    """Daily Digest exposes the three user-semantic sections and at most one
+    row per business object. Seeding the quick/task board directly must NOT
+    surface raw task rows — only real human actions (overdue rent / payable
+    expense) and real lease expiries appear (DAILY-DIGEST-TRUTH-CLEANUP-006)."""
+    lease, unit = _seed_lease(db_session)
+    # Seed raw PENDING/IN_PROGRESS operational tasks: they must NOT be dumped
+    # into the digest (system-internal rows are not "what the human does").
     _make_task(db_session, status=OperationalTaskStatus.PENDING, lease_id=lease.id,
                dedupe_key="v2-d1")
     _make_task(db_session, status=OperationalTaskStatus.IN_PROGRESS, lease_id=lease.id,
@@ -460,9 +466,25 @@ def test_digest_structure(client, db_session, admin_headers):
     resp = client.get(f"{API}/operations/digest", headers=admin_headers)
     assert resp.status_code == 200
     body = resp.json()
-    assert len(body["pending"]) == 1
-    assert len(body["in_progress"]) == 1
-    assert body["recently_completed"] == []
+    # The 1680 lease is overdue (due day 5, current PH date is in Aug-2026) ->
+    # at least the Jan..Aug uncovered periods give a semantic item.
+    assert len(body["act_now"]) == 1
+    rent = body["act_now"][0]
+    assert rent["kind"] == "rent_overdue"
+    assert rent["business_dedupe_key"] == f"lease:{lease.id}:RENT_OVERDUE"
+    assert rent["unit"] == "1680"
+    # Total arrears truth: uncovered periods x 12,000 monthly rent (never a
+    # bare monthly rent in place of the outstanding).
+    periods = rent["unpaid_periods"]
+    assert periods >= 8
+    assert float(rent["amount"]) == float(periods) * 12000.0
+    assert rent["overdue_days"] >= 15
+    # Upcoming is empty: the lease ends in Dec (outside the 30d window).
+    assert body["upcoming"] == []
+    assert body["done_today"] == []
+    # Raw-board tasks must not leak into the user's digest.
+    assert len(body["pending"]) == 1  # legacy alias == act_now count
+    assert body["in_progress"] == []
 
 
 # ---------------------------------------------------------------------------

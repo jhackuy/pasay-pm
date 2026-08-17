@@ -231,17 +231,20 @@ def build_application(
         logger.warning("jobs.register_jobs failed: %s", exc)
 
     async def _set_rescue_command_menu(app_):
-        """Advertise ONLY the rescue commands in the BotFather menu."""
+        """DAILY-DIGEST-TRUTH-CLEANUP-006 PHASE 12-17: keep the production
+        Telegram command menu EMPTY so Owners / Secretaries never see dev
+        slash commands (/new /stop /status /stress ...) or even /start /help
+        /cancel. This is a real Telegram Bot API call — it clears the DEFAULT
+        scope and every standard scope that could have held a stale command.
+        The start/help/cancel *handlers* stay registered (a handler existing is
+        not the same as a command being published to the visible menu)."""
         try:
-            await app_.bot.set_my_commands(
-                [
-                    ("start", "Start (recovery)"),
-                    ("help", "Help"),
-                    ("cancel", "Cancel"),
-                ]
-            )
+            await app_.bot.set_my_commands([])  # default scope -> empty
+            await app_.bot.set_my_commands([], scope=telegram.BotCommandScopeAllPrivateChats())
+            await app_.bot.set_my_commands([], scope=telegram.BotCommandScopeAllGroupChats())
+            await app_.bot.set_my_commands([], scope=telegram.BotCommandScopeAllChatAdministrators())
         except Exception as exc:  # noqa: BLE001 - cosmetic, never fatal
-            logger.warning("set_my_commands failed: %s", exc)
+            logger.warning("set_my_commands (empty) failed: %s", exc)
 
     app.post_init = _set_rescue_command_menu
     return app

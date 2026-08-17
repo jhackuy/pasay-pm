@@ -84,6 +84,7 @@ class FakeBot:
         self.username = "pasay_test_bot"
         self.id = 999
         self._answered_ids: set[str] = set()
+        self.command_menu: dict = {}
         # Real Telegram semantics: only messages sent WITHOUT a reply keyboard
         # (or with an inline keyboard) are editable. Track what the bot sent so
         # edit_message_text can reject the reply-keyboard case exactly like the
@@ -98,6 +99,31 @@ class FakeBot:
 
     async def get_me(self):
         return SimpleNamespace(username=self.username, id=self.id)
+
+    async def set_my_commands(self, commands, scope=None, language_code=None, **kw):
+        """Record a setMyCommands publication. ``commands`` is a list of
+        (command, description) tuples or BotCommand objects; ``scope`` is a
+        BotCommandScope (None == default scope)."""
+        self.command_menu = self.command_menu or {}
+        names = [
+            getattr(c, "command", None) or (c[0] if isinstance(c, (tuple, list)) else None)
+            for c in (commands or [])
+        ]
+        scope_label = getattr(scope, "type", None) if scope is not None else "default"
+        self.command_menu[scope_label] = [n for n in names if n]
+        self.calls.append(
+            {
+                "type": "set_my_commands",
+                "commands": names,
+                "scope": scope_label,
+                "language_code": language_code,
+            }
+        )
+
+    def published_commands(self):
+        """Commands published to each Telegram command scope (None == default).
+        Empty list means that scope was cleared."""
+        return getattr(self, "command_menu", {}) or {}
 
     async def send_message(self, chat_id, text=None, parse_mode=None, reply_markup=None, **kw):
         self.calls.append(

@@ -26,6 +26,7 @@ from telegram.ext import Application
 from pasay_bot.api_client import PasayApiClient, PasayApiError
 from pasay_bot.config import Settings
 from pasay_bot.render import cards
+from pasay_bot.roles import ROLE_LOCALES, Role, telegram_id_for_role
 from pasay_bot.state.store import StateStore
 
 logger = logging.getLogger(__name__)
@@ -39,18 +40,41 @@ def _digest_locale() -> str:
     return "bi"  # group digest is always bilingual
 
 
+def _digest_recipients() -> list[tuple[int, str]]:
+    """Per-user private-chat digest recipients with the role's single-language
+    locale (DAILY-DIGEST-TRUTH-CLEANUP-006 PHASE 8/9/10):
+    Owner -> zh, Secretary -> en. chat_id of a private chat == the user id."""
+    recipients: list[tuple[int, str]] = []
+    for role in (Role.OWNER, Role.SECRETARY):
+        chat_id = telegram_id_for_role(role)
+        if chat_id is not None:
+            recipients.append((int(chat_id), ROLE_LOCALES.get(role, "zh")))
+    return recipients
+
+
 async def _send_digest(app: Application, api: PasayApiClient, store: StateStore) -> None:
     try:
         data = await api.get_digest()
     except PasayApiError as exc:
         logger.warning("digest fetch failed: %s", exc)
         return
-    if not (data.get("pending") or data.get("in_progress")):
+    if not (data.get("pending") or data.get("in_progress")
+            or data.get("act_now") or data.get("upcoming")
+            or data.get("done_today")):
         return  # no active tasks -> nothing to push today
-    text = cards.active_tasks_digest_card(data, _digest_locale())
+    # Per-user private chats: Owner Chinese single-language, Secretary English
+    # single-language.
+    for chat_id, locale in _digest_recipients():
+        text = cards.active_tasks_digest_card(data, locale)
+        try:
+            await app.bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception as exc:  # noqa: BLE001 - one bad recipient never blocks
+            logger.warning("digest send to %s failed: %s", chat_id, exc)
+    # Shared group broadcast stays bilingual (mixed audience).
     groups = store.list_known_groups()
     if not groups:
         return
+    text = cards.active_tasks_digest_card(data, _digest_locale())
     for group in groups:
         try:
             await app.bot.send_message(

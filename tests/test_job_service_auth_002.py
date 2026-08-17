@@ -165,8 +165,13 @@ def test_system_scheduler_job_reads_quick_tasks_and_digest_as_system(
     resp = client.get(f"{API}/operations/digest", headers=headers)
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert len(body["pending"]) == 1
-    assert len(body["in_progress"]) == 1
+    # DAILY-DIGEST-TRUTH-CLEANUP-006: the digest exposes the three user-
+    # semantic sections and never dumps the seeded AC_MAINTENANCE board rows
+    # (a raw scheduler task is not a human action today).
+    for key in ("act_now", "upcoming", "done_today", "counts", "hidden"):
+        assert key in body, key
+    assert isinstance(body["act_now"], list)
+    assert body["done_today"] == []
 
     # Provenance is the SYSTEM principal itself, never the Owner.
     subject, caller, credential_id, channel = current_audit_context(db_session)
@@ -216,7 +221,10 @@ def test_owner_human_behavior_unchanged(client, db_session, admin, admin_headers
 
     resp = client.get(f"{API}/operations/digest", headers=admin_headers)
     assert resp.status_code == 200, resp.text
-    assert len(resp.json()["pending"]) == 1
+    digest = resp.json()
+    # DAILY-DIGEST-TRUTH-CLEANUP-006: the seeded raw AC_MAINTENANCE task is a
+    # system-internal row — it must NOT surface as a digest human action.
+    assert "act_now" in digest and isinstance(digest["act_now"], list)
 
     subject, caller, _, channel = current_audit_context(db_session)
     subject_principal = db_session.get(Principal, subject)

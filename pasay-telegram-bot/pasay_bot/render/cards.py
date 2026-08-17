@@ -2699,24 +2699,181 @@ def _v2_expense_payable_line(row: dict, locale: str) -> str:
     return " · ".join(parts)
 
 
+def _digest_section(header_key: str, locale: str, emoji: str) -> str:
+    """One digest section header, e.g. ``🔴 现在处理 · 6`` (count appended by
+    the caller as part of the header text when needed)."""
+    return f"{emoji} <b>{H.escape(_bi_header(locale, t(header_key, 'en'), t(header_key, 'zh')))}</b>"
+
+
+def _digest_act_line(item: dict, locale: str) -> str:
+    """🔴 ACT-NOW line. Rent overdue reads ``催租 · ₱total · N期 · 逾期D天``
+    from the REAL arrears truth; payable expense reads ``付款 · <purpose> ·
+    ₱amount`` (PHASE 6: the action, not a bare category)."""
+    kind = str(item.get("kind") or "").lower()
+    unit = H.escape(str(item.get("unit") or item.get("unit_code") or ""))
+    en: list[str] = []
+    zh: list[str] = []
+    if kind == "payable_expense" and item.get("expense_id") is not None:
+        e_id = f"E{int(item['expense_id'])}"
+        en.append(e_id)
+        zh.append(e_id)
+    if unit:
+        en.append(unit)
+        zh.append(unit)
+    action_en = t("v2.digest_rent_action", "en") if kind == "rent_overdue" else t("v2.digest_pay_action", "en")
+    action_zh = t("v2.digest_rent_action", "zh") if kind == "rent_overdue" else t("v2.digest_pay_action", "zh")
+    en.append(action_en)
+    zh.append(action_zh)
+    if kind == "rent_overdue":
+        if item.get("amount") is not None:
+            en.append(H.money(item.get("amount")))
+            zh.append(H.money(item.get("amount")))
+        periods = item.get("unpaid_periods")
+        if periods:
+            en.append(f"{int(periods)} period(s)")
+            zh.append(f"{int(periods)}期")
+        if item.get("overdue_days") is not None:
+            en.append(t("v2.overdue_days", "en", days=int(item["overdue_days"])))
+            zh.append(t("v2.overdue_days", "zh", days=int(item["overdue_days"])))
+    else:  # payable_expense
+        purpose = H.escape(str(item.get("purpose") or ""))
+        if purpose:
+            en.append(purpose)
+            zh.append(purpose)
+        if item.get("amount") is not None:
+            en.append(H.money(item.get("amount")))
+            zh.append(H.money(item.get("amount")))
+    en_line = " · ".join(p for p in en if p)
+    zh_line = " · ".join(p for p in zh if p)
+    return f"🔴 {_bi_line(locale, en_line, zh_line)}"
+
+
+def _digest_upcoming_line(item: dict, locale: str) -> str:
+    """🟡 UPCOMING line: ``1608 · 合同18天后到期`` (lease expiry is a watch item,
+    never a red chase)."""
+    unit = H.escape(str(item.get("unit") or item.get("unit_code") or ""))
+    days = item.get("days_to_expiry")
+    label_en = t("v2.digest_lease_action", "en", days=int(days or 0))
+    label_zh = t("v2.digest_lease_action", "zh", days=int(days or 0))
+    parts = [p for p in (unit, ) if p]
+    en_line = " · ".join(parts + [label_en])
+    zh_line = " · ".join(parts + [label_zh])
+    return f"🟡 {_bi_line(locale, en_line, zh_line)}"
+
+
+def _digest_done_line(item: dict, locale: str) -> str:
+    """✅ DONE-TODAY line: only genuinely HUMAN completions. Rent follow-up reads
+    ``1680 · 已联系租客``; a paid expense reads ``E4 · 已付款 · ₱amount``."""
+    kind = str(item.get("kind") or "").lower()
+    unit = H.escape(str(item.get("unit") or item.get("unit_code") or ""))
+    expense_id = item.get("expense_id")
+    en: list[str] = []
+    zh: list[str] = []
+    if expense_id is not None:
+        e_id = f"E{int(expense_id)}"
+        en.append(e_id)
+        zh.append(e_id)
+    if unit:
+        en.append(unit)
+        zh.append(unit)
+    label_key = {
+        "rent_followup": "v2.digest_followed_up",
+        "expense_paid": "v2.digest_paid_action",
+        "expense_approved": "v2.digest_approved_action",
+        "maintenance": "v2.digest_maintenance_action",
+    }.get(kind, "v2.digest_done_action")
+    en.append(t(label_key, "en"))
+    zh.append(t(label_key, "zh"))
+    if kind == "expense_paid" and item.get("amount") is not None:
+        en.append(H.money(item.get("amount")))
+        zh.append(H.money(item.get("amount")))
+    en_line = " · ".join(p for p in en if p)
+    zh_line = " · ".join(p for p in zh if p)
+    return f"✅ {_bi_line(locale, en_line, zh_line)}"
+
+
+def _digest_section_block(data: dict, key: str, locale: str, emoji: str,
+                          line_fn, row_key: str, max_items: int,
+                          more_key: str = "v2.digest_more") -> str:
+    """Build one digest section block. Defense-in-depth: rows are deduped by
+    business_dedupe_key (PHASE 4 — one line per business object) and truncated
+    to ``max_items`` with an overflow line (PHASE 11)."""
+    rows = data.get(row_key) or []
+    if not rows:
+        return ""
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    for r in rows:
+        bkey = r.get("business_dedupe_key") or (
+            f"{r.get('kind')}:{r.get('expense_id') or r.get('unit')}"
+        )
+        if bkey in seen:
+            continue
+        seen.add(bkey)
+        deduped.append(r)
+    count = int((data.get("counts") or {}).get(row_key, len(deduped)))
+    shown = deduped[:max_items]
+    hidden = int((data.get("hidden") or {}).get(row_key, 0))
+    header_en = t(key, "en")
+    header_zh = t(key, "zh")
+    header = _bi_header(locale, f"{header_en} · {count}", f"{header_zh} · {count}")
+    blocks = [f"{emoji} <b>{H.escape(header)}</b>"]
+    blocks.extend(line_fn(r, locale) for r in shown)
+    if hidden or len(deduped) > max_items:
+        overflow = hidden if hidden else len(deduped) - max_items
+        blocks.append(H.escape(_bi_line(
+            locale,
+            t(more_key, "en", count=overflow),
+            t(more_key, "zh", count=overflow),
+        )))
+    return "\n".join(blocks)
+
+
 def active_tasks_digest_card(data, locale: str = "bi") -> str:
-    """Daily Active Tasks Digest: pending / in progress / recently completed."""
+    """Daily Tasks Digest — three user-semantic sections.
+
+    * 🔴 Act now — real current human actions (overdue rent / payable expense)
+    * 🟡 Upcoming — near-term lease expiries
+    * ✅ Done today — tasks a HUMAN completed today (system auto-completions
+      never appear)
+
+    One line per business object at most, hard mobile length caps per section,
+    deterministic ordering, single-language per ``locale`` (zh / en / bi)."""
     data = data or {}
-    pending = data.get("pending") or []
-    in_progress = data.get("in_progress") or []
-    recently = data.get("recently_completed") or []
-    blocks = [_v2_title(locale, "v2.digest_title", "📋")]
-    if pending:
-        blocks.append(_v2_section("v2.status.pending", locale, "🔴"))
-        blocks.extend(_v2_task_line(t_, locale, "🔴") for t_ in pending)
-    if in_progress:
-        blocks.append(_v2_section("v2.status.in_progress", locale, "🟡"))
-        blocks.extend(_v2_task_line(t_, locale, "🟡") for t_ in in_progress)
-    if recently:
-        blocks.append(_v2_section("v2.status.completed", locale, "✅"))
-        blocks.extend(_v2_task_line(t_, locale, "✅") for t_ in recently)
-    if not (pending or in_progress or recently):
-        blocks.append(H.escape(t("v2.empty", locale)))
+    title_en = t("v2.digest_title", "en")
+    title_zh = t("v2.digest_title", "zh")
+    blocks = [f"📋 <b>{H.escape(_bi_header(locale, title_en, title_zh))}</b>"]
+    act = _digest_section_block(
+        data, "v2.digest_act", locale, "🔴", _digest_act_line,
+        "act_now", max_items=8, more_key="v2.digest_more",
+    )
+    upcoming = _digest_section_block(
+        data, "v2.digest_upcoming", locale, "🟡", _digest_upcoming_line,
+        "upcoming", max_items=5, more_key="v2.digest_more",
+    )
+    done = _digest_section_block(
+        data, "v2.digest_done", locale, "✅", _digest_done_line,
+        "done_today", max_items=3, more_key="v2.digest_done_more",
+    )
+    for block in (act, upcoming, done):
+        if block:
+            blocks.append(block)
+    if not (act or upcoming or done):
+        # Legacy payload fallback (older callers without the semantic keys).
+        pending = data.get("pending") or []
+        in_progress = data.get("in_progress") or []
+        recently = data.get("recently_completed") or []
+        if in_progress:
+            blocks.append(_v2_section("v2.status.in_progress", locale, "🟡"))
+            blocks.extend(_v2_task_line(t_, locale, "🟡") for t_ in in_progress)
+        if pending:
+            blocks.append(_v2_section("v2.status.pending", locale, "🔴"))
+            blocks.extend(_v2_task_line(t_, locale, "🔴") for t_ in pending)
+        if recently:
+            blocks.append(_v2_section("v2.status.completed", locale, "✅"))
+            blocks.extend(_v2_task_line(t_, locale, "✅") for t_ in recently)
+        if not (pending or in_progress or recently):
+            blocks.append(H.escape(t("v2.empty", locale)))
     return "\n\n".join(blocks)
 
 
