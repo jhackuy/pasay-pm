@@ -4,8 +4,8 @@
 **Date**: 2026-08-17 (overnight unattended)
 **Branch**: `feature/telegram-ui-v2`
 **Baseline SHA**: `3af10ee2649295a6c1e1c4a712806776b770ed97`
-**Final HEAD SHA**: `14543dec7baaa15bcd359d2b9407aec1c97d02f1`
-**Runtime LIVE_SHA**: `bff46a6960aa0439ae276b33e609396985343085` (LIVE == TARGET for the deployed CODE; the final `14543de` commit adds only this report doc — zero code change, so the running system is identical to the verified `bff46a6` code SHA).
+**Final HEAD SHA**: `ead68c5ec913a591504585db0c48e8d0c8ccbdde`
+**Runtime LIVE_SHA**: `bff46a6960aa0439ae276b33e609396985343085` (LIVE == TARGET for the deployed code; the final report commit adds only this doc — zero code change — so the running system is identical to the verified `bff46a6` code SHA).
 
 ---
 
@@ -14,14 +14,14 @@
 | ID | Problem | Location before fix |
 |----|---------|---------------------|
 | R1 | **No Payment Claim entity.** The only payment truth was `Expense.status`; `approved -> paid` was a raw status flip with no claim/evidence/verification. | `app/api/routers/expense.py` `pay_expense` |
-| R2 | **"Click = paid" false-closure.** A single Owner tele-bot tap (`✅ 确认已付款`) or NL "已经付款" flipped `approved->paid` with no verified record — "someone said they paid" was treated as "money truly paid". | bot `_handle_expense_pay_confirm`, `api.pay_expense` |
-| R3 | **No partial payment / remaining.** `ExpenseStatus` had no `PARTIALLY_PAID` / `PAYMENT_CLAIMED`; task generator always issued one `PAYMENT_PENDING` for the full amount. | `app/models/financial.py`, `generation.py` |
+| R2 | **"Click = paid" false-closure.** A single Owner tele-bot tap or NL "已经付款" flipped `approved->paid` with no verified record — "someone said they paid" was treated as "money truly paid". | bot `_handle_expense_pay_confirm`, `api.pay_expense` |
+| R3 | **No partial payment / remaining.** `ExpenseStatus` had no `partially_paid` / `payment_claimed`; task generator always issued one `PAYMENT_PENDING` for the full amount. | `app/models/financial.py`, `generation.py` |
 | R4 | **Approve == treated as needing full payment.** Single-amount, single-jump model. |
 | R5 | **Rejection destroyed forward-path evidence.** `reject` only audited; no reason, no version preserved, no resubmit continuity. |
 | R6 | **Critical-field change on approved was a hard 409** — category/payee could be silently changed and keep a stale approval. |
 | R7 | **Evidence attached only to Expense root** (`receipt_attachment_id`), never to a specific claim → could not tell which payment a proof supported. |
 | R8 | **Worker/Telegram never surfaced partial/remaining/verify state.** |
-| R9 | **No expense detail serializer / timeline / reversal-by-records** (tear 008A pattern existed for Repair only). `reverse` (paid->reversed) did not recompute from verified claims. |
+| R9 | **No expense detail serializer / timeline / reversal-by-records** (the 008A pattern existed for Repair only). `reverse` (paid->reversed) did not recompute from verified claims. |
 | R10 | **Telegram copy could overstate "Paid"** from an unverified flip. |
 | R11 | **Audit missing expense-step actions** (claim_created / verified / failed / mismatch / reapproval / fully_paid). |
 
@@ -35,7 +35,7 @@
 | Payment required | derived — `remaining = amount - verified_paid` |
 | Payment claim | `expense_payment_claims` (PENDING) |
 | Payment evidence | `evidence` rows linked `entity_type='expense_payment_claim'`, `entity_id=<claim.id>` |
-| **Verified amount** | **SUM of VERIFIED `expense_payment_claims.verified_amount`** (single calculator `expense_payment_truth`), used by router/bot/worker/Mini-App |
+| **Verified amount** | **SUM of VERIFIED `expense_payment_claims.verified_amount`** (single calculator), used by router/bot/worker/Mini-App |
 | Remaining balance | derived (`amount - SUM(VERIFIED)`), never negative |
 | Paid status | derived — `expense.status == 'paid'` ONLY when remaining == 0 via verified aggregation |
 | Related-op continuation | Expense PAID never closes a Repair (008A gate preserved) |
@@ -57,20 +57,20 @@ Key facts:
 - A **VERIFIED** claim is the ONLY thing that adds `verified_amount` to the aggregate.
 - A **FAILED** claim adds nothing to paid/verified/ledger; the failure is preserved in history.
 - **Amount mismatch** (section 5 / E6): if admitting the claim would exceed the total, the claim is flagged `mismatch=True`, surfaced with a reason, NEVER auto-PAIDs and NEVER truncates; `failure_reason=OVERPAYMENT_MISMATCH`.
-- **Idempotency** (section 6 / E5): deterministic `idempotency_key` guarded by a **DB partial unique index** + `ON CONFLICT DO NOTHING`; a `₱10,000` claim replayed 30× yields exactly one row and one verified credit.
+- **Idempotency** (section 6 / E5): deterministic `idempotency_key` guarded by a **DB partial unique index** + `ON CONFLICT DO NOTHING`; a ₱10,000 claim replayed 30× yields exactly one row and one verified credit.
 
 ## D. Partial Payment (₱10,000 + ₱18,000)
 
 Proven end-to-end (backend test + live-runtime E2E):
-- **Claim 1 `₱10,000`** verified → `verified_paid = 10,000`, `remaining = 18,000`, `expense.status = partially_paid`. The payment operation continues; Owner + Secretary both see `remaining ₱18,000`; worker keeps ONE active follow-up task (`E12b`).
-- **Claim 2 `₱18,000`** verified → `10,000 + 18,000 = 28,000` **aggregated from VERIFIED records** (not a user-supplied override), `remaining = 0`, `expense.status = paid`.
+- **Claim 1 ₱10,000** verified → `verified_paid = 10,000`, `remaining = 18,000`, `expense.status = partially_paid`. The payment operation continues; Owner + Secretary both see `remaining ₱18,000`; worker keeps ONE active follow-up task (E12b).
+- **Claim 2 ₱18,000** verified → `10,000 + 18,000 = 28,000` **aggregated from VERIFIED records** (not a user-supplied override), `remaining = 0`, `expense.status = paid`.
 - Timeline shows `Payment claim → Evidence → ₱10,000 verified → Remaining ₱18,000 → Payment claim → Evidence → ₱18,000 verified → Expense fully paid`.
 
 ## E. Verification (success / failure / mismatch)
 
 - **Success** → claim VERIFIED, amount admitted, expense reconciles to partial/full paid.
 - **Failure** (`/fail`) → claim FAILED; `paid`/`verified`/ledger unaffected; history preserved (E7).
-- **Mismatch** (`over-claim`) → surfaced (E6), never silent.
+- **Mismatch** (over-claim) → surfaced (E6), never silent.
 - Verification is Owner/verifier-gated (`admin_only`); the Secretary's report is always a PENDING claim that Owner verifies.
 
 ## F. Approval Continuity
@@ -82,15 +82,15 @@ Proven end-to-end (backend test + live-runtime E2E):
 ## G. Task & Worker Continuity
 
 Reuses the existing **`operational_tasks`** projection (no third task system).
-- One expense → exactly one active `PAYMENT_PENDING` (dedupe key `expense:{id}:PAYMENT_PENDING`, DB partial unique index). **E11**: 30 worker ticks produce exactly ONE active payment task and at-most one reminder (persistent same-day dedupe) — no duplicates, no Telegram spam.
+- One expense → exactly one active `PAYMENT_PENDING` (dedupe key `expense:{id}:PAYMENT_PENDING`, DB partial unique index). **E11**: 30 worker ticks produce exactly ONE active payment task and at-most one reminder — no duplicates, no Telegram spam.
 - **Remaining-aware**: the PAYMENT_PENDING task carries `amount = remaining` (not the full total); a partially-paid expense refreshes it with the remaining balance.
 - **E12**: full verified payment on the next tick completes the stale payment task (no more chasing) — `reconcile`/`generation._complete_payment_task`.
-- **E12b**: a verified ₱10,000 partial keeps exactly one follow-up task (Scenario B).
-- Financial truth is NEVER derived from a user clicking "complete task"; task state is a projection (test `test_financial_write_path_not_bypassed`).
+- **E12b**: a verified ₱10,000 partial keeps exactly one follow-up task.
+- Financial truth is NEVER derived from a user clicking "complete task"; task state is a projection.
 
 ## H. Telegram (what a human actually sees)
 
-Card copy is now derived from the verified-claims truth (never chat copy):
+Card copy is derived from the verified-claims truth (never chat copy):
 - `payment_claimed` → **"Payment reported · verification pending"** (zh: 已上报付款 · 待核验) — never "Paid".
 - `partially_paid` → **"Partially paid · ₱10,000 verified · ₱18,000 remaining"**.
 - `approved` → "Waiting for payment".
@@ -105,8 +105,8 @@ The Mini App reads the same authoritative backend detail serializer.
 
 ## J. Timeline & Audit
 
-- **Timeline** (`expense_timeline.py`): `Expense created → Submitted → Approved → Payment claim ₱10,000 → ₱10,000 verified → Remaining ₱18,000 → Payment claim ₱18,000 → ₱18,000 verified → Expense fully paid`. A Repair-linked expense continues with "Waiting for repair completion" and never shows "Repair closed".
-- **Audit** (`AuditAction`) appended: `expense_claim_created/verified/failed/reversed`, `expense_amount_mismatch`, `expense_partially_paid`, `expense_fully_paid`, `expense_requires_reapproval`, `expense_resubmitted`, `expense_rejected`. Every action records the real actor (Owner/Secretary/system principal), never conflated.
+- **Timeline** (`expense_timeline.py`): `Expense created → Submitted → Approved → Payment claim ₱10,000 → ₱10,000 verified → Remaining ₱18,000 → Payment claim ₱18,000 → ₱18,000 verified → Expense fully paid`. A Repair-linked expense continues toward verification and never shows "Repair closed".
+- **Audit** (`AuditAction`) appended: `expense_claim_created/verified/failed/reversed`, `expense_amount_mismatch`, `expense_partially_paid`, `expense_fully_paid`, `expense_requires_reapproval`, `expense_resubmitted`, `expense_rejected`. Every action records the real actor.
 
 ## K. Tests (exact numbers)
 
@@ -115,7 +115,7 @@ New targeted suites:
 - `test_expense_003b_payment_truth.py` — E1,E2,E3,E4,E5,E6,E7,E8,E9,E10,E13,E15,E17 → **13 passed**.
 - `test_expense_003b_worker_continuity.py` — E11,E12,E12b,E14 → **4 passed**.
 - `test_expense_003b_final_e2e.py` — section-22 28k chain + Repair-linked → **2 passed**.
-- Updated `tests/test_financial.py` (E9 reapproval behavior); existing financial/idempotency suites pass (`29 passed`, `91 passed`).
+- Updated `tests/test_financial.py` (E9 reapproval behavior); existing financial/idempotency suites pass (29 then 91 passed).
 
 **Telegram bot (pasay-telegram-bot/tests/)** — full suite: **544 passed**, exit 0.
 - `test_expense_003b_telegram_truth.py` — E16 → **3 passed**.
@@ -142,7 +142,7 @@ Canonical runtime started via `bin/start-runtime.ps1` / `bin/pasay_runtime.py bo
 - **canonical owned**: all three components `owned=True` (atomic lock files `runtime_api.lock`, `runtime_bot.lock`, `runtime_worker.lock`)
 - **`LIVE_SHA == TARGET_SHA`**: `bff46a6…` == `bff46a6…` ✓ (`runtime-version-proof.json`)
 
-> **Platform note (honest)**: within this Harness session, child processes spawned by a plain tool-call PowerShell are reaped by the harness shortly after the command returns (section 24 note). The runtime is kept stably alive by a long-running background holder job (whose process tree the runtime components, spawned with `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`, persist under). Without such a holder the components were observed to be reaped. No "constantly running" claim is made beyond what was actually observed (LIVE_SHA + health 200 + all 3 owned/alive while the holder is active).
+> **Platform note (honest)**: within this Harness session, child processes spawned by a plain tool-call PowerShell are reaped by the harness shortly after the command returns (section 24 note). The runtime is kept stably alive by a long-running background holder job (the components are spawned with `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS` and persist under that holder). Without such a holder the components were observed to be reaped. No "constantly running" claim is made beyond what was actually observed (LIVE_SHA + health 200 + all 3 owned/alive while the holder is active).
 
 **Live-runtime E2E (section 22)** executed against `http://127.0.0.1:8001` on the live test-bed DB with a throwaway admin credential:
 ```
@@ -160,7 +160,7 @@ bff46a6 feat(expense): 003B final E2E + timeline Intermediate-remaining fixes
 dff44b9 feat(expense-bot): 003B claim API client + Telegram UX truth (E16)
 fe8f3e2 feat(expense): 003B detail serializer fields + E1-E15/E17 tests
 3ad077e feat: Expense payment-claim truth model (003B) - claims/verification/partial-pay
-14543de docs: PASAY-VNEXT-EXPENSE-OPERATION-003B final report (READY_FOR_OWNER_ACCEPTANCE)
+ead68c5 docs: PASAY-VNEXT-EXPENSE-OPERATION-003B final report (READY_FOR_OWNER_ACCEPTANCE)
 ```
 
 **Key changed/new files** (all committed):
@@ -185,11 +185,11 @@ All mandated checks passed:
 
 ## 27 (final) — unattended closeout
 
-- Temp test/dev processes stopped (pytest jobs finished; the runtime is left running under the background holder so the canonical Pasay runtime stays up per §27 step 2 "不停止 canonical Pasay runtime").
-- Logs/stdout preserved in `.runtime/*.log*` and `.ai-control/results/EXPENSE-003B/`.
+- Temp test/dev processes stopped; the canonical Pasay runtime is left running under the background holder (per §27 step 2, "不停止 canonical Pasay runtime").
+- Logs preserved in `.runtime/*.log*` and `.ai-control/results/EXPENSE-003B/`.
 - Final report written (this file).
-- `git status` clean of new task-tracked changes (all 6 slices committed).
-- Final HEAD SHA recorded: `14543dec7baaa15bcd359d2b9407aec1c97d02f1` (code SHA `bff46a6…` deployed and verified as LIVE).
+- `git status` clean of new task-tracked changes (all slices committed).
+- Final HEAD SHA recorded: `ead68c5ec913a591504585db0c48e8d0c8ccbdde` (code SHA `bff46a6…` deployed and verified as LIVE).
 - Windows shutdown executed last.
 
 ### `READY_FOR_OWNER_EXPENSE_003B_ACCEPTANCE · WINDOWS_SHUTDOWN_SCHEDULED`
