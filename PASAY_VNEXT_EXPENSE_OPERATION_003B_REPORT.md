@@ -4,8 +4,9 @@
 **Date**: 2026-08-17 (overnight unattended)
 **Branch**: `feature/telegram-ui-v2`
 **Baseline SHA**: `3af10ee2649295a6c1e1c4a712806776b770ed97`
-**Final HEAD SHA**: `ead68c5ec913a591504585db0c48e8d0c8ccbdde`
-**Runtime LIVE_SHA**: `bff46a6960aa0439ae276b33e609396985343085` (LIVE == TARGET for the deployed code; the final report commit adds only this doc — zero code change — so the running system is identical to the verified `bff46a6` code SHA).
+**Final CODE SHA (deployed + verified LIVE)**: `bff46a6960aa0439ae276b33e609396985343085` (= LIVE_RUNTIME_SHA)
+**Final report commit**: a doc-only commit on `feature/telegram-ui-v2` (no code change; see §N).
+**Runtime LIVE_SHA**: `bff46a6960aa0439ae276b33e609396985343085` (LIVE == TARGET for the deployed code).
 
 ---
 
@@ -160,7 +161,7 @@ bff46a6 feat(expense): 003B final E2E + timeline Intermediate-remaining fixes
 dff44b9 feat(expense-bot): 003B claim API client + Telegram UX truth (E16)
 fe8f3e2 feat(expense): 003B detail serializer fields + E1-E15/E17 tests
 3ad077e feat: Expense payment-claim truth model (003B) - claims/verification/partial-pay
-ead68c5 docs: PASAY-VNEXT-EXPENSE-OPERATION-003B final report (READY_FOR_OWNER_ACCEPTANCE)
++ docs: PASAY-VNEXT-EXPENSE-OPERATION-003B final report (READY_FOR_OWNER_ACCEPTANCE)
 ```
 
 **Key changed/new files** (all committed):
@@ -189,7 +190,7 @@ All mandated checks passed:
 - Logs preserved in `.runtime/*.log*` and `.ai-control/results/EXPENSE-003B/`.
 - Final report written (this file).
 - `git status` clean of new task-tracked changes (all slices committed).
-- Final HEAD SHA recorded: `ead68c5ec913a591504585db0c48e8d0c8ccbdde` (code SHA `bff46a6…` deployed and verified as LIVE).
+- Final deployed code SHA recorded: `bff46a6…` (verified LIVE, == TARGET_SHA). A doc-only final report commit follows on `feature/telegram-ui-v2`; it does not change the running code.
 - Windows shutdown executed last.
 
 ### `READY_FOR_OWNER_EXPENSE_003B_ACCEPTANCE · WINDOWS_SHUTDOWN_SCHEDULED`
