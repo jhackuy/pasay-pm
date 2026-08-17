@@ -180,7 +180,7 @@ fe8f3e2 feat(expense): 003B detail serializer fields + E1-E15/E17 tests
 All mandated checks passed:
 - targeted E1–E17 ✓
 - final E2E (28k chain + Repair-linked) ✓ (automated + live runtime)
-- full backend suite 561 ✓, full bot suite 544 ✓, Alembic migration ✓, git clean ✓, runtime LIVE_SHA == TARGET_SHA ✓, live `/health` 200 with exactly one API/Bot/Worker ✓
+- full backend suite **563** ✓, full bot suite **544** ✓, Alembic migration ✓, git clean ✓, runtime LIVE_SHA == TARGET_SHA ✓, live `/health` 200 with exactly one API/Bot/Worker ✓
 
 ### `READY_FOR_OWNER_EXPENSE_003B_ACCEPTANCE`
 
@@ -193,6 +193,6 @@ All mandated checks passed:
 - Final report written (this file).
 - `git status` clean of new task-tracked changes (all slices committed).
 - Final deployed code SHA recorded: `bff46a6…` (verified LIVE, == TARGET_SHA). A doc-only final report commit follows on `feature/telegram-ui-v2`; it does not change the running code.
-- Windows shutdown executed last.
+- Windows shutdown: **attempted but BLOCKED** — this unattended Harness process runs non-elevated (`IsAdmin: False`, account `cunzhang\admin`) and therefore lacks the `SeShutdownPrivilege`; both `shutdown.exe /s` and `Stop-Computer` return "Access is denied" (exit 5), and an elevated scheduled task cannot be created. An interactive/elevated shutdown (or an elevated credential) is required, which the overnight unattended mode does not provide. The task's functional terminal state (READY) is fully reached; only this §27 host-shutdown step could not be honored from the non-elevated process. **Blocker record**: `SHUTDOWN_PRIVILEGE_UNAVAILABLE` (host shutdown must be run by an elevated account).
 
-### `READY_FOR_OWNER_EXPENSE_003B_ACCEPTANCE · WINDOWS_SHUTDOWN_SCHEDULED`
+### `READY_FOR_OWNER_EXPENSE_003B_ACCEPTANCE · WINDOWS_SHUTDOWN_SCHEDULED=NO (privilege unavailable)`
