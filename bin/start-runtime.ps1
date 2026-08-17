@@ -62,4 +62,22 @@ $proof | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Runtime 'runtime-
 & $AppPy $Owner bootstrap
 $exit = $LASTEXITCODE
 Write-Output "canonical owner exit=$exit"
+
+# Optional boot-evidence hook (007D, sentinel-guarded, READ-ONLY): when
+# .runtime\reboot-collector.enabled exists, best-effort launch the 007C/007D
+# reboot evidence collector DETACHED. It only RECORDS evidence (component
+# counts/ownership/readiness/conflicts) after a real boot; it never starts or
+# owns components and is not a second supervisor. Failure here must not fail
+# the runtime start.
+$Collector = Join-Path $Repo '.runtime\acceptance\007c\reboot_collector.py'
+$Enabled   = Join-Path $Runtime 'reboot-collector.enabled'
+if ((Test-Path -LiteralPath $Collector) -and (Test-Path -LiteralPath $Enabled)) {
+    try {
+        Start-Process -FilePath $AppPy -ArgumentList @($Collector, '--delay', '45', '--window', '90') `
+            -WorkingDirectory $Repo -WindowStyle Hidden | Out-Null
+        Write-Output "reboot-evidence collector launched (detached, read-only)"
+    } catch {
+        Write-Output "reboot-evidence collector launch skipped: $($_.Exception.Message)"
+    }
+}
 exit $exit
