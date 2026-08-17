@@ -311,18 +311,26 @@ def pay_linked_expense(
     db: Session = Depends(get_db),
     user: User = Depends(admin_only),
 ):
-    """Mark the linked expense paid (admin) — the repair goes at most to
-    VERIFYING, NEVER CLOSED."""
+    """Mark the linked expense paid via a VERIFIED payment claim (003B) — the
+    repair goes at most to VERIFYING, NEVER CLOSED."""
     repair = _get_repair_or_404(db, repair_id)
     expense = db.get(Expense, expense_id)
     if expense is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
     if expense.status != ExpenseStatus.approved:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only approved expenses can be paid")
-    expense.status = ExpenseStatus.paid
-    expense.updated_by = user.id
-    expense.updated_at = datetime.now(timezone.utc)
-    db.flush()
+    # 003B: paid status is reached ONLY through verified-claims aggregation.
+    try:
+        from app.services.expense_claims import create_claim, verify_claim
+
+        claim, _ = create_claim(
+            db, expense, claimed_amount=expense.amount, claimed_by=user.id,
+            idempotency_key=f"repair:{repair_id}:expense:{expense.id}:owner-pay",
+        )
+        verify_claim(db, expense, claim.id, verified_by=user.id)
+    except Exception as exc:  # noqa: BLE001 - preserve the 409 financial guard
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, f"Payment verification failed: {exc}") from exc
     record_audit(
         db,
         table_name="expenses",
