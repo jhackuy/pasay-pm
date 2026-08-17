@@ -308,6 +308,67 @@ def test_case_f_history_preserved_after_closed(db_session):
 
 
 # ---------------------------------------------------------------------------
+# Router-level integration (exercises audit enum + detail serialization so the
+# live 500s caught during E2E are locked in as regressions).
+# ---------------------------------------------------------------------------
+
+def test_router_full_flow_create_reject_verify(client, db_session, admin_headers):
+    # Step 1: create repair (regression: record_audit must accept repair_created).
+    resp = client.post("/api/v1/repairs", json={
+        "issue": "Aircon compressor replacement",
+        "issue_description": "Not cooling",
+        "created_source": "test",
+        "reported_by": 1,
+    }, headers=admin_headers)
+    assert resp.status_code == 201, resp.text
+    detail = resp.json()
+    rid = detail["id"]
+    assert detail["status"] == "OPEN"
+    # Step 1b: detail serialization handles NULL evidence (regression).
+    assert detail.get("evidence") in ({}, None)
+
+    # Step 2: submit proposal V1.
+    resp = client.post(f"/api/v1/repairs/{rid}/proposals", json={
+        "amount": "8000.00", "vendor": "ACPro",
+    }, headers=admin_headers)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["status"] == "WAITING_APPROVAL"
+
+    # Step 3: owner rejects V1.
+    resp = client.post(f"/api/v1/repairs/{rid}/decide", json={
+        "decision": "reject", "version": 1, "reason": "Too expensive",
+    }, headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    detail = resp.json()
+    assert detail["status"] == "WAITING_HUMAN"
+    # requote action auto-created.
+    actions = client.get(f"/api/v1/repairs/{rid}/actions", headers=admin_headers)
+    assert actions.status_code == 200, actions.text
+    kinds = [a["action_kind"] for a in actions.json()]
+    assert "REQUOTE" in kinds
+
+    # Step 13: verify -> CLOSED (audit enum repair_closed_after_verification).
+    resp = client.post(f"/api/v1/repairs/{rid}/verify", json={
+        "verification_result": "cooling restored",
+        "closure_signal": "HUMAN_CONFIRMED",
+    }, headers=admin_headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "CLOSED"
+    assert resp.json()["closure_reason"] == "HUMAN_CONFIRMED"
+
+    # Audit rows were written with valid AuditAction values (no 500).
+    from app.models.audit_log import AuditLog
+    actions_audit = (
+        db_session.query(AuditLog)
+        .filter(AuditLog.table_name == "repair_operations", AuditLog.record_id == rid)
+        .all()
+    )
+    acts = [a.action.value for a in actions_audit]
+    assert "repair_created" in acts
+    assert "repair_closed_after_verification" in acts
+
+
+# ---------------------------------------------------------------------------
 # helper
 # ---------------------------------------------------------------------------
 
