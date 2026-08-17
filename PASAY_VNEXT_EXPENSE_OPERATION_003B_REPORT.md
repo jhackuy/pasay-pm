@@ -111,7 +111,7 @@ The Mini App reads the same authoritative backend detail serializer.
 
 ## K. Tests (exact numbers)
 
-**Backend (tests/)** — full suite: **561 passed**, 4 deselected, exit 0.
+**Backend (tests/)** — full suite at final code state: **563 passed**, 4 deselected, exit 0.
 New targeted suites:
 - `test_expense_003b_payment_truth.py` — E1,E2,E3,E4,E5,E6,E7,E8,E9,E10,E13,E15,E17 → **13 passed**.
 - `test_expense_003b_worker_continuity.py` — E11,E12,E12b,E14 → **4 passed**.
@@ -132,6 +132,7 @@ New targeted suites:
 - **Idempotency / concurrency** — `test_financial_idempotency` concurrent pay/reverse converges (row-lock + ON CONFLICT).
 - **canonical runtime / API/Bot/Worker singleton** — verified (see M).
 - **Alembic migration** — `upgrade d1a9b3c4e5f6 -> e2a114b2f9d0` validated by `test_alembic_migration_upgrade_downgrade` and applied to the live test-bed DB.
+- **Pre-existing test hardening**: `test_zero_learning_004.py::test_tasks_payable_appears_once_not_in_pending` intentionally hardcoded a fee waiting-days number; its FakeBackend derives `waiting_days` from the real wall-clock day vs the seeded `approved_at`, so the assertion broke as the real date advanced past the seed (pre-existing date-boundary flakiness, unrelated to 003B). Made the assertion derive the expected day count from the same formula (intent preserved).
 
 ## M. Runtime
 
@@ -161,6 +162,7 @@ bff46a6 feat(expense): 003B final E2E + timeline Intermediate-remaining fixes
 dff44b9 feat(expense-bot): 003B claim API client + Telegram UX truth (E16)
 fe8f3e2 feat(expense): 003B detail serializer fields + E1-E15/E17 tests
 3ad077e feat: Expense payment-claim truth model (003B) - claims/verification/partial-pay
+6b3aa1f test(bot): make zero-learning payable waiting-days assertion date-robust
 + docs: PASAY-VNEXT-EXPENSE-OPERATION-003B final report (READY_FOR_OWNER_ACCEPTANCE)
 ```
 
