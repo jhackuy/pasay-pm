@@ -229,7 +229,10 @@ def verify_claim(
     claim.verified_amount = admitted
     claim.verified_by = verified_by
     claim.verified_at = now
-    claim.verification_note = result or claim.verification_note
+    if result:
+        claim.verification_note = (
+            f"{claim.verification_note} · {result}" if claim.verification_note else result
+        )
     claim.updated_by = verified_by
     claim.updated_at = now
     db.flush()

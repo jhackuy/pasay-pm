@@ -130,23 +130,41 @@ def build_expense_timeline(
             "detail": expense.reapproval_reason,
         })
 
-    # 4. Claims: PENDING, VERIFIED, FAILED, REVERSED in chronological order.
+    # 4. Claims: PENDING, VERIFIED, FAILED, REVERSED in chronological order,
+    # with a Remaining-balance step after each verification (section 16 shows
+    # 'Remaining ₱18,000' as part of the history after the first ₹10k verify).
+    from decimal import Decimal as _Decimal
+    from app.services.expense_payment_truth import payment_truth
+
+    total = _Decimal(str(expense.amount))
+    running_paid = _Decimal("0")
     for c in sorted(claims, key=lambda x: (x.claimed_at or x.created_at, x.id)):
         # The claim-as-reported event always appears (payment reported).
-        if c.status != ClaimStatus.VERIFIED or True:
-            events.append({
-                "at": _iso(c.claimed_at or c.created_at),
-                "kind": "payment_claim",
-                "label": f"Payment claim {_money(c.claimed_amount)}",
-                "detail": c.verification_note or "",
-            })
+        events.append({
+            "at": _iso(c.claimed_at or c.created_at),
+            "kind": "payment_claim",
+            "label": f"Payment claim {_money(c.claimed_amount)}",
+            "detail": c.verification_note or "",
+        })
         if c.status == ClaimStatus.VERIFIED:
+            admitted = _Decimal(str(c.verified_amount)) if c.verified_amount is not None else _Decimal(str(c.claimed_amount))
+            running_paid += admitted
             events.append({
                 "at": _iso(c.verified_at or c.claimed_at or c.created_at),
                 "kind": "verified",
-                "label": f"{_money(c.verified_amount or c.claimed_amount)} verified",
+                "label": f"{_money(admitted)} verified",
                 "detail": c.verification_note or "",
             })
+            # Remaining balance at this point (while money still remains) —
+            # the intermediate ₱18,000 step from section 16.
+            remaining_now = total - running_paid
+            if remaining_now > 0:
+                events.append({
+                    "at": _iso(c.verified_at or c.claimed_at or c.created_at),
+                    "kind": "remaining",
+                    "label": f"Remaining {_money(remaining_now)}",
+                    "detail": f"{_money(running_paid)} verified so far",
+                })
         elif c.status == ClaimStatus.FAILED:
             events.append({
                 "at": _iso(c.updated_at or c.claimed_at or c.created_at),
@@ -163,8 +181,6 @@ def build_expense_timeline(
             })
 
     # 5. Fully paid derived from VERIFIED aggregate.
-    from app.services.expense_payment_truth import payment_truth
-
     truth = payment_truth(db, expense)
     if truth.fully_paid:
         events.append({
@@ -172,16 +188,6 @@ def build_expense_timeline(
             "kind": "fully_paid",
             "label": "Expense fully paid",
             "detail": f"{_money(truth.verified_paid)} verified / {_money(expense.amount)} total",
-        })
-
-    # 6. Remaining balance after partial payment (derived) — shown as its own
-    # step only when there is verified-but-remaining money.
-    if truth.verified_paid > 0 and truth.remaining > 0:
-        events.append({
-            "at": _iso(expense.updated_at or expense.created_at),
-            "kind": "remaining",
-            "label": f"Remaining {_money(truth.remaining)}",
-            "detail": f"{_money(truth.verified_paid)} verified so far",
         })
 
     # Sort deterministically by time then kind-order.
