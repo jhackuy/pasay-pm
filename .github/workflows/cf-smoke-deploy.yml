@@ -41,8 +41,12 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install Wrangler
-        run: npm install --no-save wrangler@^4.123.0
+      - name: Install Wrangler + jq
+        run: |
+          npm install --no-save wrangler@^4.123.0
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || apt-get install -y jq || true
+          command -v jq && jq --version
 
       - name: Resolve Cloudflare account id
         id: account
@@ -66,7 +70,7 @@ jobs:
             printf '%s\n' "$ACCOUNTS_JSON"
             exit 1
           fi
-          ACC_ID=$(printf '%s' "$ACCOUNTS_JSON" | sed -n 's/.*"id":"\([A-Za-z0-9_-]*\)".*/\1/p' | head -n 1)
+          ACC_ID=$(printf '%s' "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
           if [ -z "$ACC_ID" ]; then
             echo "::error::could not parse account id from /accounts response"
             exit 1
@@ -82,27 +86,28 @@ jobs:
         run: |
           set -euo pipefail
           ACC="${{ steps.account.outputs.account_id }}"
-          HDR="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
-          GET=$(curl -sS -H "$HDR" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
-          if printf '%s' "$GET" | grep -q '"success":true'; then
-            SUBDOMAIN=$(printf '%s' "$GET" | sed -n 's/.*"subdomain":"\([^"]*\)".*/\1/p')
-            if [ -n "$SUBDOMAIN" ]; then
-              echo "workers.dev subdomain already registered: $SUBDOMAIN"
-              echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+          HDR=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          GET=$(curl -sS "${HDR[@]}" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
+          echo "GET response (one line):"
+          printf '%s' "$GET" | jq -c .
+          SUBDOMAIN=$(printf '%s' "$GET" | jq -r '.result.subdomain // empty')
+          if [ -n "$SUBDOMAIN" ]; then
+            echo "workers.dev subdomain already registered: $SUBDOMAIN"
+            echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "::notice::no workers.dev subdomain yet; registering via API"
-          PUT=$(curl -sS -X PUT -H "$HDR" -H "Content-Type: application/json" \
+          PUT=$(curl -sS -X PUT "${HDR[@]}" -H "Content-Type: application/json" \
             --data '{"subdomain":"'"$ACC"'"}' \
             "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
-          echo "PUT response: $PUT"
-          if ! printf '%s' "$PUT" | grep -q '"success":true'; then
+          echo "PUT response (one line):"
+          printf '%s' "$PUT" | jq -c .
+          if ! printf '%s' "$PUT" | jq -e '.success == true' >/dev/null; then
             echo "::error::failed to register workers.dev subdomain"
             printf '%s\n' "$PUT"
             exit 1
           fi
-          SUBDOMAIN=$(printf '%s' "$PUT" | sed -n 's/.*"subdomain":"\([^"]*\)".*/\1/p' | head -n 1)
+          SUBDOMAIN=$(printf '%s' "$PUT" | jq -r '.result.subdomain // empty')
           if [ -z "$SUBDOMAIN" ]; then
             echo "::error::could not parse subdomain from PUT response"
             exit 1
