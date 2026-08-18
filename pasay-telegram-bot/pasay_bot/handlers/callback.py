@@ -27,6 +27,11 @@ from pasay_bot.api_client import (
     PasayApiTimeoutError,
     Income,
 )
+from pasay_bot.followup_truth import (
+    followup_assigned,
+    followup_completed_today,
+    match_followup_task,
+)
 from pasay_bot.handlers import commands as pages
 from pasay_bot.handlers import expense_flow, nl_bridge, nl_queries
 from pasay_bot.handlers.commands import (
@@ -233,6 +238,18 @@ async def _ack_processing(update: Update, locale: str):
     await _answer(update, t("common.working", locale))
 
 
+def _mark_business_completed() -> None:
+    """Record the business-complete moment for latency breakdowns."""
+    try:
+        from pasay_bot.state.latency import current_phase
+
+        probe = current_phase()
+        if probe is not None:
+            probe.mark_business_completed()
+    except Exception:  # noqa: BLE001 - instrumentation never blocks UX
+        pass
+
+
 async def _edit(update: Update, text: str, keyboard=None):
     cq = update.callback_query
     await edit_message_text_idempotent(
@@ -331,6 +348,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     backend_fetch_ms=probe.backend_fetch_ms,
                     render_ms=probe.render_ms,
                     telegram_edit_ms=probe.telegram_edit_ms,
+                    business_completed_ms=probe.business_completed_ms,
                     total_ms=(time.monotonic() - started) * 1000,
                     outcome=outcome, detail=detail,
                 )
@@ -1236,13 +1254,22 @@ async def _handle_rent_quick_detail(update, context, ref, role, locale):
     unit_code = str(row.get("unit") or row.get("unit_code") or "")
     unit_id = await _resolve_unit_id(update, context, unit_code)
     followup_assigned = False
+    followed_up_today = False
     if unit_id:
+        followed_up_today = await _followup_completed_today_for_unit(
+            api, context.bot_data.get("store"), unit_id, unit_code
+        )
         followup_assigned = await _followup_assigned_for_unit(api, unit_id, unit_code)
     text = await _render_rent_detail_text(
         api, unit_code, unit_id, row, locale, assume_assigned=followup_assigned
     )
     kb = (
-        rent_detail_keyboard(unit_id, locale, followup_assigned=followup_assigned)
+        rent_detail_keyboard(
+            unit_id,
+            locale,
+            followed_up_today=followed_up_today,
+            followup_assigned=followup_assigned,
+        )
         if unit_id
         else home_keyboard(locale)
     )
@@ -1355,65 +1382,38 @@ async def _followup_status_for_unit(api, unit_id, unit_code, locale, *, assume_a
     """Resolve the real-world follow-up state for a unit's Rent detail card
     (§7): ``🟡 已交秘书跟进`` when a follow-up task is assigned to the Secretary,
     ``✅ 今日已催`` when already executed, else empty (🔴 pending)."""
-    try:
-        tasks = await api.get_operational_tasks()
-    except PasayApiError:
-        tasks = []
-    lease_id = None
-    try:
-        leases = await api.get_leases()
-        active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
-        if active is not None:
-            lease_id = active.id
-    except PasayApiError:
-        pass
-    unit_key = str(unit_code).split("-")[-1]
-    for t_ in tasks:
-        if str(t_.task_type or "").upper() not in ("RENT_OVERDUE", "FOLLOWUP"):
-            continue
-        details = t_.details or {}
-        if lease_id is not None and t_.lease_id != lease_id:
-            if str(details.get("unit_number") or "").split("-")[-1] != unit_key:
-                continue
-        elif lease_id is None and str(details.get("unit_number") or "").split("-")[-1] != unit_key:
-            continue
-        if str(t_.status or "").upper() == "COMPLETED":
+    task = await _followup_task_for_unit(api, unit_id, unit_code)
+    if task is not None:
+        details = task.details or {}
+        if str(task.status or "").upper() == "COMPLETED":
             return cards.followup_status_text(details, locale, executed_daily=True)
-        if details.get("assigned_to"):
+        if followup_assigned(task):
             return cards.followup_status_text(details, locale)
     if assume_assigned:
         return cards.followup_status_text({"assigned_to": True}, locale)
     return ""
 
 
+async def _followup_task_for_unit(api, unit_id, unit_code):
+    try:
+        tasks, leases = await asyncio.gather(
+            api.get_operational_tasks(),
+            api.get_leases(),
+        )
+    except PasayApiError:
+        return None
+    return match_followup_task(tasks, leases, unit_id, unit_code)
+
+
 async def _followup_assigned_for_unit(api, unit_id, unit_code) -> bool:
     """Truth-only assigned flag for the Rent detail keyboard (never by text)."""
-    try:
-        tasks = await api.get_operational_tasks()
-    except PasayApiError:
-        return False
-    lease_id = None
-    try:
-        leases = await api.get_leases()
-        active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
-        if active is not None:
-            lease_id = active.id
-    except PasayApiError:
-        lease_id = None
-    unit_key = str(unit_code).split("-")[-1]
-    for t_ in tasks:
-        if str(t_.task_type or "").upper() not in ("RENT_OVERDUE", "FOLLOWUP"):
-            continue
-        details = t_.details or {}
-        if lease_id is not None and t_.lease_id != lease_id:
-            if str(details.get("unit_number") or "").split("-")[-1] != unit_key:
-                continue
-        elif lease_id is None and str(details.get("unit_number") or "").split("-")[-1] != unit_key:
-            continue
-        if str(t_.status or "").upper() == "COMPLETED":
-            return False
-        return bool(details.get("assigned_to"))
-    return False
+    task = await _followup_task_for_unit(api, unit_id, unit_code)
+    return followup_assigned(task)
+
+
+async def _followup_completed_today_for_unit(api, store, unit_id, unit_code) -> bool:
+    task = await _followup_task_for_unit(api, unit_id, unit_code)
+    return followup_completed_today(task, store, unit_id)
 
 
 def _v2_context_followup_message_id(store, chat_id, user_id, unit_id: int) -> int | None:
@@ -1445,9 +1445,12 @@ async def _render_rent_detail_in_place(
     """Edit-first render of the Rent detail card (callback + self-heal)."""
     unit = await api.get_unit(unit_id)
     unit_code = unit.unit_number
+    resolved_followed_up_today = bool(
+        followed_up_today or await _followup_completed_today_for_unit(api, store, unit_id, unit_code)
+    )
     followup_assigned = (
         False
-        if followed_up_today
+        if resolved_followed_up_today
         else bool(assume_assigned or await _followup_assigned_for_unit(api, unit_id, unit_code))
     )
     row = {"amount": None, "overdue_days": 0}
@@ -1468,7 +1471,7 @@ async def _render_rent_detail_in_place(
     kb = rent_detail_keyboard(
         unit_id,
         locale,
-        followed_up_today=followed_up_today,
+        followed_up_today=resolved_followed_up_today,
         followup_assigned=followup_assigned,
     )
     await edit_message_text_or_send(
@@ -1504,6 +1507,10 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
     unit_id = int(ref)
     api = context.bot_data["api_client"]
     store = context.bot_data["store"]
@@ -1536,9 +1543,24 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
         return
     if guard is not None:
         status = guard.acquire(key, kind="rent_followup", resource=str(unit_id))
+        if status == "done":
+            await _answer(update, t("v2.followup_already_assigned", locale), durable=True)
+            if chat_id is not None and message_id is not None:
+                await _render_rent_detail_in_place(
+                    update.get_bot(),
+                    api,
+                    store,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    unit_id=unit_id,
+                    locale=locale,
+                    assume_assigned=True,
+                )
+            return
         if status == "in_flight":
             await _answer(update, t("common.processing", locale), durable=True)
             return
+    await _ack_fast(update, locale)
     # 1) resolve the unit + real overdue context.
     try:
         units = await api.get_units()
@@ -1606,7 +1628,7 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
         return
     already_assigned = bool((getattr(task, "details", None) or {}).get("assigned_to"))
     if already_assigned:
-        await _answer(update, t("v2.followup_already_assigned", locale), durable=True)
+        _mark_business_completed()
         if chat_id is not None and message_id is not None:
             await _render_rent_detail_in_place(
                 update.get_bot(),
@@ -1661,11 +1683,7 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
         if guard is not None:
             guard.fail(key, resource=str(unit_id))
         return
-    assigned_now = result.delivery_state == "DELIVERED"
-    if assigned_now:
-        await _answer(update, t("v2.followup_assigned_toast", locale))
-    else:
-        await _answer(update, t("v2.followup_already_assigned", locale), durable=True)
+    _mark_business_completed()
     # Re-render the group Rent detail card in place as 🟡 (NOT executed).
     if chat_id is not None and message_id is not None:
         await _render_rent_detail_in_place(
@@ -1886,6 +1904,10 @@ async def _handle_sec_followup_contact(update, context, ref, nonce, ts, role, lo
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
     task_id = int(ref)
     api = context.bot_data["api_client"]
     store = context.bot_data["store"]
@@ -1894,18 +1916,19 @@ async def _handle_sec_followup_contact(update, context, ref, nonce, ts, role, lo
     unit_id = await _unit_id_for_followup_task(context, task_id)
     if unit_id is not None and await _followed_up_today(context, unit_id):
         await _answer(update, t("v2.sec_dm_already_today", locale), durable=True)
-        await _edit_secretary_done(update, unit_id, locale)
+        await _edit_secretary_done(update, task_id, unit_id, locale)
         return
     guard = context.bot_data["idempotency"]
     key = f"ik:sfc:{task_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="sec_followup_contact", resource=str(task_id))
     if status == "done":
-        await _answer(update, t("v2.sec_confirm_toast", locale))
+        await _answer(update, t("v2.sec_dm_already_today", locale), durable=True)
+        await _edit_secretary_done(update, task_id, unit_id, locale)
         return
     if status == "in_flight":
         await _answer(update, t("common.processing", locale), durable=True)
         return
-    await _ack_processing(update, locale)
+    await _ack_fast(update, locale)
     try:
         task = await api.complete_operational_task(task_id)
     except (PasayApiPermissionError, PasayApiError) as exc:
@@ -1915,8 +1938,8 @@ async def _handle_sec_followup_contact(update, context, ref, nonce, ts, role, lo
     guard.settle(key, {"task_id": task_id}, resource=str(task_id))
     if unit_id is not None:
         store.mark_daily(f"followup:{unit_id}:{ph_local_date()}")
-    await _answer(update, t("v2.sec_confirm_toast", locale))
-    await _edit_secretary_done(update, unit_id, locale)
+    _mark_business_completed()
+    await _edit_secretary_done(update, task_id, unit_id, locale)
     # Owners see the real state on their next refresh — no group spam (§4.2).
 
 
@@ -1944,7 +1967,7 @@ async def _unit_id_for_followup_task(context, task_id: int) -> int | None:
     return None
 
 
-async def _edit_secretary_done(update, unit_id, locale):
+async def _edit_secretary_done(update, task_id, unit_id, locale):
     """Edit the Secretary's DM card in place to the executed state (§4.1)."""
     try:
         text = cards.secretary_followup_card(
@@ -1953,7 +1976,7 @@ async def _edit_secretary_done(update, unit_id, locale):
         await update.get_bot().edit_message_text(
             H.truncate(text), chat_id=update.effective_chat.id,
             message_id=update.callback_query.message.message_id,
-            parse_mode=HTML, reply_markup=secretary_followup_done_keyboard(locale),
+            parse_mode=HTML, reply_markup=secretary_followup_done_keyboard(task_id, locale),
         )
     except Exception:  # noqa: BLE001 - best-effort in-place update
         pass
@@ -1970,6 +1993,11 @@ async def _handle_sec_followup_payment(update, context, ref, nonce, ts, role, lo
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    await _ack_fast(update, locale)
     unit_id = int(ref)
     # Reuse the existing record-payment entry point (ACTION_RENT -> _handle_rent).
     await _handle_rent(update, context, "go", str(unit_id), role, locale)
@@ -1984,8 +2012,14 @@ async def _handle_sec_followup_snooze(update, context, ref, nonce, ts, role, loc
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    await _ack_fast(update, locale)
     task_id = int(ref)
     text = H.escape(t("ops.snooze_title", locale))
+    _mark_business_completed()
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,
@@ -2008,9 +2042,13 @@ async def _handle_sec_followup_no_answer(update, context, ref, nonce, ts, role, 
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    await _ack_fast(update, locale)
     task_id = int(ref)
     api = context.bot_data["api_client"]
-    store = context.bot_data["store"]
     try:
         task = await api.get_operational_task(task_id)
         details = dict(task.details or {})
@@ -2021,8 +2059,8 @@ async def _handle_sec_followup_no_answer(update, context, ref, nonce, ts, role, 
         await api.update_operational_task(task_id, details=details)
     except (PasayApiError, ValueError):
         pass
-    await _answer(update, t("v2.sec_no_answer_recorded", locale), durable=True)
     text = H.escape(t("ops.snooze_title", locale))
+    _mark_business_completed()
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,
@@ -2044,6 +2082,11 @@ async def _handle_sec_followup_promise(update, context, ref, nonce, ts, role, lo
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    await _ack_fast(update, locale)
     task_id = int(ref)
     store = context.bot_data["store"]
     chat_id = update.effective_chat.id
@@ -2053,7 +2096,7 @@ async def _handle_sec_followup_promise(update, context, ref, nonce, ts, role, lo
         {"task_id": task_id}, nonce=nonce,
     )
     # Also allow a bare inline capture via the message text.
-    await _answer(update, t("v2.sec_promise_ask", locale))
+    _mark_business_completed()
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=chat_id,
@@ -2074,6 +2117,11 @@ async def _handle_sec_followup_wrong_number(update, context, ref, nonce, ts, rol
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
+    settings = context.bot_data["settings"]
+    if nonce and _expired(ts, settings):
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    await _ack_fast(update, locale)
     task_id = int(ref)
     api = context.bot_data["api_client"]
     # Resolve the tenant from the task.
@@ -2108,13 +2156,13 @@ async def _handle_sec_followup_wrong_number(update, context, ref, nonce, ts, rol
         except PasayApiError:
             pass
     fix_cmd = f"{unit_code} 租客电话 09XXXXXXXXX"
-    await _answer(update, t("v2.sec_wrong_number_recorded", locale), durable=True)
     text = (
         f"⚠️ <b>{H.escape(t('v2.sec_wrong_number_title', locale, unit=H.escape(unit_code)))}</b>\n\n"
         f"{H.escape(t('v2.sec_wrong_number_why', locale))}\n\n"
         f"直接发送：\n<code>{H.escape(fix_cmd)}</code>\n\n"
         f"{H.escape(t('v2.sec_wrong_number_after', locale))}"
     )
+    _mark_business_completed()
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,

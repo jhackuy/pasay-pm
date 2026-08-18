@@ -152,6 +152,7 @@ def test_latency_record_phases_breaks_down_callback(make_app):
     assert samples
     last = samples[-1]
     for key in ("callback_ack_ms", "backend_fetch_ms", "render_ms",
+                "business_completed_ms",
                 "telegram_edit_ms", "total_ms", "elapsed_ms"):
         assert key in last, f"missing phase key {key}"
     assert isinstance(last["total_ms"], (int, float))
@@ -161,9 +162,11 @@ def test_latency_record_phases_breaks_down_callback(make_app):
 def test_latency_tracker_record_phases_unit():
     tr = LatencyTracker()
     tr.record_phases("callback", "home", callback_ack_ms=5.0, backend_fetch_ms=120.0,
-                     render_ms=8.0, telegram_edit_ms=40.0, total_ms=180.0)
+                     render_ms=8.0, telegram_edit_ms=40.0,
+                     business_completed_ms=150.0, total_ms=180.0)
     s = tr.snapshot()[0]
     assert s["callback_ack_ms"] == 5.0
     assert s["backend_fetch_ms"] == 120.0
     assert s["telegram_edit_ms"] == 40.0
+    assert s["business_completed_ms"] == 150.0
     assert s["total_ms"] == 180.0

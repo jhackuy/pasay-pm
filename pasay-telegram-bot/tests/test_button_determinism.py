@@ -393,7 +393,7 @@ def test_latency_sample_has_no_llm_fields(make_app):
     allowed = {
         "kind", "label", "elapsed_ms", "outcome", "detail", "ts",
         "callback_ack_ms", "backend_fetch_ms", "render_ms",
-        "telegram_edit_ms", "total_ms",
+        "telegram_edit_ms", "business_completed_ms", "total_ms",
     }
     assert set(sample) <= allowed
     for banned in ("model", "llm", "prompt", "tokens", "provider", "nlu"):

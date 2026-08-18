@@ -19,6 +19,11 @@ from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import PasayApiError
+from pasay_bot.followup_truth import (
+    followup_assigned,
+    followup_completed_today,
+    match_followup_task,
+)
 from pasay_bot.keyboards import (
     ACTION_COPILOT_ASK,
     ACTION_COPILOT_NAV,
@@ -764,9 +769,38 @@ async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
     overdue = data.get("overdue") or []
     text = cards.rent_quick_card(data, locale)
     if overdue:
+        actionable_indices: set[int] = set()
+        try:
+            units, leases, tasks = await asyncio.gather(
+                api.get_units(),
+                api.get_leases(),
+                api.get_operational_tasks(),
+            )
+        except PasayApiError:
+            units, leases, tasks = [], [], []
+        unit_id_by_code = {}
+        for unit in units:
+            unit_num = str(getattr(unit, "unit_number", "") or "")
+            unit_id = getattr(unit, "id", None)
+            if unit_num and unit_id is not None:
+                unit_id_by_code[unit_num] = unit_id
+                unit_id_by_code.setdefault(unit_num.split("-")[-1], unit_id)
+        store = context.bot_data.get("store")
+        for i, row in enumerate(overdue, start=1):
+            unit_code = str(row.get("unit") or row.get("unit_code") or "")
+            unit_id = unit_id_by_code.get(unit_code) or unit_id_by_code.get(unit_code.split("-")[-1])
+            if unit_id is None:
+                actionable_indices.add(i)
+                continue
+            task = match_followup_task(tasks, leases, unit_id, unit_code)
+            if followup_completed_today(task, store, unit_id):
+                continue
+            if followup_assigned(task):
+                continue
+            actionable_indices.add(i)
         await _render(
             context, chat_id, message_id, text,
-            keyboard=rent_quick_keyboard(overdue, locale),
+            keyboard=rent_quick_keyboard(overdue, locale, actionable_indices=actionable_indices),
         )
     else:
         await _render(
