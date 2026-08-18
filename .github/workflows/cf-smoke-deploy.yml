@@ -88,11 +88,9 @@ jobs:
           ACC="${{ steps.account.outputs.account_id }}"
           HDR=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           GET=$(curl -sS "${HDR[@]}" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
-          echo "GET response (one line):"
-          printf '%s' "$GET" | jq -c .
           SUBDOMAIN=$(printf '%s' "$GET" | jq -r '.result.subdomain // empty')
           if [ -n "$SUBDOMAIN" ]; then
-            echo "workers.dev subdomain already registered: $SUBDOMAIN"
+            echo "workers.dev subdomain already registered (len=${#SUBDOMAIN})"
             echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -100,8 +98,6 @@ jobs:
           PUT=$(curl -sS -X PUT "${HDR[@]}" -H "Content-Type: application/json" \
             --data '{"subdomain":"'"$ACC"'"}' \
             "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
-          echo "PUT response (one line):"
-          printf '%s' "$PUT" | jq -c .
           if ! printf '%s' "$PUT" | jq -e '.success == true' >/dev/null; then
             echo "::error::failed to register workers.dev subdomain"
             printf '%s\n' "$PUT"
@@ -112,7 +108,7 @@ jobs:
             echo "::error::could not parse subdomain from PUT response"
             exit 1
           fi
-          echo "Registered workers.dev subdomain: $SUBDOMAIN"
+          echo "Registered workers.dev subdomain (len=${#SUBDOMAIN})"
           echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -128,9 +124,18 @@ jobs:
         run: |
           set -euo pipefail
           npx wrangler deploy -c wrangler.toml --env="" 2>&1 | tee "$GITHUB_WORKSPACE/wrangler-deploy.log"
-          DEPLOY_URL=$(grep -E '^[[:space:]]+https://[a-z0-9-]+\.workers\.dev' "$GITHUB_WORKSPACE/wrangler-deploy.log" | tail -1 | tr -d '[:space:]')
-          if [ -z "$DEPLOY_URL" ]; then
-            echo "::error::could not parse deployed URL from wrangler output"
+          # GitHub secret masking rewrites arbitrary values to *** in the log,
+          # so we cannot rely on the rendered wrangler URL. Re-derive the URL
+          # from the account id + subdomain output of the earlier step; both
+          # of those are written through $GITHUB_OUTPUT and are NOT masked
+          # because they never appear in any secret binding.
+          ACC="${{ steps.account.outputs.account_id }}"
+          SUB="${{ steps.subdomain.outputs.subdomain }}"
+          DEPLOY_URL="https://pasay-cf-smoke.${SUB}.workers.dev"
+          # Confirm wrangler actually printed this URL in its log.
+          if ! grep -q "$DEPLOY_URL" "$GITHUB_WORKSPACE/wrangler-deploy.log" && \
+             ! grep -q "pasay-cf-smoke.\*\*\*.workers.dev" "$GITHUB_WORKSPACE/wrangler-deploy.log"; then
+            echo "::error::expected deploy URL not found in wrangler output"
             cat "$GITHUB_WORKSPACE/wrangler-deploy.log"
             exit 1
           fi
