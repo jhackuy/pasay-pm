@@ -114,6 +114,7 @@ from pasay_bot.keyboards import (
     expense_open_keyboard,
     expense_pay_confirm_keyboard,
     expense_pay_result_keyboard,
+    expense_reminder_actions,
     expense_result_keyboard,
     expired_keyboard,
     home_keyboard,
@@ -2082,12 +2083,20 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
         guard.fail(key, resource=str(expense_id))
         await _answer(update, t("v2.remind_owner_failed", locale), durable=True)
         return
-    # Step 2: send the DM to the Owner's PRIVATE chat.
+    # Step 2: send the DM to the Owner's PRIVATE chat, with STATE-DRIVEN
+    # action buttons reusing the exact Expense card callbacks (never a new
+    # workflow). No actionable state (paid/rejected/closed) -> plain card.
+    reminder_kb = expense_reminder_actions(
+        getattr(expense, "status", "") or "", expense_id, locale=owner_locale,
+    )
+    send_kwargs = {"parse_mode": HTML}
+    if reminder_kb is not None:
+        send_kwargs["reply_markup"] = reminder_kb
     try:
         send_result = await update.get_bot().send_message(
             owner_chat_id_int,
             H.truncate(dm_text),
-            parse_mode=HTML,
+            **send_kwargs,
         )
     except Exception as exc:  # noqa: BLE001 - any delivery failure is a real failure
         logger.warning("remind owner DM to %s failed: %s", owner_chat_id, exc)

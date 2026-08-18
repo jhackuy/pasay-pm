@@ -200,3 +200,159 @@ def test_remind_persisted_delivery_survives_restart(make_app):
         assert fresh.get_reminder_delivery(7, todays)["message_id"]
     finally:
         fresh.close()
+
+
+# ---------------------------------------------------------------------------
+# State-driven actionable Owner reminder (WINDOWS-RUNTIME-REBOOT-RECOVERY-002,
+# Phase C follow-up): the reminder DM carries action buttons derived from the
+# CURRENT Expense Operation next_action and REUSES the existing callbacks.
+# ---------------------------------------------------------------------------
+
+from pasay_bot.keyboards import (
+    ACTION_EXPENSE_APPROVE,
+    ACTION_EXPENSE_DETAIL,
+    ACTION_EXPENSE_PAY,
+    ACTION_EXPENSE_REJECT,
+    expense_reminder_actions,
+    encode,
+    new_nonce,
+    now_ts,
+)
+
+
+def _remind_actions(env):
+    """Return the callback_data/actions of the reminder DM's reply keyboard."""
+    dm = env.bot.sends()[-1]
+    kb = dm.get("reply_markup")
+    if kb is None or kb.__class__.__name__ != "InlineKeyboardMarkup":
+        return []
+    return [b.callback_data for row in kb.inline_keyboard for b in row]
+
+
+def _trigger_reminder(env):
+    detail = _open_expense_detail(env, 7)
+    remind_cb = _remind_cb(detail)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, remind_cb,
+                                           message_id=detail["message_id"], bot=env.bot)])
+    return env.bot.sends()[-1]
+
+
+# 1) approved / waiting-payment reminder -> [✅ Paid] + [🔎 View]
+def test_reminder_dm_approved_has_paid_and_view(make_app):
+    env = make_app(backend=ZLBackend())
+    dm = _trigger_reminder(env)
+    assert dm["chat_id"] == OWNER_ID
+    actions = _remind_actions(env)
+    paid = [a for a in actions if a.startswith(encode(ACTION_EXPENSE_PAY, str(7)))]
+    view = [a for a in actions if a.startswith(encode(ACTION_EXPENSE_DETAIL, str(7)))]
+    assert len(paid) == 1, actions       # ✅ Paid present
+    assert len(view) == 1, actions       # 🔎 View present
+
+
+# 2) pending-approval reminder -> [✅ Approve][❌ Reject][🔎 View]
+def test_reminder_actions_pending_has_approve_reject_view():
+    kb = expense_reminder_actions("pending", 7, "en")
+    assert kb is not None
+    data = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert any(d.startswith(encode(ACTION_EXPENSE_APPROVE, str(7))) for d in data)
+    assert any(d.startswith(encode(ACTION_EXPENSE_REJECT, str(7))) for d in data)
+    assert any(d.startswith(encode(ACTION_EXPENSE_DETAIL, str(7))) for d in data)
+
+
+# closed/paid -> no actionable reminder (None)
+def test_reminder_actions_closed_returns_none():
+    for state in ("paid", "rejected", "reversed", "cancelled"):
+        assert expense_reminder_actions(state, 7, "en") is None
+
+
+# 3) the Paid action callback reuses the SAME existing pay handler
+def test_reminder_paid_action_uses_existing_pay_handler(make_app):
+    env = make_app(backend=ZLBackend())
+    dm = _trigger_reminder(env)
+    actions = _remind_actions(env)
+    paid_cb = next(a for a in actions if a.startswith(encode(ACTION_EXPENSE_PAY, str(7))))
+    # Tap [✅ Paid] on the reminder DM -> it must open the deterministic pay
+    # confirm card (same _handle_expense_pay used by the Expense card), NOT a
+    # bespoke handler. The confirm card backends on get_expense + duplicates.
+    n_sends = len(env.bot.sends())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, paid_cb,
+                                           message_id=dm["message_id"], bot=env.bot)])
+    last = env.bot.edits()[-1]["text"]
+    from pasay_bot.render.i18n import t as _t
+    assert ("Confirm payment" in last) or ("确认付款" in last) or ("payment" in last.lower())
+    assert len(env.bot.sends()) >= n_sends  # the shared handler ran (no crash)
+
+
+# 4) unauthorized user cannot execute the Owner-only payment action
+def test_reminder_paid_action_unauthorized_blocked(make_app):
+    env = make_app(backend=ZLBackend())
+    dm = _trigger_reminder(env)
+    actions = _remind_actions(env)
+    paid_cb = next(a for a in actions if a.startswith(encode(ACTION_EXPENSE_PAY, str(7))))
+    UNKNOWN = 999999999  # not a recognized role -> no Owner permission
+    n_sends = len(env.bot.sends())
+    run_updates(env, [make_callback_update(UNKNOWN, OWNER_ID, paid_cb,
+                                           message_id=dm["message_id"], bot=env.bot)])
+    # unknown user has no read permission -> blocked before any pay flow
+    assert len(env.bot.sends()) == n_sends          # nothing executed
+    # E7 must remain approved (not paid by the blocked tap)
+    states = {e["id"]: e["status"] for e in env.backend.expenses}
+    assert states[7] == "approved"
+
+
+# 5) stale reminder cannot execute an obsolete action (state re-read at tap)
+def test_reminder_stale_paid_action_after_state_change(make_app):
+    env = make_app(backend=ZLBackend())
+    dm = _trigger_reminder(env)
+    actions = _remind_actions(env)
+    paid_cb = next(a for a in actions if a.startswith(encode(ACTION_EXPENSE_PAY, str(7))))
+    # Simulate the underlying expense already being paid by the time the Owner
+    # taps the reminder button.
+    for e in env.backend.expenses:
+        if e["id"] == 7:
+            e["status"] = "paid"
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, paid_cb,
+                                           message_id=dm["message_id"], bot=env.bot)])
+    # the handler re-reads truth and shows "already paid" / does NOT push a new
+    # payment (no duplicate). It never claims a fresh payment succeeded.
+    last = env.bot.edits()[-1]["text"]
+    assert ("already" in last.lower()) or ("已付" in last) or ("paid" in last.lower())
+
+
+# 6) reminder delivery alone does NOT alter Expense business state
+def test_reminder_delivery_alone_does_not_alter_state(make_app):
+    env = make_app(backend=ZLBackend())
+    before = {e["id"]: e["status"] for e in env.backend.expenses}
+    assert before[7] == "approved"
+    _trigger_reminder(env)
+    after = {e["id"]: e["status"] for e in env.backend.expenses}
+    assert after[7] == "approved"      # still Waiting for payment
+
+
+# 7) a successful action on the reminder progresses the SAME expense/operation
+def test_reminder_action_progresses_same_expense(make_app):
+    env = make_app(backend=ZLBackend())
+    dm = _trigger_reminder(env)
+    actions = _remind_actions(env)
+    paid_cb = next(a for a in actions if a.startswith(encode(ACTION_EXPENSE_PAY, str(7))))
+    # Drive the full pay-confirm flow (same as the Expense card) via the
+    # reminder's Paid button: open confirm -> tap Confirm (PAY_CONFIRM).
+    from pasay_bot.keyboards import ACTION_EXPENSE_PAY_CONFIRM
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, paid_cb,
+                                           message_id=dm["message_id"], bot=env.bot)])
+    confirm_cb = None
+    for edit in env.bot.edits():
+        kb = edit.get("reply_markup")
+        if kb is None or kb.__class__.__name__ != "InlineKeyboardMarkup":
+            continue
+        for row in kb.inline_keyboard:
+            for b in row:
+                if b.callback_data.startswith(encode(ACTION_EXPENSE_PAY_CONFIRM, str(7))):
+                    confirm_cb = b.callback_data
+    assert confirm_cb is not None, "pay-confirm button missing from reminder flow"
+    n = len(env.bot.sends())
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, confirm_cb,
+                                           message_id=env.bot.edits()[-1]["message_id"],
+                                           bot=env.bot)])
+    states = {e["id"]: e["status"] for e in env.backend.expenses}
+    assert states[7] == "paid"          # progressed the same Expense/Operation

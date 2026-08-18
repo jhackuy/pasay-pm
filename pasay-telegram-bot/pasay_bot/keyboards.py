@@ -1969,6 +1969,68 @@ def expense_remind_keyboard(
 
 # --- TELEGRAM-OPS-REAL-WORLD-CLOSURE-005: Secretary DM follow-up card --------
 
+def expense_reminder_actions(
+    status: str,
+    expense_id: int,
+    locale: str = "bi",
+) -> InlineKeyboardMarkup | None:
+    """STATE-DRIVEN action buttons for the Owner Reminder DM.
+
+    The reminder is only another surface for the SAME Expense Operation
+    ``next_action`` — it never invents its own workflow. Buttons reuse the exact
+    existing deterministic callback actions and handlers already used by the
+    Expense card:
+
+      * pending (Owner approval)        -> [✅ Approve][❌ Reject][🔎 View]
+      * approved (waiting payment)      -> [✅ Paid][🔎 View]
+      * paid/rejected/reversed/closed   -> None (no actionable reminder;
+                                           the DM should not ask for a no-op)
+
+    State-changing buttons carry a FRESH nonce/ts so each tap is a distinct
+    idempotent callback (reuses IdempotencyGuard + backend re-read: a stale
+    reminder whose state moved is refused by the handler). Returns None when no
+    human action applies.
+    """
+    status = (status or "").lower()
+    def _row(*btns):
+        return btns
+    rows = []
+    if status == "pending":
+        n, ts = new_nonce(), now_ts()
+        rows.append(_row(
+            InlineKeyboardButton(
+                _approve_button_label(locale),
+                callback_data=encode(ACTION_EXPENSE_APPROVE, str(expense_id), "", nonce=n, ts=ts),
+            ),
+            InlineKeyboardButton(
+                _reject_button_label(locale),
+                callback_data=encode(ACTION_EXPENSE_REJECT, str(expense_id), "", nonce=n, ts=ts),
+            ),
+        ))
+        rows.append(_row(
+            InlineKeyboardButton(
+                t("expense.view_detail", locale),
+                callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
+            ),
+        ))
+    elif status == "approved":
+        n, ts = new_nonce(), now_ts()
+        rows.append(_row(
+            InlineKeyboardButton(
+                t("expense.pay_now_short", locale),
+                callback_data=encode(ACTION_EXPENSE_PAY, str(expense_id), "", nonce=n, ts=ts),
+            ),
+            InlineKeyboardButton(
+                t("expense.view_detail", locale),
+                callback_data=encode(ACTION_EXPENSE_DETAIL, str(expense_id)),
+            ),
+        ))
+    else:
+        # paid / rejected / reversed / other-closed: no actionable reminder.
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
 def secretary_followup_keyboard(task_id: int, unit_id: int, locale: str = "bi") -> InlineKeyboardMarkup:
     """Secretary private-chat collection card (PASAY-AI-EMPLOYEE-FOUNDATION-007
     §13.1) — realistic second-tier results, mobile-first:
