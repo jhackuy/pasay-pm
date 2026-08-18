@@ -60,6 +60,12 @@ def _display_followup(value: str | None) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M")
 
 
+def _last_followup_is_today(value: str | None, today: str) -> bool:
+    if not today:
+        return False
+    return _same_ph_day(value, today)
+
+
 def iter_followup_tasks(tasks: Iterable, leases: Iterable, unit_id: int, unit_code: str):
     """Yield all candidate follow-up tasks matching one unit."""
     lease_id = None
@@ -159,14 +165,20 @@ def compute_followup_snapshot(
     completed_today = False
     if completed_task is not None:
         completed_today = followup_completed_today(completed_task, store, unit_id)
-    display_last_followup = (last_followup_at or "").strip()
+    last_followup_today = _last_followup_is_today(last_followup_at, today)
+    display_last_followup = _display_followup(last_followup_at) or (last_followup_at or "").strip()
     if not display_last_followup and completed_task is not None:
         display_last_followup = _display_followup(
             getattr(completed_task, "completed_at", None)
             or (getattr(completed_task, "details", None) or {}).get("executed_at")
         )
-    if persisted_today or completed_today:
-        reason = "persisted_same_day_mark" if persisted_today else "completed_today"
+    if persisted_today or completed_today or last_followup_today:
+        if persisted_today:
+            reason = "persisted_same_day_mark"
+        elif completed_today:
+            reason = "completed_today"
+        else:
+            reason = "last_followup_today"
         task_id = getattr(completed_task, "id", None) or getattr(assigned_task, "id", None)
         return FollowupSnapshot(
             status="followed_up_today",

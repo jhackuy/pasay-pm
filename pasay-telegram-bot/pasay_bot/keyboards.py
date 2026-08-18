@@ -1884,20 +1884,26 @@ def rent_quick_keyboard(
     overdue_rows,
     locale: str = "bi",
     *,
-    actionable_indices: set[int] | None = None,
+    button_labels: dict[int, str] | None = None,
 ) -> InlineKeyboardMarkup:
-    """💰 Rent Quick View overdue actions (ZERO-LEARNING-004 §7): one SHORT
-    ``1680 · Follow up`` button per overdue row (opens the Rent detail card),
-    then Home — the full property code stays in the list text above."""
+    """💰 Rent Quick View overdue entry buttons.
+
+    Each row stays navigable even when follow-up is no longer actionable today:
+    the button opens the unit's Rent detail card and shows the current state
+    inline (pending / assigned / followed-up-today)."""
     kb: list[list[InlineKeyboardButton]] = []
     for i, row in enumerate(overdue_rows, start=1):
-        if actionable_indices is not None and i not in actionable_indices:
-            continue
         unit = str(row.get("unit") or row.get("unit_code") or "")
+        amount = H.money(row.get("amount"))
+        label = (
+            button_labels.get(i)
+            if button_labels is not None and button_labels.get(i)
+            else f"{_short_unit_code(unit)} · {amount}"
+        )
         kb.append(
             [
                 InlineKeyboardButton(
-                    f"{_short_unit_code(unit)} · {t('v2.rent_followup', locale)}",
+                    label,
                     callback_data=encode(ACTION_RENT_QUICK_DETAIL, "ovd", str(i)),
                 )
             ]

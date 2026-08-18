@@ -15,6 +15,7 @@ import concurrent.futures
 import httpx
 import pytest
 
+import pasay_bot.followup_truth as followup_truth
 from conftest import (
     OWNER_ID,
     SECRETARY_ID,
@@ -39,6 +40,13 @@ def _inline_labels(kb):
     if kb is None or kb.__class__.__name__ != "InlineKeyboardMarkup":
         return []
     return [b.text for row in kb.inline_keyboard for b in row]
+
+
+def _label_for_unit(kb, unit: str) -> str:
+    for label in _inline_labels(kb):
+        if unit in (label or ""):
+            return label or ""
+    return ""
 
 
 def _answer_texts(env):
@@ -103,6 +111,41 @@ class FollowupTruthBackend(ClosureBackend):
         )
         self.operational_tasks[-1]["lease_id"] = 9
         self.operational_tasks[-1]["completed_at"] = completed_at
+
+
+class FollowupLastTodayBackend(ClosureBackend):
+    def __init__(self):
+        super().__init__()
+        self.units = [
+            {**u, "id": 79, "unit_number": "7789"}
+            if u.get("id") == 9 else u
+            for u in self.units
+        ]
+        self.leases = [
+            {**l, "id": 79, "unit_id": 79}
+            if l.get("unit_id") == 9 else l
+            for l in self.leases
+        ]
+        self.quick_rent = {
+            **self.quick_rent,
+            "overdue": [
+                {
+                    "unit": "7789",
+                    "unit_code": "7789",
+                    "amount": "160000.00",
+                    "unpaid_periods": 4,
+                    "monthly_rent": "40000.00",
+                    "overdue_days": 110,
+                    "last_followup_at": "2026-08-18T18:40:00+08:00",
+                },
+            ],
+            "outstanding_total": "160000.00",
+            "expected_rent_total": "40000.00",
+            "collected_rent": "0.00",
+            "outstanding_rent": "40000.00",
+            "collection_rate": "0.00",
+            "unpaid_unit_count": 1,
+        }
 
 
 def _owner_open_rent_detail(env):
@@ -347,8 +390,10 @@ def test_followup_assigned_hides_quick_rent_action_on_rerender(make_app):
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", update_id=55, bot=env.bot)])
     rent = env.bot.last_send()
     assert "1680" in (rent["text"] or "")
-    labels = _inline_labels(rent["reply_markup"])
-    assert not any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in labels)
+    label = _label_for_unit(rent["reply_markup"], "1680")
+    assert label
+    assert "Assigned" in label or "已交秘书" in label
+    assert not any(d.split(":")[1] == "rfu" for d in _inline_data(rent["reply_markup"]))
 
 
 def test_followup_callback_ack_precedes_business_completion(make_app):
@@ -437,7 +482,10 @@ def test_persisted_same_day_followup_mark_hides_action_everywhere(make_app):
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     rent = env.bot.last_send()
     assert "1680" in (rent["text"] or "")
-    assert not any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
+    label = _label_for_unit(rent["reply_markup"], "1680")
+    assert label
+    assert "Followed up" in label or "今日已催" in label
+    assert not any(d.split(":")[1] == "rfu" for d in _inline_data(rent["reply_markup"]))
     detail = _owner_open_rent_detail(env)
     assert "Followed up today" in (detail["text"] or "") or "今日已催" in (detail["text"] or "")
     assert not any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
@@ -453,7 +501,10 @@ def test_assigned_followup_task_hides_action(make_app):
     env = make_app(backend=backend)
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     rent = env.bot.last_send()
-    assert not any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
+    label = _label_for_unit(rent["reply_markup"], "1680")
+    assert label
+    assert "Assigned" in label or "已交秘书" in label
+    assert not any(d.split(":")[1] == "rfu" for d in _inline_data(rent["reply_markup"]))
     detail = _owner_open_rent_detail(env)
     assert "Assigned" in (detail["text"] or "") or "已交秘书" in (detail["text"] or "")
     assert not any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
@@ -480,7 +531,9 @@ def test_completed_followup_yesterday_is_actionable_again(make_app):
     env = make_app(backend=backend)
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     rent = env.bot.last_send()
-    assert any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
+    label = _label_for_unit(rent["reply_markup"], "1680")
+    assert label
+    assert "Pending" in label or "待催" in label
     detail = _owner_open_rent_detail(env)
     assert not ("Followed up today" in (detail["text"] or "") or "今日已催" in (detail["text"] or ""))
     assert any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
@@ -498,3 +551,32 @@ def test_followup_snapshot_never_renders_done_label_with_action(make_app):
     labels = _inline_labels(detail["reply_markup"])
     assert ("Followed up today" in text or "今日已催" in text)
     assert not any("Follow up" in (lbl or "") or "催租" in (lbl or "") for lbl in labels)
+
+
+def test_last_followup_today_keeps_quick_navigation_but_hides_followup_action(make_app, monkeypatch):
+    monkeypatch.setattr(followup_truth, "ph_local_date", lambda: "2026-08-18")
+    env = make_app(backend=FollowupLastTodayBackend())
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    rent = env.bot.last_send()
+    assert "7789" in (rent["text"] or "")
+    quick_label = _label_for_unit(rent["reply_markup"], "7789")
+    assert quick_label
+    assert "160,000" in quick_label
+    assert "Followed up" in quick_label or "今日已催" in quick_label
+    quick_data = _inline_data(rent["reply_markup"])
+    assert any(d.split(":")[1] == "rnq" for d in quick_data)
+    assert not any(d.split(":")[1] == "rfu" for d in quick_data)
+
+    detail_cb = next(d for d in quick_data if d.split(":")[1] == "rnq")
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, detail_cb,
+                                           message_id=rent["message_id"], bot=env.bot)])
+    detail = env.bot.edits()[-1]
+    detail_text = detail["text"] or ""
+    assert "7789" in detail_text
+    assert "Followed up today" in detail_text or "今日已催" in detail_text
+    assert "160,000" in detail_text
+    assert "Last follow-up: 2026-08-18 18:40" in detail_text or "最近催租：2026-08-18 18:40" in detail_text
+    detail_data = _inline_data(detail["reply_markup"])
+    assert not any(d.split(":")[1] == "rfu" for d in detail_data)
+    assert any("Collect" in (lbl or "") or "收租" in (lbl or "") for lbl in _inline_labels(detail["reply_markup"]))
+    assert any("History" in (lbl or "") or "记录" in (lbl or "") for lbl in _inline_labels(detail["reply_markup"]))

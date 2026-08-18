@@ -62,7 +62,7 @@ from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.roles import Role
 from pasay_bot.render import cards, html as H
 from pasay_bot.render.cards import PAGE_SIZE_OVERDUE, PAGE_SIZE_PROPERTIES
-from pasay_bot.render.i18n import t
+from pasay_bot.render.i18n import bl, t
 from pasay_bot.roles import (
     PERMISSION_OPERATIONS,
     PERMISSION_RENT_CONFIRM,
@@ -767,7 +767,7 @@ async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
     overdue = data.get("overdue") or []
     text = cards.rent_quick_card(data, locale)
     if overdue:
-        actionable_indices: set[int] = set()
+        button_labels: dict[int, str] = {}
         try:
             units, leases, tasks = await asyncio.gather(
                 api.get_units(),
@@ -786,19 +786,26 @@ async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
         store = context.bot_data.get("store")
         for i, row in enumerate(overdue, start=1):
             unit_code = str(row.get("unit") or row.get("unit_code") or "")
+            amount = H.money(row.get("amount"))
+            button_unit = unit_code.split("-")[-1] if unit_code else unit_code
             unit_id = unit_id_by_code.get(unit_code) or unit_id_by_code.get(unit_code.split("-")[-1])
             if unit_id is None:
-                actionable_indices.add(i)
+                button_labels[i] = f"{button_unit} · {amount}"
                 continue
             snapshot = compute_followup_snapshot(
                 tasks, leases, store, unit_id, unit_code,
                 last_followup_at=row.get("last_followup_at"),
             )
-            if snapshot.actionable:
-                actionable_indices.add(i)
+            if snapshot.followed_up_today:
+                status_label = bl("v2.rent_followed_short", locale)
+            elif snapshot.assigned:
+                status_label = bl("v2.followup_status_assigned", locale)
+            else:
+                status_label = bl("v2.rent_followup_pending_short", locale)
+            button_labels[i] = f"{button_unit} · {amount} · {status_label}"
         await _render(
             context, chat_id, message_id, text,
-            keyboard=rent_quick_keyboard(overdue, locale, actionable_indices=actionable_indices),
+            keyboard=rent_quick_keyboard(overdue, locale, button_labels=button_labels),
         )
     else:
         await _render(
