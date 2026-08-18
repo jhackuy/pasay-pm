@@ -85,8 +85,10 @@ def test_group_menu_is_3x2_archive(make_app):
 
     reply_sends = _reply_keyboard_sends(env)
     assert reply_sends
-    assert _reply_row_lengths(reply_sends[0]["reply_markup"]) == [3, 3]
-    assert "📁 档案" in _reply_labels(reply_sends[0]["reply_markup"])
+    assert _reply_rows(reply_sends[0]["reply_markup"]) == [
+        ["🏠 Home", "🏘 Properties", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense", "📁 Archive"],
+    ]
 
 
 def test_old_owner_chat_migration_delivers_new_keyboard(make_app):
@@ -148,6 +150,53 @@ def test_more_no_longer_rendered():
     assert fixed_menu_route_for("☰ 更多") == "archive"
 
 
+def test_legacy_group_4key_chat_migration_delivers_new_keyboard(make_app):
+    env = make_app()
+    env.app.bot_data.setdefault("menu_init_chats", {})[GROUP_CHAT_ID] = "legacy_group_4key"
+    run_updates(env, [_make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "🏠 Properties", bot=env.bot)])
+
+    reply_sends = _reply_keyboard_sends(env)
+    assert reply_sends
+    assert _reply_rows(reply_sends[0]["reply_markup"]) == [
+        ["🏠 Home", "🏘 Properties", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense", "📁 Archive"],
+    ]
+
+
+def test_group_clicking_tasks_sends_new_keyboard(make_app):
+    env = make_app()
+    env.app.bot_data.setdefault("menu_init_chats", {})[GROUP_CHAT_ID] = "legacy_group_4key"
+    run_updates(env, [_make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "✅ Tasks", bot=env.bot)])
+
+    reply_sends = _reply_keyboard_sends(env)
+    assert reply_sends
+    assert _reply_rows(reply_sends[0]["reply_markup"]) == [
+        ["🏠 Home", "🏘 Properties", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense", "📁 Archive"],
+    ]
+
+
+def test_group_clicking_rent_sends_new_keyboard(make_app):
+    env = make_app()
+    env.app.bot_data.setdefault("menu_init_chats", {})[GROUP_CHAT_ID] = "legacy_group_4key"
+    run_updates(env, [_make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "💰 Rent", bot=env.bot)])
+
+    reply_sends = _reply_keyboard_sends(env)
+    assert reply_sends
+    assert _reply_rows(reply_sends[0]["reply_markup"]) == [
+        ["🏠 Home", "🏘 Properties", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense", "📁 Archive"],
+    ]
+
+
+def test_group_archive_exists():
+    kb = reply_keyboard(Role.SECRETARY)
+    assert _reply_rows(kb) == [
+        ["🏠 Home", "🏘 Properties", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense", "📁 Archive"],
+    ]
+
+
 def test_archive_handler_bypasses_nl_llm(make_app, monkeypatch):
     env = make_app()
     env.app.bot_data["settings"].archive_chat_id = "-1009876543210"
@@ -163,6 +212,21 @@ def test_archive_handler_bypasses_nl_llm(make_app, monkeypatch):
     sends = env.bot.sends()
     assert sends
     assert "📁 房产档案" in (sends[-1]["text"] or "")
+    assert called["nl"] == 0
+
+
+def test_group_menu_bypasses_nl_llm(make_app, monkeypatch):
+    env = make_app()
+    env.app.bot_data.setdefault("menu_init_chats", {})[GROUP_CHAT_ID] = "legacy_group_4key"
+    called = {"nl": 0}
+
+    async def _fail_nl(*args, **kwargs):
+        called["nl"] += 1
+        raise AssertionError("group fixed-menu route must bypass NL/LLM")
+
+    monkeypatch.setattr("pasay_bot.handlers.nl_bridge.handle_nl", _fail_nl)
+    run_updates(env, [_make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "✅ Tasks", bot=env.bot)])
+
     assert called["nl"] == 0
 
 

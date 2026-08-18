@@ -113,7 +113,7 @@ def _bind_identity(update, context, user_id=None) -> bool:
 # process, so normal messages never spam menu messages while a deployed menu
 # migration still remounts the new keyboard on the next ordinary interaction.
 
-_MENU_VERSION = "ux_freeze_v1_archive_menu_3x2_002"
+_MENU_VERSION = "ux_freeze_v1_group_menu_3x2_003"
 
 
 def _menu_init_chats(context) -> dict:
@@ -128,11 +128,27 @@ def _is_menu_initialized(context, chat_id) -> bool:
     return _menu_init_chats(context).get(chat_id) == _MENU_VERSION
 
 
-async def _send_persistent_menu(context, chat_id, role, locale) -> bool:
-    """Re-send the persistent Reply Keyboard once per chat (private chats only,
-    enforced by callers) for identified users. Never depends on backend data
-    and never prompts the user to type /start. Returns True when sent."""
-    if role is None or not has_read_permission(role):
+def _menu_role_for_chat(chat_type, role):
+    if chat_type in ("group", "supergroup"):
+        return Role.SECRETARY
+    return role
+
+
+def _menu_reply_keyboard(chat_type, role):
+    menu_role = _menu_role_for_chat(chat_type, role)
+    if menu_role is None:
+        return None
+    return reply_keyboard(menu_role)
+
+
+async def _send_persistent_menu(context, chat_id, role, locale, *, chat_type=None) -> bool:
+    """Re-send the persistent Reply Keyboard once per chat.
+
+    Private chats keep role language; group chats always receive the shared
+    English 3x2 keyboard because Telegram pins one keyboard per chat.
+    """
+    menu_role = _menu_role_for_chat(chat_type, role)
+    if menu_role is None or not has_read_permission(menu_role):
         return False
     if _is_menu_initialized(context, chat_id):
         return False
@@ -140,7 +156,7 @@ async def _send_persistent_menu(context, chat_id, role, locale) -> bool:
         chat_id,
         H.escape(t("menu.ready", locale)),
         parse_mode=HTML,
-        reply_markup=reply_keyboard(role),
+        reply_markup=_menu_reply_keyboard(chat_type, role),
     )
     _mark_menu_initialized(context, chat_id)
     return True
@@ -287,7 +303,7 @@ async def handle_new_chat_members(update: Update, context: ContextTypes.DEFAULT_
         chat.id,
         H.escape("\n".join(lines)),
         parse_mode=HTML,
-        reply_markup=None if _is_menu_initialized(context, chat.id) else reply_keyboard(Role.OWNER),
+        reply_markup=None if _is_menu_initialized(context, chat.id) else _menu_reply_keyboard(chat.type, Role.SECRETARY),
     )
     _mark_menu_initialized(context, chat.id)
 
@@ -308,7 +324,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await context.bot.send_message(
         update.effective_chat.id, text, parse_mode=HTML,
-        reply_markup=reply_keyboard(role),
+        reply_markup=_menu_reply_keyboard(update.effective_chat.type if update.effective_chat else None, role),
     )
 
 
@@ -904,14 +920,14 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id,
                 H.escape(t("v2.media_archived", locale)),
                 parse_mode=HTML,
-                reply_markup=reply_keyboard(role),
+                reply_markup=_menu_reply_keyboard(update.effective_chat.type if update.effective_chat else None, role),
             )
         else:
             await context.bot.send_message(
                 chat_id,
                 H.escape(t("v2.media_received", locale)),
                 parse_mode=HTML,
-                reply_markup=reply_keyboard(role),
+                reply_markup=_menu_reply_keyboard(update.effective_chat.type if update.effective_chat else None, role),
             )
     else:
         # §6.2: no semantic caption -> one clarifying question, NO publication.
@@ -936,7 +952,7 @@ async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYP
             chat_id,
             H.escape(t("v2.media_ask_caption", locale)),
             parse_mode=HTML,
-            reply_markup=reply_keyboard(role),
+            reply_markup=_menu_reply_keyboard(update.effective_chat.type if update.effective_chat else None, role),
         )
     _mark_menu_initialized(context, chat_id)
 

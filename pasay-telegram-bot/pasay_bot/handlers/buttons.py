@@ -89,11 +89,16 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
     # ReplyKeyboardMarkup in a later ordinary interaction.
     if (
         update.effective_chat is not None
-        and update.effective_chat.type == "private"
         and route in _INLINE_MENU_REFRESH_ROUTES
         and not pages._is_menu_initialized(context, chat_id)
     ):
-        await pages._send_persistent_menu(context, chat_id, role, locale)
+        await pages._send_persistent_menu(
+            context,
+            chat_id,
+            role,
+            locale,
+            chat_type=update.effective_chat.type,
+        )
 
     status = None
     try:
@@ -135,21 +140,30 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
                 chat_id,
                 H.escape(t("menu.tenants_hint", locale)),
                 parse_mode=HTML,
-                reply_markup=pages.reply_keyboard(role),
+                reply_markup=pages._menu_reply_keyboard(
+                    update.effective_chat.type if update.effective_chat else None,
+                    role,
+                ),
             )
         elif route == "maintenance":
             await context.bot.send_message(
                 chat_id,
                 H.escape(t("menu.maintenance_hint", locale)),
                 parse_mode=HTML,
-                reply_markup=pages.reply_keyboard(role),
+                reply_markup=pages._menu_reply_keyboard(
+                    update.effective_chat.type if update.effective_chat else None,
+                    role,
+                ),
             )
         else:
             await context.bot.send_message(
                 chat_id,
                 H.escape(t("common.unknown", locale)),
                 parse_mode=HTML,
-                reply_markup=pages.reply_keyboard(role),
+                reply_markup=pages._menu_reply_keyboard(
+                    update.effective_chat.type if update.effective_chat else None,
+                    role,
+                ),
             )
         _track(context, route, (time.monotonic() - started) * 1000)
     except Exception as exc:  # noqa: BLE001 - fail closed with user feedback
@@ -174,14 +188,20 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
                         chat_id,
                         H.escape(t("common.unexpected", locale)),
                         parse_mode=HTML,
-                        reply_markup=pages.reply_keyboard(role),
+                        reply_markup=pages._menu_reply_keyboard(
+                            update.effective_chat.type if update.effective_chat else None,
+                            role,
+                        ),
                     )
             else:
                 await context.bot.send_message(
                     chat_id,
                     H.escape(t("common.unexpected", locale)),
                     parse_mode=HTML,
-                    reply_markup=pages.reply_keyboard(role),
+                    reply_markup=pages._menu_reply_keyboard(
+                        update.effective_chat.type if update.effective_chat else None,
+                        role,
+                    ),
                 )
         except Exception:  # noqa: BLE001
             logger.exception("fixed menu button fallback message failed")

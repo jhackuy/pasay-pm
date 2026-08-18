@@ -837,21 +837,30 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id,
             f"📖 <b>{H.escape(t('help.title', locale))}</b>\n\n{H.escape(t('help.text', locale))}",
             parse_mode=HTML,
-            reply_markup=pages.reply_keyboard(role),
+            reply_markup=pages._menu_reply_keyboard(
+                update.effective_chat.type if update.effective_chat else None,
+                role,
+            ),
         )
     elif route == "tenants":
         await context.bot.send_message(
             chat_id,
             H.escape(t("menu.tenants_hint", locale)),
             parse_mode=HTML,
-            reply_markup=pages.reply_keyboard(role),
+            reply_markup=pages._menu_reply_keyboard(
+                update.effective_chat.type if update.effective_chat else None,
+                role,
+            ),
         )
     elif route == "maintenance":
         await context.bot.send_message(
             chat_id,
             H.escape(t("menu.maintenance_hint", locale)),
             parse_mode=HTML,
-            reply_markup=pages.reply_keyboard(role),
+            reply_markup=pages._menu_reply_keyboard(
+                update.effective_chat.type if update.effective_chat else None,
+                role,
+            ),
         )
     else:
         # BOT-V1-USABLE-001 P0-5: every unmatched ordinary text enters the AI
@@ -956,11 +965,11 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
 
 async def _v2_reply(update, context, text: str, role, locale: str):
     """Send one V2 reply carrying the fixed keyboard (self-healing reuse)."""
-    from pasay_bot.handlers.commands import _is_menu_initialized, reply_keyboard
+    from pasay_bot.handlers.commands import _is_menu_initialized, _menu_reply_keyboard
     chat_id = update.effective_chat.id
     try:
         keyboard = (
-            reply_keyboard(role)
+            _menu_reply_keyboard(update.effective_chat.type if update.effective_chat else None, role)
             if role and not _is_menu_initialized(context, chat_id)
             else None
         )
