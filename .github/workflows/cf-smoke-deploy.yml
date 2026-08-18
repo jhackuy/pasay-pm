@@ -7,12 +7,11 @@ name: cf-smoke-deploy
 #
 # Required GitHub Actions secrets (Owner-bound):
 #   CLOUDFLARE_API_TOKEN  - scoped to Workers Scripts:Edit on the smoke account
-#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id (optional; if
-#                           present it must be alphanumeric/hyphen/underscore
-#                           only — no leading/trailing whitespace, no quotes)
-#
-# Push to `codex/pasay-cf-env-001` triggers dry-run only; deploy is gated to
-# `workflow_dispatch` so real-account deploys are always Owner-initiated.
+#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id (optional helper;
+#                           if present it must be alphanumeric/hyphen/underscore
+#                           only — no leading/trailing whitespace, no quotes.
+#                           When bound but malformed we discover the real ID
+#                           from the API token via Cloudflare /accounts.)
 
 on:
   workflow_dispatch:
@@ -44,32 +43,49 @@ jobs:
       - name: Install Wrangler
         run: npm install --no-save wrangler@^4.123.0
 
-      - name: Sanitize Cloudflare account id
-        if: env.CLOUDFLARE_ACCOUNT_ID != ''
+      - name: Resolve Cloudflare account id
+        id: account
         run: |
           set -euo pipefail
-          # Strip CR/LF/leading/trailing whitespace and any double-quote pairs
-          # that some paste-from-dashboard workflows accidentally include.
-          CLEAN=$(printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
-          if [ -z "$CLEAN" ]; then
-            echo "::error::CLOUDFLARE_ACCOUNT_ID is empty after sanitization"
+          # Step 1: try the bound CLOUDFLARE_ACCOUNT_ID, but only if it is
+          # purely alphanumeric / hyphen / underscore. Whitespace and quote
+          # paste artefacts are stripped first.
+          BOUND_RAW="$CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$BOUND_RAW" ]; then
+            CLEAN=$(printf '%s' "$BOUND_RAW" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
+            if printf '%s' "$CLEAN" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+              echo "Using sanitized CLOUDFLARE_ACCOUNT_ID (len=${#CLEAN})"
+              echo "account_id=$CLEAN" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::bound CLOUDFLARE_ACCOUNT_ID was malformed (raw len=${#BOUND_RAW}, clean len=${#CLEAN}); falling back to /accounts discovery"
+          else
+            echo "CLOUDFLARE_ACCOUNT_ID not bound; discovering from API token"
+          fi
+          # Step 2: discover the account ID by calling Cloudflare /accounts
+          # with the API token. /accounts is accessible with Account:Read.
+          ACCOUNTS_JSON=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts?per_page=1")
+          if ! printf '%s' "$ACCOUNTS_JSON" | grep -q '"success":true'; then
+            echo "::error::Cloudflare /accounts call failed:"
+            printf '%s\n' "$ACCOUNTS_JSON"
             exit 1
           fi
-          if ! printf '%s' "$CLEAN" | grep -Eq '^[A-Za-z0-9_-]+$'; then
-            echo "::error::CLOUDFLARE_ACCOUNT_ID still contains invalid characters after sanitization"
-            printf 'value-len=%d\n' "${#CLEAN}"
+          ACC_ID=$(printf '%s' "$ACCOUNTS_JSON" | sed -n 's/.*"id":"\([A-Za-z0-9_-]*\)".*/\1/p' | head -n 1)
+          if [ -z "$ACC_ID" ]; then
+            echo "::error::could not parse account id from /accounts response"
             exit 1
           fi
-          echo "CLOUDFLARE_ACCOUNT_ID=$CLEAN" >> "$GITHUB_ENV"
-          unset CLOUDFLARE_ACCOUNT_ID
+          echo "Discovered account_id via /accounts (len=${#ACC_ID})"
+          echo "account_id=$ACC_ID" >> "$GITHUB_OUTPUT"
         env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Dry-run compile (always)
         run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Deploy smoke Worker (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
@@ -86,7 +102,7 @@ jobs:
           echo "Deployed Worker URL: $DEPLOY_URL"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Probe smoke endpoint
         if: github.event_name == 'workflow_dispatch' && env.DEPLOY_URL != ''
