@@ -193,4 +193,4 @@ jobs:
             exit 0
           fi
           git commit -m "ci(cf-smoke): record real-account deploy URL for run $GITHUB_RUN_ID"
-          git push github HEAD:codex/pasay-cf-env-001
+          git remote add github https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git 2>/dev/null || git remote set-url github https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git; git push github HEAD:codex/pasay-cf-env-001
