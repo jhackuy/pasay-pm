@@ -7,7 +7,9 @@ name: cf-smoke-deploy
 #
 # Required GitHub Actions secrets (Owner-bound):
 #   CLOUDFLARE_API_TOKEN  - scoped to Workers Scripts:Edit on the smoke account
-#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id
+#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id (optional; if
+#                           present it must be alphanumeric/hyphen/underscore
+#                           only — no leading/trailing whitespace, no quotes)
 #
 # Push to `codex/pasay-cf-env-001` triggers dry-run only; deploy is gated to
 # `workflow_dispatch` so real-account deploys are always Owner-initiated.
@@ -42,11 +44,32 @@ jobs:
       - name: Install Wrangler
         run: npm install --no-save wrangler@^4.123.0
 
+      - name: Sanitize Cloudflare account id
+        if: env.CLOUDFLARE_ACCOUNT_ID != ''
+        run: |
+          set -euo pipefail
+          # Strip CR/LF/leading/trailing whitespace and any double-quote pairs
+          # that some paste-from-dashboard workflows accidentally include.
+          CLEAN=$(printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
+          if [ -z "$CLEAN" ]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID is empty after sanitization"
+            exit 1
+          fi
+          if ! printf '%s' "$CLEAN" | grep -Eq '^[A-Za-z0-9_-]+$'; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID still contains invalid characters after sanitization"
+            printf 'value-len=%d\n' "${#CLEAN}"
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$CLEAN" >> "$GITHUB_ENV"
+          unset CLOUDFLARE_ACCOUNT_ID
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Dry-run compile (always)
         run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deploy smoke Worker (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
@@ -63,7 +86,7 @@ jobs:
           echo "Deployed Worker URL: $DEPLOY_URL"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ env.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Probe smoke endpoint
         if: github.event_name == 'workflow_dispatch' && env.DEPLOY_URL != ''
