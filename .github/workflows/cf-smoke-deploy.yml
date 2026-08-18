@@ -9,8 +9,8 @@ name: cf-smoke-deploy
 #   CLOUDFLARE_API_TOKEN  - scoped to Workers Scripts:Edit on the smoke account
 #   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id
 #
-# Trigger: manual (workflow_dispatch) for this task, plus push to the deploy
-# branch once Owner has bound the secrets.
+# Push to `codex/pasay-cf-env-001` triggers dry-run only; deploy is gated to
+# `workflow_dispatch` so real-account deploys are always Owner-initiated.
 
 on:
   workflow_dispatch:
@@ -46,25 +46,35 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      - name: Deploy smoke Worker
-        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/codex/pasay-cf-env-001'
-        run: npx wrangler deploy -c cf-smoke/wrangler.toml --env=""
+      - name: Deploy smoke Worker (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          cd cf-smoke
+          npx wrangler deploy -c cf-smoke/wrangler.toml --env="" 2>&1 | tee "$GITHUB_WORKSPACE/wrangler-deploy.log"
+          DEPLOY_URL=$(grep -E '^[[:space:]]+https://[a-z0-9-]+\.workers\.dev' "$GITHUB_WORKSPACE/wrangler-deploy.log" | tail -1 | tr -d '[:space:]')
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "::error::could not parse deployed URL from wrangler output"
+            cat "$GITHUB_WORKSPACE/wrangler-deploy.log"
+            exit 1
+          fi
+          echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_ENV"
+          echo "Deployed Worker URL: $DEPLOY_URL"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Probe smoke endpoint
-        if: success()
+        if: github.event_name == 'workflow_dispatch' && env.DEPLOY_URL != ''
         run: |
           set -euo pipefail
-          BASE="https://pasay-cf-smoke.${CLOUDFLARE_SMOKE_SUBDOMAIN:-workers.dev}"
-          STATUS=$(curl -s -o /tmp/health.out -w "%{http_code}" "$BASE/health")
+          echo "Probing $DEPLOY_URL/health"
+          STATUS=$(curl -s -o /tmp/health.out -w "%{http_code}" "$DEPLOY_URL/health")
           BODY=$(cat /tmp/health.out)
-          echo "GET $BASE/health -> $STATUS"
+          echo "GET $DEPLOY_URL/health -> $STATUS"
           echo "body: $BODY"
           if [ "$STATUS" != "200" ] || [ "$BODY" != "PASAY_CF_SMOKE_OK" ]; then
-            echo "Smoke probe FAILED" >&2
+            echo "::error::Smoke probe FAILED (expected 200 + PASAY_CF_SMOKE_OK)" >&2
             exit 1
           fi
-        env:
-          CLOUDFLARE_SMOKE_SUBDOMAIN: ${{ secrets.CLOUDFLARE_SMOKE_SUBDOMAIN }}
+          echo "Smoke probe OK"
