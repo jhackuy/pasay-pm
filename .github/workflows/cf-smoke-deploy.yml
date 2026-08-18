@@ -1,30 +1,22 @@
 name: cf-smoke-deploy
 
-# PASAY-CLOUDFLARE-ENV-001 deployment-readiness CI.
+# PASAY-CLOUDFLARE-ENV-001C deployment-readiness CI.
 #
 # This workflow only deploys the ISOLATED smoke Worker in `cf-smoke/`.
 # It does NOT touch FastAPI / Telegram bot / Postgres / production routes.
 #
 # Required GitHub Actions secrets (Owner-bound):
 #   CLOUDFLARE_API_TOKEN  - scoped to Workers Scripts:Edit on the smoke account
-#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id (optional helper;
-#                           when bound but malformed we discover the real ID
-#                           from the API token via Cloudflare /accounts.)
+#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id, exactly 32
+#                           lowercase hex chars. The workflow validates the
+#                           format up front and fails fast on any deviation;
+#                           no /accounts discovery fallback.
 #
-# Push to `codex/pasay-cf-env-001` triggers dry-run only; deploy is gated to
-# `workflow_dispatch` so real-account deploys are always Owner-initiated.
+# Trigger: `workflow_dispatch` only (real-account deploys are always
+# Owner-initiated).
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/pasay-cf-env-001
-    paths:
-      - "cf-smoke/**"
-      - ".github/workflows/cf-smoke-deploy.yml"
-
-permissions:
-  contents: write
 
 concurrency:
   group: cf-smoke-deploy
@@ -51,69 +43,43 @@ jobs:
           sudo apt-get install -y jq >/dev/null 2>&1 || apt-get install -y jq || true
           command -v jq && jq --version
 
-      - name: Resolve Cloudflare account id
+      - name: Validate CLOUDFLARE_ACCOUNT_ID (fail fast)
         id: account
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -eo pipefail
-          BOUND_RAW="$CLOUDFLARE_ACCOUNT_ID"
-          if [ -n "$BOUND_RAW" ]; then
-            CLEAN=$(printf '%s' "$BOUND_RAW" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
-            if printf '%s' "$CLEAN" | grep -Eq '^[A-Za-z0-9_-]+$'; then
-              echo "Using sanitized CLOUDFLARE_ACCOUNT_ID (len=${#CLEAN})"
-              echo "account_id=$CLEAN" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "::warning::bound CLOUDFLARE_ACCOUNT_ID was malformed (raw len=${#BOUND_RAW}, clean len=${#CLEAN}); falling back to /accounts discovery"
-          else
-            echo "CLOUDFLARE_ACCOUNT_ID not bound; discovering from API token"
-          fi
-          ACCOUNTS_JSON=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts?per_page=1")
-          if ! printf '%s' "$ACCOUNTS_JSON" | grep -q '"success":true'; then
-            echo "::error::Cloudflare /accounts call failed:"
-            printf '%s\n' "$ACCOUNTS_JSON"
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID is not bound; expected exactly 32 lowercase hex chars"
             exit 1
           fi
-          ACC_ID=$(printf '%s' "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
-          if [ -z "$ACC_ID" ]; then
-            echo "::error::could not parse account id from /accounts response"
+          CLEAN=$(printf '%s' "$CLOUDFLARE_ACCOUNT_ID" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
+          if ! printf '%s' "$CLEAN" | grep -Eq '^[a-f0-9]{32}$'; then
+            echo "::error::CLOUDFLARE_ACCOUNT_ID is malformed; expected ^[a-f0-9]{32}$ (32 lowercase hex chars), got raw_len=${#CLOUDFLARE_ACCOUNT_ID} clean_len=${#CLEAN}"
             exit 1
           fi
-          echo "Discovered account_id via /accounts (len=${#ACC_ID})"
-          echo "account_id=$ACC_ID" >> "$GITHUB_OUTPUT"
+          echo "CLOUDFLARE_ACCOUNT_ID format OK (32 lowercase hex chars)"
+          echo "account_id=$CLEAN" >> "$GITHUB_OUTPUT"
 
-      - name: Ensure workers.dev subdomain registered
+      - name: Read workers.dev subdomain (GET only)
         id: subdomain
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           set -eo pipefail
           ACC="${{ steps.account.outputs.account_id }}"
-          HDR=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
-          GET=$(curl -sS "${HDR[@]}" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
+          GET=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
+          if ! printf '%s' "$GET" | jq -e '.success == true' >/dev/null; then
+            echo "::error::GET /workers/subdomain failed:"
+            printf '%s\n' "$GET"
+            exit 1
+          fi
           SUBDOMAIN=$(printf '%s' "$GET" | jq -r '.result.subdomain // empty')
-          if [ -n "$SUBDOMAIN" ]; then
-            echo "workers.dev subdomain already registered (len=${#SUBDOMAIN})"
-            echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "::notice::no workers.dev subdomain yet; registering via API"
-          PUT=$(curl -sS -X PUT "${HDR[@]}" -H "Content-Type: application/json" \
-            --data '{"subdomain":"'"$ACC"'"}' \
-            "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
-          if ! printf '%s' "$PUT" | jq -e '.success == true' >/dev/null; then
-            echo "::error::failed to register workers.dev subdomain"
-            printf '%s\n' "$PUT"
-            exit 1
-          fi
-          SUBDOMAIN=$(printf '%s' "$PUT" | jq -r '.result.subdomain // empty')
           if [ -z "$SUBDOMAIN" ]; then
-            echo "::error::could not parse subdomain from PUT response"
+            echo "::error::workers.dev subdomain not registered on account $ACC; register it once via the Cloudflare dashboard or via 'wrangler login' before re-running"
             exit 1
           fi
-          echo "Registered workers.dev subdomain (len=${#SUBDOMAIN})"
+          echo "workers.dev subdomain: $SUBDOMAIN"
           echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
 
       - name: Dry-run compile (always)
@@ -122,8 +88,7 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
         run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
 
-      - name: Deploy smoke Worker (workflow_dispatch only)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Deploy smoke Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
@@ -143,7 +108,7 @@ jobs:
           {
             echo "### PASay CF smoke deploy"
             echo "- Worker name: pasay-cf-smoke"
-            echo "- Cloudflare account id (resolved): $ACC"
+            echo "- Cloudflare account id: $ACC"
             echo "- workers.dev subdomain: $SUB"
             echo "- Public URL: $DEPLOY_URL"
             echo "- Public /health endpoint: $DEPLOY_URL/health"
@@ -151,7 +116,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Probe smoke endpoint
-        if: github.event_name == 'workflow_dispatch' && env.DEPLOY_URL != ''
+        if: env.DEPLOY_URL != ''
         run: |
           set -eo pipefail
           echo "Probing $DEPLOY_URL/health"
@@ -164,36 +129,3 @@ jobs:
             exit 1
           fi
           echo "Smoke probe OK"
-
-      - name: Record deploy URL back to the repo
-        if: github.event_name == 'workflow_dispatch' && success()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eo pipefail
-          cd $GITHUB_WORKSPACE
-          mkdir -p deploy-record
-          cat > deploy-record/cf-smoke.json <<EOF
-          {
-            "worker_name": "pasay-cf-smoke",
-            "cloudflare_account_id": "${{ steps.account.outputs.account_id }}",
-            "workers_dev_subdomain": "${{ steps.subdomain.outputs.subdomain }}",
-            "public_url": "$DEPLOY_URL",
-            "health_endpoint": "$DEPLOY_URL/health",
-            "probe_status": 200,
-            "probe_body": "PASAY_CF_SMOKE_OK",
-            "github_run_id": "$GITHUB_RUN_ID",
-            "recorded_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deploy-record/cf-smoke.json
-          if git diff --cached --quiet; then
-            echo "deploy-record/cf-smoke.json unchanged; skipping commit"
-            exit 0
-          fi
-          git commit -m "ci(cf-smoke): record real-account deploy URL for run $GITHUB_RUN_ID"
-          git remote add github "https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git" 2>/dev/null || git remote set-url github "https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git"
-          git push github HEAD:codex/pasay-cf-env-001
-
