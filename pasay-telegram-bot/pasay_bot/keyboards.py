@@ -1880,12 +1880,19 @@ def properties_quick_keyboard(rows, locale: str = "bi") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb)
 
 
-def rent_quick_keyboard(overdue_rows, locale: str = "bi") -> InlineKeyboardMarkup:
+def rent_quick_keyboard(
+    overdue_rows,
+    locale: str = "bi",
+    *,
+    actionable_indices: set[int] | None = None,
+) -> InlineKeyboardMarkup:
     """💰 Rent Quick View overdue actions (ZERO-LEARNING-004 §7): one SHORT
     ``1680 · Follow up`` button per overdue row (opens the Rent detail card),
     then Home — the full property code stays in the list text above."""
     kb: list[list[InlineKeyboardButton]] = []
     for i, row in enumerate(overdue_rows, start=1):
+        if actionable_indices is not None and i not in actionable_indices:
+            continue
         unit = str(row.get("unit") or row.get("unit_code") or "")
         kb.append(
             [
@@ -1914,17 +1921,14 @@ def rent_detail_keyboard(
     nonce: str = "",
     ts: Optional[int] = None,
 ) -> InlineKeyboardMarkup:
-    """💰 Rent detail card actions: follow up + record payment + history. The
+    """💰 Rent detail card actions: record payment + history, plus Follow up
+    only while the current follow-up window is still actionable. The
     record-payment button routes into the existing deterministic rent-collect
     path; follow-up prefers an existing task (dedupe) over a duplicate.
 
-    CONVERGENCE-003 §5.2: after a successful same-day follow-up the Follow-up
-    button flips to the short state ``✅ Followed up`` (still tappable ->
-    'already followed up today' toast).
-
-    PASAY-VNEXT-FOLLOWUP-FEEDBACK-005A: after a successful assign-to-Secretary
-    delivery, the button flips to an "assigned" state so it does not look like
-    it is still pending; re-tapping stays idempotent (never sends a second DM).
+    PASAY-VNEXT-FOLLOWUP-FEEDBACK-005B: once the current follow-up is assigned
+    or already recorded for today, the action disappears from the keyboard so
+    the UI matches the real task truth.
     """
     if not nonce:
         nonce = new_nonce()
@@ -1932,20 +1936,6 @@ def rent_detail_keyboard(
         ts = now_ts()
     kb: list[list[InlineKeyboardButton]] = [
         [
-            InlineKeyboardButton(
-                (
-                    t("v2.rent_followed_short", locale)
-                    if followed_up_today
-                    else (
-                        t("v2.followup_assigned_to", locale)
-                        if followup_assigned
-                        else t("v2.rent_followup", locale)
-                    )
-                ),
-                callback_data=encode(
-                    ACTION_RENT_FOLLOWUP, "r", str(unit_id), nonce=nonce, ts=ts
-                ),
-            ),
             InlineKeyboardButton(
                 t("v2.rent_record_payment", locale),
                 callback_data=encode(ACTION_RENT, "go", str(unit_id)),
@@ -1958,6 +1948,16 @@ def rent_detail_keyboard(
             ),
         ],
     ]
+    if not followed_up_today and not followup_assigned:
+        kb[0].insert(
+            0,
+            InlineKeyboardButton(
+                t("v2.rent_followup", locale),
+                callback_data=encode(
+                    ACTION_RENT_FOLLOWUP, "r", str(unit_id), nonce=nonce, ts=ts
+                ),
+            ),
+        )
     # PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ◀ 租金 | 🏠 Home.
     kb.append(_back_home_row("rent", locale))
     return InlineKeyboardMarkup(kb)
@@ -2104,10 +2104,22 @@ def secretary_followup_keyboard(task_id: int, unit_id: int, locale: str = "bi") 
     )
 
 
-def secretary_followup_done_keyboard(locale: str = "bi") -> InlineKeyboardMarkup:
+def secretary_followup_done_keyboard(
+    task_id: int,
+    locale: str = "bi",
+) -> InlineKeyboardMarkup:
     """Secretary DM card after ``✅ 已联系租客`` (§4.1): the card is DONE — no
-    repeat execution button, so a same-day re-tap cannot create a second real
-    follow-up. There is nothing further to action in the private chat."""
+    repeat side effect is possible; a same-day re-tap routes back through the
+    real confirmation handler and answers "already recorded" instead of
+    falling into the generic invalid callback path."""
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(t("v2.sec_dm_done_card", locale), callback_data="_")]]
+        [[
+            InlineKeyboardButton(
+                t("v2.sec_dm_done_card", locale),
+                callback_data=encode(
+                    ACTION_SEC_FOLLOWUP_CONTACT, "sec", str(task_id),
+                    nonce=new_nonce(), ts=now_ts(),
+                ),
+            )
+        ]]
     )

@@ -24,7 +24,7 @@ class PhaseProbe:
     """
 
     __slots__ = ("_started", "callback_ack_ms", "backend_fetch_ms",
-                 "render_ms", "telegram_edit_ms")
+                 "render_ms", "telegram_edit_ms", "business_completed_ms")
 
     def __init__(self) -> None:
         self._started = time.monotonic()
@@ -32,6 +32,7 @@ class PhaseProbe:
         self.backend_fetch_ms = 0.0
         self.render_ms = 0.0
         self.telegram_edit_ms = 0.0
+        self.business_completed_ms = 0.0
 
     def mark_ack(self) -> None:
         self.callback_ack_ms = (time.monotonic() - self._started) * 1000
@@ -44,6 +45,9 @@ class PhaseProbe:
 
     def add_telegram(self, ms: float) -> None:
         self.telegram_edit_ms += ms
+
+    def mark_business_completed(self) -> None:
+        self.business_completed_ms = (time.monotonic() - self._started) * 1000
 
     def total(self) -> float:
         return (time.monotonic() - self._started) * 1000
@@ -102,6 +106,7 @@ class LatencyTracker:
         backend_fetch_ms: float = 0.0,
         render_ms: float = 0.0,
         telegram_edit_ms: float = 0.0,
+        business_completed_ms: float = 0.0,
         total_ms: float = 0.0,
         outcome: str = "ok",
         detail: str = "",
@@ -121,6 +126,7 @@ class LatencyTracker:
             "backend_fetch_ms": round(float(backend_fetch_ms), 3),
             "render_ms": round(float(render_ms), 3),
             "telegram_edit_ms": round(float(telegram_edit_ms), 3),
+            "business_completed_ms": round(float(business_completed_ms), 3),
             "total_ms": round(float(total_ms), 3),
             "elapsed_ms": round(float(total_ms), 3),
             "outcome": outcome,
