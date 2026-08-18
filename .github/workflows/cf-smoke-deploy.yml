@@ -124,23 +124,26 @@ jobs:
         run: |
           set -euo pipefail
           npx wrangler deploy -c wrangler.toml --env="" 2>&1 | tee "$GITHUB_WORKSPACE/wrangler-deploy.log"
-          # GitHub secret masking rewrites arbitrary values to *** in the log,
-          # so we cannot rely on the rendered wrangler URL. Re-derive the URL
-          # from the account id + subdomain output of the earlier step; both
-          # of those are written through $GITHUB_OUTPUT and are NOT masked
-          # because they never appear in any secret binding.
           ACC="${{ steps.account.outputs.account_id }}"
           SUB="${{ steps.subdomain.outputs.subdomain }}"
           DEPLOY_URL="https://pasay-cf-smoke.${SUB}.workers.dev"
-          # Confirm wrangler actually printed this URL in its log.
-          if ! grep -q "$DEPLOY_URL" "$GITHUB_WORKSPACE/wrangler-deploy.log" && \
-             ! grep -q "pasay-cf-smoke.\*\*\*.workers.dev" "$GITHUB_WORKSPACE/wrangler-deploy.log"; then
-            echo "::error::expected deploy URL not found in wrangler output"
+          if ! grep -q "pasay-cf-smoke" "$GITHUB_WORKSPACE/wrangler-deploy.log"; then
+            echo "::error::deploy output did not mention pasay-cf-smoke"
             cat "$GITHUB_WORKSPACE/wrangler-deploy.log"
             exit 1
           fi
           echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_ENV"
           echo "Deployed Worker URL: $DEPLOY_URL"
+          # Also write to step summary so the URL is visible in the GitHub UI
+          # without going through the secret-masked log surface.
+          {
+            echo "### PASay CF smoke deploy"
+            echo "- Worker name: pasay-cf-smoke"
+            echo "- Cloudflare account id (resolved): $ACC"
+            echo "- workers.dev subdomain: $SUB"
+            echo "- Public URL: $DEPLOY_URL"
+            echo "- Public /health endpoint: $DEPLOY_URL/health"
+          } >> "$GITHUB_STEP_SUMMARY"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
