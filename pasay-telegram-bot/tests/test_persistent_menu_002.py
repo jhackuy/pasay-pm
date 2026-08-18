@@ -25,9 +25,9 @@ from conftest import (
 
 GROUP_CHAT_ID = -1001234567890
 
-# PASAY-V2-FOUNDATION-001: one identical 4-button English Quick View menu
-# for every role (Properties / Tasks / Rent / Expense), is_persistent=True.
-OWNER_LABELS = ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
+# one identical 4-button English menu for every role
+# (Home / Tasks / Rent / Expense), is_persistent=True.
+OWNER_LABELS = ["🏠 Home", "✅ Tasks", "💰 Rent", "💸 Expense"]
 SECRETARY_LABELS = OWNER_LABELS
 
 FORBIDDEN_PROMPTS = (

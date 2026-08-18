@@ -1,9 +1,8 @@
-"""PASAY-V2-FOUNDATION-001: persistent Reply Keyboard menu tests.
+"""Persistent Reply Keyboard menu tests.
 
-Both roles share ONE identical 4-button English Quick View menu (Properties /
-Tasks / Rent / Expense). Each fixed button exact-matches to a deterministic
-Quick View BEFORE any NL/AI path; unknown users cannot reach a page through a
-menu button.
+Both roles share ONE identical 4-button English menu (Home / Tasks / Rent /
+Expense). Each fixed button exact-matches to a deterministic route BEFORE any
+NL/AI path; unknown users cannot reach a page through a menu button.
 """
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ def _markup_name(send):
     return kb.__class__.__name__ if kb is not None else None
 
 
-EXPECTED_LABELS = ["\U0001f3e0 Properties", "\u2705 Tasks", "\U0001f4b0 Rent", "\U0001f4b8 Expense"]
+EXPECTED_LABELS = ["\U0001f3e0 Home", "\u2705 Tasks", "\U0001f4b0 Rent", "\U0001f4b8 Expense"]
 
 
 # --- keyboard structure: identical for both roles --------------------------
@@ -50,13 +49,21 @@ def test_secretary_reply_keyboard_structure():
 
 @pytest.mark.parametrize(
     ("user_id", "marker"),
-    [(OWNER_ID, "\u623f\u6e90"), (SECRETARY_ID, "Properties")],
+    [(OWNER_ID, "运营总览"), (SECRETARY_ID, "Operations Overview")],
 )
-def test_properties_button_routes_to_quick_view(make_app, user_id, marker):
+def test_home_button_routes_to_home_overview(make_app, user_id, marker):
     env = make_app()
-    run_updates(env, [make_text_update(user_id, user_id, "\U0001f3e0 Properties", bot=env.bot)])
+    run_updates(env, [make_text_update(user_id, user_id, "\U0001f3e0 Home", bot=env.bot)])
     send = env.bot.last_send()
     assert marker in send["text"]
+    assert _markup_name(send) == "ReplyKeyboardMarkup"
+
+
+def test_legacy_properties_button_still_routes_to_properties(make_app):
+    env = make_app()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "\U0001f3e0 Properties", bot=env.bot)])
+    send = env.bot.last_send()
+    assert "房源" in send["text"] or "Properties" in send["text"]
     assert _markup_name(send) == "ReplyKeyboardMarkup"
 
 

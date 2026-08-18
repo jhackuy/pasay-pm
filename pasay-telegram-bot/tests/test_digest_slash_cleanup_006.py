@@ -89,7 +89,7 @@ def test_request_error_never_breaks_startup(make_app):
 def test_fixed_reply_keyboard_unchanged():
     from pasay_bot.keyboards import reply_keyboard
     labels = [b.text for row in reply_keyboard("owner").keyboard for b in row]
-    assert labels == ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
+    assert labels == ["🏠 Home", "✅ Tasks", "💰 Rent", "💸 Expense"]
 
 
 def test_secretary_has_no_dev_command_permission():

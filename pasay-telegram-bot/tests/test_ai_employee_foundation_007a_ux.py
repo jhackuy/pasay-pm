@@ -51,13 +51,34 @@ def test_global_home_title_owner_zh_operations_overview(make_app):
     assert "Pasay Property" not in edit["text"]
 
 
+def test_home_shows_collection_and_property_summary(make_app):
+    env = make_app()
+    edit = _home_edit(env)
+    text = edit["text"]
+    assert "本月应收" in text or "Expected" in text
+    assert "收缴率" in text or "Collection rate" in text
+    assert "历史累计欠租" in text or "Total arrears" in text
+    assert "总房源" in text or "Total units" in text
+    assert "已出租" in text or "Occupied" in text
+
+
 def test_global_home_separate_from_properties(make_app):
     """Home still carries the situational ⚠️ Today / 🔄 Refresh actions and is
     a God View - it never merges into the Properties index."""
     env = make_app()
     edit = _home_edit(env)
     labels = _labels(edit["reply_markup"])
-    assert "⚠️ Today" in labels and "🔄 Refresh" in labels
+    assert "⚠️ Today" in labels and "🏢 Properties" in labels and "🔄 Refresh" in labels
+
+
+def test_home_properties_child_navigation(make_app):
+    env = make_app()
+    edit = _home_edit(env)
+    props_cb = next(d for d in _inline_data(edit["reply_markup"]) if d.split(":")[1] == "nav" and d.split(":")[2] == "properties")
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, props_cb,
+                                           message_id=edit["message_id"], bot=env.bot)])
+    text = env.bot.edits()[-1]["text"]
+    assert "Property Overview" in text or "房源概况" in text
 
 
 # --- B) Back semantics (back = parent, home = global) -----------------

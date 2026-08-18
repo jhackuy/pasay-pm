@@ -559,9 +559,9 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
         and (l.end_date - today).days <= EXPIRING_CONTRACT_DAYS
     )
     vacant_count = sum(1 for u in units_list if u.status == "vacant")
-    maintenance_open = sum(1 for tk in tasks_list if _is_maintenance_task(tk))
     payable_count = len(quick_exp_data.get("payable") or [])
     total_arrears = quick_rent_data.get("outstanding_total")
+    occupied_count = sum(1 for u in units_list if u.status == "occupied")
     text = cards.home_summary_card(
         expected=fin.expected_rent_total,
         collected=fin.collected_rent,
@@ -571,8 +571,9 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
         expiring_count=expiring_contracts,
         vacant_count=vacant_count,
         payable_count=payable_count,
-        maintenance_open=maintenance_open,
         today_count=len(tasks_list),
+        property_total=len(units_list),
+        occupied_count=occupied_count,
         locale=locale,
     )
     if message_id:
@@ -581,14 +582,17 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
         # message carries the situational action buttons instead.
         await _render(context, chat_id, message_id, text, home_summary_keyboard(locale))
     else:
-        await _send(
-            context, chat_id, text,
-            reply_keyboard=reply_keyboard(role) if role else None,
-        )
-        if role:
-            # The persistent keyboard was just mounted on this message;
-            # remember it so later normal messages don't re-send it.
-            _mark_menu_initialized(context, chat_id)
+        if role and _is_menu_initialized(context, chat_id):
+            await _send(context, chat_id, text, keyboard=home_summary_keyboard(locale))
+        else:
+            await _send(
+                context, chat_id, text,
+                reply_keyboard=reply_keyboard(role) if role else None,
+            )
+            if role:
+                # The persistent keyboard was just mounted on this message;
+                # remember it so later normal messages don't re-send it.
+                _mark_menu_initialized(context, chat_id)
 
 
 async def show_greeting(context, chat_id, role, locale: str, message_id=None):
