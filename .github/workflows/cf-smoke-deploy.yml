@@ -141,6 +141,7 @@ jobs:
             echo "- workers.dev subdomain: $SUB"
             echo "- Public URL: $DEPLOY_URL"
             echo "- Public /health endpoint: $DEPLOY_URL/health"
+            echo "- Run id: $GITHUB_RUN_ID"
           } >> "$GITHUB_STEP_SUMMARY"
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -161,4 +162,35 @@ jobs:
           fi
           echo "Smoke probe OK"
 
-
+      - name: Record deploy URL back to the repo
+        if: github.event_name == 'workflow_dispatch' && success()
+        run: |
+          set -euo pipefail
+          cd $GITHUB_WORKSPACE
+          # Persist the resolved public URL + smoke probe result so the
+          # post-run commit (and the deploy record file) carries the real
+          # subdomain value rather than the GitHub-masked '***' string.
+          mkdir -p deploy-record
+          cat > deploy-record/cf-smoke.json <<EOF
+          {
+            "worker_name": "pasay-cf-smoke",
+            "cloudflare_account_id": "${{ steps.account.outputs.account_id }}",
+            "workers_dev_subdomain": "${{ steps.subdomain.outputs.subdomain }}",
+            "public_url": "$DEPLOY_URL",
+            "health_endpoint": "$DEPLOY_URL/health",
+            "probe_status": 200,
+            "probe_body": "PASAY_CF_SMOKE_OK",
+            "github_run_id": "$GITHUB_RUN_ID",
+            "recorded_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add deploy-record/cf-smoke.json
+          # Only commit if the file actually changed.
+          if git diff --cached --quiet; then
+            echo "deploy-record/cf-smoke.json unchanged; skipping commit"
+            exit 0
+          fi
+          git commit -m "ci(cf-smoke): record real-account deploy URL for run $GITHUB_RUN_ID"
+          git push github HEAD:codex/pasay-cf-env-001
