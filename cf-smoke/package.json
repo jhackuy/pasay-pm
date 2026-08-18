@@ -1,0 +1,14 @@
+{
+  "name": "pasay-cf-smoke",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PASay Cloudflare smoke Worker. Isolated from production code; returns PASAY_CF_SMOKE_OK on GET /health to validate GitHub/local -> Wrangler -> Cloudflare -> public HTTPS chain.",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.123.0"
+  }
+}

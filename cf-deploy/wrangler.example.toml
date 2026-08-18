@@ -1,0 +1,29 @@
+# Example Wrangler config for a FUTURE non-smoke Pasay Worker.
+# This file is a TEMPLATE ONLY. Real account_id / routes / secrets are bound
+# by Owner after `wrangler login`; nothing here is live.
+#
+# Do NOT copy this into a real wrangler.toml until PASAY-CLOUDFLARE-DEPLOY-002
+# is approved and an Owner-bound Cloudflare account is available.
+
+name = "pasay-api-edge"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# observability / logpush only; never put secrets here
+[observability]
+enabled = true
+
+[env.development]
+name = "pasay-api-edge-dev"
+vars = { ENV_NAME = "development", LOG_LEVEL = "debug" }
+
+[env.staging]
+name = "pasay-api-edge-staging"
+vars = { ENV_NAME = "staging", LOG_LEVEL = "info" }
+
+[env.production]
+# production deploy is Owner-only; values below are illustrative.
+name = "pasay-api-edge-prod"
+vars = { ENV_NAME = "production", LOG_LEVEL = "warn" }
+# routes = ["api.pasay.example.com/*"]
+# custom_domains = ["api.pasay.example.com"]

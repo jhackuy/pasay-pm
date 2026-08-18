@@ -1,0 +1,20 @@
+# Wrangler config for the isolated PASay smoke Worker.
+# Production Pasay traffic stays on its own deployment surface; this file is
+# only used by `wrangler deploy -c cf-smoke/wrangler.toml`.
+name = "pasay-cf-smoke"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# Default env: development preview deploys. Production-bound values, if any,
+# must live in the `[env.production]` block below and stay out of Git.
+[env.development]
+name = "pasay-cf-smoke-dev"
+
+[env.staging]
+name = "pasay-cf-smoke-staging"
+
+[env.production]
+# The production name is reserved; the actual production deploy is performed
+# by Owner after `wrangler login` + Cloudflare account binding. NOT enabled
+# in this task.
+name = "pasay-cf-smoke-prod"

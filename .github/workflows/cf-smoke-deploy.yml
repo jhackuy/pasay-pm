@@ -1,0 +1,70 @@
+name: cf-smoke-deploy
+
+# PASAY-CLOUDFLARE-ENV-001 deployment-readiness CI.
+#
+# This workflow only deploys the ISOLATED smoke Worker in `cf-smoke/`.
+# It does NOT touch FastAPI / Telegram bot / Postgres / production routes.
+#
+# Required GitHub Actions secrets (Owner-bound):
+#   CLOUDFLARE_API_TOKEN  - scoped to Workers Scripts:Edit on the smoke account
+#   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id
+#
+# Trigger: manual (workflow_dispatch) for this task, plus push to the deploy
+# branch once Owner has bound the secrets.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/pasay-cf-env-001
+    paths:
+      - "cf-smoke/**"
+      - ".github/workflows/cf-smoke-deploy.yml"
+
+concurrency:
+  group: cf-smoke-deploy
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Wrangler
+        run: npm install --no-save wrangler@^4.123.0
+        working-directory: cf-smoke
+
+      - name: Dry-run compile (always)
+        run: npx wrangler deploy -c cf-smoke/wrangler.toml --dry-run --env=""
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Deploy smoke Worker
+        if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/codex/pasay-cf-env-001'
+        run: npx wrangler deploy -c cf-smoke/wrangler.toml --env=""
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Probe smoke endpoint
+        if: success()
+        run: |
+          set -euo pipefail
+          BASE="https://pasay-cf-smoke.${CLOUDFLARE_SMOKE_SUBDOMAIN:-workers.dev}"
+          STATUS=$(curl -s -o /tmp/health.out -w "%{http_code}" "$BASE/health")
+          BODY=$(cat /tmp/health.out)
+          echo "GET $BASE/health -> $STATUS"
+          echo "body: $BODY"
+          if [ "$STATUS" != "200" ] || [ "$BODY" != "PASAY_CF_SMOKE_OK" ]; then
+            echo "Smoke probe FAILED" >&2
+            exit 1
+          fi
+        env:
+          CLOUDFLARE_SMOKE_SUBDOMAIN: ${{ secrets.CLOUDFLARE_SMOKE_SUBDOMAIN }}
