@@ -161,12 +161,4 @@ jobs:
           fi
           echo "Smoke probe OK"
 
-      - name: Upload deploy record
-        if: github.event_name == 'workflow_dispatch' && success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cf-smoke-deploy-record
-          path: |
-            ${{ github.workspace }}/wrangler-deploy.log
-            /tmp/health.out
-        if-no-files-found: ignore
+
