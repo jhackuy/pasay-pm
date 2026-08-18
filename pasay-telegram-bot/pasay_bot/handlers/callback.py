@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from datetime import date
 from decimal import Decimal
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import (
@@ -70,6 +70,7 @@ from pasay_bot.keyboards import (
     ACTION_METHOD,
     ACTION_NAV,
     ACTION_OPS_NAV,
+    back_keyboard,
     back_home_keyboard,
     ACTION_PAGE,
     ACTION_PROP_ARCHIVE,
@@ -508,7 +509,7 @@ async def _handle_nav(update, context, entity, role, locale):
     chat_id = update.effective_chat.id
     message_id = update.callback_query.message.message_id
     if entity == "properties":
-        await pages.show_properties(context, chat_id, role, locale, page=1, message_id=message_id)
+        await pages.show_quick_properties(context, chat_id, role, locale, message_id=message_id)
     elif entity == "tasks":
         await pages.show_today_digest(context, chat_id, role, locale, message_id=message_id)
     elif entity == "finance":
@@ -516,7 +517,7 @@ async def _handle_nav(update, context, entity, role, locale):
     elif entity == "overdue":
         await pages.show_overdue(context, chat_id, locale, page=1, message_id=message_id)
     elif entity == "rent":
-        await pages.show_rent(context, chat_id, locale, message_id=message_id)
+        await pages.show_quick_rent(context, chat_id, role, locale, message_id=message_id)
     elif entity == "pending":
         await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
     else:  # home / menu
@@ -538,7 +539,7 @@ async def _handle_page(update, context, entity, ref, role, locale):
     message_id = update.callback_query.message.message_id
     await _ack_fast(update, locale)
     if entity == "prop":
-        await pages.show_properties(context, chat_id, None, locale, page=page, message_id=message_id)
+        await pages.show_quick_properties(context, chat_id, role, locale, message_id=message_id)
     elif entity == "ovd":
         await pages.show_overdue(context, chat_id, locale, page=page, message_id=message_id)
     else:
@@ -1176,7 +1177,7 @@ async def _handle_detail(update, context, entity, ref, role, locale):
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    await _ack_working(update, locale)
+    await _ack_fast(update, locale)
     if entity == "unit" and ref.isdigit():
         await pages.show_unit_page(
             context,
@@ -1185,8 +1186,22 @@ async def _handle_detail(update, context, entity, ref, role, locale):
             int(ref),
             can_rent=has_permission(role, PERMISSION_RENT_ENTRY),
             locale=locale,
-            back_entity="overdue",
+            back_entity="properties",
         )
+        return
+    if entity == "unitrent" and ref.isdigit():
+        await _render_rent_detail_for_unit(
+            update, context, int(ref), role, locale
+        )
+        return
+    if entity == "unitpay" and ref.isdigit():
+        await _render_unit_payments(update, context, int(ref), locale)
+        return
+    if entity == "unitact" and ref.isdigit():
+        await _render_unit_activity(update, context, int(ref), locale)
+        return
+    if entity == "unitactu" and ref.isdigit():
+        await _render_unit_activity(update, context, int(ref), locale, back_entity="properties")
         return
     if entity == "inc" and ref.isdigit():
         api = context.bot_data["api_client"]
@@ -1216,7 +1231,10 @@ async def _handle_detail(update, context, entity, ref, role, locale):
                         unit_label=(getattr(unit, "unit_number", None) or ""),
                         tenant_name=(getattr(tenant, "full_name", None) or ""),
                     ),
-                    home_keyboard(locale))
+                    back_keyboard("rent", locale))
+        return
+    if entity == "expa" and ref.isdigit():
+        await _render_expense_activity(update, context, int(ref), locale)
         return
     await _answer(update, t("common.invalid", locale))
 
@@ -1224,7 +1242,7 @@ async def _handle_detail(update, context, entity, ref, role, locale):
 # --- TELEGRAM-OPS-UX-CONVERGENCE-001: Properties / Rent / Remind actions ----
 
 async def _handle_quick_unit_view(update, context, ref, role, locale):
-    """👁 1608 on the Properties index -> the unit's Quick View."""
+    """Units list row -> Unit Detail asset profile."""
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
@@ -1241,26 +1259,167 @@ async def _handle_quick_unit_view(update, context, ref, role, locale):
     if index < 1 or index > len(rows):
         await _answer(update, t("common.expired", locale), durable=True)
         return
+    await _ack_fast(update, locale)
     row = rows[index - 1]
     unit_code = str(row.get("unit_code") or "")
-    vacant = (str(row.get("status") or "").lower() == "vacant")
-    text = cards.quick_unit_view_card(
-        unit_label=unit_code,
+    unit_id = await _resolve_unit_id(update, context, unit_code)
+    if unit_id is None:
+        await _answer(update, t("common.expired", locale), durable=True)
+        return
+    await pages.show_unit_page(
+        context,
+        update.effective_chat.id,
+        update.callback_query.message.message_id,
+        unit_id,
+        can_rent=has_permission(role, PERMISSION_RENT_ENTRY),
         locale=locale,
-        vacant=vacant,
-        status=str(row.get("status") or "normal"),
-        amount=row.get("amount"),
-        days=row.get("days"),
-        open_maintenance=row.get("open_maintenance"),
+        back_entity="properties",
     )
-    kb = back_home_keyboard("properties", locale)
-    await edit_message_text_or_send(
-        update.get_bot(),
-        chat_id=update.effective_chat.id,
-        message_id=update.callback_query.message.message_id,
-        text=H.truncate(text),
-        parse_mode=HTML,
-        reply_markup=kb,
+
+
+async def _render_rent_detail_for_unit(update, context, unit_id: int, role, locale: str) -> None:
+    api = context.bot_data["api_client"]
+    try:
+        unit, data = await asyncio.gather(
+            api.get_unit(unit_id),
+            api.get_quick_rent(),
+        )
+    except PasayApiError as exc:
+        await _edit(update, _load_error(exc.detail, locale), error_keyboard("rent", locale))
+        return
+    unit_code = str(getattr(unit, "unit_number", "") or "")
+    overdue = data.get("overdue") or []
+    row = next(
+        (
+            item for item in overdue
+            if str(item.get("unit") or item.get("unit_code") or "").strip().lower()
+            == unit_code.strip().lower()
+        ),
+        None,
+    )
+    if row is None:
+        await pages.show_quick_rent(
+            context,
+            update.effective_chat.id,
+            role,
+            locale,
+            message_id=update.callback_query.message.message_id,
+        )
+        return
+    snapshot = await _followup_snapshot_for_unit(
+        api,
+        context.bot_data.get("store"),
+        unit_id,
+        unit_code,
+        last_followup_at=row.get("last_followup_at"),
+    )
+    text = await _render_rent_detail_text(api, unit_code, unit_id, row, locale, snapshot=snapshot)
+    kb = rent_detail_keyboard(
+        unit_id,
+        locale,
+        followed_up_today=bool(snapshot and snapshot.followed_up_today),
+        followup_assigned=bool(snapshot and snapshot.assigned),
+    )
+    await _edit(update, text, kb)
+
+
+async def _render_unit_payments(update, context, unit_id: int, locale: str) -> None:
+    api = context.bot_data["api_client"]
+    try:
+        unit, leases, incomes, tenants = await asyncio.gather(
+            api.get_unit(unit_id),
+            api.get_leases(),
+            api.list_incomes(),
+            api.get_tenants(),
+        )
+    except PasayApiError as exc:
+        await _edit(update, _load_error(exc.detail, locale), error_keyboard("rent", locale))
+        return
+    unit_leases = [l for l in leases if l.unit_id == unit_id]
+    lease_ids = {l.id for l in unit_leases}
+    tenant_by_id = {t_.id: t_ for t_ in tenants}
+    active = next((l for l in unit_leases if l.status == "active"), None)
+    tenant_name = ""
+    if active is not None and active.tenant_id in tenant_by_id:
+        tenant_name = getattr(tenant_by_id[active.tenant_id], "full_name", "") or ""
+    rows = []
+    buttons: list[list[InlineKeyboardButton]] = []
+    for income in sorted(
+        [inc for inc in incomes if inc.lease_id in lease_ids],
+        key=lambda inc: (str(inc.received_date), inc.id),
+        reverse=True,
+    ):
+        purpose = str(income.description or f"{income.received_date:%Y-%m} Rent").strip()
+        rows.append(
+            {
+                "status": income.status,
+                "purpose": purpose,
+                "amount": income.amount,
+            }
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    " · ".join(
+                        part for part in (
+                            purpose,
+                            H.money(income.amount),
+                        ) if part
+                    ),
+                    callback_data=encode(ACTION_DETAIL, "inc", str(income.id)),
+                )
+            ]
+        )
+    subject = " · ".join(part for part in (getattr(unit, "unit_number", "") or "", tenant_name) if part)
+    buttons.append(back_keyboard("rent", locale).inline_keyboard[0])
+    await _edit(
+        update,
+        cards.payments_list_card(rows, subject_label=subject, locale=locale),
+        InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _render_unit_activity(
+    update, context, unit_id: int, locale: str, *, back_entity: str = "rent"
+) -> None:
+    api = context.bot_data["api_client"]
+    try:
+        timeline = await api.get_unit_timeline(unit_id)
+    except PasayApiError as exc:
+        await _edit(update, _load_error(exc.detail, locale), error_keyboard("rent", locale))
+        return
+    unit = timeline.get("unit") or {}
+    subject = str(unit.get("unit_number") or unit.get("unit_code") or "")
+    await _edit(
+        update,
+        cards.activity_card(timeline.get("events") or [], subject_label=subject, locale=locale),
+        back_keyboard(back_entity, locale),
+    )
+
+
+async def _render_expense_activity(update, context, expense_id: int, locale: str) -> None:
+    api = context.bot_data["api_client"]
+    try:
+        expense = await api.get_expense_detail(expense_id)
+    except PasayApiError as exc:
+        await _edit(update, _load_error(exc.detail, locale), error_keyboard("expense", locale))
+        return
+    events: list[dict] = []
+    approved_at = getattr(expense, "approved_at", None)
+    if approved_at:
+        events.append({"at": str(approved_at), "label": "Approved" if locale == "en" else "已批准"})
+    for claim in getattr(expense, "claims", []) or []:
+        events.append(
+            {
+                "at": str(claim.get("claimed_at") or claim.get("verified_at") or ""),
+                "label": str(claim.get("status") or ""),
+                "detail": H.money(claim.get("claimed_amount") or claim.get("verified_amount") or 0),
+            }
+        )
+    await _edit(
+        update,
+        cards.activity_card(events, subject_label=f"E{expense.id}", locale=locale),
+        back_keyboard("expense", locale),
     )
 
 
@@ -2814,7 +2973,7 @@ async def _handle_expense_detail(update, context, expense_id_raw, role, locale):
     if not expense_id_raw.isdigit():
         await _answer(update, t("common.invalid", locale))
         return
-    await _ack_working(update, locale)
+    await _ack_fast(update, locale)
     expense_id = int(expense_id_raw)
     await _render_expense_detail_in_place(update, context, expense_id, locale)
 

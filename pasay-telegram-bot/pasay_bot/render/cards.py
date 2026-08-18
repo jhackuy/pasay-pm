@@ -950,24 +950,38 @@ def payment_detail_card(
     unit_label: str = "",
     tenant_name: str = "",
 ) -> str:
-    """Paid unit's payment record with business identity, not bare record id."""
+    """One payment record shown with business identity, not a bare row id."""
     purpose = _payment_purpose_label(income, locale)
-    lines = [t("rent.payment_detail_title", locale)]
-    header_parts = [p for p in [unit_label.strip(), purpose] if p]
-    if header_parts:
-        lines.append(" · ".join(H.escape(p) for p in header_parts))
+    title = _bi_header(locale, t("v2.payments_title", "en"), t("v2.payments_title", "zh"))
+    lines = [f"💳 <b>{H.escape(title)}</b>"]
+    if unit_label:
+        lines.append(H.escape(_bi_value(locale, f"Unit: {unit_label}", f"房号：{unit_label}")))
     if tenant_name:
-        prefix = "Tenant" if locale != "zh" else "租客"
-        lines.append(f"{prefix}: {H.escape(tenant_name)}")
-    amount_prefix = "Amount" if locale != "zh" else "金额"
-    method_prefix = "Method" if locale != "zh" else "方式"
-    status_prefix = "Status" if locale != "zh" else "状态"
-    date_prefix = "Date" if locale != "zh" else "日期"
-    lines.append(f"{amount_prefix}: {H.money(income.amount)}")
-    lines.append(f"{method_prefix}: {H.escape(_payment_method_label(getattr(income, 'payment_method', None)))}")
-    lines.append(f"{status_prefix}: {H.escape(_payment_status_label(getattr(income, 'status', ''), locale))}")
-    lines.append(f"{date_prefix}: {H.format_date(income.received_date)}")
-    lines.append(f"#{income.id}")
+        lines.append(H.escape(_bi_value(locale, f"Tenant: {tenant_name}", f"租客：{tenant_name}")))
+    lines.append(H.escape(_bi_value(locale, f"Period / Purpose: {purpose}", f"期别 / 用途：{purpose}")))
+    lines.append(H.escape(_bi_value(locale, f"Amount: {H.money(income.amount)}", f"金额：{H.money(income.amount)}")))
+    lines.append(
+        H.escape(
+            _bi_value(
+                locale,
+                f"Method: {_payment_method_label(getattr(income, 'payment_method', None))}",
+                f"方式：{_payment_method_label(getattr(income, 'payment_method', None))}",
+            )
+        )
+    )
+    lines.append(
+        H.escape(
+            _bi_value(
+                locale,
+                f"Status: {_payment_status_label(getattr(income, 'status', ''), 'en')}",
+                f"状态：{_payment_status_label(getattr(income, 'status', ''), 'zh')}",
+            )
+        )
+    )
+    evidence = "Yes" if getattr(income, "attachment_id", None) else "No"
+    lines.append(H.escape(_bi_value(locale, f"Evidence: {evidence}", f"凭据：{'有' if evidence == 'Yes' else '无'}")))
+    lines.append(H.escape(_bi_value(locale, f"Date: {H.format_date(income.received_date)}", f"日期：{H.format_date(income.received_date)}")))
+    lines.append(H.escape(_bi_value(locale, f"Audit ID: {income.id}", f"审计 ID：{income.id}")))
     return "\n".join(lines)
 
 
@@ -1532,6 +1546,97 @@ def unit_timeline_card(timeline: dict, unit_number: str, locale: str = "zh") -> 
     return "\n".join(lines)
 
 
+def activity_card(
+    events: list[dict],
+    *,
+    subject_label: str = "",
+    locale: str = "zh",
+) -> str:
+    """Compact activity list: what happened to this object."""
+    title = _bi_header(locale, t("v2.activity_title", "en"), t("v2.activity_title", "zh"))
+    lines = [f"🕘 <b>{H.escape(title)}</b>"]
+    if subject_label:
+        lines.append(H.escape(subject_label))
+    if not events:
+        lines.append(H.escape(t("v2.empty", locale)))
+        return "\n".join(lines)
+    for ev in events:
+        raw_at = str(ev.get("at") or "")
+        stamp = raw_at[11:16] if len(raw_at) >= 16 else raw_at[:10]
+        label = str(ev.get("label") or "").strip()
+        detail = str(ev.get("detail") or "").strip()
+        line = " ".join(part for part in (stamp, label) if part)
+        if detail:
+            line = f"{line} · {detail}" if line else detail
+        lines.append(H.escape(line or "·"))
+    return "\n".join(lines)
+
+
+def payments_list_card(
+    rows: list[dict],
+    *,
+    subject_label: str = "",
+    locale: str = "zh",
+) -> str:
+    """Payment list for one business object."""
+    title = _bi_header(locale, t("v2.payments_title", "en"), t("v2.payments_title", "zh"))
+    lines = [f"💳 <b>{H.escape(title)}</b>"]
+    if subject_label:
+        lines.append(H.escape(subject_label))
+    if not rows:
+        lines.append(H.escape(t("v2.empty", locale)))
+        return "\n".join(lines)
+    for row in rows:
+        status = str(row.get("status") or "").lower()
+        emoji = "✅" if status == "confirmed" else "🟡"
+        purpose = str(row.get("purpose") or "")
+        amount = H.money(row.get("amount"))
+        lines.append(f"{emoji} {H.escape(purpose)} · {amount}")
+    return "\n".join(lines)
+
+
+def _mask_phone(value: str) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    if len(digits) < 7:
+        return str(value or "")
+    return f"{digits[:4]}••••{digits[-3:]}"
+
+
+def unit_detail_card(
+    *,
+    unit_number: str,
+    property_name: str,
+    status: str,
+    tenant_name: str = "",
+    tenant_phone: str = "",
+    monthly_rent=None,
+    contract_start=None,
+    contract_end=None,
+    address: str = "",
+    locale: str = "zh",
+) -> str:
+    """Asset-profile Unit detail card."""
+    title = _bi_header(locale, t("v2.units_title", "en"), t("v2.units_title", "zh"))
+    occupied = str(status or "").lower() == "occupied"
+    status_icon = "🟢" if occupied else "🟡"
+    status_text = _bi_value(locale, "Occupied", "已出租") if occupied else _bi_value(locale, "Vacant", "空置")
+    lines = [f"🏢 <b>{H.escape(property_name)} · {H.escape(unit_number)}</b>"]
+    lines.append(H.escape(_bi_value(locale, f"Status: {status_icon} {'Occupied' if occupied else 'Vacant'}", f"状态：{status_icon} {'已出租' if occupied else '空置'}")))
+    if tenant_name:
+        lines.append(H.escape(_bi_value(locale, f"Tenant: {tenant_name}", f"租客：{tenant_name}")))
+    if tenant_phone:
+        masked = _mask_phone(tenant_phone)
+        lines.append(H.escape(_bi_value(locale, f"Phone: {masked}", f"电话：{masked}")))
+    if monthly_rent is not None:
+        lines.append(H.escape(_bi_value(locale, f"Monthly rent: {H.money(monthly_rent)}", f"月租：{H.money(monthly_rent)}")))
+    if contract_start or contract_end:
+        period = f"{H.format_date(contract_start) or '-'} → {H.format_date(contract_end) or '-'}"
+        lines.append(H.escape(_bi_value(locale, f"Contract: {period}", f"合同：{period}")))
+    if address:
+        lines.append(H.escape(_bi_value(locale, f"Address: {address}", f"地址：{address}")))
+    return "\n".join(lines)
+
+
 def home_summary_card(
     *,
     expected=None,
@@ -1547,45 +1652,28 @@ def home_summary_card(
     occupied_count: int = 0,
     locale: str = "zh",
 ) -> str:
-    """CONVERGENCE-003 §2.2 + PASAY-AI-EMPLOYEE-FOUNDATION-007A §C: Home =
-    the ONE global Operations Overview (God View), titled ``运营总览`` for the
-    Owner (zh) / ``Pasay Operations`` (en) — never "Pasay Property".
-
-    Ten deterministic numbers: this month expected / collected / outstanding,
-    historical total arrears, overdue units, expiring contracts, vacant units,
-    expenses awaiting payment, open maintenance, and items needing action
-    today. No first-level menu buttons live on the card (the fixed Reply
-    Keyboard carries navigation); only the two situational actions (⚠️ Today /
-    🔄 Refresh) ride on the keyboard.
-    """
-    title = t("common.home", locale)
-    overview = _bi_value(locale, "📊 Operations Overview", "📊 运营总览")
-    property_header = _bi_value(locale, "🏢 Properties", "🏢 房源")
-    lines = [f"<b>{H.escape(title)}</b>", H.escape(overview)]
+    """Home command center: answer only 'how is the business doing now?'."""
+    title = t("home.title", locale)
+    lines = [f"<b>{H.escape(title)}</b>", "", H.escape(_bi_value(locale, "📊 This month rent", "📊 本月租金"))]
     if expected is not None:
-        lines.append(H.escape(_bi_value(locale, f"Expected {H.money(expected)}", f"本月应收 {H.money(expected)}")))
-    lines.append(H.escape(_bi_value(locale, f"Collected {H.money(collected)}", f"本月已收 {H.money(collected)}")))
+        lines.append(H.escape(_bi_value(locale, f"Expected {H.money(expected)}", f"应收 {H.money(expected)}")))
+    lines.append(H.escape(_bi_value(locale, f"Collected {H.money(collected)}", f"已收 {H.money(collected)}")))
     if outstanding is not None:
-        lines.append(H.escape(_bi_value(locale, f"This month outstanding {H.money(outstanding)}", f"本月未收 {H.money(outstanding)}")))
+        lines.append(H.escape(_bi_value(locale, f"Outstanding {H.money(outstanding)}", f"未收 {H.money(outstanding)}")))
     if expected is not None:
         rate = H.percent(collected, expected)
         lines.append(H.escape(_bi_value(locale, f"Collection rate {rate}%", f"收缴率 {rate}%")))
-    if total_arrears is not None:
-        lines.append(H.escape(_bi_value(locale, f"Total arrears {H.money(total_arrears)}", f"历史累计欠租 {H.money(total_arrears)}")))
+    lines.append("")
     lines.append(H.escape(_bi_value(locale, f"🔴 Overdue rents {overdue_count}", f"🔴 逾期租金 {overdue_count}")))
-    lines.append(H.escape(_bi_value(locale, f"🟡 Today's actions {today_count}", f"🟡 今日待办 {today_count}")))
-    lines.append(H.escape(_bi_value(locale, f"🟠 Expenses to pay {payable_count}", f"🟠 待付款 {payable_count}")))
-    lines.append(H.escape(_bi_value(locale, f"📅 Leases expiring {expiring_count}", f"📅 合同即将到期 {expiring_count}")))
+    lines.append(H.escape(_bi_value(locale, f"🟡 Tasks today {today_count}", f"🟡 今日待办 {today_count}")))
+    lines.append(H.escape(_bi_value(locale, f"🟠 Payments pending {payable_count}", f"🟠 待付款 {payable_count}")))
+    lines.append(H.escape(_bi_value(locale, f"📅 Contracts expiring {expiring_count}", f"📅 合同即将到期 {expiring_count}")))
     lines.append(H.escape(_bi_value(locale, f"🏢 Vacant {vacant_count}", f"🏢 空置 {vacant_count}")))
-    lines.extend(
-        [
-            "",
-            H.escape(property_header),
-            H.escape(_bi_value(locale, f"Total units {property_total}", f"总房源 {property_total}")),
-            H.escape(_bi_value(locale, f"Occupied {occupied_count}", f"已出租 {occupied_count}")),
-            H.escape(_bi_value(locale, f"Vacant {vacant_count}", f"空置 {vacant_count}")),
-        ]
-    )
+    lines.append("")
+    lines.append(H.escape(_bi_value(locale, "🏢 Units", "🏢 房源")))
+    lines.append(H.escape(_bi_value(locale, f"{property_total} units · Occupied {occupied_count} · Vacant {vacant_count}", f"{property_total} 套 · 已出租 {occupied_count} · 空置 {vacant_count}")))
+    if total_arrears is not None:
+        lines.append(H.escape(_bi_value(locale, f"Historical arrears {H.money(total_arrears)}", f"历史欠租 {H.money(total_arrears)}")))
     return "\n".join(lines)
 
 
@@ -2041,56 +2129,26 @@ def rent_detail_card(
     vacant: bool = False,
     followup_status: str = "",
 ) -> str:
-    """💰 Rent detail card for one overdue/collectible unit. Compact: title +
-    tenant + outstanding + unpaid periods + overdue days + last follow-up. Only
-    the fields that are real are shown; ``vacant`` shows the vacant line. The
-    buttons (Follow up / Record payment / History) ride on the keyboard, never
-    in the text.
-
-    ``followup_status`` (§7), when provided, renders the real-world follow-up
-    state as its own line (``🟡 已交秘书跟进`` / ``✅ 今日已催``) — a button tap
-    never fabricates this; only the Secretary's real confirmation does.
-
-    CONVERGENCE-003 §6: fields render as ONE bilingual line
-    (``Outstanding ₱75,000 · 未付 ₱75,000``) — never two duplicated lines."""
+    """Rent object detail: status, amount, periods, timing and nothing else."""
     title = H.escape(t("v2.rent_detail_title", locale, unit=H.escape(unit_label)))
     lines = [f"<b>{title}</b>"]
-    if followup_status:
-        lines.append(f"{H.escape(followup_status)}")
     if vacant:
         lines.append(H.escape(t("v2.rent_vacant", locale)))
         return "\n".join(lines)
     if tenant_name:
-        lines.append(
-            H.escape(_bi_value(locale, f"Tenant: {tenant_name}", f"租客：{tenant_name}"))
-        )
-    if outstanding is not None:
-        money = H.money(outstanding)
-        lines.append(
-            H.escape(_bi_value(locale, f"Outstanding {money}", f"未付 {money}"))
-        )
-    if unpaid_periods > 0:
-        lines.append(
-            H.escape(_bi_value(
-                locale,
-                f"Unpaid periods: {int(unpaid_periods)}",
-                f"未付期数：{int(unpaid_periods)}",
-            ))
-        )
+        lines.append(H.escape(tenant_name))
+    if outstanding is not None or unpaid_periods > 0:
+        money = H.money(outstanding or 0)
+        lines.append(H.escape(_bi_value(locale, f"Outstanding {money} · {int(unpaid_periods)} periods", f"未付 {money} · {int(unpaid_periods)}期")))
     if overdue_days >= 0:
-        lines.append(
-            H.escape(_bi_value(
-                locale,
-                f"Overdue {int(overdue_days)}d",
-                f"逾期 {int(overdue_days)} 天",
-            ))
-        )
-    if last_followup:
-        lines.append(
-            H.escape(_bi_value(locale, f"Last follow-up: {last_followup}", f"最近催租：{last_followup}"))
-        )
-    else:
-        lines.append(H.escape(_bi_value(locale, "Last follow-up: none", "最近催租：无")))
+        lines.append(H.escape(_bi_value(locale, f"Overdue {int(overdue_days)}d", f"逾期 {int(overdue_days)} 天")))
+    if followup_status:
+        stamp = ""
+        if last_followup:
+            stamp = str(last_followup)[11:16] if len(str(last_followup)) >= 16 else str(last_followup)
+        lines.append(H.escape(f"{followup_status}{f' · {stamp}' if stamp else ''}"))
+    elif last_followup:
+        lines.append(H.escape(_bi_value(locale, f"Last follow-up {last_followup}", f"最近催租 {last_followup}")))
     return "\n".join(lines)
 
 
@@ -2503,45 +2561,24 @@ def _v2_is_zero(value) -> bool:
 
 
 def properties_quick_card(data, locale: str = "bi") -> str:
-    """🏠 Properties quick view: occupancy summary + ONE high-density line per
-    unit, ordered by severity (§1.3: 🔴 first, then 🟡, then 🟢) so the Owner
-    sees problem units first.
-
-    §1.1/§1.2: each row shows exactly ONE traffic light (🟢/🟡/🔴) as the
-    severity, with the concrete business fact in words. §1.4: the unit id is
-    the SHORT room number. §1.5: the top summary is compact and bilingual in
-    groups (``6 occupied · 1 vacant · 4 need action``). The title carries the
-    unit count (``🏠 Properties · 7``)."""
+    """Units asset directory: list the inventory, not operations workload."""
     rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
     total = len(rows)
-    header = _bi_header(
-        locale, t("v2.properties_title", "en"), t("v2.properties_title", "zh")
-    )
-    blocks = [f"🏠 <b>{H.escape(header)}{(' · ' + str(total)) if total else ''}</b>"]
+    header = _bi_header(locale, t("v2.units_title", "en"), t("v2.units_title", "zh"))
+    blocks = [f"🏢 <b>{H.escape(header)}{(' · ' + str(total)) if total else ''}</b>"]
     if not rows:
         blocks.append(H.escape(t("v2.empty", locale)))
         return "\n".join(blocks)
-    vacant = sum(1 for r in rows if str(r.get("status") or "normal").lower() == "vacant")
-    occupied = total - vacant
-
-    def _row_light(r) -> str:
-        light = _property_traffic_light(str(r.get("status") or "normal").lower())
-        if int(r.get("open_maintenance") or 0) and light != "🔴":
-            light = "🔴"
-        return light
-
-    ordered = sorted(
-        rows,
-        key=lambda r: (_PROPERTY_TRAFFIC_ORDER.get(r.get("status", ""), 0),
-                       str(r.get("unit_code") or r.get("property_code") or "")),
-        reverse=True,
-    )
-    need_action = sum(1 for r in rows if _row_light(r) == "🔴")
-    want_attention = sum(1 for r in rows if _row_light(r) == "🟡")
-    blocks.append(_properties_summary_line(locale, total, occupied, vacant, need_action, want_attention))
-    for row in ordered:
-        blocks.append(_v2_property_label(row, locale))
-    return "\n\n".join(blocks)
+    for row in rows:
+        status = str(row.get("status") or "").lower()
+        icon = "🟡" if status == "vacant" else "🟢"
+        unit = H.escape(str(row.get("unit_code") or ""))
+        prop = H.escape(str(row.get("property_name") or ""))
+        tenant = H.escape(
+            str(row.get("tenant_name") or (_bi_header(locale, "Vacant", "空置") if status == "vacant" else _bi_header(locale, "Occupied", "已出租")))
+        )
+        blocks.append(f"{icon} {unit} · {prop} · {tenant}")
+    return "\n".join(blocks)
 
 
 def _properties_summary_line(
@@ -2653,48 +2690,23 @@ def tasks_quick_card(data, locale: str = "bi") -> str:
 
 
 def rent_quick_card(data, locale: str = "bi") -> str:
-    """💰 Rent quick view: current-month statistics (expected / collected /
-    outstanding / collection rate / unpaid unit count) + overdue units.
-
-    ``outstanding_rent`` = expected - valid collected in this month; partial
-    payments reduce it and are never treated as fully paid. The overdue list
-    below stays the per-period aggregate view."""
+    """Rent page summary only; object rows live on the keyboard."""
     data = data or {}
-    overdue = data.get("overdue") or []
     outstanding = data.get("outstanding_total")
     blocks = [_v2_title(locale, "v2.rent_title", "💰")]
     expected = data.get("expected_rent_total")
     collected = data.get("collected_rent")
     cur_outstanding = data.get("outstanding_rent")
     rate = data.get("collection_rate")
-    unpaid_count = data.get("unpaid_unit_count")
     if expected is not None:
-        blocks.append(_rent_month_stats(locale, expected, collected, cur_outstanding, rate, unpaid_count))
-    if not overdue:
-        blocks.append(H.escape(t("v2.rent_no_overdue", locale)))
-    else:
-        blocks.append(_v2_section("v2.rent_overdue_section", locale, "🔴"))
-        for row in overdue:
-            unit = H.escape(str(row.get("unit") or row.get("unit_code") or ""))
-            amount = H.money(row.get("amount"))
-            days = row.get("overdue_days")
-            if days is None:
-                days = row.get("days")
-            en = f"{unit} · {amount} · " + t("v2.overdue_days", "en", days=days or 0)
-            zh = f"{unit} · {amount} · " + t("v2.overdue_days", "zh", days=days or 0)
-            blocks.append("🔴 " + _bi_line(locale, en, zh))
+        blocks.append(H.escape(_bi_value(locale, f"This month expected {H.money(expected)}", f"本月应收 {H.money(expected)}")))
+    if collected is not None or cur_outstanding is not None:
+        blocks.append(H.escape(_bi_value(locale, f"Collected {H.money(collected or 0)} · Outstanding {H.money(cur_outstanding or 0)}", f"已收 {H.money(collected or 0)} · 未收 {H.money(cur_outstanding or 0)}")))
+    if rate is not None:
+        blocks.append(H.escape(_bi_value(locale, f"Collection rate {_pct(rate)}%", f"收缴率 {_pct(rate)}%")))
     if outstanding is not None:
-        # CONVERGENCE-003 §9: ``outstanding_total`` is the HISTORICAL arrears
-        # sum (never the current-month number) — labelled distinctly from the
-        # current-month ``outstanding_rent`` in the stats block above.
-        blocks.append(
-            H.escape(_bi_value(
-                locale,
-                f"Total overdue arrears {H.money(outstanding)}",
-                f"历史累计欠租 {H.money(outstanding)}",
-            ))
-        )
-    return "\n\n".join(blocks)
+        blocks.append(H.escape(_bi_value(locale, f"Historical arrears {H.money(outstanding)}", f"历史欠租 {H.money(outstanding)}")))
+    return "\n".join(blocks)
 
 
 def _rent_month_stats(
@@ -2734,49 +2746,22 @@ def _rent_month_stats(
 
 
 def expense_quick_card(data, locale: str = "bi") -> str:
-    """💸 Expense quick view: month total, then the pending-payment queue
-    (APPROVED, unpaid) built from the REAL expense fields, then this month's
-    PAID records. No unresolved-task text block is generated, so an APPROVED
-    expense appears exactly once per page and legacy `??` task titles can
-    never leak in (EXPENSE-UX-FIX-001)."""
+    """Expense page summary only; object rows live on the keyboard."""
     data = data or {}
     month_total = data.get("month_total")
     if month_total is None:
         month_total = data.get("current_month_total")
     payable = data.get("payable") or []
-    paid_records = data.get("paid_records")
-    if paid_records is None:
-        paid_records = [
-            r for r in (data.get("records") or [])
-            if str(r.get("status") or "").lower() == "paid"
-        ]
     pending_count = data.get("pending_approval_count")
-    pending_amount = data.get("pending_approval_amount")
     blocks = [_v2_title(locale, "v2.expense_title", "💸")]
     if month_total is not None:
-        blocks.append(
-            H.escape(t("v2.expense_month_total", locale, amount=H.money(month_total)))
-        )
-    if payable:
-        blocks.append(_v2_expense_payable_header(locale, len(payable)))
-        blocks.extend(_v2_expense_payable_line(row, locale) for row in payable)
-    if paid_records:
-        blocks.append(_v2_section("v2.expense_paid_section", locale, "✅"))
-        blocks.extend(_v2_expense_record_line(row, locale) for row in paid_records)
-    elif _v2_is_zero(month_total) and not payable:
+        blocks.append(H.escape(_bi_value(locale, f"This month {H.money(month_total)}", f"本月支出 {H.money(month_total)}")))
+    if pending_count is not None:
+        blocks.append(H.escape(_bi_value(locale, f"Pending approval {int(pending_count)}", f"待审批 {int(pending_count)}")))
+    blocks.append(H.escape(_bi_value(locale, f"Pending payment {len(payable)}", f"待付款 {len(payable)}")))
+    if _v2_is_zero(month_total) and not payable and not pending_count:
         blocks.append(H.escape(t("v2.expense_records_empty", locale)))
-    if pending_count:
-        blocks.append(
-            H.escape(
-                t(
-                    "v2.expense_pending_approval",
-                    locale,
-                    count=pending_count,
-                    amount=H.money(pending_amount or 0),
-                )
-            )
-        )
-    return "\n\n".join(blocks)
+    return "\n".join(blocks)
 
 
 def _v2_expense_payable_header(locale: str, count: int) -> str:

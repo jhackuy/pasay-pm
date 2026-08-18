@@ -65,12 +65,12 @@ def _latency(env):
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 Home", "运营总览"),
-        (OWNER_ID, "✅ Tasks", "待办"),
-        (OWNER_ID, "💰 Rent", "租金"),
-        (OWNER_ID, "💸 Expense", "支出"),
-        (SECRETARY_ID, "🏠 Home", "Operations Overview"),
-        (SECRETARY_ID, "✅ Tasks", "Tasks"),
+        (OWNER_ID, "🏠 首页", "🏠 首页"),
+        (OWNER_ID, "✅ 待办", "今日待办"),
+        (OWNER_ID, "💰 租金", "租金"),
+        (OWNER_ID, "💸 支出", "支出"),
+        (SECRETARY_ID, "🏠 Home", "🏠 Home"),
+        (SECRETARY_ID, "✅ Tasks", "Today"),
         (SECRETARY_ID, "💰 Rent", "Rent"),
         (SECRETARY_ID, "💸 Expense", "Expense"),
     ],
@@ -78,10 +78,9 @@ def _latency(env):
 def test_fixed_menu_button_exact_routes_without_nl(make_app, user_id, label, marker):
     env = make_app()
     run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
-    # V2 Quick Views: ONE deterministic reply (no stub message, no LLM).
     send = env.bot.last_send()
     assert marker in send["text"]
-    assert send["reply_markup"] is not None
+    assert any(s["reply_markup"] is not None for s in env.bot.sends())
 
 
 def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
@@ -97,12 +96,12 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
     monkeypatch.setattr(nl_bridge, "handle_nl", boom)
     env = make_app()
     for user_id, label, marker in [
-        (OWNER_ID, "🏠 Home", "运营总览"),
-        (OWNER_ID, "✅ Tasks", "待办"),
-        (OWNER_ID, "💰 Rent", "租金"),
-        (OWNER_ID, "💸 Expense", "支出"),
-        (SECRETARY_ID, "🏠 Home", "Operations Overview"),
-        (SECRETARY_ID, "✅ Tasks", "Tasks"),
+        (OWNER_ID, "🏠 首页", "🏠 首页"),
+        (OWNER_ID, "✅ 待办", "今日待办"),
+        (OWNER_ID, "💰 租金", "租金"),
+        (OWNER_ID, "💸 支出", "支出"),
+        (SECRETARY_ID, "🏠 Home", "🏠 Home"),
+        (SECRETARY_ID, "✅ Tasks", "Today"),
         (SECRETARY_ID, "💰 Rent", "Rent"),
         (SECRETARY_ID, "💸 Expense", "Expense"),
     ]:
@@ -115,12 +114,12 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 Home", "运营总览"),
-        (OWNER_ID, "✅ Tasks", "待办"),
-        (OWNER_ID, "💰 Rent", "租金"),
-        (OWNER_ID, "💸 Expense", "支出"),
-        (SECRETARY_ID, "🏠 Home", "Operations Overview"),
-        (SECRETARY_ID, "✅ Tasks", "Tasks"),
+        (OWNER_ID, "🏠 首页", "🏠 首页"),
+        (OWNER_ID, "✅ 待办", "今日待办"),
+        (OWNER_ID, "💰 租金", "租金"),
+        (OWNER_ID, "💸 支出", "支出"),
+        (SECRETARY_ID, "🏠 Home", "🏠 Home"),
+        (SECRETARY_ID, "✅ Tasks", "Today"),
         (SECRETARY_ID, "💰 Rent", "Rent"),
         (SECRETARY_ID, "💸 Expense", "Expense"),
     ],
@@ -128,21 +127,26 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
 def test_fixed_menu_slow_routes_status_message_is_editable(
     make_app, user_id, label, marker
 ):
-    """PASAY-V2-FOUNDATION-001: Quick View buttons reply directly with a
-    single deterministic card (no 'processing' stub, no edit needed)."""
+    """Quick View buttons stay deterministic.
+
+    Some first private-chat interactions may also mount the persistent reply
+    keyboard with a separate helper message because Telegram cannot combine an
+    inline keyboard and a reply keyboard on the same send.
+    """
     env = make_app()
     run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
     sends = env.bot.sends()
-    assert len(sends) == 1  # exactly one reply, no junk
-    assert marker in sends[0]["text"]
-    assert sends[0]["reply_markup"] is not None
+    assert 1 <= len(sends) <= 2
+    assert marker in sends[-1]["text"]
+    if len(sends) == 2:
+        assert "menu" in sends[0]["text"].lower() or "菜单" in sends[0]["text"]
 
 
 def test_rent_button_live_ux_failure_repro_edits_status_in_place(make_app):
     """V2 Rent Quick View replies directly (deterministic, no stub/edit)."""
     env = make_app()
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
-    send = env.bot.sends()[0]
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 租金", bot=env.bot)])
+    send = env.bot.last_send()
     assert "租金" in send["text"]
     assert send["reply_markup"] is not None
 
@@ -358,7 +362,7 @@ def test_retry_button_reloads_same_page(make_app):
         env,
         [make_callback_update(OWNER_ID, OWNER_ID, encode("nav", "properties"), bot=env.bot)],
     )
-    assert "房源概况" in env.bot.last_edit()["text"]
+    assert "🏢 房源" in env.bot.last_edit()["text"]
     assert len(env.bot.answers()) == 1
 
 

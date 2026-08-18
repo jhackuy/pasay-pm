@@ -109,13 +109,17 @@ ACTION_SEC_FOLLOWUP_WRONG_NUMBER = "sfwn"   # 📞 号码错误 (PASAY-AI-EMPLOY
 # NOT natural language: the text-message handler must exact-match them and
 # route deterministically BEFORE any NL/NLU/LLM processing can run.
 #
-# PASAY-V2-FOUNDATION-001: V2 menu is 4 simple-English Quick View buttons
-# shared by every role. They are direct views, never a feature navigation.
+# Pasay Telegram UX Freeze v1: one frozen 4-button IA; only the visible
+# language changes by role.
 FIXED_MENU_ROUTES: dict[str, str] = {
     "🏠 Home": "home",
+    "🏠 首页": "home",
     "✅ Tasks": "tasks",
+    "✅ 待办": "tasks",
     "💰 Rent": "rent",
+    "💰 租金": "rent",
     "💸 Expense": "expense",
+    "💸 支出": "expense",
 }
 
 # V2 legacy aliases: old Chinese labels still route deterministically so
@@ -124,16 +128,21 @@ FIXED_MENU_ROUTES: dict[str, str] = {
 LEGACY_MENU_ROUTES: dict[str, str] = {
     "🏠 Properties": "properties",
     "🏠 首页": "home",
-    "✅ 待办": "pending",
+    "✅ 待办": "tasks",
     "💰 收租": "rent",
     "💸 支出": "expense",
 }
 
-# Row layout for the persistent keyboard (role -> rows of exact labels).
-_FIXED_REPLY_ROWS = [
-    ["🏠 Home", "✅ Tasks"],
-    ["💰 Rent", "💸 Expense"],
-]
+_FIXED_REPLY_ROWS_BY_ROLE: dict[Role, list[list[str]]] = {
+    Role.OWNER: [
+        ["🏠 首页", "✅ 待办"],
+        ["💰 租金", "💸 支出"],
+    ],
+    Role.SECRETARY: [
+        ["🏠 Home", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense"],
+    ],
+}
 
 
 def fixed_menu_route_for(text: str) -> Optional[str]:
@@ -341,14 +350,14 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
-    """Persistent bottom navigation (PASAY-V2-FOUNDATION-001): one identical
-    4-button English menu for every role (Home / Tasks / Rent / Expense).
-    Every label is an exact-match UI command routed
+    """Persistent bottom navigation: one frozen 4-button IA, with role-specific
+    labels (Owner=zh, Secretary=en). Every label is an exact-match UI command routed
     deterministically (see ``FIXED_MENU_ROUTES`` / ``fixed_menu_route_for``)
     and never reaches NL/NLU/LLM processing. ``is_persistent=True`` pins the
     keyboard above the input field across messages."""
+    rows = _FIXED_REPLY_ROWS_BY_ROLE.get(role) or _FIXED_REPLY_ROWS_BY_ROLE[Role.SECRETARY]
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(label) for label in row] for row in _FIXED_REPLY_ROWS],
+        [[KeyboardButton(label) for label in row] for row in rows],
         resize_keyboard=True,
         is_persistent=True,
     )
@@ -691,16 +700,7 @@ def unit_page_keyboard(
     back_entity: str = "home",
     ref: str = "",
 ) -> InlineKeyboardMarkup:
-    """State-driven unit-page buttons (B5):
-    - action='collect' -> unpaid: [✅ 登记收租]
-    - action='reopen'  -> reversed: [🔄 重新登记]
-    - action='view'    -> paid:     [💰 查看付款] (ref = income id)
-    - action=None      -> vacant / no active lease: no collect button
-
-    PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: the detail always ends with a
-    ``◀ <parent> | 🏠 Home`` row so Back returns to the business parent
-    (e.g. Properties) and Home stays the ONE global Operations Overview —
-    Home never doubles as "back"."""
+    """Legacy unit page keyboard kept for older flows."""
     buttons = []
     if action == "collect":
         buttons.append(
@@ -729,7 +729,7 @@ def unit_page_keyboard(
                 )
             ]
         )
-    buttons.append(_back_home_row(back_entity, locale))
+    buttons.append(_back_row(back_entity, locale))
     return InlineKeyboardMarkup(buttons)
 
 
@@ -737,6 +737,11 @@ def back_home_keyboard(back_entity: str, locale: str = "zh") -> InlineKeyboardMa
     """PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: public ``◀ <parent> | 🏠 Home``
     navigation row (Back = business parent, Home = global Operations Overview)."""
     return InlineKeyboardMarkup([_back_home_row(back_entity, locale)])
+
+
+def back_keyboard(back_entity: str, locale: str = "zh") -> InlineKeyboardMarkup:
+    """Public back-only row for detail pages covered by the freeze."""
+    return InlineKeyboardMarkup([_back_row(back_entity, locale)])
 
 
 def _back_home_row(back_entity: str, locale: str):
@@ -770,12 +775,39 @@ def _back_home_row(back_entity: str, locale: str):
     ]
 
 
+def _back_row(back_entity: str, locale: str):
+    """Back-only row: the fixed ReplyKeyboard owns global navigation."""
+    back = _parent_back_label(back_entity, locale)
+    if back_entity == "expense":
+        return [
+            InlineKeyboardButton(
+                back or t("common.back_short", locale),
+                callback_data=encode(ACTION_EXPENSE_BACK),
+            )
+        ]
+    if back_entity == "archive":
+        return [
+            InlineKeyboardButton(
+                back or t("common.back_short", locale),
+                callback_data=encode(ACTION_PROP_ARCHIVE),
+            )
+        ]
+    if back is None:
+        return [
+            InlineKeyboardButton(
+                t("common.back_short", locale), callback_data=encode(ACTION_NAV, "home")
+            )
+        ]
+    return [InlineKeyboardButton(back, callback_data=encode(ACTION_NAV, back_entity))]
+
+
 def _parent_back_label(back_entity: str, locale: str):
     """Map a back target to its parent-page label (◀ 房源 / ◀ 租金 / ...)."""
     key = {
         "properties": "nav.back_properties",
         "rent": "nav.back_rent",
         "expense": "nav.back_expense",
+        "payments": "nav.back_payments",
         "pending": "nav.back_tasks",
         "tasks": "nav.back_tasks",
         "overdue": "nav.back_overdue",
@@ -784,6 +816,38 @@ def _parent_back_label(back_entity: str, locale: str):
     if key:
         return t(key, locale)
     return None
+
+
+def unit_detail_keyboard(
+    unit_id: int,
+    locale: str = "zh",
+    *,
+    archive_link: str = "",
+) -> InlineKeyboardMarkup:
+    """Unit detail keyboard: asset profile only, no inline Home."""
+    kb: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                t("v2.unit_rent_button", locale),
+                callback_data=encode(ACTION_DETAIL, "unitrent", str(unit_id)),
+            ),
+            InlineKeyboardButton(
+                t("v2.activity_title", locale),
+                callback_data=encode(ACTION_DETAIL, "unitactu", str(unit_id)),
+            ),
+        ]
+    ]
+    if archive_link:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("v2.unit_files_button", locale),
+                    url=archive_link,
+                )
+            ]
+        )
+    kb.append(_back_row("properties", locale))
+    return InlineKeyboardMarkup(kb)
 
 
 def payment_method_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
@@ -1442,11 +1506,8 @@ def expense_open_keyboard(
     has_receipt: bool = False,
     reminded_today: bool = False,
 ) -> InlineKeyboardMarkup:
-    """CONVERGENCE-003 §4.3 Expense Detail actions — SHORT mobile buttons:
-    ``🔔 Remind | ✅ Paid`` (APPROVED unpaid), ``📎 Receipt | ◀ Back`` and
-    ``🏠 Home``. Once reminded today the Remind button flips to
-    ``✅ Reminded`` (still tappable -> 'already reminded' toast). PENDING
-    keeps approve/reject for the Owner; PAID/closed only Back + Home."""
+    """Expense Detail actions under the freeze: actions + activity + back,
+    never inline Home."""
     kb: list[list[InlineKeyboardButton]] = []
     status = (status or "").lower()
     if status == "pending":
@@ -1494,15 +1555,19 @@ def expense_open_keyboard(
                 ),
             ]
         )
-    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ◀ 支出 (back parent) | 🏠 Home.
+    kb.append(
+        [
+            InlineKeyboardButton(
+                t("v2.activity_title", locale),
+                callback_data=encode(ACTION_DETAIL, "expa", str(expense_id)),
+            )
+        ]
+    )
     kb.append(
         [
             InlineKeyboardButton(
                 _parent_back_label("expense", locale) or t("common.back_short", locale),
                 callback_data=encode(ACTION_EXPENSE_BACK),
-            ),
-            InlineKeyboardButton(
-                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
             ),
         ]
     )
@@ -1649,8 +1714,7 @@ def expense_edit_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def home_summary_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
-    """CONVERGENCE-003 §2.2 Home situational actions (never a second
-    navigation): 🏢 Properties + 🔄 Refresh. The fixed Reply
+    """Home situational actions (never a second navigation): 🏢 Units + 🔄 Refresh. The fixed Reply
     Keyboard is the ONLY first-level navigation."""
     return InlineKeyboardMarkup(
         [
@@ -1851,31 +1915,15 @@ def _short_unit_code(unit: str) -> str:
 
 
 def properties_quick_keyboard(rows, locale: str = "bi", *, archive_link: str = "") -> InlineKeyboardMarkup:
-    """🏠 Properties Quick View inline buttons (ZERO-LEARNING-004 §1.2): one
-    SHORT ``1608`` entry per unit, two per row (fallback one per row handled
-    by Telegram), then a compact archive destination button. No ``👁`` prefix —
-    the list above already names each unit and the tap target is obvious."""
+    """🏢 Units page: one navigation-only unit entry per row."""
     kb: list[list[InlineKeyboardButton]] = []
-    row_batch: list[InlineKeyboardButton] = []
     for i, row in enumerate(rows, start=1):
         unit = str(row.get("unit_code") or row.get("property_code") or "")
-        row_batch.append(
-            InlineKeyboardButton(
-                _short_unit_code(unit) or str(i),
-                callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
-            )
-        )
-        if len(row_batch) == 2:
-            kb.append(row_batch)
-            row_batch = []
-    if row_batch:
-        kb.append(row_batch)
-    if archive_link:
         kb.append(
             [
                 InlineKeyboardButton(
-                    t("v2.property_archive_short", locale),
-                    url=archive_link,
+                    _short_unit_code(unit) or str(i),
+                    callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
                 )
             ]
         )
@@ -1910,13 +1958,6 @@ def rent_quick_keyboard(
                 )
             ]
         )
-    kb.append(
-        [
-            InlineKeyboardButton(
-                t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
-            )
-        ]
-    )
     return InlineKeyboardMarkup(kb)
 
 
@@ -1929,7 +1970,7 @@ def rent_detail_keyboard(
     nonce: str = "",
     ts: Optional[int] = None,
 ) -> InlineKeyboardMarkup:
-    """💰 Rent detail card actions: record payment + history, plus Follow up
+    """💰 Rent detail card actions: record payment + payments + activity, plus Follow up
     only while the current follow-up window is still actionable. The
     record-payment button routes into the existing deterministic rent-collect
     path; follow-up prefers an existing task (dedupe) over a duplicate.
@@ -1942,23 +1983,9 @@ def rent_detail_keyboard(
         nonce = new_nonce()
     if ts is None:
         ts = now_ts()
-    kb: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(
-                t("v2.rent_record_payment", locale),
-                callback_data=encode(ACTION_RENT, "go", str(unit_id)),
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                t("v2.rent_history", locale),
-                callback_data=encode(ACTION_DETAIL, "unit", str(unit_id)),
-            ),
-        ],
-    ]
+    first_row: list[InlineKeyboardButton] = []
     if not followed_up_today and not followup_assigned:
-        kb[0].insert(
-            0,
+        first_row.append(
             InlineKeyboardButton(
                 t("v2.rent_followup", locale),
                 callback_data=encode(
@@ -1966,8 +1993,73 @@ def rent_detail_keyboard(
                 ),
             ),
         )
-    # PASAY-AI-EMPLOYEE-FOUNDATION-007A §B: ◀ 租金 | 🏠 Home.
-    kb.append(_back_home_row("rent", locale))
+    first_row.append(
+        InlineKeyboardButton(
+            t("v2.rent_record_payment", locale),
+            callback_data=encode(ACTION_RENT, "go", str(unit_id)),
+        )
+    )
+    kb: list[list[InlineKeyboardButton]] = [
+        first_row,
+        [
+            InlineKeyboardButton(
+                t("v2.payments_title", locale),
+                callback_data=encode(ACTION_DETAIL, "unitpay", str(unit_id)),
+            ),
+            InlineKeyboardButton(
+                t("v2.activity_title", locale),
+                callback_data=encode(ACTION_DETAIL, "unitact", str(unit_id)),
+            ),
+        ],
+    ]
+    kb.append(_back_row("rent", locale))
+    return InlineKeyboardMarkup(kb)
+
+
+def tasks_digest_keyboard(data, locale: str = "bi") -> InlineKeyboardMarkup | None:
+    """Tasks page: only current actionable objects are tappable."""
+    rows = data.get("act_now") or []
+    if not rows:
+        return None
+    kb: list[list[InlineKeyboardButton]] = []
+    for index, row in enumerate(rows, start=1):
+        kind = str(row.get("kind") or "").lower()
+        if kind == "payable_expense" and row.get("expense_id") is not None:
+            label = " · ".join(
+                part
+                for part in (
+                    f"E{int(row['expense_id'])}",
+                    str(row.get("purpose") or "").strip(),
+                    H.money(row.get("amount")),
+                )
+                if part
+            )
+            kb.append(
+                [
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=encode(ACTION_EXPENSE_OPEN, str(int(row["expense_id"]))),
+                    )
+                ]
+            )
+            continue
+        label = " · ".join(
+            part
+            for part in (
+                str(row.get("unit") or row.get("unit_code") or "").strip(),
+                t("v2.digest_rent_action", locale),
+                H.money(row.get("amount")) if row.get("amount") is not None else "",
+            )
+            if part
+        )
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    label,
+                    callback_data=encode(ACTION_RENT_QUICK_DETAIL, "ovd", str(index)),
+                )
+            ]
+        )
     return InlineKeyboardMarkup(kb)
 
 

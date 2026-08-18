@@ -53,10 +53,11 @@ from pasay_bot.keyboards import (
     properties_quick_keyboard,
     rent_quick_keyboard,
     expense_remind_keyboard,
+    tasks_digest_keyboard,
     tasks_quick_keyboard,
     todo_keyboard,
+    unit_detail_keyboard,
     unit_list_keyboard,
-    unit_page_keyboard,
 )
 from pasay_bot.handlers.edit_utils import edit_message_text_idempotent
 from pasay_bot.roles import Role
@@ -714,9 +715,10 @@ async def show_today_digest(context, chat_id, role, locale: str, message_id=None
         return
     data = data or {}
     text = cards.active_tasks_digest_card(data, locale)
+    keyboard = tasks_digest_keyboard(data, locale)
     await _render(
         context, chat_id, message_id, text,
-        keyboard=home_keyboard(locale),
+        keyboard=keyboard,
     )
 
 
@@ -814,31 +816,25 @@ async def show_quick_expense(context, chat_id, role, locale: str, message_id=Non
     data = data or {}
     text = cards.expense_quick_card(data, locale)
     payable = data.get("payable") or []
-    # CONVERGENCE-003 §4.2/§10: the LIST is for reading — one short
-    # ``E{id} Open`` button per payable row (the actions live on the DETAIL
-    # card). Never the long ``View details 查看详情 / Remind Owner 提醒老板``
-    # labels that got truncated to ``Remin...`` on narrow phones.
     kb_rows: list[list[InlineKeyboardButton]] = []
     for row in payable:
         expense_id = row.get("expense_id")
         if expense_id is None:
             continue
+        purpose = str(row.get("purpose") or "").strip()
+        amount = H.money(row.get("amount"))
+        status_label = bl("v2.expense_pending_payment", locale)
         kb_rows.append(
             [
                 InlineKeyboardButton(
-                    f"E{int(expense_id)} · Open",
+                    " · ".join(
+                        part for part in (f"E{int(expense_id)}", purpose, amount, status_label) if part
+                    ),
                     callback_data=encode(ACTION_EXPENSE_OPEN, str(int(expense_id))),
                 )
             ]
         )
     if kb_rows:
-        kb_rows.append(
-            [
-                InlineKeyboardButton(
-                    t("common.home", locale), callback_data=encode(ACTION_NAV, "home")
-                )
-            ]
-        )
         await _render(context, chat_id, message_id, text, keyboard=InlineKeyboardMarkup(kb_rows))
     else:
         await _render(
@@ -1499,19 +1495,14 @@ async def show_todo(context, chat_id, role, locale: str, message_id=None):
 # --- unit page (state-driven, B5) ---
 
 async def build_unit_page(api, unit_id: int, can_rent: bool, locale: str,
-                          back_entity: str = "home"):
-    """Unit page used by the rent flow, overdue detail and payment view.
-
-    PASAY-AI-EMPLOYEE-FOUNDATION-007A §A8: fast-path — only the few fields this
-    card really needs are fetched, in one parallel gather (no unused round-trip
-    to the overdue report, no N+1 serial calls)."""
+                          back_entity: str = "home", archive_link: str = ""):
+    """Unit detail as an asset profile (no operational dashboard semantics)."""
     try:
-        unit, properties, leases, tenants, incomes = await asyncio.gather(
+        unit, properties, leases, tenants = await asyncio.gather(
             api.get_unit(unit_id),
             api.get_properties(),
             api.get_leases(),
             api.get_tenants(),
-            api.list_incomes(),
         )
     except PasayApiError as exc:
         return _load_error(exc.detail, locale), error_keyboard(back_entity, locale)
@@ -1521,31 +1512,40 @@ async def build_unit_page(api, unit_id: int, can_rent: bool, locale: str,
     active = next(
         (l for l in leases if l.unit_id == unit.id and l.status == "active"), None
     )
-    tenant_name = None
-    payment_state = None
-    action = None
-    action_ref = ""
+    tenant_name = ""
+    tenant_phone = ""
+    monthly_rent = None
+    contract_start = None
+    contract_end = None
     if active:
         tenant = next((tn for tn in tenants if tn.id == active.tenant_id), None)
-        tenant_name = tenant.full_name if tenant else None
-        month = _current_month()
-        if _period_covered(incomes, active.id, month):
-            payment_state = "paid"
-            last = _last_income_for_lease(incomes, active.id)
-            if last is not None:
-                action = "view"
-                action_ref = str(last.id)
-        else:
-            payment_state = "unpaid"
-            reversed_any = any(
-                i.lease_id == active.id and i.status == "reversed" for i in incomes
-            )
-            action = "reopen" if reversed_any else "collect"
-    text = cards.unit_card(
-        unit, prop_name, address, active, tenant_name, locale, payment_state
+        tenant_name = tenant.full_name if tenant else ""
+        tenant_phone = (
+            getattr(tenant, "available_phone", None)
+            or getattr(tenant, "phone", None)
+            or getattr(tenant, "secondary_phone", None)
+            or ""
+        )
+        monthly_rent = active.monthly_rent
+        contract_start = active.start_date
+        contract_end = active.end_date
+    status = "occupied" if active and getattr(unit, "status", "") != "vacant" else "vacant"
+    text = cards.unit_detail_card(
+        unit_number=getattr(unit, "unit_number", "") or "",
+        property_name=prop_name,
+        status=status,
+        tenant_name=tenant_name,
+        tenant_phone=tenant_phone,
+        monthly_rent=monthly_rent,
+        contract_start=contract_start,
+        contract_end=contract_end,
+        address=address,
+        locale=locale,
     )
-    keyboard = unit_page_keyboard(
-        unit_id, action, locale, back_entity=back_entity, ref=action_ref
+    keyboard = unit_detail_keyboard(
+        unit_id,
+        locale,
+        archive_link=archive_link,
     )
     return text, keyboard
 
@@ -1553,8 +1553,9 @@ async def build_unit_page(api, unit_id: int, can_rent: bool, locale: str,
 async def show_unit_page(context, chat_id, message_id, unit_id: int, can_rent: bool,
                          locale: str, back_entity: str = "home"):
     api = context.bot_data["api_client"]
+    archive_link = _archive_chat_link(context.bot_data.get("settings"))
     text, keyboard = await build_unit_page(api, unit_id, can_rent, locale,
-                                           back_entity=back_entity)
+                                           back_entity=back_entity, archive_link=archive_link)
     await edit_message_text_idempotent(
         context.bot,
         chat_id=chat_id,
