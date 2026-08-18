@@ -8,6 +8,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'menu.hint': '请选择功能：',
         # SLICE3-UX-PERSISTENT-MENU-002: auto-restored persistent menu.
         'menu.ready': '✅ 菜单已就绪，点下方按钮即可使用。',
+        'archive.launcher_title': '📁 房产档案',
+        'archive.launcher_open': '📁 打开档案频道 ↗',
         'menu.tenants_hint': '👥 租客查询：直接输入租客姓名即可查询交租状态（例如“John 交了吗”“这个月谁还没交”）。\n也可查看 🏠 房源 或 ⚠️ 逾期。',
         'menu.maintenance_hint': '🔧 维修事项统一在 ✅ 待办（待办中心）里处理。\n也可直接问运营助手（/copilot），例如“这个月维修费多少？”。',
         # SLICE3-UX-PERSISTENT-MENU-002: group new-member neutral welcome.
@@ -646,6 +648,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'menu.hint': 'Choose an option:',
         # SLICE3-UX-PERSISTENT-MENU-002: auto-restored persistent menu.
         'menu.ready': '✅ Menu is ready — tap the buttons below.',
+        'archive.launcher_title': '📁 Property Archive',
+        'archive.launcher_open': '📁 Open Archive Channel ↗',
         'menu.tenants_hint': '👥 Tenant status: type a tenant name directly (e.g. “has John paid?” or “who hasn’t paid this month?”).\nYou can also check 🏠 Properties or ⚠️ Overdue.',
         'menu.maintenance_hint': '🔧 Maintenance jobs are handled in ✅ Tasks (to-do center).\nYou can also ask the assistant (/copilot), e.g. “maintenance cost this month?”',
         # SLICE3-UX-PERSISTENT-MENU-002: group new-member neutral welcome.

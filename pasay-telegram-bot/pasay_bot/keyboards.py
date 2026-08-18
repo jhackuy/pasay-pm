@@ -122,8 +122,8 @@ FIXED_MENU_ROUTES: dict[str, str] = {
     "💰 租金": "rent",
     "💸 Expense": "expense",
     "💸 支出": "expense",
-    "☰ More": "more",
-    "☰ 更多": "more",
+    "📁 Archive": "archive",
+    "📁 档案": "archive",
 }
 
 # V2 legacy aliases: old Chinese labels still route deterministically so
@@ -134,17 +134,19 @@ LEGACY_MENU_ROUTES: dict[str, str] = {
     "🏠 房源": "properties",
     "💰 收租": "rent",
     "💸 支出": "expense",
-    "更多": "more",
+    "☰ More": "archive",
+    "☰ 更多": "archive",
+    "更多": "archive",
 }
 
 _FIXED_REPLY_ROWS_BY_ROLE: dict[Role, list[list[str]]] = {
     Role.OWNER: [
         ["🏠 首页", "🏘 房源", "✅ 待办"],
-        ["💰 租金", "💸 支出", "☰ 更多"],
+        ["💰 租金", "💸 支出", "📁 档案"],
     ],
     Role.SECRETARY: [
         ["🏠 Home", "🏘 Properties", "✅ Tasks"],
-        ["💰 Rent", "💸 Expense", "☰ More"],
+        ["💰 Rent", "💸 Expense", "📁 Archive"],
     ],
 }
 

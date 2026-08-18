@@ -113,7 +113,7 @@ def _bind_identity(update, context, user_id=None) -> bool:
 # process, so normal messages never spam menu messages while a deployed menu
 # migration still remounts the new keyboard on the next ordinary interaction.
 
-_MENU_VERSION = "ux_freeze_v1_menu_3x2_001"
+_MENU_VERSION = "ux_freeze_v1_archive_menu_3x2_002"
 
 
 def _menu_init_chats(context) -> dict:
@@ -136,13 +136,13 @@ async def _send_persistent_menu(context, chat_id, role, locale) -> bool:
         return False
     if _is_menu_initialized(context, chat_id):
         return False
-    _mark_menu_initialized(context, chat_id)
     await context.bot.send_message(
         chat_id,
         H.escape(t("menu.ready", locale)),
         parse_mode=HTML,
         reply_markup=reply_keyboard(role),
     )
+    _mark_menu_initialized(context, chat_id)
     return True
 
 
@@ -158,6 +158,15 @@ def _archive_chat_link(settings) -> str:
     else:
         cid = archive_id
     return f"https://t.me/c/{cid}"
+
+
+def archive_launcher(locale: str, *, link: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    text = H.escape(t("archive.launcher_title", locale))
+    if not link:
+        return text, None
+    return text, InlineKeyboardMarkup(
+        [[InlineKeyboardButton(t("archive.launcher_open", locale), url=link)]]
+    )
 
 
 def _current_month() -> str:
@@ -632,7 +641,7 @@ async def show_greeting(context, chat_id, role, locale: str, message_id=None):
     await _render(
         context, chat_id, message_id, text, reply_keyboard=keyboard,
     )
-    if role:
+    if role and keyboard is not None:
         _mark_menu_initialized(context, chat_id)
 
 
@@ -693,8 +702,20 @@ async def show_quick_properties(context, chat_id, role, locale: str, message_id=
             context, chat_id, message_id, text,
             reply_keyboard=(reply_keyboard(role) if role else None),
         )
-    if role:
-        _mark_menu_initialized(context, chat_id)
+        if role:
+            _mark_menu_initialized(context, chat_id)
+
+
+async def show_archive_launcher(context, chat_id, role, locale: str):
+    """📁 Fixed-menu archive launcher: one compact message + authoritative URL."""
+    link = _archive_chat_link(context.bot_data.get("settings"))
+    text, keyboard = archive_launcher(locale, link=link)
+    await context.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=HTML,
+        reply_markup=keyboard,
+    )
 
 
 async def show_today_digest(context, chat_id, role, locale: str, message_id=None):
@@ -792,8 +813,8 @@ async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
             context, chat_id, message_id, text,
             reply_keyboard=(reply_keyboard(role) if role else None),
         )
-    if role:
-        _mark_menu_initialized(context, chat_id)
+        if role:
+            _mark_menu_initialized(context, chat_id)
 
 
 async def show_quick_expense(context, chat_id, role, locale: str, message_id=None):
@@ -841,8 +862,8 @@ async def show_quick_expense(context, chat_id, role, locale: str, message_id=Non
             context, chat_id, message_id, text,
             reply_keyboard=(reply_keyboard(role) if role else None),
         )
-    if role:
-        _mark_menu_initialized(context, chat_id)
+        if role:
+            _mark_menu_initialized(context, chat_id)
 
 
 async def handle_media_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

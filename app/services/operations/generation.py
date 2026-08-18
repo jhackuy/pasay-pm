@@ -31,6 +31,7 @@ from app.models.operations import (
 )
 from app.models.property import Unit
 from app.models.tenant import Tenant
+from app.models.user import User, UserRole
 from app.services.audit import record_audit, serialize_row
 from app.services.operations.rent_math import covered_periods, lease_periods
 from app.services.operations.config import (
@@ -98,32 +99,131 @@ def _money(value) -> str:
     return f"{sign}₱{int_part}" + (f".{frac}" if frac else "")
 
 
-def _notification_message(task: OperationalTask) -> str:
+def _task_locale(db: Session | None, user_id: int | None) -> str:
+    if db is None or user_id is None:
+        return "zh"
+    user = db.get(User, user_id)
+    if user is None:
+        return "zh"
+    return "zh" if user.role == UserRole.admin else "en"
+
+
+def _actor_label(db: Session | None, user_id: int | None) -> str:
+    if db is None or user_id is None:
+        return "Unknown"
+    user = db.get(User, user_id)
+    if user is None:
+        return "Unknown"
+    return "Owner" if user.role == UserRole.admin else "Secretary"
+
+
+def _period_label(periods, locale: str) -> str:
+    if isinstance(periods, list):
+        return "、".join(str(p) for p in periods) if locale == "zh" else ", ".join(str(p) for p in periods)
+    return str(periods or "")
+
+
+def _overdue_days(task: OperationalTask) -> int | None:
+    if not task.due_at:
+        return None
+    days = (datetime.now(task.due_at.tzinfo).date() - task.due_at.date()).days
+    return max(days, 0)
+
+
+def _last_followup_label(details: dict, locale: str) -> str:
+    last_followup = (
+        details.get("last_followup_at")
+        or details.get("followed_up_at")
+        or details.get("last_contact_at")
+    )
+    if not last_followup:
+        return "尚未催租" if locale == "zh" else "Not yet followed up"
+    return str(last_followup).replace("T", " ")[:16]
+
+
+def _localized_next_action(task: OperationalTask, locale: str) -> str:
+    action = str(task.next_action or "").strip()
+    if task.task_type == OperationalTaskType.RENT_OVERDUE:
+        if locale == "zh":
+            if action == "Secretary to contact tenant for overdue rent.":
+                return "Secretary 联系租客催收"
+        else:
+            if action:
+                return action
+    return action
+
+
+def _notification_message(task: OperationalTask, locale: str = "zh", *, current_actor: str | None = None) -> str:
     """Humanized proactive notification (V1.3): '待办提醒' + human title +
     amount/period/due. No task_type enum values, no internal #ids."""
     details = task.details or {}
-    lines = ["🔔 待办提醒", task.title]
+    if task.task_type == OperationalTaskType.RENT_OVERDUE:
+        periods = details.get("periods") or details.get("period")
+        amount = details.get("amount") or details.get("total_outstanding")
+        overdue_days = _overdue_days(task)
+        actor = current_actor or ""
+        next_action = _localized_next_action(task, locale)
+        if locale == "zh":
+            lines = ["🔔 租金逾期"]
+            if details.get("unit_number"):
+                lines.append(f"房号：{details.get('unit_number')}")
+            if details.get("tenant_name"):
+                lines.append(f"租客：{details.get('tenant_name')}")
+            if amount is not None:
+                suffix = f" · {len(periods)}期" if isinstance(periods, list) and periods else ""
+                lines.append(f"欠款：{_money(amount)}{suffix}")
+            if periods:
+                lines.append(f"账期：{_period_label(periods, locale)}")
+            if overdue_days is not None:
+                lines.append(f"逾期：{overdue_days}天")
+            lines.append(f"最近催租：{_last_followup_label(details, locale)}")
+            if actor and actor != "Unknown":
+                lines.append(f"当前处理：{actor}")
+            if next_action:
+                lines.append("")
+                lines.append(f"下一步：{next_action}")
+            return "\n".join(lines)
+        lines = ["🔔 Rent Overdue"]
+        if details.get("unit_number"):
+            lines.append(f"Unit: {details.get('unit_number')}")
+        if details.get("tenant_name"):
+            lines.append(f"Tenant: {details.get('tenant_name')}")
+        if amount is not None:
+            period_suffix = ""
+            if isinstance(periods, list) and periods:
+                unit = "period" if len(periods) == 1 else "periods"
+                period_suffix = f" · {len(periods)} {unit}"
+            lines.append(f"Outstanding: {_money(amount)}{period_suffix}")
+        if periods:
+            lines.append(f"Rent period: {_period_label(periods, locale)}")
+        if overdue_days is not None:
+            unit = "day" if overdue_days == 1 else "days"
+            lines.append(f"Overdue: {overdue_days} {unit}")
+        lines.append(f"Last follow-up: {_last_followup_label(details, locale)}")
+        if current_actor:
+            lines.append(f"Current actor: {current_actor}")
+        if next_action:
+            lines.append("")
+            lines.append(f"Next action: {next_action}")
+        return "\n".join(lines)
+    lines = ["🔔 待办提醒" if locale == "zh" else "🔔 Task Reminder", task.title]
     amount = details.get("amount") or details.get("total_outstanding")
     if amount is not None:
-        lines.append(f"金额：{_money(amount)}")
+        lines.append(f"{'金额' if locale == 'zh' else 'Amount'}：{_money(amount)}")
     period = details.get("period") or details.get("periods")
     if period:
-        if isinstance(period, list):
-            period = "、".join(str(p) for p in period)
-        lines.append(f"账期：{period}")
+        lines.append(f"{'账期' if locale == 'zh' else 'Period'}：{_period_label(period, locale)}")
     if task.due_at:
-        lines.append(f"到期：{task.due_at:%Y-%m-%d %H:%M}")
+        lines.append(f"{'到期' if locale == 'zh' else 'Due'}：{task.due_at:%Y-%m-%d %H:%M}")
     return "\n".join(lines)
 
 
-def _ack_reply_markup(task_id: int) -> dict:
-    """Inline keyboard for a proactive reminder (CONVERGENCE-003 §1.5): one
-    short ``✅ Acknowledge`` action (callback ``v1:ack:t:<task_id>``). Tapping
-    marks the task IN_PROGRESS via the backend acknowledge endpoint, which
-    stops same-day reminders. The label is deliberately short for mobile."""
+def _task_navigation_reply_markup(task: OperationalTask, locale: str) -> dict:
+    """Notification CTA projects the existing task truth; no reminder-only flow."""
+    detail_label = "✅ 查看待办" if locale == "zh" else "✅ View Task"
     return {
         "inline_keyboard": [
-            [{"text": "✅ Acknowledge", "callback_data": f"v1:ack:t:{task_id}"}]
+            [{"text": detail_label, "callback_data": f"v1:tkd:ops:{task.id}"}]
         ]
     }
 
@@ -325,6 +425,8 @@ def _enqueue_for_task(
         ):
             return False  # already reminded today -> high-frequency scan, no send
     details = task.details or {}
+    locale = _task_locale(db, task.assigned_user_id)
+    current_actor = _actor_label(db, task.assigned_user_id)
     payload = {
         "task_id": task.id,
         "task_type": task.task_type.value,
@@ -334,15 +436,13 @@ def _enqueue_for_task(
         "message": (
             notification_message
             if notification_message is not None
-            else _notification_message(task)
+            else _notification_message(task, locale, current_actor=current_actor)
         ),
     }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     elif proactive:
-        # CONVERGENCE-003 §1.5: proactive reminder cards carry a short
-        # ✅ Acknowledge action so the human can stop same-day reminders.
-        payload["reply_markup"] = _ack_reply_markup(task.id)
+        payload["reply_markup"] = _task_navigation_reply_markup(task, locale)
     generation = task.reminder_generation or 0
     return enqueue_notification(
         db,

@@ -40,14 +40,14 @@ HTML = "HTML"
 # therefore sent WITHOUT reply_markup; the persistent keyboard remains pinned
 # client-side because it was previously sent with is_persistent=True.
 _SLOW_ROUTES = frozenset(
-    {"finance", "overdue", "pending", "more"}
+    {"finance", "overdue", "pending"}
 )
 
 # PASAY-V2-FOUNDATION-001 / 006A: Home plus the business entry buttons are
 # fast deterministic first-level routes — they render directly and never show
 # the processing stub.
-_QUICK_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense"})
-_INLINE_MENU_REFRESH_ROUTES = frozenset({"properties", "tasks", "rent", "expense"})
+_QUICK_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense", "archive"})
+_INLINE_MENU_REFRESH_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense", "archive"})
 
 
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:
@@ -116,8 +116,10 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
                 await pages.show_quick_tasks(context, chat_id, role, locale)
             elif route == "rent":
                 await pages.show_quick_rent(context, chat_id, role, locale)
-            else:  # expense
+            elif route == "expense":
                 await pages.show_quick_expense(context, chat_id, role, locale)
+            else:  # archive
+                await pages.show_archive_launcher(context, chat_id, role, locale)
         elif route == "home":
             await pages.show_home(context, chat_id, role, locale, message_id=message_id)
         elif route == "finance":
@@ -128,11 +130,6 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
             )
         elif route == "pending":
             await pages.show_todo(context, chat_id, role, locale, message_id=message_id)
-        elif route == "more":
-            # CONVERGENCE-003 §2.1: "☰ 更多" (legacy) opens the ONE Home.
-            await pages.show_home(
-                context, chat_id, role, locale, message_id=message_id
-            )
         elif route == "tenants":
             await context.bot.send_message(
                 chat_id,
