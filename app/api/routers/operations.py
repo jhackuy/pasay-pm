@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -22,9 +22,12 @@ from app.api.deps import (
     get_operations_reader,
     manager_or_admin,
 )
+from app.config import settings
 from app.database import get_db
 from app.models.copilot import CopilotActionProposal, CopilotActionStatus
 from app.models.operations import (
+    NotificationOutbox,
+    NotificationStatus,
     OperationalTask,
     OperationalTaskStatus,
     OperationalTaskType,
@@ -44,6 +47,8 @@ from app.schemas.operations import (
     SchedulerRunResult,
     TaskActionOut,
     TaskCreateIn,
+    TaskFollowupDeliveryIn,
+    TaskFollowupDeliveryOut,
     TaskSnoozeIn,
     TaskUpdateIn,
 )
@@ -76,6 +81,15 @@ from app.services.copilot import execute as copilot_execute
 from app.services.operations import copilot as copilot_svc
 from app.services.operations import proposals as copilot_proposals
 from app.services.operations import quick as quick_svc
+from app.services.operations.config import NOTIFY_CHANNEL_TELEGRAM, NOTIFY_MAX_ATTEMPTS
+from app.services.operations.notifier import (
+    TelegramSender,
+    _claim_row,
+    _finalize_failed,
+    _finalize_sent,
+    _message_text,
+)
+from app.services.operations.outbox import enqueue_notification, resolve_recipient
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
 from app.services.operations.generation import create_operational_task
@@ -145,6 +159,144 @@ def _task_read(db: Session, task: OperationalTask) -> OperationalTaskRead:
         data["details"] = data.pop("metadata")
     data["property_code"] = _task_property_code(db, task)
     return OperationalTaskRead(**data)
+
+
+def _lock_task_for_update(db: Session, task_id: int) -> OperationalTask:
+    task = (
+        db.execute(
+            select(OperationalTask)
+            .where(OperationalTask.id == task_id)
+            .with_for_update()
+        )
+        .scalar_one_or_none()
+    )
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operational task not found")
+    return task
+
+
+def _rent_followup_dedupe_key(task_id: int, recipient: str) -> str:
+    return f"rent-followup:{task_id}:{NOTIFY_CHANNEL_TELEGRAM}:{recipient}"
+
+
+def _build_notification_sender(db: Session) -> TelegramSender:
+    def resolve_user(user_id_str: str) -> str | None:
+        from app.services.identity import resolve_telegram_destination
+
+        return resolve_telegram_destination(db, int(user_id_str))
+
+    return TelegramSender(settings.telegram_bot_token, resolve_user=resolve_user)
+
+
+def _load_outbox_by_dedupe(db: Session, dedupe_key: str) -> NotificationOutbox | None:
+    return (
+        db.query(NotificationOutbox)
+        .filter(NotificationOutbox.dedupe_key == dedupe_key)
+        .first()
+    )
+
+
+def _sync_rent_followup_assignment(
+    db: Session,
+    *,
+    task_id: int,
+    assignee_user_id: int,
+    actor_id: int,
+    now: datetime,
+) -> OperationalTask:
+    task = _get_task_or_404(db, task_id)
+    details = dict(task.details or {})
+    old = serialize_row(task)
+    changed = False
+    if task.assigned_user_id != assignee_user_id:
+        task.assigned_user_id = assignee_user_id
+        changed = True
+    if details.get("assigned_to") != assignee_user_id:
+        details["assigned_to"] = assignee_user_id
+        changed = True
+    if not details.get("assigned_at"):
+        details["assigned_at"] = now.isoformat()
+        changed = True
+    if task.next_action != "Secretary to contact tenant for overdue rent.":
+        task.next_action = "Secretary to contact tenant for overdue rent."
+        changed = True
+    if not changed:
+        return task
+    task.details = details
+    task.updated_by = actor_id
+    task.updated_at = now
+    task.reminder_generation = (task.reminder_generation or 0) + 1
+    db.flush()
+    record_audit(
+        db,
+        table_name="operational_tasks",
+        record_id=task.id,
+        action="task_updated",
+        actor_id=actor_id,
+        old_value=old,
+        new_value=serialize_row(task),
+    )
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _deliver_rent_followup_outbox_row(
+    db: Session,
+    *,
+    outbox_id: int,
+    now: datetime,
+) -> tuple[str, NotificationOutbox | None]:
+    current = db.get(NotificationOutbox, outbox_id)
+    if current is None:
+        return "missing", None
+    if current.status == NotificationStatus.SENT:
+        return "sent", current
+    if current.status == NotificationStatus.FAILED:
+        db.execute(
+            update(NotificationOutbox)
+            .where(
+                NotificationOutbox.id == outbox_id,
+                NotificationOutbox.status == NotificationStatus.FAILED,
+            )
+            .values(
+                status=NotificationStatus.PENDING,
+                next_attempt_at=None,
+                claimed_at=None,
+                updated_at=now,
+            ),
+            execution_options={"synchronize_session": False},
+        )
+        db.commit()
+    row = _claim_row(db, outbox_id, now=now)
+    if row is None:
+        current = db.get(NotificationOutbox, outbox_id)
+        if current is not None and current.status == NotificationStatus.SENT:
+            return "sent", current
+        return "processing", current
+    sender = _build_notification_sender(db)
+    try:
+        message_id = sender.send(
+            row.recipient,
+            _message_text(row),
+            reply_markup=row.payload.get("reply_markup") if row.payload else None,
+        )
+        if _finalize_sent(db, row, message_id=message_id, now=now):
+            return "sent", db.get(NotificationOutbox, outbox_id)
+        current = db.get(NotificationOutbox, outbox_id)
+        if current is not None and current.status == NotificationStatus.SENT:
+            return "sent", current
+        return "processing", current
+    except Exception as exc:  # noqa: BLE001 - surfaced as retryable delivery failure
+        _finalize_failed(
+            db,
+            row,
+            exc,
+            now=now,
+            max_attempts=NOTIFY_MAX_ATTEMPTS,
+            backoff_base=0,
+        )
+        return "failed", db.get(NotificationOutbox, outbox_id)
 
 
 def _check_assignee(db: Session, user_id: int | None) -> None:
@@ -574,6 +726,95 @@ def update_task(
     db.refresh(task)
     detail = "Task completed" if task.status == OperationalTaskStatus.COMPLETED else "Task updated"
     return TaskActionOut(task=_task_read(db, task), detail=detail)
+
+
+@router.post("/tasks/{task_id}/followup-delivery", response_model=TaskFollowupDeliveryOut)
+def deliver_task_followup(
+    task_id: int,
+    payload: TaskFollowupDeliveryIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(manager_or_admin),
+):
+    """Deliver one rent follow-up DM via the canonical outbox/notifier seam."""
+    now = datetime.now(timezone.utc)
+    task = _lock_task_for_update(db, task_id)
+    _require_access(task, user)
+    if task.status != OperationalTaskStatus.PENDING:
+        db.commit()
+        return TaskFollowupDeliveryOut(
+            task=_task_read(db, task),
+            delivery_state="TASK_NOT_PENDING",
+            detail="Task is no longer pending",
+            telegram_message_id=None,
+        )
+    details = dict(task.details or {})
+    if details.get("assigned_to"):
+        db.commit()
+        return TaskFollowupDeliveryOut(
+            task=_task_read(db, task),
+            delivery_state="ALREADY_DELIVERED",
+            detail="Follow-up already assigned",
+            telegram_message_id=None,
+        )
+    _check_assignee(db, payload.assignee_user_id)
+    recipient = resolve_recipient(db, payload.assignee_user_id)
+    if not recipient:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, "Assignee has no Telegram destination")
+    dedupe_key = _rent_followup_dedupe_key(task.id, recipient)
+    outbox = _load_outbox_by_dedupe(db, dedupe_key)
+    if outbox is None:
+        enqueue_notification(
+            db,
+            task_id=task.id,
+            channel=NOTIFY_CHANNEL_TELEGRAM,
+            recipient=recipient,
+            payload={
+                "task_id": task.id,
+                "task_type": task.task_type.value,
+                "title": task.title,
+                "due_at": task.due_at.isoformat(),
+                "message": payload.message,
+                "reply_markup": payload.reply_markup,
+            },
+            dedupe_key=dedupe_key,
+        )
+        db.commit()
+        outbox = _load_outbox_by_dedupe(db, dedupe_key)
+    else:
+        db.commit()
+    if outbox is None:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Follow-up delivery outbox missing")
+    delivery_state, current = _deliver_rent_followup_outbox_row(db, outbox_id=outbox.id, now=now)
+    if delivery_state == "sent":
+        task = _sync_rent_followup_assignment(
+            db,
+            task_id=task.id,
+            assignee_user_id=payload.assignee_user_id,
+            actor_id=user.id,
+            now=now,
+        )
+        message_id = getattr(current, "telegram_message_id", None) if current is not None else None
+        return TaskFollowupDeliveryOut(
+            task=_task_read(db, task),
+            delivery_state="DELIVERED",
+            detail="Follow-up delivered",
+            telegram_message_id=message_id,
+        )
+    current_task = _get_task_or_404(db, task.id)
+    if delivery_state == "failed":
+        return TaskFollowupDeliveryOut(
+            task=_task_read(db, current_task),
+            delivery_state="FAILED",
+            detail="Follow-up delivery failed",
+            telegram_message_id=None,
+        )
+    return TaskFollowupDeliveryOut(
+        task=_task_read(db, current_task),
+        delivery_state="PROCESSING",
+        detail="Follow-up delivery is already in progress",
+        telegram_message_id=None,
+    )
 
 
 @router.post("/tasks", response_model=TaskActionOut, status_code=status.HTTP_201_CREATED)

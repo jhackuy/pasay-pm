@@ -11,6 +11,7 @@ Pins:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import httpx
 import pytest
 
@@ -88,6 +89,12 @@ def _owner_tap_followup(env, detail):
     # the real DM the Secretary received
     dm = env.bot.sends()[-1]
     return dm
+
+
+def _latest_assigned_task(env):
+    assigned = [t for t in env.backend.operational_tasks if (t.get("details") or {}).get("assigned_to")]
+    assert assigned
+    return assigned[-1]
 
 
 def test_owner_followup_dms_secretary_and_secretary_confirms(make_app):
@@ -198,3 +205,88 @@ def test_secretary_dm_snooze_and_payment_buttons_route(make_app):
                                            message_id=dm2["message_id"], bot=env2.bot)])
     after = env2.bot.edits()[-1]
     assert "method" in after["text"].lower() or "收款" in after["text"] or "method" in str(after)
+
+
+def test_followup_delivery_does_not_complete_business_task(make_app):
+    env = make_app(backend=ClosureBackend())
+    detail = _owner_open_rent_detail(env)
+    _owner_tap_followup(env, detail)
+    task = _latest_assigned_task(env)
+    assert task.get("status") != "COMPLETED"
+    assert task.get("completed_at") is None
+
+
+def test_followup_callback_replay_no_second_dm(make_app):
+    env = make_app(backend=ClosureBackend())
+    detail = _owner_open_rent_detail(env)
+    follow_cb = next(d for d in _inline_data(detail["reply_markup"]) if d.split(":")[1] == "rfu")
+    replay = make_callback_update(
+        OWNER_ID, OWNER_ID, follow_cb, message_id=detail["message_id"], update_id=77, bot=env.bot
+    )
+    run_updates(env, [replay, replay])
+    sends = [c for c in env.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends) == 1
+
+
+def test_followup_delivery_failure_then_retry_success(make_app):
+    backend = ClosureBackend()
+    backend.followup_delivery_failures["next"] = 1
+    env = make_app(backend=backend)
+    detail = _owner_open_rent_detail(env)
+    follow_cb = next(d for d in _inline_data(detail["reply_markup"]) if d.split(":")[1] == "rfu")
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, follow_cb,
+                                           message_id=detail["message_id"], bot=env.bot)])
+    sends_after_fail = [c for c in env.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends_after_fail) == 0
+    assert not any((t.get("details") or {}).get("assigned_to") for t in env.backend.operational_tasks)
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, follow_cb,
+                                           message_id=detail["message_id"], update_id=88, bot=env.bot)])
+    sends_after_retry = [c for c in env.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends_after_retry) == 1
+    task = _latest_assigned_task(env)
+    assert (task.get("details") or {}).get("assigned_to") == 2
+
+
+def test_followup_restart_persistence_no_second_dm(make_app, tmp_path):
+    backend = ClosureBackend()
+    db_path = str(tmp_path / "followup-state.sqlite3")
+    env1 = make_app(backend=backend, store_path=db_path)
+    detail = _owner_open_rent_detail(env1)
+    _owner_tap_followup(env1, detail)
+    sends1 = [c for c in env1.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends1) == 1
+
+    env2 = make_app(backend=backend, store_path=db_path)
+    detail2 = _owner_open_rent_detail(env2)
+    follow_cb = next(d for d in _inline_data(detail2["reply_markup"]) if d.split(":")[1] == "rfu")
+    run_updates(env2, [make_callback_update(OWNER_ID, OWNER_ID, follow_cb,
+                                           message_id=detail2["message_id"], bot=env2.bot)])
+    sends2 = [c for c in env2.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends2) == 0
+    acks = env2.bot.answers()
+    assert (
+        any("Already assigned" in (a.get("text") or "") or "无需重复" in (a.get("text") or "") for a in acks)
+        or any("已交秘书" in (e.get("text") or "") or "Assigned" in (e.get("text") or "") for e in env2.bot.edits())
+    )
+
+
+def test_followup_concurrent_duplicate_single_secretary_dm(make_app):
+    backend = ClosureBackend()
+    env = make_app(backend=backend)
+    detail = _owner_open_rent_detail(env)
+    follow_cb = next(d for d in _inline_data(detail["reply_markup"]) if d.split(":")[1] == "rfu")
+
+    def _tap(update_id: int):
+        run_updates(env, [make_callback_update(
+            OWNER_ID, OWNER_ID, follow_cb, message_id=detail["message_id"], update_id=update_id, bot=env.bot
+        )])
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_tap, 201), pool.submit(_tap, 202)]
+        for f in futures:
+            f.result(timeout=30)
+
+    sends = [c for c in env.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends) == 1
+    task = _latest_assigned_task(env)
+    assert (task.get("details") or {}).get("assigned_to") == 2

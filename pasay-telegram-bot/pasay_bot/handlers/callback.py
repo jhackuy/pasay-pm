@@ -1605,8 +1605,7 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
             guard.fail(key, resource=str(unit_id))
         return
     already_assigned = bool((getattr(task, "details", None) or {}).get("assigned_to"))
-    already_delivered = bool(store.get_followup_delivery(task.id))
-    if already_assigned or already_delivered:
+    if already_assigned:
         await _answer(update, t("v2.followup_already_assigned", locale), durable=True)
         if chat_id is not None and message_id is not None:
             await _render_rent_detail_in_place(
@@ -1622,10 +1621,10 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
         if guard is not None:
             guard.settle(key, {"unit_id": unit_id, "task_id": task.id}, resource=str(unit_id))
         return
-    # 3) resolve the REAL Secretary DM target (fail closed, §9).
+    # 3) resolve the REAL Secretary assignee target (fail closed, §9).
     try:
-        sec_chat_id, _sec_principal = await api.get_secretary_dm_chat_id()
-        sec_chat_id_int = int(sec_chat_id)
+        _sec_chat_id, sec_principal_id = await api.get_secretary_dm_chat_id()
+        sec_principal_id = int(sec_principal_id)
     except (PasayApiError, TypeError, ValueError):
         logger.warning("rent followup secretary target resolution failed unit=%s", unit_id)
         await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
@@ -1645,36 +1644,28 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
     )
     dm_kb = secretary_followup_keyboard(task.id, unit_id, locale_for(Role.SECRETARY))
     try:
-        dm_msg = await update.get_bot().send_message(
-            sec_chat_id_int, H.truncate(dm_text), parse_mode=HTML, reply_markup=dm_kb,
+        result = await api.deliver_task_followup(
+            task.id,
+            assignee_user_id=sec_principal_id,
+            message=H.truncate(dm_text),
+            reply_markup=dm_kb.to_dict() if dm_kb is not None else None,
         )
-    except Exception as exc:  # noqa: BLE001 - any delivery failure is real
-        logger.warning("rent followup DM to secretary %s failed: %s", sec_chat_id, exc)
+    except PasayApiError as exc:
+        logger.warning("rent followup backend delivery failed task=%s: %s", task.id, exc)
         await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
         if guard is not None:
             guard.fail(key, resource=str(unit_id))
         return
-    # Delivery truth: record the proven Telegram message_id so re-clicks never
-    # re-send, even if the backend assignment write later fails.
-    try:
-        store.record_followup_delivery(
-            task.id,
-            unit_id=unit_id,
-            date=ph_local_date(),
-            target_user=str(_sec_principal or ""),
-            destination=str(sec_chat_id_int),
-            message_id=str(getattr(dm_msg, "message_id", "") or ""),
-        )
-    except Exception:  # noqa: BLE001 - delivery truth is best-effort
-        pass
-    # 5) DM succeeded -> record the assignment (only now does it become 🟡).
-    try:
-        await _mark_rent_followup_assigned(api, task, sec_principal_id=_sec_principal)
-    except PasayApiError:
-        # The DM went out; assignment recording is best-effort but we still
-        # surface the assigned state on the group card.
-        pass
-    await _answer(update, t("v2.followup_assigned_toast", locale))
+    if result.delivery_state == "FAILED":
+        await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
+        if guard is not None:
+            guard.fail(key, resource=str(unit_id))
+        return
+    assigned_now = result.delivery_state == "DELIVERED"
+    if assigned_now:
+        await _answer(update, t("v2.followup_assigned_toast", locale))
+    else:
+        await _answer(update, t("v2.followup_already_assigned", locale), durable=True)
     # Re-render the group Rent detail card in place as 🟡 (NOT executed).
     if chat_id is not None and message_id is not None:
         await _render_rent_detail_in_place(
@@ -1871,22 +1862,6 @@ def _rent_followup_details(unit_number, amount, periods) -> dict:
         "executed_by": None,
         "executed_at": None,
     }
-
-
-async def _mark_rent_followup_assigned(api, task, sec_principal_id=None):
-    """Record the REAL assignment on the follow-up task: details.assigned_to /
-    assigned_at. The task stays PENDING (so the Secretary can complete it via
-    the existing PENDING->COMPLETED path); the 🟡 assigned state is carried by
-    the details, never by a status flip that would block the confirm. last
-    follow_up_at is untouched."""
-    details = dict(getattr(task, "details", None) or {})
-    details["assigned_to"] = sec_principal_id if sec_principal_id is not None else "secretary"
-    details["assigned_at"] = datetime.now(timezone.utc).isoformat()
-    await api.update_operational_task(
-        task.id,
-        next_action="Secretary to contact tenant for overdue rent.",
-        details=details,
-    )
 
 
 async def _followed_up_today(context, unit_id: int) -> bool:
