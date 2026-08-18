@@ -134,8 +134,6 @@ jobs:
           fi
           echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_ENV"
           echo "Deployed Worker URL: $DEPLOY_URL"
-          # Also write to step summary so the URL is visible in the GitHub UI
-          # without going through the secret-masked log surface.
           {
             echo "### PASay CF smoke deploy"
             echo "- Worker name: pasay-cf-smoke"
@@ -162,3 +160,13 @@ jobs:
             exit 1
           fi
           echo "Smoke probe OK"
+
+      - name: Upload deploy record
+        if: github.event_name == 'workflow_dispatch' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cf-smoke-deploy-record
+          path: |
+            ${{ github.workspace }}/wrangler-deploy.log
+            /tmp/health.out
+        if-no-files-found: ignore
