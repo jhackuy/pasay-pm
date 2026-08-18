@@ -40,13 +40,13 @@ HTML = "HTML"
 # therefore sent WITHOUT reply_markup; the persistent keyboard remains pinned
 # client-side because it was previously sent with is_persistent=True.
 _SLOW_ROUTES = frozenset(
-    {"home", "finance", "overdue", "pending", "more"}
+    {"finance", "overdue", "pending", "more"}
 )
 
-# PASAY-V2-FOUNDATION-001: the four fixed buttons are fast deterministic
-# Quick Views (single backend read, target < 1s) — they render directly and
-# never show the processing stub.
-_QUICK_ROUTES = frozenset({"properties", "tasks", "rent", "expense"})
+# PASAY-V2-FOUNDATION-001 / 006A: Home plus the business entry buttons are
+# fast deterministic first-level routes — they render directly and never show
+# the processing stub.
+_QUICK_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense"})
 
 
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:
@@ -96,7 +96,9 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
             message_id = None
         if route in _QUICK_ROUTES:
             # Fast deterministic Quick View: single reply, no stub message.
-            if route == "properties":
+            if route == "home":
+                await pages.show_home(context, chat_id, role, locale)
+            elif route == "properties":
                 await pages.show_quick_properties(context, chat_id, role, locale)
             elif route == "tasks":
                 await pages.show_quick_tasks(context, chat_id, role, locale)

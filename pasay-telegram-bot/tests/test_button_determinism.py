@@ -65,11 +65,11 @@ def _latency(env):
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 Properties", "房源"),
+        (OWNER_ID, "🏠 Home", "运营总览"),
         (OWNER_ID, "✅ Tasks", "待办"),
         (OWNER_ID, "💰 Rent", "租金"),
         (OWNER_ID, "💸 Expense", "支出"),
-        (SECRETARY_ID, "🏠 Properties", "Properties"),
+        (SECRETARY_ID, "🏠 Home", "Operations Overview"),
         (SECRETARY_ID, "✅ Tasks", "Tasks"),
         (SECRETARY_ID, "💰 Rent", "Rent"),
         (SECRETARY_ID, "💸 Expense", "Expense"),
@@ -97,11 +97,11 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
     monkeypatch.setattr(nl_bridge, "handle_nl", boom)
     env = make_app()
     for user_id, label, marker in [
-        (OWNER_ID, "🏠 Properties", "房源"),
+        (OWNER_ID, "🏠 Home", "运营总览"),
         (OWNER_ID, "✅ Tasks", "待办"),
         (OWNER_ID, "💰 Rent", "租金"),
         (OWNER_ID, "💸 Expense", "支出"),
-        (SECRETARY_ID, "🏠 Properties", "Properties"),
+        (SECRETARY_ID, "🏠 Home", "Operations Overview"),
         (SECRETARY_ID, "✅ Tasks", "Tasks"),
         (SECRETARY_ID, "💰 Rent", "Rent"),
         (SECRETARY_ID, "💸 Expense", "Expense"),
@@ -115,11 +115,11 @@ def test_fixed_menu_button_never_enters_nl_bridge(make_app, monkeypatch):
 @pytest.mark.parametrize(
     ("user_id", "label", "marker"),
     [
-        (OWNER_ID, "🏠 Properties", "房源"),
+        (OWNER_ID, "🏠 Home", "运营总览"),
         (OWNER_ID, "✅ Tasks", "待办"),
         (OWNER_ID, "💰 Rent", "租金"),
         (OWNER_ID, "💸 Expense", "支出"),
-        (SECRETARY_ID, "🏠 Properties", "Properties"),
+        (SECRETARY_ID, "🏠 Home", "Operations Overview"),
         (SECRETARY_ID, "✅ Tasks", "Tasks"),
         (SECRETARY_ID, "💰 Rent", "Rent"),
         (SECRETARY_ID, "💸 Expense", "Expense"),

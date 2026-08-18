@@ -37,7 +37,7 @@ def test_command_menu_excludes_dev_commands(make_app):
     env = make_app()
     # The bot's set_my_commands payload is whatever the app posts; assert the
     # registered CommandHandler set has no dev command and the fixed reply
-    # keyboard (Properties/Tasks/Rent/Expense) is untouched.
+    # keyboard (Home/Tasks/Rent/Expense) is untouched.
     commands = set()
     for handlers in env.app.handlers.values():
         for h in handlers:
@@ -47,4 +47,4 @@ def test_command_menu_excludes_dev_commands(make_app):
     assert "new" not in commands and "status" not in commands
     from pasay_bot.keyboards import reply_keyboard
     labels = [b.text for row in reply_keyboard("owner").keyboard for b in row]
-    assert labels == ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
+    assert labels == ["🏠 Home", "✅ Tasks", "💰 Rent", "💸 Expense"]

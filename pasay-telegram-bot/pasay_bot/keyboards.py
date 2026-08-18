@@ -112,7 +112,7 @@ ACTION_SEC_FOLLOWUP_WRONG_NUMBER = "sfwn"   # 📞 号码错误 (PASAY-AI-EMPLOY
 # PASAY-V2-FOUNDATION-001: V2 menu is 4 simple-English Quick View buttons
 # shared by every role. They are direct views, never a feature navigation.
 FIXED_MENU_ROUTES: dict[str, str] = {
-    "🏠 Properties": "properties",
+    "🏠 Home": "home",
     "✅ Tasks": "tasks",
     "💰 Rent": "rent",
     "💸 Expense": "expense",
@@ -122,6 +122,7 @@ FIXED_MENU_ROUTES: dict[str, str] = {
 # keyboards already pinned on clients keep working after deploy. They are
 # never part of the visible V2 menu.
 LEGACY_MENU_ROUTES: dict[str, str] = {
+    "🏠 Properties": "properties",
     "🏠 首页": "home",
     "✅ 待办": "pending",
     "💰 收租": "rent",
@@ -130,7 +131,7 @@ LEGACY_MENU_ROUTES: dict[str, str] = {
 
 # Row layout for the persistent keyboard (role -> rows of exact labels).
 _FIXED_REPLY_ROWS = [
-    ["🏠 Properties", "✅ Tasks"],
+    ["🏠 Home", "✅ Tasks"],
     ["💰 Rent", "💸 Expense"],
 ]
 
@@ -341,8 +342,8 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
     """Persistent bottom navigation (PASAY-V2-FOUNDATION-001): one identical
-    4-button English Quick View menu for every role (Properties / Tasks /
-    Rent / Expense). Every label is an exact-match UI command routed
+    4-button English menu for every role (Home / Tasks / Rent / Expense).
+    Every label is an exact-match UI command routed
     deterministically (see ``FIXED_MENU_ROUTES`` / ``fixed_menu_route_for``)
     and never reaches NL/NLU/LLM processing. ``is_persistent=True`` pins the
     keyboard above the input field across messages."""
@@ -1649,8 +1650,8 @@ def expense_edit_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 def home_summary_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
     """CONVERGENCE-003 §2.2 Home situational actions (never a second
-    navigation): ⚠️ Today (今日处理) + 🔄 Refresh. The fixed Reply Keyboard is
-    the ONLY first-level navigation."""
+    navigation): ⚠️ Today + 🏢 Properties + 🔄 Refresh. The fixed Reply
+    Keyboard is the ONLY first-level navigation."""
     return InlineKeyboardMarkup(
         [
             [
@@ -1658,6 +1659,12 @@ def home_summary_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
                     t("home.today_button", locale),
                     callback_data=encode(ACTION_HOME_NAV, "today"),
                 ),
+                InlineKeyboardButton(
+                    t("home.properties_button", locale),
+                    callback_data=encode(ACTION_NAV, "properties"),
+                ),
+            ],
+            [
                 InlineKeyboardButton(
                     t("home.refresh_button", locale),
                     callback_data=encode(ACTION_HOME_NAV, "refresh"),

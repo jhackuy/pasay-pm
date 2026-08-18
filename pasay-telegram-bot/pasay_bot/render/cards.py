@@ -1491,8 +1491,9 @@ def home_summary_card(
     expiring_count: int = 0,
     vacant_count: int = 0,
     payable_count: int = 0,
-    maintenance_open: int = 0,
     today_count: int = 0,
+    property_total: int = 0,
+    occupied_count: int = 0,
     locale: str = "zh",
 ) -> str:
     """CONVERGENCE-003 §2.2 + PASAY-AI-EMPLOYEE-FOUNDATION-007A §C: Home =
@@ -1506,26 +1507,34 @@ def home_summary_card(
     Keyboard carries navigation); only the two situational actions (⚠️ Today /
     🔄 Refresh) ride on the keyboard.
     """
-    title = _home_title(locale)
-    lines = [f"<b>{H.escape(title)}</b>"]
+    title = t("common.home", locale)
+    overview = _bi_value(locale, "📊 Operations Overview", "📊 运营总览")
+    property_header = _bi_value(locale, "🏢 Properties", "🏢 房源")
+    lines = [f"<b>{H.escape(title)}</b>", H.escape(overview)]
     if expected is not None:
         lines.append(H.escape(_bi_value(locale, f"Expected {H.money(expected)}", f"本月应收 {H.money(expected)}")))
     lines.append(H.escape(_bi_value(locale, f"Collected {H.money(collected)}", f"本月已收 {H.money(collected)}")))
     if outstanding is not None:
         lines.append(H.escape(_bi_value(locale, f"This month outstanding {H.money(outstanding)}", f"本月未收 {H.money(outstanding)}")))
+    if expected is not None:
+        rate = H.percent(collected, expected)
+        lines.append(H.escape(_bi_value(locale, f"Collection rate {rate}%", f"收缴率 {rate}%")))
     if total_arrears is not None:
         lines.append(H.escape(_bi_value(locale, f"Total arrears {H.money(total_arrears)}", f"历史累计欠租 {H.money(total_arrears)}")))
-    lines.append(H.escape(_bi_value(locale, f"Overdue rents {overdue_count}", f"逾期租金 {overdue_count}")))
-    if expiring_count:
-        lines.append(H.escape(_bi_value(locale, f"Leases expiring {expiring_count}", f"合同到期 {expiring_count}")))
-    if vacant_count:
-        lines.append(H.escape(_bi_value(locale, f"Vacant {vacant_count}", f"空置 {vacant_count}")))
-    if payable_count:
-        lines.append(H.escape(_bi_value(locale, f"Expenses to pay {payable_count}", f"待付款 {payable_count}")))
-    if maintenance_open:
-        lines.append(H.escape(_bi_value(locale, f"Maintenance {maintenance_open}", f"未完成维修 {maintenance_open}")))
-    if today_count:
-        lines.append(H.escape(_bi_value(locale, f"Today's actions {today_count}", f"今日待办 {today_count}")))
+    lines.append(H.escape(_bi_value(locale, f"🔴 Overdue rents {overdue_count}", f"🔴 逾期租金 {overdue_count}")))
+    lines.append(H.escape(_bi_value(locale, f"🟡 Today's actions {today_count}", f"🟡 今日待办 {today_count}")))
+    lines.append(H.escape(_bi_value(locale, f"🟠 Expenses to pay {payable_count}", f"🟠 待付款 {payable_count}")))
+    lines.append(H.escape(_bi_value(locale, f"📅 Leases expiring {expiring_count}", f"📅 合同即将到期 {expiring_count}")))
+    lines.append(H.escape(_bi_value(locale, f"🏢 Vacant {vacant_count}", f"🏢 空置 {vacant_count}")))
+    lines.extend(
+        [
+            "",
+            H.escape(property_header),
+            H.escape(_bi_value(locale, f"Total units {property_total}", f"总房源 {property_total}")),
+            H.escape(_bi_value(locale, f"Occupied {occupied_count}", f"已出租 {occupied_count}")),
+            H.escape(_bi_value(locale, f"Vacant {vacant_count}", f"空置 {vacant_count}")),
+        ]
+    )
     return "\n".join(lines)
 
 
