@@ -113,7 +113,7 @@ def _bind_identity(update, context, user_id=None) -> bool:
 # process, so normal messages never spam menu messages while a deployed menu
 # migration still remounts the new keyboard on the next ordinary interaction.
 
-_MENU_VERSION = "pasay_vnext_nav_006b"
+_MENU_VERSION = "ux_freeze_v1_menu_3x2_001"
 
 
 def _menu_init_chats(context) -> dict:

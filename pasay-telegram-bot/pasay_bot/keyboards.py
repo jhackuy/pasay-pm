@@ -109,17 +109,21 @@ ACTION_SEC_FOLLOWUP_WRONG_NUMBER = "sfwn"   # 📞 号码错误 (PASAY-AI-EMPLOY
 # NOT natural language: the text-message handler must exact-match them and
 # route deterministically BEFORE any NL/NLU/LLM processing can run.
 #
-# Pasay Telegram UX Freeze v1: one frozen 4-button IA; only the visible
-# language changes by role.
+# Pasay Telegram UX Freeze v1 polish: one frozen 6-button IA laid out as 3x2;
+# only the visible language changes by role.
 FIXED_MENU_ROUTES: dict[str, str] = {
     "🏠 Home": "home",
     "🏠 首页": "home",
+    "🏘 Properties": "properties",
+    "🏘 房源": "properties",
     "✅ Tasks": "tasks",
     "✅ 待办": "tasks",
     "💰 Rent": "rent",
     "💰 租金": "rent",
     "💸 Expense": "expense",
     "💸 支出": "expense",
+    "☰ More": "more",
+    "☰ 更多": "more",
 }
 
 # V2 legacy aliases: old Chinese labels still route deterministically so
@@ -127,20 +131,20 @@ FIXED_MENU_ROUTES: dict[str, str] = {
 # never part of the visible V2 menu.
 LEGACY_MENU_ROUTES: dict[str, str] = {
     "🏠 Properties": "properties",
-    "🏠 首页": "home",
-    "✅ 待办": "tasks",
+    "🏠 房源": "properties",
     "💰 收租": "rent",
     "💸 支出": "expense",
+    "更多": "more",
 }
 
 _FIXED_REPLY_ROWS_BY_ROLE: dict[Role, list[list[str]]] = {
     Role.OWNER: [
-        ["🏠 首页", "✅ 待办"],
-        ["💰 租金", "💸 支出"],
+        ["🏠 首页", "🏘 房源", "✅ 待办"],
+        ["💰 租金", "💸 支出", "☰ 更多"],
     ],
     Role.SECRETARY: [
-        ["🏠 Home", "✅ Tasks"],
-        ["💰 Rent", "💸 Expense"],
+        ["🏠 Home", "🏘 Properties", "✅ Tasks"],
+        ["💰 Rent", "💸 Expense", "☰ More"],
     ],
 }
 
@@ -350,7 +354,7 @@ def dashboard_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 
 def reply_keyboard(role) -> ReplyKeyboardMarkup:
-    """Persistent bottom navigation: one frozen 4-button IA, with role-specific
+    """Persistent bottom navigation: one frozen 6-button IA, with role-specific
     labels (Owner=zh, Secretary=en). Every label is an exact-match UI command routed
     deterministically (see ``FIXED_MENU_ROUTES`` / ``fixed_menu_route_for``)
     and never reaches NL/NLU/LLM processing. ``is_persistent=True`` pins the
@@ -1915,18 +1919,22 @@ def _short_unit_code(unit: str) -> str:
 
 
 def properties_quick_keyboard(rows, locale: str = "bi", *, archive_link: str = "") -> InlineKeyboardMarkup:
-    """🏢 Units page: one navigation-only unit entry per row."""
+    """🏢 Units page: navigation-only unit entries, max 3 buttons per row."""
     kb: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
     for i, row in enumerate(rows, start=1):
         unit = str(row.get("unit_code") or row.get("property_code") or "")
-        kb.append(
-            [
-                InlineKeyboardButton(
-                    _short_unit_code(unit) or str(i),
-                    callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
-                )
-            ]
+        current_row.append(
+            InlineKeyboardButton(
+                _short_unit_code(unit) or str(i),
+                callback_data=encode(ACTION_QUICK_UNIT_VIEW, "u", str(i)),
+            )
         )
+        if len(current_row) == 3:
+            kb.append(current_row)
+            current_row = []
+    if current_row:
+        kb.append(current_row)
     return InlineKeyboardMarkup(kb)
 
 
