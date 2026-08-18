@@ -237,6 +237,78 @@ def _pid_identity(pid: int, name: str) -> str:
     return "mismatch"
 
 
+# Toolhelp PROCESSENTRY32W (x64 field layout, stdlib/ctypes only).
+class _PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", w.DWORD),
+        ("cntUsage", w.DWORD),
+        ("th32ProcessID", w.DWORD),
+        ("th32DefaultHeapID", ctypes.c_void_p),
+        ("th32ModuleID", w.DWORD),
+        ("cntThreads", w.DWORD),
+        ("th32ParentProcessID", w.DWORD),
+        ("pcPriClassBase", ctypes.c_long),
+        ("dwFlags", w.DWORD),
+        ("szExeFile", ctypes.c_wchar * 260),
+    ]
+
+
+def _enum_pids() -> list:
+    """Enumerate live Windows PIDs via a Toolhelp snapshot (stdlib/ctypes).
+
+    Returns an empty list when enumeration fails so callers fall back safely
+    (lenient: only used to decide whether a *live* canonical component already
+    exists, never to kill anything). Overridable via ``PASAY_PROC_SCAN_HOOK``
+    (JSON list of ints) for deterministic tests.
+    """
+    hook = os.environ.get("PASAY_PROC_SCAN_HOOK")
+    if hook:
+        try:
+            return [int(x) for x in json.loads(hook)]
+        except Exception:
+            return []
+    out: list = []
+    try:
+        TH32CS_SNAPPROCESS = 0x00000002
+        snap = ctypes.windll.kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == 0xFFFFFFFFFFFFFFFF:  # INVALID_HANDLE_VALUE
+            return out
+        try:
+            entry = _PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+            ok = ctypes.windll.kernel32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                out.append(int(entry.th32ProcessID))
+                ok = ctypes.windll.kernel32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            ctypes.windll.kernel32.CloseHandle(snap)
+    except Exception:
+        return []
+    return out
+
+
+def _live_component_exists(name: str) -> int:
+    """Return the PID of a live canonical ``name`` component on ANY process, or 0.
+
+    This is the safe discriminator between the two situations that both look
+    like "lock records a live PID with a mismatched identity":
+
+    * PID-reuse after reboot/crash — the recorded PID no longer runs Pasay and
+      NO live Pasay component exists anywhere  -> lock is stale, safe to reclaim.
+    * A real live component is running but its lock is wrong/corrupt -> we must
+      NOT start a second one (Telegram 409 / duplicate poller protection).
+
+    It only READS processes (never kills/adopts). ``unknown`` identity from an
+    unreadable PEB is treated as NOT proven, so we never block on it.
+    """
+    for pid in _enum_pids():
+        if pid <= 0:
+            continue
+        if _pid_identity(pid, name) == "ok":
+            return pid
+    return 0
+
+
 def _port_owner(port: int = API_PORT) -> int:
     """Find the LISTENING PID on 127.0.0.1:<port> via netstat -ano (0 when none).
 
@@ -569,12 +641,31 @@ def _bootstrap() -> int:
             lock = _read_lock(name)
             holder = int((lock or {}).get("pid") or 0) if lock else 0
             if holder and pid_alive(holder) and _pid_identity(holder, name) != "ok":
-                print(f"[fail] {name}: lock pid={holder} is ALIVE but its identity "
-                      f"is not a Pasay {name} component; refusing to adopt or kill "
-                      f"an unrelated process -> UNOWNED_{name.upper()}")
-                ok = False
-                fail_reasons.append("UNOWNED_" + name.upper())
-                break
+                # Distinguish "stale lock whose PID was reused by an unrelated
+                # process" (reboot/crash) from "a real live component exists but
+                # its lock is wrong". Only the former is safe to recover from;
+                # the latter must NEVER spawn a second poller (Telegram 409) or
+                # a second API.
+                live_disp = _live_component_exists(name)
+                if live_disp:
+                    print(f"[fail] {name}: lock pid={holder} is ALIVE with a "
+                          f"mismatched identity, and a live canonical {name} "
+                          f"(pid={live_disp}) is already running; refusing to start "
+                          f"a duplicate and refusing to touch pid={holder} "
+                          f"-> UNOWNED_{name.upper()}")
+                    ok = False
+                    fail_reasons.append("UNOWNED_" + name.upper())
+                    break
+                # PID-reuse after reboot/crash: the recorded process is no longer
+                # the Pasay component and no live Pasay component exists anywhere.
+                # The lock is stale -> reclaim it and start a fresh one. The
+                # unrelated pid=holder is NEVER killed or adopted.
+                print(f"[reclaim] {name}: lock pid={holder} is ALIVE but is NOT a "
+                      f"Pasay {name} component (identity mismatch after reboot/"
+                      f"crash PID-reuse) and no live canonical {name} exists; "
+                      f"reclaiming the stale lock (unrelated pid={holder} left "
+                      f"untouched)")
+                _release(name)
 
             # --- claim atomically -> spawn -> record the real component PID ---
             tmp_pid = bootstrapper_pid

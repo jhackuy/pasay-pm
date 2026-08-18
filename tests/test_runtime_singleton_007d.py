@@ -18,8 +18,11 @@ Covered T-matrix (007D §五):
 - T1: 8001 healthy + no canonical lock -> FAILED / UNOWNED_API, never READY
 - T2: valid lock + correct owned API + health OK -> READY
 - T3: stale lock + PID dead -> reclaim -> replacement started -> READY
-- T4: lock PID points to an unrelated live process -> not mis-identified,
-      not mis-killed, fail closed
+- T4a: lock PID reused by an unrelated live process + NO live canonical
+       component anywhere (post-reboot PID-reuse) -> reclaim stale lock ->
+       fresh component started -> READY (never mis-killed)
+- T4b: lock PID mismatched but a LIVE canonical component exists on another
+       PID -> never spawn a duplicate, never mis-kill -> fail closed
 - T5: legacy launcher -> delegates canonical owner -> no direct uvicorn
 - T6: two launchers concurrently -> exactly one canonical runtime
 - T7: canonical stop -> components stopped -> no orphan -> locks released
@@ -70,7 +73,7 @@ def rt():
     yield mod
     for key in ("PASAY_PID_ALIVE_HOOK", "PASAY_PID_IDENTITY_HOOK",
                 "PASAY_API_HEALTHY_HOOK", "PASAY_PORT_OWNER_HOOK",
-                "PASAY_KILL_HOOK"):
+                "PASAY_KILL_HOOK", "PASAY_PROC_SCAN_HOOK"):
         os.environ.pop(key, None)
     shutil.rmtree(_SCRATCH, ignore_errors=True)
 
@@ -78,7 +81,7 @@ def rt():
 # --- hook helpers ---------------------------------------------------------
 
 def _hooks(rt, *, alive=(), identity=None, api_healthy=None, port_owner=None,
-           killed=None):
+           killed=None, proc_scan=None):
     os.environ["PASAY_PID_ALIVE_HOOK"] = json.dumps({str(p): True for p in alive})
     if identity is not None:
         os.environ["PASAY_PID_IDENTITY_HOOK"] = json.dumps(
@@ -89,6 +92,10 @@ def _hooks(rt, *, alive=(), identity=None, api_healthy=None, port_owner=None,
         os.environ["PASAY_PORT_OWNER_HOOK"] = json.dumps(port_owner)
     if killed is not None:
         os.environ["PASAY_KILL_HOOK"] = json.dumps({str(p): True for p in killed})
+    if proc_scan is not None:
+        os.environ["PASAY_PROC_SCAN_HOOK"] = json.dumps([int(p) for p in proc_scan])
+    else:
+        os.environ.pop("PASAY_PROC_SCAN_HOOK", None)
 
 
 def _write_lock(rt, name, pid):
@@ -207,27 +214,101 @@ def test_t3_stale_lock_reclaimed_and_replacement_ready(rt):
     assert rt._spawn_counter["n"] == 3
 
 
-# --- T4: lock PID is an unrelated live process -> no mis-identify/kill ----
+# --- T4a: PID-reuse after reboot/crash -> reclaim stale lock -> READY ------
 
-def test_t4_bot_lock_pid_unrelated_live_process_fails_closed(rt):
-    """A live lock PID whose identity is NOT a Pasay component: never adopted,
-    never killed, fail closed UNOWNED_BOT."""
+def test_t4_bot_lock_pid_unrelated_live_process_recovers(rt):
+    """Post-reboot PID-reuse: lock records an unrelated LIVE process (e.g. a PID
+    reused by ShellHost) and NO live Pasay bot exists anywhere. The stale lock
+    is reclaimed and a fresh bot started; the unrelated PID is never killed,
+    never adopted, and no duplicate poller is created."""
+    state = {"api_healthy": False}
+    _write_lock(rt, "bot", 7777)      # reused by an unrelated live process
+
+    def _spawn(name):
+        rt._spawn_counter["n"] += 1
+        pid = 1100 + rt._spawn_counter["n"]
+        rt._spawn_counter["pids"].append((name, pid))
+        if name == "api":
+            state["api_healthy"] = True
+        return pid
+
+    rt._spawn = _spawn
+    rt.api_healthy = lambda: state["api_healthy"]
     killed = set()
-    _write_lock(rt, "api", 1101)
-    _write_lock(rt, "bot", 7777)      # unrelated live process
-    _hooks(rt, alive=[1101, 7777],
-           identity={1101: "ok", 7777: "mismatch"},
-           api_healthy=True, killed=killed)
+    _hooks(rt, alive=[7777, 1101, 1102, 1103],
+           identity={7777: "mismatch", 1101: "ok", 1102: "ok", 1103: "ok"},
+           api_healthy=False, killed=killed)
+    rc = rt._bootstrap()
+    assert rc == 0
+    rd = _readiness(rt)
+    assert rd["lifecycle"] == rt.LIFE_CYCLE_READY
+    pids = _lock_pids(rt)
+    assert pids == {"api": 1101, "bot": 1102, "worker": 1103}
+    # bot lock reclaimed with the fresh spawned pid, not the reused 7777
+    assert pids["bot"] == 1102
+    assert rt._spawn_counter["n"] == 3          # api + fresh bot + worker
+    assert 7777 not in killed                   # unrelated process NEVER killed
+    assert rd["components"]["bot"]["owned"] is True
+
+
+def test_t4_worker_lock_pid_unrelated_live_process_recovers(rt):
+    """Same PID-reuse recovery for the operations worker."""
+    state = {"api_healthy": False}
+    _write_lock(rt, "worker", 7777)
+
+    def _spawn(name):
+        rt._spawn_counter["n"] += 1
+        pid = 1100 + rt._spawn_counter["n"]
+        if name == "api":
+            state["api_healthy"] = True
+        return pid
+
+    rt._spawn = _spawn
+    rt.api_healthy = lambda: state["api_healthy"]
+    killed = set()
+    _hooks(rt, alive=[7777, 1101, 1102, 1103],
+           identity={7777: "mismatch", 1101: "ok", 1102: "ok", 1103: "ok"},
+           api_healthy=False, killed=killed)
+    rc = rt._bootstrap()
+    assert rc == 0
+    assert _lock_pids(rt)["worker"] == 1103
+    assert 7777 not in killed
+    assert _readiness(rt)["lifecycle"] == rt.LIFE_CYCLE_READY
+
+
+# --- T4b: mismatched lock but a LIVE canonical component exists -> protect --
+
+def test_t4_live_bot_elsewhere_with_mismatched_lock_fails_closed(rt):
+    """A real live Pasay bot is running (identity 'ok' on another pid) while a
+    stale/mismatched lock points elsewhere. We must NEVER spawn a second poller
+    (Telegram 409) and never touch the unrelated pid -> fail closed."""
+    state = {"api_healthy": False}
+    for name, pid in (("api", 1101), ("worker", 1103)):
+        _write_lock(rt, name, pid)
+    _write_lock(rt, "bot", 7777)      # mismatched lock
+    # live canonical bot really exists on pid 9901
+    killed = set()
+
+    def _spawn(name):
+        rt._spawn_counter["n"] += 1
+        pid = 1100 + rt._spawn_counter["n"]
+        rt._spawn_counter["pids"].append((name, pid))
+        if name == "api":
+            state["api_healthy"] = True
+        return pid
+
+    rt._spawn = _spawn
+    rt.api_healthy = lambda: state["api_healthy"]
+    _hooks(rt, alive=[1101, 1103, 7777, 9901],
+           identity={1101: "ok", 1103: "ok", 7777: "mismatch", 9901: "ok"},
+           api_healthy=False, killed=killed, proc_scan=[9901, 7777, 1101, 1103])
     rc = rt._bootstrap()
     assert rc == 2
     rd = _readiness(rt)
     assert rd["lifecycle"] == rt.LIFE_CYCLE_FAILED
     assert rd["reason"] == "UNOWNED_BOT"
-    assert 7777 not in killed                          # never mis-killed
-    assert rt._spawn_counter["n"] == 0                 # never spawned a dup
-    # the unrelated process was not adopted: lock still records 7777, not owned
-    assert _lock_pids(rt)["bot"] == 7777
-    assert rd["components"]["bot"]["owned"] is False
+    assert 7777 not in killed          # never mis-killed
+    assert rt._spawn_counter["n"] == 0  # never spawned a duplicate poller
 
 
 def test_t4_api_lock_pid_unrelated_live_process_fails_closed(rt):
