@@ -267,10 +267,9 @@ def test_expense_safe_purpose_fallback_never_shows_placeholder(make_app):
 
 
 def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
-    """Section 七/八: overdue rows on the Rent quick view have a Follow up
-    button that opens a Rent detail with Follow-up / Record payment / History
-    (CONVERGENCE-003 §10: short buttons — zh Owner private chat uses the
-    compact Chinese labels)."""
+    """Section 七/八: overdue rows on the Rent quick view are statusful
+    navigation entries that open a Rent detail with the executable follow-up
+    action living on the detail card."""
     env = make_app(backend=ConvergeBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     send = env.bot.last_send()
@@ -280,8 +279,8 @@ def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
         return any(label in lbl for lbl in inline)
 
     assert has("1680")
-    assert any("催租" in lbl or "Follow up" in lbl for lbl in inline)
-    # Tap the follow-up -> Rent detail card with the 3 actions.
+    assert any("Pending" in lbl or "待催" in lbl or "Followed up" in lbl or "已交秘书" in lbl for lbl in inline)
+    # Tap the quick-row navigation -> Rent detail card with the 3 actions.
     data = _inline_data(send["reply_markup"])
     followup_cb = next(d for d in data if d.split(":")[1] == "rnq")
     run_updates(
