@@ -150,3 +150,38 @@ def assignee_email_name(db: Session, user_id: int | None) -> str | None:
         return None
     user = db.get(User, user_id)
     return user.username if user else None
+
+
+def cancel_repair(
+    op: RepairOperation,
+    *,
+    actor_id: int | None = None,
+    reason: str | None = None,
+    now: datetime | None = None,
+) -> str:
+    """State-machine-validated cancel of a Repair Operation.
+
+    Conformance: the only canonical way for callers (routers, tests, scripts)
+    to cancel a Repair. Routers MUST route through here so the explicit
+    state-machine guard runs; raw ``op.status = CANCELLED`` writes are no
+    longer required (the static guard forbids them in canonical modules).
+
+    Returns the audit action label (e.g. ``"cancelled"``) so callers can
+    record the same event in their audit log without re-deriving it.
+    """
+    from app.services.repairs.state import transition_to
+
+    now = now or datetime.now(timezone.utc)
+    event, _next = transition_to(
+        op.status.value,
+        RepairOperationStatus.CANCELLED.value,
+        reason=reason,
+        now=now,
+    )
+    op.status = RepairOperationStatus.CANCELLED
+    op.next_action = "Repair cancelled."
+    op.waiting_on = None
+    op.updated_at = now
+    op.updated_by = actor_id
+    _apply_derived_state(op)
+    return event

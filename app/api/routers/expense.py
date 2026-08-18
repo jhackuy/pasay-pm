@@ -40,7 +40,7 @@ from app.services.expense_payment_truth import (
     sync_expense_status,
 )
 from app.services.expense_timeline import build_expense_timeline
-from app.services.operations.redelivery import suppress_pending_redeliveries
+from app.services.operations import projection as task_projection
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
@@ -118,8 +118,16 @@ def _complete_linked_approval_task(
 ) -> None:
     """Closing an expense approval also closes the linked APPROVAL_PENDING
     operational task atomically in the same transaction (single source of
-    truth; the bot never does this itself)."""
-    now = datetime.now(timezone.utc)
+    truth; the bot never does this itself).
+
+    Convergence boundary (PASAY-VNEXT-FOUNDATION-LEGACY-001): the
+    ``OperationalTask`` close + redelivery-suppression routes through
+    ``app/services.operations.projection``. The audit ACTION NAME remains
+    the existing ``task_completed_via_approval`` (or ``..._rejection``) so
+    production contracts and tests that match the exact string stay
+    green; ``source_domain`` / ``reason`` ride in ``changed_fields`` for
+    provenance (no new enum slot, no migration).
+    """
     task = (
         db.query(OperationalTask)
         .filter(
@@ -134,25 +142,18 @@ def _complete_linked_approval_task(
     )
     if task is None:
         return
-    old = serialize_row(task)
-    task.status = OperationalTaskStatus.COMPLETED
-    task.completed_at = now
-    task.completed_by = actor_id
-    task.reminder_generation = task.reminder_generation + 1
-    task.updated_by = actor_id
-    db.flush()
-    record_audit(
-        db,
-        table_name="operational_tasks",
-        record_id=task.id,
-        action=f"task_completed_via_{reason}",
-        actor_id=actor_id,
-        changed_fields={"status": [old.get("status"), "COMPLETED"]},
-        old_value=old,
-        new_value=serialize_row(task),
+    audit_action = (
+        "task_completed_via_approval"
+        if reason == "approval"
+        else "task_completed_via_rejection"
     )
-    suppress_pending_redeliveries(
-        db, task.id, actor_id=actor_id, reason=f"expense_{reason}", now=now
+    task_projection.close_active_projections(
+        db,
+        tasks=[task],
+        actor_id=actor_id,
+        reason=reason,
+        source_domain="expense.approval",
+        audit_action=audit_action,
     )
 
 
@@ -164,8 +165,10 @@ def _complete_linked_payment_tasks(
 ) -> None:
     """When an expense is FULLY paid (remaining == 0), close every still-active
     expense-linked payment task so the to-do list never keeps showing 'waiting
-    for payment' for a fully-paid expense. NEVER closes related Repair tasks."""
-    now = datetime.now(timezone.utc)
+    for payment' for a fully-paid expense. NEVER closes related Repair tasks.
+
+    Audit ACTION NAME preserved as the existing ``task_completed_via_payment``.
+    """
     tasks = (
         db.query(OperationalTask)
         .filter(
@@ -178,27 +181,16 @@ def _complete_linked_payment_tasks(
         )
         .all()
     )
-    for task in tasks:
-        old = serialize_row(task)
-        task.status = OperationalTaskStatus.COMPLETED
-        task.completed_at = now
-        task.completed_by = actor_id
-        task.reminder_generation = task.reminder_generation + 1
-        task.updated_by = actor_id
-        db.flush()
-        record_audit(
-            db,
-            table_name="operational_tasks",
-            record_id=task.id,
-            action="task_completed_via_payment",
-            actor_id=actor_id,
-            changed_fields={"status": [old.get("status"), "COMPLETED"]},
-            old_value=old,
-            new_value=serialize_row(task),
-        )
-        suppress_pending_redeliveries(
-            db, task.id, actor_id=actor_id, reason="expense_payment", now=now
-        )
+    if not tasks:
+        return
+    task_projection.close_active_projections(
+        db,
+        tasks=tasks,
+        actor_id=actor_id,
+        reason="expense_paid",
+        source_domain="expense.payment",
+        audit_action="task_completed_via_payment",
+    )
 
 
 def _claim_out(c, expense_id: int) -> dict:

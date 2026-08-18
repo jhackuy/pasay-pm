@@ -29,6 +29,7 @@ from app.models.repair import (
     RepairAction,
     RepairActionStatus,
     RepairOperation,
+    RepairOperationStatus,
     RepairProposal,
     RepairProposalStatus,
 )

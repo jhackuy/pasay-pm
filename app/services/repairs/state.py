@@ -101,6 +101,7 @@ _ALLOWED_TRANSITIONS: dict[tuple[str, str], str] = {
     ("VERIFYING", "WAITING_HUMAN"): "rework_needed",
     ("VERIFYING", "CLOSED"): "verified",
     ("VERIFYING", "IN_PROGRESS"): "rework_needed",
+    ("VERIFYING", "CANCELLED"): "cancelled",
 
     # CANCELLED -> nothing; CLOSED -> nothing (absorbing).
 }

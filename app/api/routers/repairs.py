@@ -28,7 +28,6 @@ from app.database import get_db
 from app.models.financial import Expense, ExpenseStatus
 from app.models.repair import (
     RepairOperation,
-    RepairOperationStatus,
     RepairProposal,
 )
 from app.models.user import User, UserRole
@@ -47,6 +46,7 @@ from app.services.repairs import continuation, operations as op_svc
 from app.services.repairs import payment as payment_svc
 from app.services.repairs import proposals as prop_svc
 from app.services.repairs import verification as verify_svc
+from app.services.repairs.state import TransitionError
 
 router = APIRouter(prefix="/repairs", tags=["repairs"])
 
@@ -422,13 +422,23 @@ def cancel_repair(
     db: Session = Depends(get_db),
     user: User = Depends(manager_or_admin),
 ):
+    """Cancel a Repair Operation.
+
+    Convergence boundary (PASAY-VNEXT-FOUNDATION-LEGACY-001): the canonical
+    state-machine transition runs through ``op_svc.cancel_repair`` so the
+    explicit transition table (``_ALLOWED_TRANSITIONS``) guards it — a
+    direct ``op.status = CANCELLED`` write inside the router would defeat
+    the guard. Terminal states are rejected here so the message is
+    consistent for the bot / tests.
+    """
     repair = _get_repair_or_404(db, repair_id)
     if repair.status in ("CLOSED", "CANCELLED"):
         raise HTTPException(status.HTTP_409_CONFLICT, f"Repair is already {repair.status}")
-    repair.status = RepairOperationStatus.CANCELLED
-    repair.next_action = "Repair cancelled."
-    repair.waiting_on = None
-    repair.updated_at = datetime.now(timezone.utc)
+    try:
+        op_svc.cancel_repair(repair, actor_id=user.id)
+    except TransitionError as exc:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     record_audit(
         db,
         table_name="repair_operations",

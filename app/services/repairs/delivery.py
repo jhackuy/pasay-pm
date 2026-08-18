@@ -4,15 +4,16 @@ The authoritative business fact is the ``repair_action`` (requote requested afte
 a proposal rejection). For a REAL human to act without knowing repair/proposal
 internals, the action is **projected into the existing ``operational_tasks``
 work queue** assigned to the Secretary — the same Tasks / Telegram channel she
-already uses. We do NOT create a second task system; ``operational_tasks`` is the
-human work-entry projection, ``repair_actions`` is the source of truth.
+already uses. We do NOT create a second task system; ``operational_tasks`` is
+the human work-entry projection, ``repair_actions`` is the source of truth.
 
-The projection reuses ``create_operational_task`` so it inherits the existing:
-- DB-level dedupe (one active task per ``dedupe_key``) — a repeated worker tick
-  / reject callback / retry can never enqueue a duplicate task (Gate B §3.2);
-- outbox + notifier delivery with the send-time ``task still PENDING`` guard and
-  daily-dedup / idempotent reminder semantics (no reminder spam);
-- audit of task_created.
+Convergence boundary (PASAY-VNEXT-FOUNDATION-LEGACY-001): this module reads
+``OperationalTask`` rows (back-compat / display) but NEVER creates or mutates
+them. Both creation and active-projection completion are routed through
+``app.services.operations.projection``. The adapter owns:
+- validation (active RepairAction, same ``repair_id``);
+- task creation through the canonical operational-task seam;
+- the close seam (status + reminder_generation + audit + redelivery drop).
 
 Delivery semantics (Gate B §3.2):
 - Same active REQUOTE → at most ONE active projected task. Re-running
@@ -30,34 +31,32 @@ from the work queue and its pending reminders are dropped; the Repair moves to
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.models.operations import (
     OperationalTask,
-    OperationalTaskPriority,
     OperationalTaskStatus,
-    OperationalTaskType,
 )
-from app.models.repair import RepairAction, RepairOperation
+from app.models.repair import (
+    RepairAction,
+    RepairActionStatus,
+    RepairOperation,
+)
 from app.models.property import Unit
-from app.services.operations.generation import create_operational_task, secretary_assignee_id
-from app.services.operations.redelivery import suppress_pending_redeliveries
+from app.services.operations import projection
+from app.services.operations.generation import secretary_assignee_id
 
 
-def _task_assignee(db: Session) -> int | None:
-    """Safe Secretary assignee for the projection task: only if the configured
-    secretary user actually exists as an active human (else None → unassigned,
-    still visible on the board). Never inserts a dangling FK."""
-    candidate = secretary_assignee_id()
-    if candidate is not None:
-        from app.models.user import User
+# Re-export so legacy callers (e.g. tests that ``monkeypatch.setattr`` this
+# name on the delivery module) keep working — projection tasks resolve the
+# assignee through this function.
 
-        user = db.get(User, candidate)
-        if user is not None and user.is_active:
-            return candidate
-    return None
+
+
+_REPAIR_PROJECTION_DOMAIN = "repairs.delivery"
+
 
 # The projection task's dedupe key (stable business identity for the work entry).
 def requote_task_dedupe_key(repair_id: int) -> str:
@@ -87,8 +86,7 @@ def _money(value) -> str:
 
 
 def _rejected_quote_context(db: Session, repair: RepairOperation) -> dict | None:
-    """The rejected quote details for the requote card (the latest REJECTED
-    proposal's amount + reason)."""
+    """The rejected quote details for the requote card (latest REJECTED proposal)."""
     from app.models.repair import RepairProposal, RepairProposalStatus
 
     proposal = (
@@ -109,13 +107,13 @@ def _rejected_quote_context(db: Session, repair: RepairOperation) -> dict | None
     }
 
 
-def requote_card(
-    db: Session, repair: RepairOperation, action: RepairAction
-) -> tuple[str, str]:
-    """Human task title + notification message for a requote (008A §3.1).
+def _requote_payload(db: Session, repair: RepairOperation, action: RepairAction) -> dict:
+    """Build the canonical ``fields`` payload for the projection adapter.
 
-    English Secretary-facing; shows unit, issue, rejected amount + reason, the
-    next step and that the repair remains open — never the internal ids.
+    Title + description (Secretary-facing card text) + details context.
+    Status / dedupe / source / priority / dates are set by the adapter; callers
+    MAY supply a custom ``dedupe_key`` for non-REQUOTE kinds, otherwise the
+    adapter computes one.
     """
     unit = _unit_label(db, repair)
     title = f"Get another quote · {unit}" if unit else "Get another quote"
@@ -130,7 +128,23 @@ def requote_card(
     lines.append("")
     lines.append("Next: get another quote or propose an alternative.")
     lines.append("Repair remains open.")
-    return title, "\n".join(lines)
+    description = "\n".join(lines)
+    details = {
+        "repair_id": repair.id,
+        "repair_action_id": action.id,
+        "action_kind": action.action_kind,
+        "unit_number": unit,
+        "issue": repair.issue,
+        "requote_context": ctx,
+    }
+    return {
+        "title": title,
+        "description": description,
+        "property_id": repair.property_id,
+        "details": details,
+        "dedupe_key": requote_task_dedupe_key(repair.id),
+        "notification_message": description,
+    }
 
 
 def project_requote_to_task(
@@ -141,64 +155,68 @@ def project_requote_to_task(
     now: datetime | None = None,
     actor_id: int | None = None,
 ) -> tuple[OperationalTask | None, bool]:
-    """Project an active REQUOTE repair_action into the Secretary's task queue.
+    """Thin shim kept for back-compat: delegates the actual create /
+    validation to the projection adapter. Returns ``(task_or_existing,
+    created_flag)``; ``(None, False)`` for inactive / wrong-repair / already
+    projected actions.
 
-    Idempotent: N calls create at most one active task (DB dedupe key). Returns
-    ``(task_or_None_or_existing, created_flag)``. ``created_flag`` False when an
-    active projection already exists.
-
-    The task carries enough context that the Secretary never reads repair_action
-    ids: unit, issue, rejected amount + reason, next step, repair still open.
+    The Secretary assignee is resolved HERE (against
+    ``delivery.secretary_assignee_id``) so tests that monkeypatch this
+    module-level name pick it up via the projection layer.
     """
-    now = now or datetime.now(timezone.utc)
     if action.action_kind != "REQUOTE":
         return None, False
-    dedupe_key = requote_task_dedupe_key(repair.id)
-    title, message = requote_card(db, repair, action)
-    assignee = _task_assignee(db)
-    fields = {
-        "task_type": OperationalTaskType.FOLLOWUP,
-        "title": title,
-        "description": message,
-        "property_id": repair.property_id,
-        "source_type": "repair",
-        "source_id": repair.id,
-        "assigned_user_id": assignee,
-        "priority": OperationalTaskPriority.high,
-        "status": OperationalTaskStatus.PENDING,
-        "due_at": now + timedelta(days=2),
-        "next_action": "Get another quote / propose an alternative",
-        "next_check_at": now + timedelta(days=2),
-        "dedupe_key": dedupe_key,
-        "details": {
-            "repair_id": repair.id,
-            "repair_action_id": action.id,
-            "action_kind": action.action_kind,
-            "unit_number": _unit_label(db, repair),
-            "issue": repair.issue,
-            "requote_context": _rejected_quote_context(db, repair),
-        },
-    }
-    task, enqueued = create_operational_task(
+    payload = _requote_payload(db, repair, action)
+    payload["assigned_user_id"] = _resolve_assignee(db)
+    return projection.project_active_repair_action(
         db,
-        fields=fields,
-        now=now,
+        repair,
+        action,
+        fields=payload,
         actor_id=actor_id,
-        notification_message=message,
+        now=now,
     )
-    if task is None:
-        # An active task with this dedupe_key already exists — refresh it so the
-        # Secretary sees the current requote card.
-        existing = (
-            db.query(OperationalTask)
-            .filter(
-                OperationalTask.dedupe_key == dedupe_key,
-                OperationalTask.status.in_([OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]),
-            )
-            .first()
+
+
+def _resolve_assignee(db: Session) -> int | None:
+    """Resolve the Secretary assignee through the module-level ``secretary_assignee_id``
+    so ``monkeypatch.setattr`` on this module is honored by the projection
+    pipeline."""
+    candidate = secretary_assignee_id()
+    if candidate is None:
+        return None
+    from app.models.user import User
+
+    user = db.get(User, candidate)
+    return candidate if (user is not None and user.is_active) else None
+
+
+def _active_tasks_for(
+    db: Session,
+    *,
+    dedupe_key: str,
+    repair_id: int | None = None,
+) -> list[OperationalTask]:
+    """Read ACTIVE projected tasks for a dedupe key; filter to ``repair_id``
+    when supplied (defense in depth against wrong-repair rows)."""
+    tasks = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.dedupe_key == dedupe_key,
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
         )
-        return existing, False
-    return task, enqueued and True
+        .all()
+    )
+    if repair_id is None:
+        return tasks
+    out: list[OperationalTask] = []
+    for task in tasks:
+        details = task.details or {}
+        if details.get("repair_id") in (None, repair_id):
+            out.append(task)
+    return out
 
 
 def close_requote_projection(
@@ -208,38 +226,20 @@ def close_requote_projection(
     actor_id: int | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Complete the projected requote task(s) for a repair once the Secretary
-    submits the next proposal (Gate B §3.3).
-
-    Completing the task:
-    - removes the "get another quote" entry from the Secretary work queue;
-    - makes the notifier DROP any pending reminder for it (send-time guard),
-      so it never re-reminds;
-    - the underlying repair_action is completed separately by the continuation
-      engine (or left for history); the source of truth is not deleted.
-    Returns the number of tasks completed.
-    """
+    """Complete the projected requote task(s) once the Secretary submits the
+    next proposal (Gate B §3.3). Routed through the projection adapter."""
     now = now or datetime.now(timezone.utc)
-    tasks = (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.dedupe_key == requote_task_dedupe_key(repair.id),
-            OperationalTask.status.in_(
-                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-            ),
-        )
-        .all()
+    tasks = _active_tasks_for(
+        db, dedupe_key=requote_task_dedupe_key(repair.id), repair_id=repair.id
     )
-    for task in tasks:
-        task.status = OperationalTaskStatus.COMPLETED
-        task.completed_at = now
-        task.completed_by = actor_id
-        task.updated_at = now
-        db.flush()
-        suppress_pending_redeliveries(
-            db, task.id, actor_id=actor_id, reason="next_proposal_submitted", now=now,
-        )
-    return len(tasks)
+    return projection.close_active_projections(
+        db,
+        tasks=tasks,
+        actor_id=actor_id,
+        reason="next_proposal_submitted",
+        source_domain=_REPAIR_PROJECTION_DOMAIN,
+        now=now,
+    )
 
 
 def close_result_projection(
@@ -249,8 +249,10 @@ def close_result_projection(
     actor_id: int | None = None,
     now: datetime | None = None,
 ) -> int:
-    """Complete any projected repair-result / verification task when the Repair
-    reaches CLOSED (so the work queue stops surfacing it)."""
+    """Complete any projected result / verification task when the Repair
+    reaches CLOSED. Wrong-repair tasks are FILTERED OUT of the close call
+    (not flagged and completed) so they stay ACTIVE for the right repair.
+    """
     now = now or datetime.now(timezone.utc)
     actions = (
         db.query(RepairAction)
@@ -262,29 +264,24 @@ def close_result_projection(
         )
         .all()
     )
+    closed_total = 0
     for action in actions:
         projection_key = (
             requote_task_dedupe_key(repair.id)
             if action.action_kind == "REQUOTE"
             else f"repair-{action.action_kind.lower()}:{repair.id}"
         )
-        tasks = (
-            db.query(OperationalTask)
-            .filter(
-                OperationalTask.dedupe_key == projection_key,
-                OperationalTask.status.in_(
-                    [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-                ),
-            )
-            .all()
+        valid_tasks = _active_tasks_for(
+            db, dedupe_key=projection_key, repair_id=repair.id
         )
-        for task in tasks:
-            task.status = OperationalTaskStatus.COMPLETED
-            task.completed_at = now
-            task.completed_by = actor_id
-            task.updated_at = now
-            db.flush()
-            suppress_pending_redeliveries(
-                db, task.id, actor_id=actor_id, reason="repair_closed", now=now,
-            )
-    return len(actions)
+        if not valid_tasks:
+            continue
+        closed_total += projection.close_active_projections(
+            db,
+            tasks=valid_tasks,
+            actor_id=actor_id,
+            reason="repair_closed",
+            source_domain=_REPAIR_PROJECTION_DOMAIN,
+            now=now,
+        )
+    return closed_total
