@@ -8,10 +8,11 @@ name: cf-smoke-deploy
 # Required GitHub Actions secrets (Owner-bound):
 #   CLOUDFLARE_API_TOKEN  - scoped to Workers Scripts:Edit on the smoke account
 #   CLOUDFLARE_ACCOUNT_ID - the smoke Cloudflare account id (optional helper;
-#                           if present it must be alphanumeric/hyphen/underscore
-#                           only — no leading/trailing whitespace, no quotes.
-#                           When bound but malformed we discover the real ID
+#                           when bound but malformed we discover the real ID
 #                           from the API token via Cloudflare /accounts.)
+#
+# Push to `codex/pasay-cf-env-001` triggers dry-run only; deploy is gated to
+# `workflow_dispatch` so real-account deploys are always Owner-initiated.
 
 on:
   workflow_dispatch:
@@ -47,9 +48,6 @@ jobs:
         id: account
         run: |
           set -euo pipefail
-          # Step 1: try the bound CLOUDFLARE_ACCOUNT_ID, but only if it is
-          # purely alphanumeric / hyphen / underscore. Whitespace and quote
-          # paste artefacts are stripped first.
           BOUND_RAW="$CLOUDFLARE_ACCOUNT_ID"
           if [ -n "$BOUND_RAW" ]; then
             CLEAN=$(printf '%s' "$BOUND_RAW" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
@@ -62,8 +60,6 @@ jobs:
           else
             echo "CLOUDFLARE_ACCOUNT_ID not bound; discovering from API token"
           fi
-          # Step 2: discover the account ID by calling Cloudflare /accounts
-          # with the API token. /accounts is accessible with Account:Read.
           ACCOUNTS_JSON=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "https://api.cloudflare.com/client/v4/accounts?per_page=1")
           if ! printf '%s' "$ACCOUNTS_JSON" | grep -q '"success":true'; then
             echo "::error::Cloudflare /accounts call failed:"
@@ -80,6 +76,41 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Ensure workers.dev subdomain registered
+        id: subdomain
+        run: |
+          set -euo pipefail
+          ACC="${{ steps.account.outputs.account_id }}"
+          HDR="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+          GET=$(curl -sS -H "$HDR" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
+          if printf '%s' "$GET" | grep -q '"success":true'; then
+            SUBDOMAIN=$(printf '%s' "$GET" | sed -n 's/.*"subdomain":"\([^"]*\)".*/\1/p')
+            if [ -n "$SUBDOMAIN" ]; then
+              echo "workers.dev subdomain already registered: $SUBDOMAIN"
+              echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "::notice::no workers.dev subdomain yet; registering via API"
+          PUT=$(curl -sS -X PUT -H "$HDR" -H "Content-Type: application/json" \
+            --data '{"subdomain":"'"$ACC"'"}' \
+            "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
+          echo "PUT response: $PUT"
+          if ! printf '%s' "$PUT" | grep -q '"success":true'; then
+            echo "::error::failed to register workers.dev subdomain"
+            printf '%s\n' "$PUT"
+            exit 1
+          fi
+          SUBDOMAIN=$(printf '%s' "$PUT" | sed -n 's/.*"subdomain":"\([^"]*\)".*/\1/p' | head -n 1)
+          if [ -z "$SUBDOMAIN" ]; then
+            echo "::error::could not parse subdomain from PUT response"
+            exit 1
+          fi
+          echo "Registered workers.dev subdomain: $SUBDOMAIN"
+          echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
       - name: Dry-run compile (always)
         run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
