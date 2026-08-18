@@ -78,6 +78,21 @@ CREATE TABLE IF NOT EXISTS daily_marks (
   key        TEXT PRIMARY KEY,
   created_at TEXT NOT NULL
 );
+-- WINDOWS-RUNTIME-REBOOT-RECOVERY-002 (PHASE C fix): delivery-truth record
+-- for Remind-Owner. PRIMARY KEY (expense_id, date) makes the same-day gate
+-- atomic AND stores the proven Telegram delivery facts (target, destination,
+-- sent_at, message_id). A row is written ONLY after send_message returns a
+-- confirmed message_id; a failed delivery writes no row, so the daily limit is
+-- NOT consumed and a retry stays allowed. Survives process restart (SQLite).
+CREATE TABLE IF NOT EXISTS reminder_deliveries (
+  expense_id   TEXT NOT NULL,
+  date         TEXT NOT NULL,
+  target_user  TEXT NOT NULL DEFAULT '',
+  destination  TEXT NOT NULL DEFAULT '',
+  sent_at      TEXT NOT NULL,
+  message_id   TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (expense_id, date)
+);
 """
 
 DEFAULT_CONVERSATION_TTL = 900        # 15 minutes
@@ -315,6 +330,50 @@ class StateStore:
                 "SELECT 1 FROM daily_marks WHERE key=?", (key,)
             ).fetchone()
         return row is not None
+
+    def record_reminder_delivery(
+        self, expense_id: Any, date: str, *, target_user: str = "",
+        destination: str = "", message_id: str = "",
+    ) -> bool:
+        """Persist a CONFIRMED Remind-Owner delivery for ``(expense_id, date)``.
+
+        True = first (and only) successful delivery today for this expense; a
+        later attempt the same day returns False (daily gate, persisted).
+        Only call this AFTER ``send_message`` returned a confirmed message.
+        """
+        now = datetime.now(PH_TZ).astimezone(PH_TZ).isoformat()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO reminder_deliveries "
+                    "(expense_id, date, target_user, destination, sent_at, message_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(expense_id), str(date), str(target_user or ""),
+                     str(destination or ""), str(now), str(message_id or "")),
+                )
+                self._conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def get_reminder_delivery(self, expense_id: Any, date: str) -> Optional[dict]:
+        """Return the persisted delivery record or None (not delivered today)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT expense_id, date, target_user, destination, sent_at, message_id "
+                "FROM reminder_deliveries WHERE expense_id=? AND date=?",
+                (str(expense_id), str(date)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "expense_id": row["expense_id"],
+            "date": row["date"],
+            "target_user": row["target_user"],
+            "destination": row["destination"],
+            "sent_at": row["sent_at"],
+            "message_id": row["message_id"],
+        }
 
     def remember_group(self, chat_id: Any, title: str = "") -> None:
         now = int(time.time())

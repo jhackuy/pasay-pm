@@ -1472,7 +1472,18 @@ def expense_open_keyboard(
                 InlineKeyboardButton(
                     t("v2.remind_owner_short", locale) if not reminded_today
                     else t("v2.reminded_short", locale),
-                    callback_data=encode(ACTION_REMIND_OWNER, "exp", str(expense_id)),
+                    # WINDOWS-RUNTIME-REBOOT-RECOVERY-002 (PHASE C): a FRESH
+                    # nonce per render. Previously the Remind button carried NO
+                    # nonce, so the idempotency key collapsed to
+                    # ``ik:rmo:{expense_id}:0`` and after the first-ever send it
+                    # stayed ``done`` forever -> a next-day click replayed a
+                    # fake "Reminder sent" without delivering (delivery-truth
+                    # bug). A per-render nonce makes the idempotency key unique
+                    # per button so every real tap really sends.
+                    callback_data=encode(
+                        ACTION_REMIND_OWNER, "exp", str(expense_id),
+                        nonce=new_nonce(), ts=now_ts(),
+                    ),
                 ),
                 InlineKeyboardButton(
                     t("expense.pay_now_short", locale),

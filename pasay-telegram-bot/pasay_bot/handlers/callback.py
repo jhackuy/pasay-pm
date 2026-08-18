@@ -1971,12 +1971,16 @@ async def _reopen_rent_detail(update, context, unit_id, locale, followed_up_toda
 
 
 async def _reminded_today(context, expense_id: int) -> bool:
-    """Bot-local same-day Remind-Owner mark (SQLite, restart-safe)."""
+    """Persisted same-day Remind-Owner CONFIRMED-delivery mark (SQLite,
+    restart-safe). True only after a successfully delivered reminder for this
+    expense today (see ``store.record_reminder_delivery`` / ``get_reminder_delivery``).
+    """
     try:
         from pasay_bot.state.store import ph_local_date
-        return context.bot_data["store"].is_marked_daily(
-            f"remind_owner:{expense_id}:{ph_local_date()}"
-        )
+        store = context.bot_data.get("store")
+        if store is None:
+            return False
+        return store.get_reminder_delivery(expense_id, ph_local_date()) is not None
     except Exception:  # noqa: BLE001 - dedup is best-effort, never fatal
         return False
 
@@ -2003,9 +2007,7 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
     expense_id = int(ref)
     api = context.bot_data["api_client"]
     store = context.bot_data["store"]
-    from pasay_bot.state.store import ph_local_date
 
-    mark_key = f"remind_owner:{expense_id}:{ph_local_date()}"
     if await _reminded_today(context, expense_id):
         await _answer(update, t("v2.remind_owner_already", locale), durable=True)
         await _render_expense_detail_in_place(update, context, expense_id, locale, reminded_today=True)
@@ -2014,9 +2016,26 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
     key = f"ik:rmo:{expense_id}:{nonce or '0'}"
     status = guard.acquire(key, kind="remind_owner", resource=str(expense_id))
     if status == "done":
-        await _answer(update, t("v2.remind_owner_sent", locale))
-        return
-    if status == "in_flight":
+        # Same rendered button re-clicked. A "done" key is only ever settled
+        # AFTER a confirmed delivery, so the truthful reply is "already
+        # reminded" — never a bare "Reminder sent" and never a second DM.
+        if await _reminded_today(context, expense_id):
+            await _answer(update, t("v2.remind_owner_already", locale), durable=True)
+        else:
+            # Defensive: a stale/permanent key that claims done but has NO
+            # persisted delivery today must NOT report a fake success. Fall
+            # through and actually re-send (fresh attempt).
+            logger.warning(
+                "remind owner idempotency=%s status=done but no delivery record "
+                "for expense=%s; re-sending instead of fake success",
+                key, expense_id,
+            )
+        if await _reminded_today(context, expense_id):
+            await _render_expense_detail_in_place(
+                update, context, expense_id, locale, reminded_today=True)
+            return
+        guard.fail(key, resource=str(expense_id))
+    elif status == "in_flight":
         await _answer(update, t("common.processing", locale), durable=True)
         return
     await _ack_working(update, locale)
@@ -2065,7 +2084,7 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
         return
     # Step 2: send the DM to the Owner's PRIVATE chat.
     try:
-        await update.get_bot().send_message(
+        send_result = await update.get_bot().send_message(
             owner_chat_id_int,
             H.truncate(dm_text),
             parse_mode=HTML,
@@ -2075,9 +2094,30 @@ async def _handle_remind_owner(update, context, ref, nonce, ts, role, locale):
         guard.fail(key, resource=str(expense_id))
         await _answer(update, t("v2.remind_owner_failed", locale), durable=True)
         return
-    # Step 3: DM succeeded -> record the delivered reminder.
-    guard.settle(key, {"expense_id": expense_id}, resource=str(expense_id))
-    store.mark_daily(mark_key)
+    # A confirmed Telegram delivery requires a returned message_id. If the
+    # call did not raise but returned no message, DO NOT report success.
+    if not getattr(send_result, "message_id", None):
+        logger.warning("remind owner DM to %s: send accepted but no message_id returned",
+                       owner_chat_id)
+        guard.fail(key, resource=str(expense_id))
+        await _answer(update, t("v2.remind_owner_failed", locale), durable=True)
+        return
+    # Step 3: CONFIRMED delivery -> persist delivery truth and settle the key.
+    from pasay_bot.state.store import ph_local_date
+    today = ph_local_date()
+    store.record_reminder_delivery(
+        expense_id,
+        today,
+        target_user=owner_chat_id,           # resolved Owner Telegram destination
+        destination=str(owner_chat_id_int),  # the private chat we actually DMed
+        message_id=str(send_result.message_id),
+    )
+    guard.settle(key, {"expense_id": expense_id, "message_id": str(send_result.message_id)},
+                 resource=str(expense_id))
+    logger.info(
+        "remind_owner delivered expense=%s to=%s (private %s) message_id=%s date=%s",
+        expense_id, owner_chat_id, owner_chat_id_int, send_result.message_id, today,
+    )
     await _answer(update, t("v2.remind_owner_sent", locale))
     # Step 4: flip the group card to ✅ Reminded (message mutation).
     await _render_expense_detail_in_place(update, context, expense_id, locale, reminded_today=True)
