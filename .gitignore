@@ -23,5 +23,10 @@ ux/results/
 
 # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008: local pytest/scratch dirs stay untracked
 .git_tmp/
-pv-basetmp-*/
+pv-basetmp-*
 pasay-telegram-bot/.pytest_tmp/
+
+# PASAY-GITHUB-PRE-PUBLISH-AUDIT-001: local audit/build/research artifacts stay untracked
+.audit/
+.build/
+.research/
