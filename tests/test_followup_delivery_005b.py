@@ -141,3 +141,38 @@ def test_followup_delivery_sequential_duplicate_no_resend(db_session, monkeypatc
     assert first.delivery_state == "DELIVERED"
     assert second.delivery_state == "ALREADY_DELIVERED"
     assert len(sent) == 1
+
+
+def test_followup_delivery_retry_refreshes_render_payload(db_session, monkeypatch, admin):
+    actor = db_session.get(User, admin[0].id)
+    assignee = _user(db_session, "sec-005c-render", UserRole.agent, telegram_chat_id="tg-sec-005c")
+    task = _task(db_session)
+    first_payload = TaskFollowupDeliveryIn(
+        assignee_user_id=assignee.id,
+        message="Old generic reminder",
+        reply_markup=None,
+    )
+    second_payload = TaskFollowupDeliveryIn(
+        assignee_user_id=assignee.id,
+        message="Rent collection follow-up\nUnit: 1680",
+        reply_markup={"inline_keyboard": [[{"text": "Done", "callback_data": "v1:sfc:1"}]]},
+    )
+    sender = _FailOnceSender()
+    sent: list[tuple] = []
+
+    class _MixedSender:
+        def send(self, recipient, text, reply_markup=None):
+            if sender.calls == 0:
+                return sender.send(recipient, text, reply_markup)
+            sent.append((recipient, text, reply_markup))
+            return "779"
+
+    monkeypatch.setattr(ops_router, "_build_notification_sender", lambda db: _MixedSender())
+
+    first = ops_router.deliver_task_followup(task.id, first_payload, db=db_session, user=actor)
+    assert first.delivery_state == "FAILED"
+    second = ops_router.deliver_task_followup(task.id, second_payload, db=db_session, user=actor)
+    assert second.delivery_state == "DELIVERED"
+    assert sent
+    assert "Rent collection follow-up" in sent[-1][1]
+    assert sent[-1][2] == second_payload.reply_markup

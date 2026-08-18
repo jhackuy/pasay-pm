@@ -20,9 +20,7 @@ from telegram.ext import ContextTypes
 
 from pasay_bot.api_client import PasayApiError
 from pasay_bot.followup_truth import (
-    followup_assigned,
-    followup_completed_today,
-    match_followup_task,
+    compute_followup_snapshot,
 )
 from pasay_bot.keyboards import (
     ACTION_COPILOT_ASK,
@@ -792,12 +790,12 @@ async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
             if unit_id is None:
                 actionable_indices.add(i)
                 continue
-            task = match_followup_task(tasks, leases, unit_id, unit_code)
-            if followup_completed_today(task, store, unit_id):
-                continue
-            if followup_assigned(task):
-                continue
-            actionable_indices.add(i)
+            snapshot = compute_followup_snapshot(
+                tasks, leases, store, unit_id, unit_code,
+                last_followup_at=row.get("last_followup_at"),
+            )
+            if snapshot.actionable:
+                actionable_indices.add(i)
         await _render(
             context, chat_id, message_id, text,
             keyboard=rent_quick_keyboard(overdue, locale, actionable_indices=actionable_indices),

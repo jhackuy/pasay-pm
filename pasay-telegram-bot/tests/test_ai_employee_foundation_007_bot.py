@@ -121,6 +121,42 @@ def test_phone_nl_direct_write_resumes_and_dms(make_app):
     assert SECRETARY_ID in dm_chats
 
 
+def test_secretary_followup_reminder_contains_execution_context(make_app):
+    env = make_app(backend=PhonePresentBackend())
+    detail = _open_rent_detail(env)
+    _tap_followup(env, detail)
+    dm = env.bot.sends()[-1]
+    text = dm["text"] or ""
+    assert "Rent collection follow-up" in text or "租金催收跟进" in text
+    assert "Unit: 1680" in text or "房间：1680" in text
+    assert "Tenant:" in text or "租客：" in text
+    assert "Outstanding:" in text or "未付：" in text
+    assert "Next action:" in text or "下一步：" in text
+    labels = [b.text for row in dm["reply_markup"].inline_keyboard for b in row]
+    assert any("Contacted" in (lbl or "") or "已联系" in (lbl or "") for lbl in labels)
+    assert any("Payment received" in (lbl or "") or "已收款" in (lbl or "") for lbl in labels)
+
+
+def test_pending_missing_phone_bare_number_bypasses_ai(make_app, monkeypatch):
+    env = make_app(backend=PhoneBlockedBackend())
+    detail = _open_rent_detail(env)
+    _tap_followup(env, detail)
+    called = {"ai": 0}
+
+    async def _fail_ai(*args, **kwargs):
+        called["ai"] += 1
+        raise AssertionError("AI fallback should not run for pending missing-phone fast path")
+
+    monkeypatch.setattr("pasay_bot.handlers.nl_bridge._handle_ai_fallback", _fail_ai)
+    env.bot.clear()
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "09171234567", bot=env.bot)])
+    tenant = next(t for t in env.backend.tenants if t.get("id") == 1)
+    assert tenant.get("phone") == "09171234567"
+    dm_chats = [s["chat_id"] for s in env.bot.sends() if isinstance(s.get("chat_id"), int)]
+    assert SECRETARY_ID in dm_chats
+    assert called["ai"] == 0
+
+
 def test_followup_no_answer_not_contacted(make_app):
     """§16.2/§26: 📵 未接听 records an attempt and never moves the follow-up to
     'contacted' (the Secretary is routed into the snooze picker)."""
