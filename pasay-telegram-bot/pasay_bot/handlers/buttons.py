@@ -47,6 +47,7 @@ _SLOW_ROUTES = frozenset(
 # fast deterministic first-level routes — they render directly and never show
 # the processing stub.
 _QUICK_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense"})
+_INLINE_MENU_REFRESH_ROUTES = frozenset({"properties", "tasks", "rent", "expense"})
 
 
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:
@@ -82,6 +83,17 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
         )
         _track(context, route, (time.monotonic() - started) * 1000, outcome="no_permission")
         return
+
+    # Telegram persistent keyboards are sticky on the client. A deployed menu
+    # change only replaces an already pinned old keyboard when we send a fresh
+    # ReplyKeyboardMarkup in a later ordinary interaction.
+    if (
+        update.effective_chat is not None
+        and update.effective_chat.type == "private"
+        and route in _INLINE_MENU_REFRESH_ROUTES
+        and not pages._is_menu_initialized(context, chat_id)
+    ):
+        await pages._send_persistent_menu(context, chat_id, role, locale)
 
     status = None
     try:

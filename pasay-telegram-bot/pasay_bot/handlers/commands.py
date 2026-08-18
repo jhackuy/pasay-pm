@@ -108,20 +108,23 @@ def _bind_identity(update, context, user_id=None) -> bool:
 
 # --- SLICE3-UX-PERSISTENT-MENU-002: persistent menu initialization ----------
 # Minimal in-process dedupe (bot_data resets on restart, the allowed scope):
-# each chat gets the persistent Reply Keyboard at most once per process, so
-# normal messages never re-mount it and never spam welcome/menu messages.
+# each chat gets the CURRENT persistent Reply Keyboard version at most once per
+# process, so normal messages never spam menu messages while a deployed menu
+# migration still remounts the new keyboard on the next ordinary interaction.
+
+_MENU_VERSION = "pasay_vnext_nav_006b"
 
 
-def _menu_init_chats(context) -> set:
-    return context.bot_data.setdefault("menu_init_chats", set())
+def _menu_init_chats(context) -> dict:
+    return context.bot_data.setdefault("menu_init_chats", {})
 
 
 def _mark_menu_initialized(context, chat_id) -> None:
-    _menu_init_chats(context).add(chat_id)
+    _menu_init_chats(context)[chat_id] = _MENU_VERSION
 
 
 def _is_menu_initialized(context, chat_id) -> bool:
-    return chat_id in _menu_init_chats(context)
+    return _menu_init_chats(context).get(chat_id) == _MENU_VERSION
 
 
 async def _send_persistent_menu(context, chat_id, role, locale) -> bool:
@@ -140,6 +143,20 @@ async def _send_persistent_menu(context, chat_id, role, locale) -> bool:
         reply_markup=reply_keyboard(role),
     )
     return True
+
+
+def _archive_chat_link(settings) -> str:
+    """Authoritative Telegram archive destination derived from runtime config."""
+    archive_id = str(getattr(settings, "archive_chat_id", "") or "").strip()
+    if not archive_id:
+        return ""
+    if archive_id.startswith("-100"):
+        cid = archive_id[4:]
+    elif archive_id.startswith("-"):
+        cid = archive_id[1:]
+    else:
+        cid = archive_id
+    return f"https://t.me/c/{cid}"
 
 
 def _current_month() -> str:
@@ -522,13 +539,11 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
     # PASAY-AI-EMPLOYEE-FOUNDATION-007A §A: one parallel gather (never serial
     # N+1); every read-model ack clears the spinner immediately, so the God
     # View renders as fast as the slowest single snapshot.
-    expenses, incomes, overdue, leases, units, tasks, quick_exp, quick_rent, fin = await asyncio.gather(
-        api.list_expenses(),
-        api.list_incomes(),
+    overdue, leases, units, digest, quick_exp, quick_rent, fin = await asyncio.gather(
         api.get_overdue_rents(),
         api.get_leases(),
         api.get_units(),
-        api.get_operational_tasks(status="PENDING"),
+        api.get_digest(),
         api.get_quick_expense(),
         api.get_quick_rent(),
         api.get_financial_summary(month),
@@ -542,11 +557,10 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
             # depend on backend/dashboard success (private chat only).
             await _send_persistent_menu(context, chat_id, role, locale)
         return
-    expenses_list = [] if isinstance(expenses, Exception) else expenses
     overdue_list = [] if isinstance(overdue, Exception) else overdue
     leases_list = [] if isinstance(leases, Exception) else leases
     units_list = [] if isinstance(units, Exception) else units
-    tasks_list = [] if isinstance(tasks, Exception) else tasks
+    digest_data = {} if isinstance(digest, Exception) else (digest or {})
     quick_exp_data = {} if isinstance(quick_exp, Exception) else (quick_exp or {})
     quick_rent_data = {} if isinstance(quick_rent, Exception) else (quick_rent or {})
 
@@ -571,7 +585,7 @@ async def show_home(context, chat_id, role, locale: str, message_id=None):
         expiring_count=expiring_contracts,
         vacant_count=vacant_count,
         payable_count=payable_count,
-        today_count=len(tasks_list),
+        today_count=int((digest_data.get("counts") or {}).get("act_now") or 0),
         property_total=len(units_list),
         occupied_count=occupied_count,
         locale=locale,
@@ -667,10 +681,11 @@ async def show_quick_properties(context, chat_id, role, locale: str, message_id=
         return
     rows = data if isinstance(data, list) else ((data or {}).get("properties") or [])
     text = cards.properties_quick_card(data, locale)
+    archive_link = _archive_chat_link(context.bot_data.get("settings"))
     if rows:
         await _render(
             context, chat_id, message_id, text,
-            keyboard=properties_quick_keyboard(rows, locale),
+            keyboard=properties_quick_keyboard(rows, locale, archive_link=archive_link),
         )
     else:
         await _render(
@@ -699,56 +714,15 @@ async def show_today_digest(context, chat_id, role, locale: str, message_id=None
         return
     data = data or {}
     text = cards.active_tasks_digest_card(data, locale)
-    # Same situational nav as Home: ⚠️ Today re-entry is the digest itself.
     await _render(
         context, chat_id, message_id, text,
-        keyboard=home_summary_keyboard(locale),
+        keyboard=home_keyboard(locale),
     )
 
 
 async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None):
-    """✅ Tasks Quick View (deterministic, no LLM).
-
-    When payable APPROVED expenses are present, the card attaches per-row Pay
-    buttons so the Owner can open the deterministic payment flow straight from
-    the Quick View (PASAY-V2-EXPENSE-PAYABLE-TASK-006 §4). Otherwise the card
-    carries the fixed Reply Keyboard, matching the other Quick Views."""
-    api = context.bot_data["api_client"]
-    print(f"[TRACE] quick_tasks api start role={role.value if role else None} chat_id={chat_id}", flush=True)
-    try:
-        # AI-OPS-FOUNDATION-001 §5: the Owner's Quick Tasks view is filtered
-        # to their own Needs-You queue; the Secretary sees operational tasks.
-        data = await api.get_quick_tasks(scope="owner" if role == Role.OWNER else None)
-        print(f"[TRACE] quick_tasks api OK type={type(data).__name__} "
-              f"len={len(data) if hasattr(data, '__len__') else '?'}", flush=True)
-    except PasayApiError as exc:
-        print(f"[TRACE] quick_tasks api PasayApiError {type(exc).__name__} detail={getattr(exc, 'detail', None)!r}", flush=True)
-        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
-                      error_keyboard("home", locale))
-        return
-    except Exception as exc:  # noqa: BLE001 - user-visible fallback
-        print(f"[TRACE] quick_tasks api EXC {type(exc).__name__} {exc!r}", flush=True)
-        logger.warning("quick view tasks failed: %s", exc)
-        await _render(context, chat_id, message_id, _load_error("tasks", locale),
-                      error_keyboard("home", locale))
-        return
-    text = cards.tasks_quick_card(data, locale)
-    rows = data if isinstance(data, list) else ((data or {}).get("tasks") or [])
-    has_payable = any(
-        str(r.get("kind") or "") == "payable_expense" for r in rows
-    )
-    if has_payable:
-        await _render(
-            context, chat_id, message_id, text,
-            keyboard=tasks_quick_keyboard(data, locale),
-        )
-    else:
-        await _render(
-            context, chat_id, message_id, text,
-            reply_keyboard=(reply_keyboard(role) if role else None),
-        )
-    if role:
-        _mark_menu_initialized(context, chat_id)
+    """✅ Tasks = the single digest authority (Act now / Upcoming / Done today)."""
+    await show_today_digest(context, chat_id, role, locale, message_id=message_id)
 
 
 async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):

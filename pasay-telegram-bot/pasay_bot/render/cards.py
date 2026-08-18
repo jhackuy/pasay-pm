@@ -912,12 +912,63 @@ def pending_overview_card(sections: dict, locale: str = "zh") -> str:
     return "\n\n".join(blocks)
 
 
-def payment_detail_card(income: Income, locale: str = "zh") -> str:
-    """Paid unit's payment record (B5: [💰 查看付款])."""
-    return t(
-        "rent.payment_detail_title",
-        locale,
-    ) + f"\n#{income.id} · {H.money(income.amount)}\n{H.format_date(income.received_date)} · {H.escape(income.payment_method or '-')}"
+_PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
+
+
+def _payment_status_label(status: str | None, locale: str) -> str:
+    key = str(status or "").lower()
+    zh = {"confirmed": "已确认", "pending": "待确认", "reversed": "已撤销"}
+    en = {"confirmed": "Confirmed", "pending": "Pending", "reversed": "Reversed"}
+    if locale == "zh":
+        return zh.get(key, key or "-")
+    return en.get(key, (key.replace("_", " ").title() if key else "-"))
+
+
+def _payment_purpose_label(income: Income, locale: str) -> str:
+    desc = str(getattr(income, "description", "") or "").strip()
+    match = _PERIOD_IN_DESC.search(desc)
+    if match is not None:
+        year, month = int(match.group(1)), int(match.group(2))
+        if 1 <= month <= 12:
+            return f"{year:04d}-{month:02d} Rent"
+    if desc:
+        return desc
+    return "Rent payment" if locale != "zh" else "租金"
+
+
+def _payment_method_label(method: str | None) -> str:
+    key = str(method or "").strip().lower()
+    if not key:
+        return "-"
+    return {"bank": "Bank", "gcash": "GCash", "cash": "Cash", "other": "Other"}.get(key, key.title())
+
+
+def payment_detail_card(
+    income: Income,
+    locale: str = "zh",
+    *,
+    unit_label: str = "",
+    tenant_name: str = "",
+) -> str:
+    """Paid unit's payment record with business identity, not bare record id."""
+    purpose = _payment_purpose_label(income, locale)
+    lines = [t("rent.payment_detail_title", locale)]
+    header_parts = [p for p in [unit_label.strip(), purpose] if p]
+    if header_parts:
+        lines.append(" · ".join(H.escape(p) for p in header_parts))
+    if tenant_name:
+        prefix = "Tenant" if locale != "zh" else "租客"
+        lines.append(f"{prefix}: {H.escape(tenant_name)}")
+    amount_prefix = "Amount" if locale != "zh" else "金额"
+    method_prefix = "Method" if locale != "zh" else "方式"
+    status_prefix = "Status" if locale != "zh" else "状态"
+    date_prefix = "Date" if locale != "zh" else "日期"
+    lines.append(f"{amount_prefix}: {H.money(income.amount)}")
+    lines.append(f"{method_prefix}: {H.escape(_payment_method_label(getattr(income, 'payment_method', None)))}")
+    lines.append(f"{status_prefix}: {H.escape(_payment_status_label(getattr(income, 'status', ''), locale))}")
+    lines.append(f"{date_prefix}: {H.format_date(income.received_date)}")
+    lines.append(f"#{income.id}")
+    return "\n".join(lines)
 
 
 
@@ -2211,8 +2262,8 @@ def property_archive_card(locale: str = "bi", *, link: str = "") -> str:
         f"<b>{H.escape(t('v2.property_archive', locale))}</b>",
         _bi_line(locale, en, zh),
     ]
-    if link:
-        lines.append(f'<a href="{H.escape(link)}">{H.escape(link)}</a>')
+    if not link:
+        lines.append(_bi_line(locale, "Archive link unavailable.", "Archive 链接不可用。"))
     return "\n".join(lines)
 
 

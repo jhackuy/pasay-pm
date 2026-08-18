@@ -95,8 +95,9 @@ def test_same_business_key_20_rows_so_digest_shows_one(db_session):
     db_session.commit()
 
     digest = build_digest(db_session, user, now=NOW)
-    # The one lease is overdue -> a single act_now item.
-    assert len(digest["act_now"]) == 1
+    # A human already completed today's follow-up for this lease, so that same
+    # logical action is no longer active in today's red queue.
+    assert digest["act_now"] == []
     # Despite 20 history rows for the same business key, done_today = 1.
     assert len(digest["done_today"]) == 1
     assert digest["done_today"][0]["business_dedupe_key"] \
@@ -191,6 +192,41 @@ def test_human_secretary_completed_followup_visible(db_session):
     assert digest["done_today"][0]["kind"] == "rent_followup"
 
 
+def test_followed_up_today_leases_absent_from_act_now(db_session):
+    """A rent follow-up completed today removes that same logical action from
+    today's active red queue while keeping the completion visible."""
+    user = _seed_user(db_session)
+    leases: list[Lease] = []
+    for unit_number in ("7789", "9950"):
+        unit, tenant = _seed_property_unit_tenant(db_session, unit_number=unit_number)
+        lease = _seed_lease(
+            db_session,
+            unit=unit,
+            tenant=tenant,
+            start=date(2026, 6, 1),
+            end=date(2026, 12, 31),
+            monthly="25000.00",
+            due_day=1,
+        )
+        leases.append(lease)
+        _completed_task(
+            db_session,
+            lease=lease,
+            completed_by=user,
+            completed_at=NOW,
+            dedupe_key=f"lease:{lease.id}:RENT_OVERDUE",
+        )
+    db_session.commit()
+
+    digest = build_digest(db_session, user, now=NOW)
+
+    act_units = {row["unit"] for row in digest["act_now"] if row["kind"] == "rent_overdue"}
+    done_units = {row["unit"] for row in digest["done_today"] if row["kind"] == "rent_followup"}
+    assert "7789" not in act_units
+    assert "9950" not in act_units
+    assert {"7789", "9950"}.issubset(done_units)
+
+
 def test_human_owner_payment_completed_visible(db_session):
     unit, tenant = _seed_property_unit_tenant(db_session)
     _seed_lease(db_session, unit=unit, tenant=tenant,
@@ -261,7 +297,7 @@ def test_1680_outstanding_is_true_total_arrears(db_session):
     item = red[0]
     # Only 3 periods overdue under the lease (Jun/Aug due day 1 <= Aug 20).
     assert item["unpaid_periods"] == 3
-    # True outstanding = 3 periods x 25,000 = 75,000 â€?never the bare monthly.
+    # True outstanding = 3 periods x 25,000 = 75,000 ï¿½?never the bare monthly.
     assert float(item["amount"]) == 75000.0
 
 

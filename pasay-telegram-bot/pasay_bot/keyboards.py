@@ -1650,21 +1650,15 @@ def expense_edit_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
 
 def home_summary_keyboard(locale: str = "zh") -> InlineKeyboardMarkup:
     """CONVERGENCE-003 §2.2 Home situational actions (never a second
-    navigation): ⚠️ Today + 🏢 Properties + 🔄 Refresh. The fixed Reply
+    navigation): 🏢 Properties + 🔄 Refresh. The fixed Reply
     Keyboard is the ONLY first-level navigation."""
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    t("home.today_button", locale),
-                    callback_data=encode(ACTION_HOME_NAV, "today"),
-                ),
-                InlineKeyboardButton(
                     t("home.properties_button", locale),
                     callback_data=encode(ACTION_NAV, "properties"),
                 ),
-            ],
-            [
                 InlineKeyboardButton(
                     t("home.refresh_button", locale),
                     callback_data=encode(ACTION_HOME_NAV, "refresh"),
@@ -1856,10 +1850,10 @@ def _short_unit_code(unit: str) -> str:
     return s
 
 
-def properties_quick_keyboard(rows, locale: str = "bi") -> InlineKeyboardMarkup:
+def properties_quick_keyboard(rows, locale: str = "bi", *, archive_link: str = "") -> InlineKeyboardMarkup:
     """🏠 Properties Quick View inline buttons (ZERO-LEARNING-004 §1.2): one
     SHORT ``1608`` entry per unit, two per row (fallback one per row handled
-    by Telegram), then a compact ``📄 Archive`` deep link. No ``👁`` prefix —
+    by Telegram), then a compact archive destination button. No ``👁`` prefix —
     the list above already names each unit and the tap target is obvious."""
     kb: list[list[InlineKeyboardButton]] = []
     row_batch: list[InlineKeyboardButton] = []
@@ -1876,14 +1870,15 @@ def properties_quick_keyboard(rows, locale: str = "bi") -> InlineKeyboardMarkup:
             row_batch = []
     if row_batch:
         kb.append(row_batch)
-    kb.append(
-        [
-            InlineKeyboardButton(
-                t("v2.property_archive_short", locale),
-                callback_data=encode(ACTION_PROP_ARCHIVE),
-            )
-        ]
-    )
+    if archive_link:
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    t("v2.property_archive_short", locale),
+                    url=archive_link,
+                )
+            ]
+        )
     return InlineKeyboardMarkup(kb)
 
 

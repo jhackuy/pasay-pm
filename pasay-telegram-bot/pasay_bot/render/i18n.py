@@ -542,7 +542,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.help': '直接告诉我发生了什么，或者你想查什么。\n按钮：Home · Tasks · Rent · Expense',
         # TELEGRAM-OPS-UX-CONVERGENCE-001: Quick View action labels + Remind.
         'v2.property_archive': '📄 Property Archive',
-        'v2.property_archive_short': '📄 Archive',
+        'v2.property_archive_short': '📁 Open Property Archive',
+        'v2.property_archive_open': '📁 Open Property Archive',
         'v2.rent_followup': '📞 催租',
         'v2.rent_followup_pending_short': '📞 待催',
         'v2.rent_record_payment': '💰 收租',
@@ -1173,7 +1174,8 @@ STRINGS: dict[str, dict[str, str]] = {
         'v2.help': 'Just tell me what happened or what you need.\nButtons: Home · Tasks · Rent · Expense',
         # TELEGRAM-OPS-UX-CONVERGENCE-001: Quick View action labels + Remind.
         'v2.property_archive': '📄 Property Archive',
-        'v2.property_archive_short': '📄 Archive',
+        'v2.property_archive_short': '📁 Open Property Archive',
+        'v2.property_archive_open': '📁 Open Property Archive',
         'v2.rent_followup': '📞 Follow up',
         'v2.rent_followup_pending_short': '📞 Pending',
         'v2.rent_record_payment': '💰 Collect',

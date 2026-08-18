@@ -509,6 +509,8 @@ async def _handle_nav(update, context, entity, role, locale):
     message_id = update.callback_query.message.message_id
     if entity == "properties":
         await pages.show_properties(context, chat_id, role, locale, page=1, message_id=message_id)
+    elif entity == "tasks":
+        await pages.show_today_digest(context, chat_id, role, locale, message_id=message_id)
     elif entity == "finance":
         await pages.show_finance(context, chat_id, locale, message_id=message_id)
     elif entity == "overdue":
@@ -1194,7 +1196,26 @@ async def _handle_detail(update, context, entity, ref, role, locale):
             await _edit(update, _load_error(exc.detail, locale),
                         error_keyboard("home", locale))
             return
-        await _edit(update, cards.payment_detail_card(income, locale),
+        leases, units, tenants = await asyncio.gather(
+            api.get_leases(),
+            api.get_units(),
+            api.get_tenants(),
+            return_exceptions=True,
+        )
+        lease_rows = [] if isinstance(leases, Exception) else leases
+        unit_rows = [] if isinstance(units, Exception) else units
+        tenant_rows = [] if isinstance(tenants, Exception) else tenants
+        lease = next((l for l in lease_rows if l.id == income.lease_id), None)
+        unit = next((u for u in unit_rows if lease is not None and u.id == lease.unit_id), None)
+        tenant = next((t_ for t_ in tenant_rows if lease is not None and t_.id == lease.tenant_id), None)
+        await _edit(
+                    update,
+                    cards.payment_detail_card(
+                        income,
+                        locale,
+                        unit_label=(getattr(unit, "unit_number", None) or ""),
+                        tenant_name=(getattr(tenant, "full_name", None) or ""),
+                    ),
                     home_keyboard(locale))
         return
     await _answer(update, t("common.invalid", locale))
@@ -1244,26 +1265,23 @@ async def _handle_quick_unit_view(update, context, ref, role, locale):
 
 
 async def _handle_prop_archive(update, context, role, locale):
-    """📄 Property Archive: surface the private archive channel link (index
-    stays in the group; the full archive lives in the channel)."""
+    """Backward-compatible handler for already-sent Archive callback cards."""
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
-    settings = context.bot_data["settings"]
-    archive_id = str(getattr(settings, "archive_chat_id", "") or "").strip()
-    if archive_id:
-        # -100xxx -> c/xxx ; a bare group/supergroup id also maps to c/.
-        if archive_id.startswith("-100"):
-            cid = archive_id[4:]
-        elif archive_id.startswith("-"):
-            cid = archive_id[1:]
-        else:
-            cid = archive_id
-        link = f"https://t.me/c/{cid}"
-    else:
-        link = ""
+    link = pages._archive_chat_link(context.bot_data.get("settings"))
     text = cards.property_archive_card(locale, link=link)
-    kb = home_keyboard(locale) if link else None
+    if link:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(t("v2.property_archive_open", locale), url=link)],
+                [InlineKeyboardButton(t("common.home", locale), callback_data=encode(ACTION_NAV, "home"))],
+            ]
+        )
+    else:
+        kb = home_keyboard(locale)
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,
@@ -3329,9 +3347,11 @@ async def _handle_ai_choice(update, context, entity, ref, nonce, ts, role, local
 
 
 async def _handle_home_nav(update, context, sub, role, locale):
-    """Home situational actions (CONVERGENCE-003 §2.2): ⚠️ Today opens the
-    needs-action list, 🔄 Refresh re-renders Home in place. No navigation
-    grid — the fixed Reply Keyboard is the only navigation."""
+    """Home situational actions: Refresh re-renders Home in place.
+
+    ``today`` stays as a backward-compatible callback target for already sent
+    legacy cards, but Home itself no longer renders that button.
+    """
     if not has_read_permission(role):
         await _answer(update, t("common.no_permission", locale))
         return
@@ -3341,9 +3361,6 @@ async def _handle_home_nav(update, context, sub, role, locale):
     message_id = update.callback_query.message.message_id
     chat_id = update.effective_chat.id
     if sub == "today":
-        # PASAY-AI-EMPLOYEE-FOUNDATION-007A §D: Today = the SAME digest builder
-        # + renderer as the scheduled Daily Digest (business dedup, HUMAN/SYSTEM
-        # filter, language). Never the separate quick-tasks path.
         await pages.show_today_digest(context, chat_id, role, locale, message_id=message_id)
     elif sub == "refresh":
         await pages.show_home(context, chat_id, role, locale, message_id=message_id)

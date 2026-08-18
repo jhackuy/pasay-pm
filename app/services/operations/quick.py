@@ -915,8 +915,37 @@ def _overdue_rent_digest_rows(db: Session, *, now: datetime) -> list[dict]:
         .all()
     ):
         confirmed_by_lease.setdefault(income.lease_id, []).append(income)
+    from app.services.operations.daily_dedup import philippines_local_date
+
+    ph_today = philippines_local_date(now)
+    day_start = datetime.fromisoformat(f"{ph_today}T00:00:00+08:00").astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    followed_up_today_lease_ids = {
+        lease_id
+        for lease_id, in (
+            db.query(OperationalTask.lease_id)
+            .filter(
+                OperationalTask.lease_id.in_([l.id for l in leases]),
+                OperationalTask.task_type.in_(
+                    [OperationalTaskType.RENT_OVERDUE, OperationalTaskType.FOLLOWUP]
+                ),
+                OperationalTask.status == OperationalTaskStatus.COMPLETED,
+                OperationalTask.completed_by.isnot(None),
+                OperationalTask.completed_at.isnot(None),
+                OperationalTask.completed_at >= day_start,
+                OperationalTask.completed_at < day_end,
+            )
+            .all()
+        )
+        if lease_id is not None
+    }
     rows: list[dict] = []
     for lease in leases:
+        if lease.id in followed_up_today_lease_ids:
+            # A real human already completed today's rent follow-up for this
+            # lease, so the same logical business action is not actionable
+            # again in today's red queue.
+            continue
         periods = _lease_periods(lease)
         due_periods = [(m, due) for m, due in periods if due <= today]
         if not due_periods:
