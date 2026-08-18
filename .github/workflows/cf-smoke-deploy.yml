@@ -50,8 +50,11 @@ jobs:
 
       - name: Resolve Cloudflare account id
         id: account
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           BOUND_RAW="$CLOUDFLARE_ACCOUNT_ID"
           if [ -n "$BOUND_RAW" ]; then
             CLEAN=$(printf '%s' "$BOUND_RAW" | tr -d '\r\n' | sed -E 's/^["'"'"']+|["'"'"']+$//g' | xargs)
@@ -77,14 +80,13 @@ jobs:
           fi
           echo "Discovered account_id via /accounts (len=${#ACC_ID})"
           echo "account_id=$ACC_ID" >> "$GITHUB_OUTPUT"
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Ensure workers.dev subdomain registered
         id: subdomain
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           ACC="${{ steps.account.outputs.account_id }}"
           HDR=(-H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           GET=$(curl -sS "${HDR[@]}" "https://api.cloudflare.com/client/v4/accounts/$ACC/workers/subdomain")
@@ -110,19 +112,20 @@ jobs:
           fi
           echo "Registered workers.dev subdomain (len=${#SUBDOMAIN})"
           echo "subdomain=$SUBDOMAIN" >> "$GITHUB_OUTPUT"
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
 
       - name: Dry-run compile (always)
-        run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
+        run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
 
       - name: Deploy smoke Worker (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           npx wrangler deploy -c wrangler.toml --env="" 2>&1 | tee "$GITHUB_WORKSPACE/wrangler-deploy.log"
           ACC="${{ steps.account.outputs.account_id }}"
           SUB="${{ steps.subdomain.outputs.subdomain }}"
@@ -143,14 +146,11 @@ jobs:
             echo "- Public /health endpoint: $DEPLOY_URL/health"
             echo "- Run id: $GITHUB_RUN_ID"
           } >> "$GITHUB_STEP_SUMMARY"
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ steps.account.outputs.account_id }}
 
       - name: Probe smoke endpoint
         if: github.event_name == 'workflow_dispatch' && env.DEPLOY_URL != ''
         run: |
-          set -euo pipefail
+          set -eo pipefail
           echo "Probing $DEPLOY_URL/health"
           STATUS=$(curl -s -o /tmp/health.out -w "%{http_code}" "$DEPLOY_URL/health")
           BODY=$(cat /tmp/health.out)
@@ -164,12 +164,11 @@ jobs:
 
       - name: Record deploy URL back to the repo
         if: github.event_name == 'workflow_dispatch' && success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           cd $GITHUB_WORKSPACE
-          # Persist the resolved public URL + smoke probe result so the
-          # post-run commit (and the deploy record file) carries the real
-          # subdomain value rather than the GitHub-masked '***' string.
           mkdir -p deploy-record
           cat > deploy-record/cf-smoke.json <<EOF
           {
@@ -187,10 +186,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add deploy-record/cf-smoke.json
-          # Only commit if the file actually changed.
           if git diff --cached --quiet; then
             echo "deploy-record/cf-smoke.json unchanged; skipping commit"
             exit 0
           fi
           git commit -m "ci(cf-smoke): record real-account deploy URL for run $GITHUB_RUN_ID"
-          git remote add github https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git 2>/dev/null || git remote set-url github https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git; git push github HEAD:codex/pasay-cf-env-001
+          git remote add github "https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git" 2>/dev/null || git remote set-url github "https://x-access-token:${GITHUB_TOKEN}@github.com/jhackuy/pasay-pm.git"
+          git push github HEAD:codex/pasay-cf-env-001
