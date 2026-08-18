@@ -740,6 +740,26 @@ class CopilotExecute:
 
 
 @dataclass
+class TaskFollowupDelivery:
+    task: OperationalTask
+    delivery_state: str = ""
+    detail: str = ""
+    telegram_message_id: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TaskFollowupDelivery":
+        return cls(
+            task=OperationalTask.from_dict(d.get("task") or {}),
+            delivery_state=d.get("delivery_state") or "",
+            detail=d.get("detail") or "",
+            telegram_message_id=(
+                int(d["telegram_message_id"])
+                if d.get("telegram_message_id") is not None else None
+            ),
+        )
+
+
+@dataclass
 class RepairProposal:
     """One versioned solution candidate (PENDING/APPROVED/REJECTED/SUPERSEDED).
     Fully decoupled from the Repair Operation — rejecting a proposal never
@@ -1472,6 +1492,28 @@ class PasayApiClient:
             "PATCH", f"/operations/tasks/{task_id}", json=body, timeout=15.0
         )
         return OperationalTask.from_dict(data["task"])
+
+    async def deliver_task_followup(
+        self,
+        task_id: int,
+        *,
+        assignee_user_id: int,
+        message: str,
+        reply_markup: Optional[dict] = None,
+    ) -> TaskFollowupDelivery:
+        body: dict[str, Any] = {
+            "assignee_user_id": int(assignee_user_id),
+            "message": message,
+        }
+        if reply_markup is not None:
+            body["reply_markup"] = reply_markup
+        data = await self._request(
+            "POST",
+            f"/operations/tasks/{task_id}/followup-delivery",
+            json=body,
+            timeout=30.0,
+        )
+        return TaskFollowupDelivery.from_dict(data)
 
     async def get_quick_tasks(self, scope: Optional[str] = None) -> list[dict]:
         """GET /operations/quick/tasks: deterministic active-task quick view.

@@ -16,7 +16,7 @@ import httpx
 import pytest
 from datetime import date, timedelta
 from telegram.error import BadRequest
-from telegram import Update
+from telegram import InlineKeyboardMarkup, Update
 from telegram import ReplyKeyboardMarkup
 
 TODAY = date.today().isoformat()
@@ -373,6 +373,10 @@ class FakeBackend:
         self._next_repair_id = 1000
         self._next_repair_proposal_id = 2000
         self._next_repair_action_id = 3000
+        self.followup_delivery_claimed: set[int] = set()
+        self.followup_delivery_sent: dict[int, dict] = {}
+        self.followup_delivery_failures: dict[int, int] = {}
+        self.bot = None
 
     def add_income(self, status="pending", lease_id=1, amount="55000.00",
                    received_date="2026-08-10", payment_method="Bank",
@@ -1082,6 +1086,11 @@ class FakeBackend:
                 }
             )
             return httpx.Response(200, json={"task": task, "detail": "Task updated"})
+        if path.startswith("/operations/tasks/") and path.endswith("/followup-delivery") and method == "POST":
+            task = self._ops_task(path.replace("/followup-delivery", ""))
+            if task is None:
+                return httpx.Response(404, json={"detail": "Operational task not found"})
+            return self._deliver_followup(task, body or {})
 
         # --- REPAIR-AI-EMPLOYEE-WORKFLOW-008A: Repair Operation fast path ---
         if path == "/repairs" and method == "GET":
@@ -1583,6 +1592,88 @@ class FakeBackend:
             },
         }
 
+    def _deliver_followup(self, task: dict, payload: dict):
+        task_id = int(task["id"])
+        details = dict(task.get("details") or {})
+        if details.get("assigned_to"):
+            return httpx.Response(
+                200,
+                json={
+                    "task": task,
+                    "delivery_state": "ALREADY_DELIVERED",
+                    "detail": "Follow-up already assigned",
+                    "telegram_message_id": self.followup_delivery_sent.get(task_id, {}).get("message_id"),
+                },
+            )
+        if task_id in self.followup_delivery_claimed:
+            return httpx.Response(
+                200,
+                json={
+                    "task": task,
+                    "delivery_state": "PROCESSING",
+                    "detail": "Follow-up delivery is already in progress",
+                    "telegram_message_id": None,
+                },
+            )
+        self.followup_delivery_claimed.add(task_id)
+        try:
+            remaining_failures = int(self.followup_delivery_failures.get(task_id, 0) or 0)
+            if remaining_failures <= 0:
+                remaining_failures = int(self.followup_delivery_failures.get("next", 0) or 0)
+                if remaining_failures > 0:
+                    self.followup_delivery_failures["next"] = remaining_failures - 1
+            if remaining_failures > 0:
+                if task_id in self.followup_delivery_failures:
+                    self.followup_delivery_failures[task_id] = remaining_failures - 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "task": task,
+                        "delivery_state": "FAILED",
+                        "detail": "Follow-up delivery failed",
+                        "telegram_message_id": None,
+                    },
+                )
+            delivered = self.followup_delivery_sent.get(task_id)
+            if delivered is None:
+                if self.bot is None:
+                    raise RuntimeError("FakeBackend.bot is not configured")
+                reply_markup = payload.get("reply_markup")
+                if reply_markup is not None:
+                    reply_markup = InlineKeyboardMarkup.de_json(reply_markup, self.bot)
+                message_id = len(self.bot.calls) + 1
+                self.bot.calls.append(
+                    {
+                        "type": "send_message",
+                        "chat_id": SECRETARY_ID,
+                        "text": payload.get("message"),
+                        "parse_mode": None,
+                        "reply_markup": reply_markup,
+                        "message_id": message_id,
+                    }
+                )
+                self.bot._sent_by_id[message_id] = {
+                    "chat_id": SECRETARY_ID,
+                    "reply_markup": reply_markup,
+                }
+                delivered = {"message_id": message_id}
+                self.followup_delivery_sent[task_id] = delivered
+            task["assigned_user_id"] = int(payload.get("assignee_user_id") or 0) or task.get("assigned_user_id")
+            details["assigned_to"] = int(payload.get("assignee_user_id") or 0) or details.get("assigned_to")
+            details.setdefault("assigned_at", "2026-08-20T09:00:00Z")
+            task["details"] = details
+            return httpx.Response(
+                200,
+                json={
+                    "task": task,
+                    "delivery_state": "DELIVERED",
+                    "detail": "Follow-up delivered",
+                    "telegram_message_id": delivered.get("message_id"),
+                },
+            )
+        finally:
+            self.followup_delivery_claimed.discard(task_id)
+
     # --- V1.2 ops helpers ---
     def add_ops_task(self, task_id=1, title="季度空调保养", task_type="AC_MAINTENANCE",
                      status="PENDING", due_at=None, snoozed_until=None, property_id=1,
@@ -1659,10 +1750,10 @@ def make_app(tmp_path):
     created: list[tuple[Any, Any, Any]] = []
 
     def _make(backend=None, api_key="manager-key", admin_api_key="admin-key",
-              callback_ttl=900, state_db=None, bot=None, job_api_key=""):
+              callback_ttl=900, state_db=None, bot=None, job_api_key="", store_path=None):
         backend = backend or FakeBackend()
         settings = Settings(
-            state_db=state_db or str(tmp_path / f"state_{len(created)}.db"),
+            state_db=store_path or state_db or str(tmp_path / f"state_{len(created)}.db"),
             pasay_tg_bot_token="123:TEST",
             pasay_api_base="http://test/api/v1",
             callback_ttl_seconds=callback_ttl,
@@ -1697,6 +1788,7 @@ def make_app(tmp_path):
                 transport=httpx.MockTransport(backend.handler),
             )
         bot = bot or FakeBot()
+        backend.bot = bot
         app = build_application(
             settings, api, store, bot=bot, admin_api_client=admin_api,
             job_api_client=job_api,

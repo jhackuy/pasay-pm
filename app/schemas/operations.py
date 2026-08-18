@@ -1,5 +1,6 @@
 """Pydantic schemas for the /operations router (V1.2 + V2 Foundation)."""
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -84,6 +85,21 @@ class TaskCreateIn(BaseModel):
 class TaskActionOut(BaseModel):
     task: OperationalTaskRead
     detail: str
+
+
+class TaskFollowupDeliveryIn(BaseModel):
+    """Bot-provided render payload for one rent follow-up Secretary DM."""
+
+    assignee_user_id: int
+    message: str = Field(min_length=1, max_length=10000)
+    reply_markup: dict[str, Any] | None = None
+
+
+class TaskFollowupDeliveryOut(BaseModel):
+    task: OperationalTaskRead
+    delivery_state: str
+    detail: str
+    telegram_message_id: int | None = None
 
 
 class OperationsSummary(BaseModel):
