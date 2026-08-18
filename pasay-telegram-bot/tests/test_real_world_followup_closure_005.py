@@ -23,6 +23,7 @@ from conftest import (
     make_text_update,
     run_updates,
 )
+from pasay_bot.keyboards import ACTION_RENT_QUICK_DETAIL, encode
 from pasay_bot.state.store import ph_local_date
 
 BANNED = ("💰⚠️", "📄✅", "🔧0", "👁")
@@ -76,11 +77,42 @@ class ClosureBackend(FakeBackend):
         }
 
 
+class FollowupTruthBackend(ClosureBackend):
+    def set_followup_task(
+        self,
+        *,
+        status: str,
+        assigned_to: int | None = None,
+        completed_at: str | None = None,
+        assigned_at: str | None = None,
+    ) -> None:
+        self.operational_tasks = []
+        self.quick_tasks = []
+        self.add_ops_task(
+            task_id=90,
+            title="Collect overdue rent · 1680",
+            task_type="RENT_OVERDUE",
+            status=status,
+            details={
+                "unit_number": "1680",
+                "assigned_to": assigned_to,
+                "assigned_at": assigned_at,
+                "executed_at": completed_at,
+            },
+            assigned_user_id=assigned_to,
+        )
+        self.operational_tasks[-1]["lease_id"] = 9
+        self.operational_tasks[-1]["completed_at"] = completed_at
+
+
 def _owner_open_rent_detail(env):
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     send = env.bot.last_send()
     data = _inline_data(send["reply_markup"])
-    detail_cb = next(d for d in data if d.split(":")[1] == "rnq")
+    detail_cb = next(
+        (d for d in data if d.split(":")[1] == "rnq"),
+        encode(ACTION_RENT_QUICK_DETAIL, "ovd", "1"),
+    )
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, detail_cb,
                                            message_id=send["message_id"], bot=env.bot)])
     return env.bot.edits()[-1]
@@ -216,7 +248,7 @@ def test_secretary_done_card_repeat_click_is_idempotent_not_invalid(make_app):
 
 def test_secretary_dm_snooze_and_payment_buttons_route(make_app):
     """§5/§6: ⏰ 稍后处理 opens the existing snooze preset picker; 💰 已收款
-    routes into the existing record-payment flow (never a forced PAID)."""
+    lands in one terminal payment outcome (never a second confirm UI)."""
     # 1) Snooze path (edits the DM in place).
     env = make_app(backend=ClosureBackend())
     detail = _owner_open_rent_detail(env)
@@ -237,7 +269,51 @@ def test_secretary_dm_snooze_and_payment_buttons_route(make_app):
     run_updates(env2, [make_callback_update(SECRETARY_ID, SECRETARY_ID, sfp,
                                            message_id=dm2["message_id"], bot=env2.bot)])
     after = env2.bot.edits()[-1]
-    assert "method" in after["text"].lower() or "收款" in after["text"] or "method" in str(after)
+    assert "pending confirmation" in (after["text"] or "").lower() or "待确认" in (after["text"] or "")
+    assert not any("Something went wrong" in t or "处理时出错" in t for t in _answer_texts(env2))
+
+
+def test_payment_received_callback_ack_precedes_business_completion(make_app):
+    env = make_app(backend=ClosureBackend())
+    detail = _owner_open_rent_detail(env)
+    dm = _owner_tap_followup(env, detail)
+    sfp = next(d for d in _inline_data(dm["reply_markup"]) if d.split(":")[1] == "sfp")
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, sfp,
+                                           message_id=dm["message_id"], bot=env.bot)])
+    sample = env.app.bot_data["latency"].last("callback")
+    assert sample is not None
+    assert sample["label"] == "sfp"
+    assert 0 <= sample["callback_ack_ms"] < 300
+    assert sample["callback_ack_ms"] <= sample["business_completed_ms"] <= sample["total_ms"]
+
+
+def test_payment_received_timeout_reconciles_without_generic_error(make_app):
+    backend = ClosureBackend()
+    backend.timeout_after_write_paths.add("/incomes")
+    env = make_app(backend=backend)
+    detail = _owner_open_rent_detail(env)
+    dm = _owner_tap_followup(env, detail)
+    sfp = next(d for d in _inline_data(dm["reply_markup"]) if d.split(":")[1] == "sfp")
+    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, sfp,
+                                           message_id=dm["message_id"], bot=env.bot)])
+    texts = " ".join(env.bot.all_texts())
+    assert "Something went wrong" not in texts
+    assert "处理时出错" not in texts
+    assert any(inc.get("status") == "pending" for inc in env.backend.incomes)
+
+
+def test_payment_received_duplicate_callback_is_idempotent(make_app):
+    env = make_app(backend=ClosureBackend())
+    detail = _owner_open_rent_detail(env)
+    dm = _owner_tap_followup(env, detail)
+    sfp = next(d for d in _inline_data(dm["reply_markup"]) if d.split(":")[1] == "sfp")
+    replay = make_callback_update(
+        SECRETARY_ID, SECRETARY_ID, sfp, message_id=dm["message_id"], bot=env.bot
+    )
+    run_updates(env, [replay, replay])
+    assert env.backend.count_calls("POST", "/incomes") == 1
+    assert env.backend.count_calls("POST", "/incomes/1/confirm") == 0
+    assert not any("Something went wrong" in t or "处理时出错" in t for t in _answer_texts(env))
 
 
 def test_followup_delivery_does_not_complete_business_task(make_app):
@@ -353,3 +429,72 @@ def test_followup_concurrent_duplicate_single_secretary_dm(make_app):
     assert len(sends) == 1
     task = _latest_assigned_task(env)
     assert (task.get("details") or {}).get("assigned_to") == 2
+
+
+def test_persisted_same_day_followup_mark_hides_action_everywhere(make_app):
+    env = make_app(backend=FollowupTruthBackend())
+    env.store.mark_daily(f"followup:9:{ph_local_date()}")
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    rent = env.bot.last_send()
+    assert "1680" in (rent["text"] or "")
+    assert not any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
+    detail = _owner_open_rent_detail(env)
+    assert "Followed up today" in (detail["text"] or "") or "今日已催" in (detail["text"] or "")
+    assert not any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
+
+
+def test_assigned_followup_task_hides_action(make_app):
+    backend = FollowupTruthBackend()
+    backend.set_followup_task(
+        status="PENDING",
+        assigned_to=2,
+        assigned_at="2026-08-18T09:00:00+08:00",
+    )
+    env = make_app(backend=backend)
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    rent = env.bot.last_send()
+    assert not any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
+    detail = _owner_open_rent_detail(env)
+    assert "Assigned" in (detail["text"] or "") or "已交秘书" in (detail["text"] or "")
+    assert not any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
+
+
+def test_completed_followup_today_hides_action(make_app):
+    backend = FollowupTruthBackend()
+    backend.set_followup_task(
+        status="COMPLETED",
+        completed_at="2026-08-18T10:30:00+08:00",
+    )
+    env = make_app(backend=backend)
+    detail = _owner_open_rent_detail(env)
+    assert "Followed up today" in (detail["text"] or "") or "今日已催" in (detail["text"] or "")
+    assert not any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
+
+
+def test_completed_followup_yesterday_is_actionable_again(make_app):
+    backend = FollowupTruthBackend()
+    backend.set_followup_task(
+        status="COMPLETED",
+        completed_at="2026-08-17T10:30:00+08:00",
+    )
+    env = make_app(backend=backend)
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    rent = env.bot.last_send()
+    assert any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
+    detail = _owner_open_rent_detail(env)
+    assert not ("Followed up today" in (detail["text"] or "") or "今日已催" in (detail["text"] or ""))
+    assert any(d.split(":")[1] == "rfu" for d in _inline_data(detail["reply_markup"]))
+
+
+def test_followup_snapshot_never_renders_done_label_with_action(make_app):
+    backend = FollowupTruthBackend()
+    backend.set_followup_task(
+        status="COMPLETED",
+        completed_at="2026-08-18T11:30:00+08:00",
+    )
+    env = make_app(backend=backend)
+    detail = _owner_open_rent_detail(env)
+    text = detail["text"] or ""
+    labels = _inline_labels(detail["reply_markup"])
+    assert ("Followed up today" in text or "今日已催" in text)
+    assert not any("Follow up" in (lbl or "") or "催租" in (lbl or "") for lbl in labels)

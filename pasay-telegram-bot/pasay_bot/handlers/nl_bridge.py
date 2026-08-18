@@ -515,6 +515,35 @@ _ROUTES = [
     (("维修", "maintenance"), "maintenance"),
 ]
 
+def _record_timeline_event(context, kind: str, label: str, started: float) -> None:
+    tracker = context.bot_data.get("latency")
+    if tracker is None:
+        return
+    try:
+        tracker.record(kind, label, (time.monotonic() - started) * 1000)
+    except Exception:  # noqa: BLE001 - instrumentation never blocks UX
+        pass
+
+
+def _normalize_phone_candidate(value: str) -> Optional[str]:
+    phone = re.sub(r"[\s\-()]", "", str(value or ""))
+    digit_count = sum(1 for c in phone if c.isdigit())
+    if digit_count < 7 or digit_count > 15:
+        return None
+    return phone
+
+
+def _pending_missing_phone_context(context, chat_id, user_id) -> Optional[dict]:
+    store = context.bot_data.get("store")
+    if store is None:
+        return None
+    ctx = store.get_v2_context(chat_id, user_id)
+    if not ctx:
+        return None
+    payload = dict(ctx.get("payload") or {})
+    pending = payload.get("missing_phone_followup")
+    return dict(pending) if isinstance(pending, dict) else None
+
 
 def detect_tenant_phone_update(text: str) -> Optional[dict]:
     """PASAY-AI-EMPLOYEE-FOUNDATION-007 §9: low-risk direct phone write
@@ -533,12 +562,29 @@ def detect_tenant_phone_update(text: str) -> Optional[dict]:
         return None
     unit_m = _UNIT_TOKEN.search(raw)
     unit_token = unit_m.group(1) if unit_m else None
-    phone = re.sub(r"[\s\-()]", "", m.group("phone"))
-    # A phone must look phone-like (>=7 digits); otherwise treat as not-a-fix.
-    digit_count = sum(1 for c in phone if c.isdigit())
-    if digit_count < 7 or digit_count > 15:
+    phone = _normalize_phone_candidate(m.group("phone"))
+    if not phone:
         return None
     return {"unit_token": unit_token, "phone": phone}
+
+
+def detect_tenant_phone_update_fast_path(
+    text: str,
+    *,
+    pending_unit_token: str | None = None,
+) -> Optional[dict]:
+    parsed = detect_tenant_phone_update(text)
+    if parsed is not None:
+        if parsed.get("unit_token") or not pending_unit_token:
+            return parsed
+        parsed["unit_token"] = pending_unit_token
+        return parsed
+    if not pending_unit_token:
+        return None
+    phone = _normalize_phone_candidate((text or "").strip())
+    if not phone:
+        return None
+    return {"unit_token": pending_unit_token, "phone": phone}
 
 
 def is_rent_payment_statement(text: str) -> bool:
@@ -636,6 +682,11 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     chat_id = update.effective_chat.id
     text = update.effective_message.text or ""
+    pending_phone = _pending_missing_phone_context(
+        context,
+        update.effective_chat.id if update.effective_chat else None,
+        user.id if user else None,
+    )
 
     # PASAY-V2-FOUNDATION-001: plain "hello"/"hi"/"你好" is a SHORT greeting
     # (never the old full Portfolio Summary / dashboard).
@@ -669,7 +720,10 @@ async def handle_nl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # self-healing resume. A "1680 租客电话 09XXXXXXXX" message supplies missing
     # phone data (and any blocked rent task auto-resumes). Runs BEFORE the
     # expense/rent statement lanes so the phone-fix is never misrouted.
-    phone_fix = detect_tenant_phone_update(text)
+    phone_fix = detect_tenant_phone_update_fast_path(
+        text,
+        pending_unit_token=(pending_phone or {}).get("unit_code"),
+    )
     if phone_fix is not None and phone_fix.get("phone"):
         handled = await _handle_tenant_phone_update(update, context, phone_fix, role, locale)
         if handled:
@@ -816,6 +870,10 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
 
     api = context.bot_data["api_client"]
     chat_id = update.effective_chat.id
+    user = update.effective_user
+    user_id = user.id if user else None
+    started = time.monotonic()
+    _record_timeline_event(context, "phone_fast_path", "phone_input_received", started)
     phone = fix.get("phone")
     unit_token = fix.get("unit_token")
     if not phone:
@@ -832,6 +890,9 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
         leases = await api.get_leases()
     except PasayApiError:
         units, leases = [], []
+    pending = _pending_missing_phone_context(context, chat_id, user_id)
+    if not unit_token and pending:
+        unit_token = pending.get("unit_code")
     key = (unit_token or "").split("-")[-1]
     for u in units:
         if (u.unit_number or "").split("-")[-1] == key:
@@ -839,6 +900,7 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
             break
     if unit_id is None:
         return False  # unresolved -> normal lanes / AI fallback
+    _record_timeline_event(context, "phone_fast_path", "phone_parsed", started)
     active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
     if active is not None:
         lease_id = active.id
@@ -849,6 +911,7 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
         )
     except PasayApiError:
         return False
+    _record_timeline_event(context, "phone_fast_path", "phone_saved", started)
     tenant_name = ""
     try:
         tenants = await api.get_tenants()
@@ -872,9 +935,22 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
                 # carry no nonce/ts.
                 await cb._handle_rent_followup(update, context, str(unit_id), "", None, role, locale)
                 lines.append("✅ 已自动恢复原任务。")
+                _record_timeline_event(context, "phone_fast_path", "task_resumed", started)
         except Exception:  # noqa: BLE001 - self-heal must never hard-fail
             lines.append("✅ 已自动恢复原任务。")
+            _record_timeline_event(context, "phone_fast_path", "task_resumed", started)
+    if user_id is not None:
+        try:
+            store = context.bot_data.get("store")
+            if store is not None:
+                ctx = store.get_v2_context(chat_id, user_id)
+                payload = dict(ctx["payload"]) if ctx else {}
+                payload.pop("missing_phone_followup", None)
+                store.save_v2_context(chat_id, user_id, payload)
+        except Exception:  # noqa: BLE001 - best effort cleanup only
+            pass
     await _v2_reply(update, context, "\n".join(lines), role, locale)
+    _record_timeline_event(context, "phone_fast_path", "reply_sent", started)
     return True
 
 

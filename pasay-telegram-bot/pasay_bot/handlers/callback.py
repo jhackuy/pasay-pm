@@ -28,9 +28,8 @@ from pasay_bot.api_client import (
     Income,
 )
 from pasay_bot.followup_truth import (
-    followup_assigned,
-    followup_completed_today,
-    match_followup_task,
+    FollowupSnapshot,
+    compute_followup_snapshot,
 )
 from pasay_bot.handlers import commands as pages
 from pasay_bot.handlers import expense_flow, nl_bridge, nl_queries
@@ -720,6 +719,50 @@ async def _begin_rent_entry(update, context, unit_id: int, role, locale):
     await _render_confirm_from_payload(update, context, payload, role, locale)
 
 
+def _record_timeline_event(context, kind: str, label: str, started: float) -> None:
+    tracker = context.bot_data.get("latency")
+    if tracker is None:
+        return
+    try:
+        tracker.record(kind, label, (time.monotonic() - started) * 1000)
+    except Exception:  # noqa: BLE001 - instrumentation never breaks UX
+        pass
+
+
+async def _build_rent_shortcut_payload(context, unit_id: int, user_id: int):
+    """Build the deterministic rent-payment payload used by both UI shortcuts
+    and the normal confirmation flow."""
+    api = context.bot_data["api_client"]
+    store = context.bot_data["store"]
+    unit, properties, leases, incomes = await asyncio.gather(
+        api.get_unit(unit_id),
+        api.get_properties(),
+        api.get_leases(),
+        api.list_incomes(),
+    )
+    prop = next((p for p in properties if p.id == unit.property_id), None)
+    lease = next(
+        (l for l in leases if l.unit_id == unit.id and l.status == "active"), None
+    )
+    if lease is None:
+        return None, None, None
+    month = _current_month()
+    covered = pages._period_covered(incomes, lease.id, month)
+    payload = {
+        "unit_id": unit.id,
+        "lease_id": lease.id,
+        "property_id": unit.property_id,
+        "property_name": prop.name if prop else "?",
+        "unit_number": unit.unit_number,
+        "monthly_rent": str(lease.monthly_rent),
+        "amount": str(lease.monthly_rent),
+        "received_date": date.today().isoformat(),
+        "period": month,
+        "method": store.get_user_default_method(user_id),
+    }
+    return payload, covered, lease
+
+
 async def _render_confirm_from_payload(update, context, payload, role, locale):
     """Render the final confirmation card onto the current message (B4)."""
     store = context.bot_data["store"]
@@ -1253,22 +1296,24 @@ async def _handle_rent_quick_detail(update, context, ref, role, locale):
     row = overdue[index - 1]
     unit_code = str(row.get("unit") or row.get("unit_code") or "")
     unit_id = await _resolve_unit_id(update, context, unit_code)
-    followup_assigned = False
-    followed_up_today = False
+    snapshot = None
     if unit_id:
-        followed_up_today = await _followup_completed_today_for_unit(
-            api, context.bot_data.get("store"), unit_id, unit_code
+        snapshot = await _followup_snapshot_for_unit(
+            api,
+            context.bot_data.get("store"),
+            unit_id,
+            unit_code,
+            last_followup_at=row.get("last_followup_at"),
         )
-        followup_assigned = await _followup_assigned_for_unit(api, unit_id, unit_code)
     text = await _render_rent_detail_text(
-        api, unit_code, unit_id, row, locale, assume_assigned=followup_assigned
+        api, unit_code, unit_id, row, locale, snapshot=snapshot
     )
     kb = (
         rent_detail_keyboard(
             unit_id,
             locale,
-            followed_up_today=followed_up_today,
-            followup_assigned=followup_assigned,
+            followed_up_today=bool(snapshot and snapshot.followed_up_today),
+            followup_assigned=bool(snapshot and snapshot.assigned),
         )
         if unit_id
         else home_keyboard(locale)
@@ -1310,7 +1355,7 @@ async def _render_rent_detail_text(
     row,
     locale,
     *,
-    assume_assigned: bool = False,
+    snapshot: FollowupSnapshot | None = None,
 ) -> str:
     """Rent detail text from the quick-rent row + per-unit page data (tenant,
     outstanding, unpaid periods, overdue days, last follow-up).
@@ -1319,7 +1364,7 @@ async def _render_rent_detail_text(
     (``unpaid_periods`` = the SAME len(overdue) the RENT_OVERDUE task generator
     uses) — the renderer never computes its own arrears fact, so Tasks and
     Rent detail can never disagree (3 periods / 1 period bug)."""
-    last_followup = ""
+    last_followup = snapshot.last_followup_at if snapshot is not None else ""
     tenant_name = ""
     vacant = False
     if unit_id:
@@ -1355,16 +1400,14 @@ async def _render_rent_detail_text(
         except Exception:  # noqa: BLE001 - never crash the detail card
             unpaid_periods = 0
     raw_followup = row.get("last_followup_at")
-    if raw_followup:
+    if raw_followup and not last_followup:
         try:
             last_followup = str(raw_followup)[:16].replace("T", " ")
         except Exception:  # noqa: BLE001
             last_followup = str(raw_followup)[:16]
     followup_status = ""
-    if not vacant:
-        followup_status = await _followup_status_for_unit(
-            api, unit_id, unit_code, locale, assume_assigned=assume_assigned
-        )
+    if not vacant and snapshot is not None:
+        followup_status = _followup_status_text(snapshot, locale)
     return cards.rent_detail_card(
         unit_label=unit_code,
         locale=locale,
@@ -1378,42 +1421,48 @@ async def _render_rent_detail_text(
     )
 
 
-async def _followup_status_for_unit(api, unit_id, unit_code, locale, *, assume_assigned: bool = False):
-    """Resolve the real-world follow-up state for a unit's Rent detail card
-    (§7): ``🟡 已交秘书跟进`` when a follow-up task is assigned to the Secretary,
-    ``✅ 今日已催`` when already executed, else empty (🔴 pending)."""
-    task = await _followup_task_for_unit(api, unit_id, unit_code)
-    if task is not None:
-        details = task.details or {}
-        if str(task.status or "").upper() == "COMPLETED":
-            return cards.followup_status_text(details, locale, executed_daily=True)
-        if followup_assigned(task):
-            return cards.followup_status_text(details, locale)
-    if assume_assigned:
+def _followup_status_text(snapshot: FollowupSnapshot, locale: str) -> str:
+    if snapshot.followed_up_today:
+        return cards.followup_status_text({}, locale, executed_daily=True)
+    if snapshot.assigned:
         return cards.followup_status_text({"assigned_to": True}, locale)
     return ""
 
 
-async def _followup_task_for_unit(api, unit_id, unit_code):
+async def _followup_snapshot_for_unit(
+    api,
+    store,
+    unit_id,
+    unit_code,
+    *,
+    last_followup_at: str | None = None,
+) -> FollowupSnapshot:
     try:
         tasks, leases = await asyncio.gather(
             api.get_operational_tasks(),
             api.get_leases(),
         )
     except PasayApiError:
-        return None
-    return match_followup_task(tasks, leases, unit_id, unit_code)
+        tasks, leases = [], []
+    return compute_followup_snapshot(
+        tasks,
+        leases,
+        store,
+        unit_id,
+        unit_code,
+        last_followup_at=last_followup_at,
+    )
 
 
 async def _followup_assigned_for_unit(api, unit_id, unit_code) -> bool:
     """Truth-only assigned flag for the Rent detail keyboard (never by text)."""
-    task = await _followup_task_for_unit(api, unit_id, unit_code)
-    return followup_assigned(task)
+    snapshot = await _followup_snapshot_for_unit(api, None, unit_id, unit_code)
+    return snapshot.assigned
 
 
 async def _followup_completed_today_for_unit(api, store, unit_id, unit_code) -> bool:
-    task = await _followup_task_for_unit(api, unit_id, unit_code)
-    return followup_completed_today(task, store, unit_id)
+    snapshot = await _followup_snapshot_for_unit(api, store, unit_id, unit_code)
+    return snapshot.followed_up_today
 
 
 def _v2_context_followup_message_id(store, chat_id, user_id, unit_id: int) -> int | None:
@@ -1445,14 +1494,6 @@ async def _render_rent_detail_in_place(
     """Edit-first render of the Rent detail card (callback + self-heal)."""
     unit = await api.get_unit(unit_id)
     unit_code = unit.unit_number
-    resolved_followed_up_today = bool(
-        followed_up_today or await _followup_completed_today_for_unit(api, store, unit_id, unit_code)
-    )
-    followup_assigned = (
-        False
-        if resolved_followed_up_today
-        else bool(assume_assigned or await _followup_assigned_for_unit(api, unit_id, unit_code))
-    )
     row = {"amount": None, "overdue_days": 0}
     try:
         rent_data = await api.get_quick_rent()
@@ -1465,14 +1506,37 @@ async def _render_rent_detail_in_place(
             row = found
     except PasayApiError:
         pass
+    snapshot = await _followup_snapshot_for_unit(
+        api,
+        store,
+        unit_id,
+        unit_code,
+        last_followup_at=row.get("last_followup_at"),
+    )
+    if followed_up_today and not snapshot.followed_up_today:
+        snapshot = FollowupSnapshot(
+            status="followed_up_today",
+            actionable=False,
+            reason="forced_followed_up_today",
+            task_id=snapshot.task_id,
+            last_followup_at=snapshot.last_followup_at,
+        )
+    elif assume_assigned and snapshot.actionable:
+        snapshot = FollowupSnapshot(
+            status="assigned",
+            actionable=False,
+            reason="forced_assigned",
+            task_id=snapshot.task_id,
+            last_followup_at=snapshot.last_followup_at,
+        )
     text = await _render_rent_detail_text(
-        api, unit_code, unit_id, row, locale, assume_assigned=followup_assigned
+        api, unit_code, unit_id, row, locale, snapshot=snapshot
     )
     kb = rent_detail_keyboard(
         unit_id,
         locale,
-        followed_up_today=resolved_followed_up_today,
-        followup_assigned=followup_assigned,
+        followed_up_today=snapshot.followed_up_today,
+        followup_assigned=snapshot.assigned,
     )
     await edit_message_text_or_send(
         bot,
@@ -1583,6 +1647,30 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
     except PasayApiError:
         tenants = []
     tenant = next((tn for tn in tenants if tn.id == getattr(active, "tenant_id", None)), None) if active else None
+    overdue_ctx = await _load_rent_followup_ctx(api, unit_code)
+    snapshot = await _followup_snapshot_for_unit(
+        api,
+        store,
+        unit_id,
+        unit_code,
+        last_followup_at=overdue_ctx.get("last_followup"),
+    )
+    if not snapshot.actionable:
+        text_key = "v2.followup_already_today" if snapshot.followed_up_today else "v2.followup_already_assigned"
+        await _answer(update, t(text_key, locale), durable=True)
+        if chat_id is not None and message_id is not None:
+            await _render_rent_detail_in_place(
+                update.get_bot(),
+                api,
+                store,
+                chat_id=chat_id,
+                message_id=message_id,
+                unit_id=unit_id,
+                locale=locale,
+            )
+        if guard is not None and snapshot.assigned:
+            guard.settle(key, {"unit_id": unit_id, "task_id": snapshot.task_id}, resource=str(unit_id))
+        return
 
     # PASAY-AI-EMPLOYEE-FOUNDATION-007 §12: never hand a collection job to the
     # Secretary without real execution materials. If the tenant phone is
@@ -1613,7 +1701,6 @@ async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
                 guard.fail(key, resource=str(unit_id))
             return
 
-    overdue_ctx = await _load_rent_followup_ctx(api, unit_code)
     # 2) confirm the follow-up task exists (dedupe with the auto RENT_OVERDUE
     #    of the same lease so the board never holds two copies of one item).
     try:
@@ -1731,6 +1818,19 @@ async def _block_followup_on_missing_phone(
     )
     # Leave a blocked marker on the active rent task for the resolver, so the
     # moment the phone is supplied the follow-up auto-resumes.
+    try:
+        store = context.bot_data["store"]
+        user = update.effective_user
+        if update.effective_chat is not None and user is not None:
+            ctx = store.get_v2_context(update.effective_chat.id, user.id)
+            payload = dict(ctx["payload"]) if ctx else {}
+            payload["missing_phone_followup"] = {
+                "unit_id": getattr(unit, "id", None),
+                "unit_code": unit_code,
+            }
+            store.save_v2_context(update.effective_chat.id, user.id, payload)
+    except Exception:  # noqa: BLE001 - best-effort only
+        pass
     try:
         leases = await api.get_leases()
         active = next((l for l in leases if l.unit_id == unit.id and l.status == "active"), None)
@@ -1997,10 +2097,140 @@ async def _handle_sec_followup_payment(update, context, ref, nonce, ts, role, lo
     if nonce and _expired(ts, settings):
         await _answer(update, t("common.expired", locale), durable=True)
         return
-    await _ack_fast(update, locale)
     unit_id = int(ref)
-    # Reuse the existing record-payment entry point (ACTION_RENT -> _handle_rent).
-    await _handle_rent(update, context, "go", str(unit_id), role, locale)
+    user = update.effective_user
+    user_id = user.id if user else 0
+    started = time.monotonic()
+    _record_timeline_event(context, "payment_callback", "callback_received", started)
+    guard = context.bot_data["idempotency"]
+    payload = shortcut_key = None
+    try:
+        payload, covered, lease = await _build_rent_shortcut_payload(context, unit_id, user_id)
+    except PasayApiError as exc:
+        await _ack_fast(update, locale)
+        _record_timeline_event(context, "payment_callback", "callback_acked", started)
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+        return
+    if payload is None or lease is None:
+        await _ack_fast(update, locale)
+        _record_timeline_event(context, "payment_callback", "callback_acked", started)
+        await _answer(update, t("rent.no_active_lease", locale), durable=True)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+        return
+    shortcut_key = f"ik:sfp:{lease.id}:{payload['period']}"
+    status = guard.acquire(shortcut_key, kind="rent_payment_shortcut", resource=str(unit_id))
+    if status == "done":
+        result = guard.result(shortcut_key) or {}
+        current = Income.from_dict(result) if isinstance(result, dict) and result.get("id") else None
+        await _ack_fast(update, locale)
+        _record_timeline_event(context, "payment_callback", "callback_acked", started)
+        if current is not None:
+            await _render_income_state(update, context, current, role, locale)
+        else:
+            await _edit(update, t("unit.payment_paid", locale))
+        _mark_business_completed()
+        _record_timeline_event(context, "payment_callback", "payment_operation_result", started)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+        return
+    if status == "in_flight":
+        await _answer(update, t("common.processing", locale), durable=True)
+        return
+    await _ack_fast(update, locale)
+    _record_timeline_event(context, "payment_callback", "callback_acked", started)
+    try:
+        await _edit(update, H.escape(t("common.working", locale)))
+    except Exception:  # noqa: BLE001 - best-effort visual progress only
+        pass
+    _record_timeline_event(context, "payment_callback", "payment_operation_started", started)
+    if covered:
+        guard.settle(shortcut_key, {"status": "confirmed"}, resource=str(unit_id))
+        await _edit(update, t("unit.payment_paid", locale))
+        _mark_business_completed()
+        _record_timeline_event(context, "payment_callback", "payment_operation_result", started)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+        return
+    api = context.bot_data["api_client"]
+    can_confirm = has_permission(role, PERMISSION_RENT_CONFIRM)
+    income = None
+    try:
+        matched = await api.find_income(
+            lease_id=payload.get("lease_id"),
+            amount=payload.get("amount"),
+            received_date=payload.get("received_date"),
+            payment_method=payload.get("method"),
+            idempotency_key=shortcut_key,
+        )
+        if matched is not None:
+            if matched.status == "pending" and can_confirm:
+                confirmed = await api.confirm_income(matched.id)
+                guard.settle(shortcut_key, confirmed.as_dict(), resource=str(matched.id))
+                await _render_done_card(update, context, confirmed, payload, role, locale)
+            elif matched.status == "pending":
+                guard.settle(shortcut_key, matched.as_dict(), resource=str(matched.id))
+                await _render_pending_card(update, context, matched, payload, role, locale)
+            else:
+                guard.settle(shortcut_key, matched.as_dict(), resource=str(matched.id))
+                await _render_done_card(update, context, matched, payload, role, locale)
+            _mark_business_completed()
+            _record_timeline_event(context, "payment_callback", "payment_operation_result", started)
+            _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+            return
+        income = await api.create_income(
+            lease_id=payload.get("lease_id"),
+            amount=payload.get("amount"),
+            received_date=payload.get("received_date"),
+            payment_method=payload.get("method"),
+            description=f"rent {payload.get('period')}",
+            idempotency_key=shortcut_key,
+        )
+        if can_confirm:
+            confirmed = await api.confirm_income(income.id)
+            guard.settle(shortcut_key, confirmed.as_dict(), resource=str(income.id))
+            await _render_done_card(update, context, confirmed, payload, role, locale)
+        else:
+            guard.settle(shortcut_key, income.as_dict(), resource=str(income.id))
+            await _render_pending_card(update, context, income, payload, role, locale)
+        _mark_business_completed()
+        _record_timeline_event(context, "payment_callback", "payment_operation_result", started)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+    except PasayApiConflictError:
+        current = await api.find_income(
+            lease_id=payload.get("lease_id"),
+            amount=payload.get("amount"),
+            received_date=payload.get("received_date"),
+            payment_method=payload.get("method"),
+            idempotency_key=shortcut_key,
+        )
+        if current is None:
+            guard.fail(shortcut_key, resource=str(unit_id))
+            await _answer(update, t("common.error", locale, detail="conflict"), durable=True)
+            _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+            return
+        guard.settle(shortcut_key, current.as_dict(), resource=str(current.id))
+        await _render_done_card(update, context, current, payload, role, locale)
+        _mark_business_completed()
+        _record_timeline_event(context, "payment_callback", "payment_operation_result", started)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+    except PasayApiTimeoutError:
+        if income is not None:
+            await _reconcile_after_timeout(
+                update, context, shortcut_key, income.id, payload, role, locale
+            )
+        else:
+            await _reconcile_create_after_timeout(
+                update, context, shortcut_key, payload, role, locale
+            )
+        _record_timeline_event(context, "payment_callback", "payment_operation_result", started)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+    except PasayApiPermissionError:
+        guard.fail(shortcut_key, resource=str(unit_id))
+        await _answer(update, t("common.no_permission", locale), durable=True)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
+    except PasayApiError as exc:
+        guard.fail(shortcut_key, resource=str(unit_id))
+        await _answer(update, f"⚠️ {H.escape(str(exc.detail) or '')}", durable=True)
+        _record_timeline_event(context, "payment_callback", "ui_terminal_result", started)
 
 
 async def _handle_sec_followup_snooze(update, context, ref, nonce, ts, role, locale):

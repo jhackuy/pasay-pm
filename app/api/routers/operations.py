@@ -763,25 +763,31 @@ def deliver_task_followup(
         raise HTTPException(status.HTTP_409_CONFLICT, "Assignee has no Telegram destination")
     dedupe_key = _rent_followup_dedupe_key(task.id, recipient)
     outbox = _load_outbox_by_dedupe(db, dedupe_key)
+    followup_payload = {
+        "task_id": task.id,
+        "task_type": task.task_type.value,
+        "title": task.title,
+        "due_at": task.due_at.isoformat(),
+        "message": payload.message,
+        "reply_markup": payload.reply_markup,
+    }
     if outbox is None:
         enqueue_notification(
             db,
             task_id=task.id,
             channel=NOTIFY_CHANNEL_TELEGRAM,
             recipient=recipient,
-            payload={
-                "task_id": task.id,
-                "task_type": task.task_type.value,
-                "title": task.title,
-                "due_at": task.due_at.isoformat(),
-                "message": payload.message,
-                "reply_markup": payload.reply_markup,
-            },
+            payload=followup_payload,
             dedupe_key=dedupe_key,
         )
         db.commit()
         outbox = _load_outbox_by_dedupe(db, dedupe_key)
     else:
+        outbox.recipient = recipient
+        outbox.payload = followup_payload
+        outbox.updated_by = user.id
+        outbox.updated_at = now
+        db.add(outbox)
         db.commit()
     if outbox is None:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Follow-up delivery outbox missing")

@@ -2095,9 +2095,10 @@ def secretary_followup_card(
             lines.append(H.escape(unit_label))
         lines.append(H.escape(t("v2.sec_dm_already_today", locale)))
         return "\n".join(lines)
-    title = H.escape(t("v2.sec_dm_title", locale,
-                       unit=H.escape(unit_label) if unit_label else ""))
-    lines = [f"🔴 <b>{title}</b>", ""]
+    title = H.escape(t("v2.sec_dm_title", locale))
+    lines = [f"🔔 <b>{title}</b>", ""]
+    if unit_label:
+        lines.append(H.escape(t("v2.sec_dm_unit", locale, unit=H.escape(unit_label))))
     if tenant_name:
         lines.append(H.escape(t("v2.sec_dm_tenant", locale, tenant=H.escape(tenant_name))))
     if tenant_phone:
@@ -2113,6 +2114,7 @@ def secretary_followup_card(
     else:
         lines.append(H.escape(t("v2.sec_dm_last_none", locale)))
     lines.append("")
+    lines.append(H.escape(t("v2.sec_dm_next_action", locale)))
     lines.append(H.escape(t("v2.sec_dm_body", locale)))
     if outstanding is not None and _dec(outstanding) > 0:
         lines.append(H.escape(t("v2.sec_dm_redirect_payment", locale)))
