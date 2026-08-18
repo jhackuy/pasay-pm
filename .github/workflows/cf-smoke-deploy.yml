@@ -29,19 +29,21 @@ jobs:
   smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: cf-smoke
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install Wrangler
         run: npm install --no-save wrangler@^4.123.0
-        working-directory: cf-smoke
 
       - name: Dry-run compile (always)
-        run: npx wrangler deploy -c cf-smoke/wrangler.toml --dry-run --env=""
+        run: npx wrangler deploy -c wrangler.toml --dry-run --env=""
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -50,8 +52,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
-          cd cf-smoke
-          npx wrangler deploy -c cf-smoke/wrangler.toml --env="" 2>&1 | tee "$GITHUB_WORKSPACE/wrangler-deploy.log"
+          npx wrangler deploy -c wrangler.toml --env="" 2>&1 | tee "$GITHUB_WORKSPACE/wrangler-deploy.log"
           DEPLOY_URL=$(grep -E '^[[:space:]]+https://[a-z0-9-]+\.workers\.dev' "$GITHUB_WORKSPACE/wrangler-deploy.log" | tail -1 | tr -d '[:space:]')
           if [ -z "$DEPLOY_URL" ]; then
             echo "::error::could not parse deployed URL from wrangler output"
