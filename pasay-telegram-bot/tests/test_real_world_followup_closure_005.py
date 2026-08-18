@@ -103,9 +103,12 @@ def test_owner_followup_dms_secretary_and_secretary_confirms(make_app):
     assert any(d.split(":")[1] == "sfc" for d in dm_data)   # ✅ 已联系租客
     assert any(d.split(":")[1] == "sfp" for d in dm_data)   # 💰 已收款
     assert any(d.split(":")[1] == "sfs" for d in dm_data)   # ⏰ 稍后处理
-    # The group card is 🟡 (assigned), not ✅, and the button is not flipped.
+    # The group card is 🟡 (assigned), not ✅, and the button is flipped to the
+    # assigned state (so it doesn't look pending/executable).
     group_after = env.bot.edits()[-1]
     assert "已交秘书" in group_after["text"] or "Assigned" in group_after["text"]
+    labels = _inline_labels(group_after["reply_markup"])
+    assert any("已交秘书" in (lbl or "") or "Assigned" in (lbl or "") for lbl in labels)
 
     # Secretary taps ✅ 已联系租客 (private chat).
     sfc = next(d for d in dm_data if d.split(":")[1] == "sfc")
@@ -123,6 +126,28 @@ def test_owner_followup_dms_secretary_and_secretary_confirms(make_app):
             or "Already recorded today" in (last_edit["text"] or "")
             or "已联系" in (last_edit["text"] or "")
             or "今日已催" in (last_edit["text"] or ""))
+
+
+def test_owner_followup_second_click_no_second_dm(make_app):
+    """PASAY-VNEXT-FOLLOWUP-FEEDBACK-005A: re-tapping Follow Up must be
+    idempotent: no second Secretary DM, and the user gets a clear
+    already-assigned toast + the card stays in assigned state."""
+    env = make_app(backend=ClosureBackend())
+    detail = _owner_open_rent_detail(env)
+    dm = _owner_tap_followup(env, detail)
+    sends = [c for c in env.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends) == 1
+    # After the first assign, the group card was edited in place; tap the
+    # follow-up button again from the latest markup.
+    group_after = env.bot.edits()[-1]
+    follow_cb = next(d for d in _inline_data(group_after["reply_markup"]) if d.split(":")[1] == "rfu")
+    run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, follow_cb,
+                                           message_id=group_after["message_id"], update_id=99, bot=env.bot)])
+    sends2 = [c for c in env.bot.calls if c.get("type") == "send_message" and c.get("chat_id") == SECRETARY_ID]
+    assert len(sends2) == 1  # still only one real DM
+    # The already-assigned feedback must be visible.
+    acks = [c for c in env.bot.calls if c.get("type") == "answer_callback_query"]
+    assert any("Already assigned" in (a.get("text") or "") or "无需重复" in (a.get("text") or "") for a in acks)
 
 
 def test_secretary_dm_contact_same_day_no_second_followup(make_app):
@@ -152,23 +177,24 @@ def test_secretary_dm_contact_same_day_no_second_followup(make_app):
 def test_secretary_dm_snooze_and_payment_buttons_route(make_app):
     """§5/§6: ⏰ 稍后处理 opens the existing snooze preset picker; 💰 已收款
     routes into the existing record-payment flow (never a forced PAID)."""
+    # 1) Snooze path (edits the DM in place).
     env = make_app(backend=ClosureBackend())
     detail = _owner_open_rent_detail(env)
     dm = _owner_tap_followup(env, detail)
     dm_data = _inline_data(dm["reply_markup"])
-    # ⏰ 稍后处理
     sfs = next(d for d in dm_data if d.split(":")[1] == "sfs")
     run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, sfs,
                                            message_id=dm["message_id"], bot=env.bot)])
     snooze_picker = env.bot.edits()[-1]
     assert any(c.split(":")[1] == "tsp" for c in _inline_data(snooze_picker["reply_markup"]))
-    # 💰 已收款 -> routes to the deterministic record-payment flow via the
-    # ACTION_RENT "go" handler. Re-open a fresh follow-up and tap 💰 已收款.
-    detail2 = _owner_open_rent_detail(env)
-    dm3 = _owner_tap_followup(env, detail2)
-    sfp = next(d for d in _inline_data(dm3["reply_markup"]) if d.split(":")[1] == "sfp")
-    run_updates(env, [make_callback_update(SECRETARY_ID, SECRETARY_ID, sfp,
-                                           message_id=dm3["message_id"], bot=env.bot)])
-    # The record-payment flow shows the pay-method selector (existing path).
-    after = env.bot.edits()[-1]
+
+    # 2) Payment path (fresh env so follow-up idempotency does not suppress a
+    # second DM in the same test).
+    env2 = make_app(backend=ClosureBackend())
+    detail2 = _owner_open_rent_detail(env2)
+    dm2 = _owner_tap_followup(env2, detail2)
+    sfp = next(d for d in _inline_data(dm2["reply_markup"]) if d.split(":")[1] == "sfp")
+    run_updates(env2, [make_callback_update(SECRETARY_ID, SECRETARY_ID, sfp,
+                                           message_id=dm2["message_id"], bot=env2.bot)])
+    after = env2.bot.edits()[-1]
     assert "method" in after["text"].lower() or "收款" in after["text"] or "method" in str(after)

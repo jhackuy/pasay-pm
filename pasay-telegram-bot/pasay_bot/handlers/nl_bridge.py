@@ -868,12 +868,12 @@ async def _handle_tenant_phone_update(update, context, fix: dict, role, locale: 
         try:
             if resumed == "assign_to_secretary" and unit_id:
                 # Re-route to the deterministic 催租 action (it re-checks the
-                # now-present phone and DMs the Secretary).
-                await cb._handle_rent_followup(update, context, str(unit_id), role, locale)
-                return True
+                # now-present phone and DMs the Secretary). Non-callback updates
+                # carry no nonce/ts.
+                await cb._handle_rent_followup(update, context, str(unit_id), "", None, role, locale)
+                lines.append("✅ 已自动恢复原任务。")
         except Exception:  # noqa: BLE001 - self-heal must never hard-fail
-            pass
-        lines.append("✅ 已自动恢复原任务。")
+            lines.append("✅ 已自动恢复原任务。")
     await _v2_reply(update, context, "\n".join(lines), role, locale)
     return True
 

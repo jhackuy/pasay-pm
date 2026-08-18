@@ -93,6 +93,19 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
   message_id   TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (expense_id, date)
 );
+-- PASAY-VNEXT-FOLLOWUP-FEEDBACK-005A: delivery-truth record for rent follow-up
+-- assignment DM to the Secretary. This is NOT domain completion, but it is
+-- the non-repeatable proof that the bot already delivered the notification.
+-- Stored as Telegram message_id so we don't rely on message text.
+CREATE TABLE IF NOT EXISTS followup_deliveries (
+  task_id      TEXT PRIMARY KEY,
+  unit_id      TEXT NOT NULL DEFAULT '',
+  date         TEXT NOT NULL DEFAULT '',
+  target_user  TEXT NOT NULL DEFAULT '',
+  destination  TEXT NOT NULL DEFAULT '',
+  sent_at      TEXT NOT NULL,
+  message_id   TEXT NOT NULL DEFAULT ''
+);
 """
 
 DEFAULT_CONVERSATION_TTL = 900        # 15 minutes
@@ -368,6 +381,64 @@ class StateStore:
             return None
         return {
             "expense_id": row["expense_id"],
+            "date": row["date"],
+            "target_user": row["target_user"],
+            "destination": row["destination"],
+            "sent_at": row["sent_at"],
+            "message_id": row["message_id"],
+        }
+
+    def record_followup_delivery(
+        self,
+        task_id: Any,
+        *,
+        unit_id: Any = "",
+        date: str = "",
+        target_user: str = "",
+        destination: str = "",
+        message_id: str = "",
+    ) -> bool:
+        """Persist a CONFIRMED rent follow-up DM delivery for a task id.
+
+        True = first successful delivery for this task; later attempts return
+        False (idempotent non-repeatability). Only call this AFTER
+        ``send_message`` returned a confirmed message_id.
+        """
+        now = datetime.now(PH_TZ).astimezone(PH_TZ).isoformat()
+        with self._lock:
+            try:
+                self._conn.execute(
+                    "INSERT INTO followup_deliveries "
+                    "(task_id, unit_id, date, target_user, destination, sent_at, message_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        str(task_id),
+                        str(unit_id or ""),
+                        str(date or ""),
+                        str(target_user or ""),
+                        str(destination or ""),
+                        str(now),
+                        str(message_id or ""),
+                    ),
+                )
+                self._conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def get_followup_delivery(self, task_id: Any) -> Optional[dict]:
+        """Return the persisted follow-up delivery record or None."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_id, unit_id, date, target_user, destination, sent_at, message_id "
+                "FROM followup_deliveries WHERE task_id=?",
+                (str(task_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "task_id": row["task_id"],
+            "unit_id": row["unit_id"],
             "date": row["date"],
             "target_user": row["target_user"],
             "destination": row["destination"],

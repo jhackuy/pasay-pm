@@ -1905,20 +1905,46 @@ def rent_quick_keyboard(overdue_rows, locale: str = "bi") -> InlineKeyboardMarku
     return InlineKeyboardMarkup(kb)
 
 
-def rent_detail_keyboard(unit_id: int, locale: str = "bi", *, followed_up_today: bool = False) -> InlineKeyboardMarkup:
+def rent_detail_keyboard(
+    unit_id: int,
+    locale: str = "bi",
+    *,
+    followed_up_today: bool = False,
+    followup_assigned: bool = False,
+    nonce: str = "",
+    ts: Optional[int] = None,
+) -> InlineKeyboardMarkup:
     """💰 Rent detail card actions: follow up + record payment + history. The
     record-payment button routes into the existing deterministic rent-collect
     path; follow-up prefers an existing task (dedupe) over a duplicate.
 
     CONVERGENCE-003 §5.2: after a successful same-day follow-up the Follow-up
     button flips to the short state ``✅ Followed up`` (still tappable ->
-    'already followed up today' toast)."""
+    'already followed up today' toast).
+
+    PASAY-VNEXT-FOLLOWUP-FEEDBACK-005A: after a successful assign-to-Secretary
+    delivery, the button flips to an "assigned" state so it does not look like
+    it is still pending; re-tapping stays idempotent (never sends a second DM).
+    """
+    if not nonce:
+        nonce = new_nonce()
+    if ts is None:
+        ts = now_ts()
     kb: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                t("v2.rent_followed_short", locale) if followed_up_today
-                else t("v2.rent_followup", locale),
-                callback_data=encode(ACTION_RENT_FOLLOWUP, "r", str(unit_id)),
+                (
+                    t("v2.rent_followed_short", locale)
+                    if followed_up_today
+                    else (
+                        t("v2.followup_assigned_to", locale)
+                        if followup_assigned
+                        else t("v2.rent_followup", locale)
+                    )
+                ),
+                callback_data=encode(
+                    ACTION_RENT_FOLLOWUP, "r", str(unit_id), nonce=nonce, ts=ts
+                ),
             ),
             InlineKeyboardButton(
                 t("v2.rent_record_payment", locale),

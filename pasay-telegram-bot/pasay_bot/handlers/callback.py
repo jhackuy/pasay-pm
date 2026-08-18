@@ -444,7 +444,7 @@ async def _dispatch_callback(
     elif action == ACTION_RENT_QUICK_DETAIL:
         await _handle_rent_quick_detail(update, context, ref, role, locale)
     elif action == ACTION_RENT_FOLLOWUP:
-        await _handle_rent_followup(update, context, ref, role, locale)
+        await _handle_rent_followup(update, context, ref, nonce, ts, role, locale)
     elif action == ACTION_REMIND_OWNER:
         await _handle_remind_owner(update, context, ref, nonce, ts, role, locale)
     elif action == ACTION_SEC_FOLLOWUP_CONTACT:
@@ -1235,8 +1235,17 @@ async def _handle_rent_quick_detail(update, context, ref, role, locale):
     row = overdue[index - 1]
     unit_code = str(row.get("unit") or row.get("unit_code") or "")
     unit_id = await _resolve_unit_id(update, context, unit_code)
-    text = await _render_rent_detail_text(api, unit_code, unit_id, row, locale)
-    kb = rent_detail_keyboard(unit_id, locale) if unit_id else home_keyboard(locale)
+    followup_assigned = False
+    if unit_id:
+        followup_assigned = await _followup_assigned_for_unit(api, unit_id, unit_code)
+    text = await _render_rent_detail_text(
+        api, unit_code, unit_id, row, locale, assume_assigned=followup_assigned
+    )
+    kb = (
+        rent_detail_keyboard(unit_id, locale, followup_assigned=followup_assigned)
+        if unit_id
+        else home_keyboard(locale)
+    )
     await edit_message_text_or_send(
         update.get_bot(),
         chat_id=update.effective_chat.id,
@@ -1267,7 +1276,15 @@ async def _resolve_unit_id(update, context, unit_code: str):
     return None
 
 
-async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
+async def _render_rent_detail_text(
+    api,
+    unit_code,
+    unit_id,
+    row,
+    locale,
+    *,
+    assume_assigned: bool = False,
+) -> str:
     """Rent detail text from the quick-rent row + per-unit page data (tenant,
     outstanding, unpaid periods, overdue days, last follow-up).
 
@@ -1318,7 +1335,9 @@ async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
             last_followup = str(raw_followup)[:16]
     followup_status = ""
     if not vacant:
-        followup_status = await _followup_status_for_unit(api, unit_id, unit_code, locale)
+        followup_status = await _followup_status_for_unit(
+            api, unit_id, unit_code, locale, assume_assigned=assume_assigned
+        )
     return cards.rent_detail_card(
         unit_label=unit_code,
         locale=locale,
@@ -1332,14 +1351,14 @@ async def _render_rent_detail_text(api, unit_code, unit_id, row, locale) -> str:
     )
 
 
-async def _followup_status_for_unit(api, unit_id, unit_code, locale):
+async def _followup_status_for_unit(api, unit_id, unit_code, locale, *, assume_assigned: bool = False):
     """Resolve the real-world follow-up state for a unit's Rent detail card
     (§7): ``🟡 已交秘书跟进`` when a follow-up task is assigned to the Secretary,
     ``✅ 今日已催`` when already executed, else empty (🔴 pending)."""
     try:
         tasks = await api.get_operational_tasks()
     except PasayApiError:
-        return ""
+        tasks = []
     lease_id = None
     try:
         leases = await api.get_leases()
@@ -1362,10 +1381,107 @@ async def _followup_status_for_unit(api, unit_id, unit_code, locale):
             return cards.followup_status_text(details, locale, executed_daily=True)
         if details.get("assigned_to"):
             return cards.followup_status_text(details, locale)
+    if assume_assigned:
+        return cards.followup_status_text({"assigned_to": True}, locale)
     return ""
 
 
-async def _handle_rent_followup(update, context, ref, role, locale):
+async def _followup_assigned_for_unit(api, unit_id, unit_code) -> bool:
+    """Truth-only assigned flag for the Rent detail keyboard (never by text)."""
+    try:
+        tasks = await api.get_operational_tasks()
+    except PasayApiError:
+        return False
+    lease_id = None
+    try:
+        leases = await api.get_leases()
+        active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
+        if active is not None:
+            lease_id = active.id
+    except PasayApiError:
+        lease_id = None
+    unit_key = str(unit_code).split("-")[-1]
+    for t_ in tasks:
+        if str(t_.task_type or "").upper() not in ("RENT_OVERDUE", "FOLLOWUP"):
+            continue
+        details = t_.details or {}
+        if lease_id is not None and t_.lease_id != lease_id:
+            if str(details.get("unit_number") or "").split("-")[-1] != unit_key:
+                continue
+        elif lease_id is None and str(details.get("unit_number") or "").split("-")[-1] != unit_key:
+            continue
+        if str(t_.status or "").upper() == "COMPLETED":
+            return False
+        return bool(details.get("assigned_to"))
+    return False
+
+
+def _v2_context_followup_message_id(store, chat_id, user_id, unit_id: int) -> int | None:
+    """Best-effort message_id to refresh for a rent follow-up self-heal."""
+    try:
+        ctx = store.get_v2_context(chat_id, user_id)
+        payload = dict(ctx["payload"]) if ctx else {}
+        hint = payload.get("rent_followup_ui") or {}
+        if int(hint.get("unit_id") or 0) != int(unit_id):
+            return None
+        mid = hint.get("message_id")
+        return int(mid) if mid is not None else None
+    except Exception:  # noqa: BLE001 - best-effort only
+        return None
+
+
+async def _render_rent_detail_in_place(
+    bot,
+    api,
+    store,
+    *,
+    chat_id: int,
+    message_id: int,
+    unit_id: int,
+    locale: str,
+    followed_up_today: bool = False,
+    assume_assigned: bool = False,
+):
+    """Edit-first render of the Rent detail card (callback + self-heal)."""
+    unit = await api.get_unit(unit_id)
+    unit_code = unit.unit_number
+    followup_assigned = (
+        False
+        if followed_up_today
+        else bool(assume_assigned or await _followup_assigned_for_unit(api, unit_id, unit_code))
+    )
+    row = {"amount": None, "overdue_days": 0}
+    try:
+        rent_data = await api.get_quick_rent()
+        found = next(
+            (r for r in (rent_data.get("overdue") or [])
+             if str(r.get("unit") or r.get("unit_code") or "") == unit_code),
+            None,
+        )
+        if found is not None:
+            row = found
+    except PasayApiError:
+        pass
+    text = await _render_rent_detail_text(
+        api, unit_code, unit_id, row, locale, assume_assigned=followup_assigned
+    )
+    kb = rent_detail_keyboard(
+        unit_id,
+        locale,
+        followed_up_today=followed_up_today,
+        followup_assigned=followup_assigned,
+    )
+    await edit_message_text_or_send(
+        bot,
+        chat_id=chat_id,
+        message_id=message_id,
+        text=H.truncate(text),
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
+
+
+async def _handle_rent_followup(update, context, ref, nonce, ts, role, locale):
     """📞 催租 — TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2/§8/§9.
 
     A tap only ASSIGNS the collection to the Secretary; it never marks it done.
@@ -1383,7 +1499,7 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     is created.
     """
     if not has_permission(role, PERMISSION_OPERATIONS):
-        await _answer(update, t("common.no_permission", locale))
+        await _answer(update, t("common.no_permission", locale), durable=True)
         return
     if not ref.isdigit():
         await _answer(update, t("common.invalid", locale))
@@ -1392,12 +1508,37 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     api = context.bot_data["api_client"]
     store = context.bot_data["store"]
     from pasay_bot.state.store import ph_local_date
+    guard = context.bot_data.get("idempotency")
+    user_id = update.effective_user.id if update.effective_user else None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    message_id = None
+    if update.callback_query is not None:
+        message_id = update.callback_query.message.message_id
+    elif chat_id is not None and user_id is not None:
+        message_id = _v2_context_followup_message_id(store, chat_id, user_id, unit_id)
+
+    key = f"ik:rfu:{unit_id}:{nonce or '0'}"
 
     # Same-day EXECUTED dedup: the rent was already actually followed-up.
     if await _followed_up_today(context, unit_id):
         await _answer(update, t("v2.followup_already_today", locale), durable=True)
-        await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=True)
+        if chat_id is not None and message_id is not None:
+            await _render_rent_detail_in_place(
+                update.get_bot(),
+                api,
+                store,
+                chat_id=chat_id,
+                message_id=message_id,
+                unit_id=unit_id,
+                locale=locale,
+                followed_up_today=True,
+            )
         return
+    if guard is not None:
+        status = guard.acquire(key, kind="rent_followup", resource=str(unit_id))
+        if status == "in_flight":
+            await _answer(update, t("common.processing", locale), durable=True)
+            return
     # 1) resolve the unit + real overdue context.
     try:
         units = await api.get_units()
@@ -1431,11 +1572,23 @@ async def _handle_rent_followup(update, context, ref, role, locale):
         available_phone = (tenant.phone or "").strip() or (tenant.secondary_phone or "").strip()
         contact_status = (tenant.contact_status or "").strip()
     if not available_phone or contact_status == "WRONG_NUMBER":
+        # Persist the in-place message target so a later phone fix (text) can
+        # refresh the original actionable card.
+        try:
+            if chat_id is not None and user_id is not None and message_id is not None:
+                ctx = store.get_v2_context(chat_id, user_id)
+                payload = dict(ctx["payload"]) if ctx else {}
+                payload["rent_followup_ui"] = {"unit_id": unit_id, "message_id": message_id}
+                store.save_v2_context(chat_id, user_id, payload)
+        except Exception:  # noqa: BLE001 - best-effort only
+            pass
         blocked = await _block_followup_on_missing_phone(
             context, tenant, unit, unit_code, available_phone, contact_status,
             update, role, locale,
         )
         if blocked:
+            if guard is not None:
+                guard.fail(key, resource=str(unit_id))
             return
 
     overdue_ctx = await _load_rent_followup_ctx(api, unit_code)
@@ -1448,6 +1601,26 @@ async def _handle_rent_followup(update, context, ref, role, locale):
         return
     if task is None:
         await _answer(update, t("common.unexpected", locale), durable=True)
+        if guard is not None:
+            guard.fail(key, resource=str(unit_id))
+        return
+    already_assigned = bool((getattr(task, "details", None) or {}).get("assigned_to"))
+    already_delivered = bool(store.get_followup_delivery(task.id))
+    if already_assigned or already_delivered:
+        await _answer(update, t("v2.followup_already_assigned", locale), durable=True)
+        if chat_id is not None and message_id is not None:
+            await _render_rent_detail_in_place(
+                update.get_bot(),
+                api,
+                store,
+                chat_id=chat_id,
+                message_id=message_id,
+                unit_id=unit_id,
+                locale=locale,
+                assume_assigned=True,
+            )
+        if guard is not None:
+            guard.settle(key, {"unit_id": unit_id, "task_id": task.id}, resource=str(unit_id))
         return
     # 3) resolve the REAL Secretary DM target (fail closed, §9).
     try:
@@ -1456,6 +1629,8 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     except (PasayApiError, TypeError, ValueError):
         logger.warning("rent followup secretary target resolution failed unit=%s", unit_id)
         await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
+        if guard is not None:
+            guard.fail(key, resource=str(unit_id))
         return
     # 4) build + send the Secretary DM card (§3).
     dm_text = cards.secretary_followup_card(
@@ -1470,13 +1645,28 @@ async def _handle_rent_followup(update, context, ref, role, locale):
     )
     dm_kb = secretary_followup_keyboard(task.id, unit_id, locale_for(Role.SECRETARY))
     try:
-        await update.get_bot().send_message(
+        dm_msg = await update.get_bot().send_message(
             sec_chat_id_int, H.truncate(dm_text), parse_mode=HTML, reply_markup=dm_kb,
         )
     except Exception as exc:  # noqa: BLE001 - any delivery failure is real
         logger.warning("rent followup DM to secretary %s failed: %s", sec_chat_id, exc)
         await _answer(update, t("v2.followup_cannot_notify_toast", locale), durable=True)
+        if guard is not None:
+            guard.fail(key, resource=str(unit_id))
         return
+    # Delivery truth: record the proven Telegram message_id so re-clicks never
+    # re-send, even if the backend assignment write later fails.
+    try:
+        store.record_followup_delivery(
+            task.id,
+            unit_id=unit_id,
+            date=ph_local_date(),
+            target_user=str(_sec_principal or ""),
+            destination=str(sec_chat_id_int),
+            message_id=str(getattr(dm_msg, "message_id", "") or ""),
+        )
+    except Exception:  # noqa: BLE001 - delivery truth is best-effort
+        pass
     # 5) DM succeeded -> record the assignment (only now does it become 🟡).
     try:
         await _mark_rent_followup_assigned(api, task, sec_principal_id=_sec_principal)
@@ -1486,7 +1676,19 @@ async def _handle_rent_followup(update, context, ref, role, locale):
         pass
     await _answer(update, t("v2.followup_assigned_toast", locale))
     # Re-render the group Rent detail card in place as 🟡 (NOT executed).
-    await _reopen_rent_detail(update, context, unit_id, locale, followed_up_today=False)
+    if chat_id is not None and message_id is not None:
+        await _render_rent_detail_in_place(
+            update.get_bot(),
+            api,
+            store,
+            chat_id=chat_id,
+            message_id=message_id,
+            unit_id=unit_id,
+            locale=locale,
+            assume_assigned=True,
+        )
+    if guard is not None:
+        guard.settle(key, {"unit_id": unit_id, "task_id": task.id}, resource=str(unit_id))
 
 
 async def _block_followup_on_missing_phone(
@@ -1549,10 +1751,27 @@ async def _block_followup_on_missing_phone(
     except PasayApiError:
         pass  # the warning message still delivers even if the marker fails
     if update.effective_chat:
-        await update.effective_chat.send_message(
-            H.truncate(text), parse_mode=HTML,
-            reply_markup=home_keyboard(locale_for_chat(update.effective_chat.type, client_role)),
-        )
+        kb = home_keyboard(locale_for_chat(update.effective_chat.type, client_role))
+        # Refresh the original actionable card in place when possible, so the
+        # Follow-up button does not keep looking executable while blocked.
+        if update.callback_query is not None:
+            try:
+                await edit_message_text_or_send(
+                    update.get_bot(),
+                    chat_id=update.effective_chat.id,
+                    message_id=update.callback_query.message.message_id,
+                    text=H.truncate(text),
+                    parse_mode=HTML,
+                    reply_markup=kb,
+                )
+            except Exception:  # noqa: BLE001
+                await update.effective_chat.send_message(
+                    H.truncate(text), parse_mode=HTML, reply_markup=kb
+                )
+        else:
+            await update.effective_chat.send_message(
+                H.truncate(text), parse_mode=HTML, reply_markup=kb
+            )
     else:
         await _answer(update, H.escape("缺少租客电话"), durable=True)
     return True
@@ -1934,38 +2153,16 @@ async def _handle_sec_followup_wrong_number(update, context, ref, nonce, ts, rol
 async def _reopen_rent_detail(update, context, unit_id, locale, followed_up_today: bool = False):
     try:
         api = context.bot_data["api_client"]
-        unit = await api.get_unit(unit_id)
-        leases = await api.get_leases()
-        tenants = await api.get_tenants()
-        active = next((l for l in leases if l.unit_id == unit_id and l.status == "active"), None)
-        tenant_name = ""
-        if active is not None and unit.status != "vacant":
-            tenant = next((tn for tn in tenants if tn.id == active.tenant_id), None)
-            tenant_name = tenant.full_name if tenant else ""
-        unit_code = unit.unit_number
-        row = {"amount": None, "overdue_days": 0}
-        try:
-            rent_data = await api.get_quick_rent()
-            found = next(
-                (r for r in (rent_data.get("overdue") or [])
-                 if str(r.get("unit") or r.get("unit_code") or "") == unit_code),
-                None,
-            )
-            if found is not None:
-                row = found
-        except PasayApiError:
-            pass
-        text = await _render_rent_detail_text(
-            api, unit_code, unit_id, row, locale
-        )
-        kb = rent_detail_keyboard(unit_id, locale, followed_up_today=followed_up_today)
-        await edit_message_text_or_send(
+        store = context.bot_data["store"]
+        await _render_rent_detail_in_place(
             update.get_bot(),
+            api,
+            store,
             chat_id=update.effective_chat.id,
             message_id=update.callback_query.message.message_id,
-            text=H.truncate(text),
-            parse_mode=HTML,
-            reply_markup=kb,
+            unit_id=int(unit_id),
+            locale=locale,
+            followed_up_today=followed_up_today,
         )
     except Exception:
         pass  # best-effort; the toast already reported the outcome
