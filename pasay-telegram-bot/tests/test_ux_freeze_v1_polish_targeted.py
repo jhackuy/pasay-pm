@@ -87,7 +87,7 @@ def test_owner_fixed_menu_is_3x2():
         "✅ 待办",
         "💰 租金",
         "💸 支出",
-        "☰ 更多",
+        "📁 档案",
     ]
 
 
@@ -101,7 +101,7 @@ def test_secretary_fixed_menu_is_3x2():
         "✅ Tasks",
         "💰 Rent",
         "💸 Expense",
-        "☰ More",
+        "📁 Archive",
     ]
 
 
@@ -134,11 +134,13 @@ def test_deterministic_menu_routing_is_unchanged():
         "💰 Rent": "rent",
         "💸 支出": "expense",
         "💸 Expense": "expense",
-        "☰ 更多": "more",
-        "☰ More": "more",
+        "📁 档案": "archive",
+        "📁 Archive": "archive",
         "🏠 Properties": "properties",
         "💰 收租": "rent",
-        "更多": "more",
+        "☰ 更多": "archive",
+        "☰ More": "archive",
+        "更多": "archive",
     }
     for label, route in expected.items():
         assert fixed_menu_route_for(label) == route

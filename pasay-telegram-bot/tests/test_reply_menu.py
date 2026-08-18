@@ -1,7 +1,8 @@
 """Persistent Reply Keyboard menu tests.
 
-UX Freeze v1 pins one deterministic 4-button IA for both roles. Position and
-semantics stay fixed; only the role language changes.
+UX Freeze v1 pins one deterministic 6-button IA. Private chats keep role
+language; fixed-menu taps render page content with inline keyboards while the
+persistent reply keyboard stays pinned below the input.
 """
 from __future__ import annotations
 
@@ -25,8 +26,8 @@ def _has_reply_keyboard(sends):
     return any(_markup_name(send) == "ReplyKeyboardMarkup" for send in sends)
 
 
-OWNER_LABELS = ["\U0001f3e0 首页", "\u2705 待办", "\U0001f4b0 租金", "\U0001f4b8 支出"]
-SECRETARY_LABELS = ["\U0001f3e0 Home", "\u2705 Tasks", "\U0001f4b0 Rent", "\U0001f4b8 Expense"]
+OWNER_LABELS = ["\U0001f3e0 首页", "\U0001f3d8 房源", "\u2705 待办", "\U0001f4b0 租金", "\U0001f4b8 支出", "\U0001f4c1 档案"]
+SECRETARY_LABELS = ["\U0001f3e0 Home", "\U0001f3d8 Properties", "\u2705 Tasks", "\U0001f4b0 Rent", "\U0001f4b8 Expense", "\U0001f4c1 Archive"]
 
 
 # --- keyboard structure: identical for both roles --------------------------
@@ -61,7 +62,7 @@ def test_home_button_routes_to_home_overview(make_app, user_id, marker):
     run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
     send = env.bot.last_send()
     assert marker in send["text"]
-    assert _markup_name(send) == "ReplyKeyboardMarkup"
+    assert _markup_name(send) == "InlineKeyboardMarkup"
 
 
 def test_legacy_properties_button_still_routes_to_properties(make_app):

@@ -389,7 +389,6 @@ def test_followup_assigned_hides_quick_rent_action_on_rerender(make_app):
     _owner_tap_followup(env, detail)
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", update_id=55, bot=env.bot)])
     rent = env.bot.last_send()
-    assert "1680" in (rent["text"] or "")
     label = _label_for_unit(rent["reply_markup"], "1680")
     assert label
     assert "Assigned" in label or "已交秘书" in label
@@ -445,7 +444,6 @@ def test_followup_restart_persistence_no_second_dm(make_app, tmp_path):
     assert len(sends2) == 0
     run_updates(env2, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", update_id=66, bot=env2.bot)])
     rent = env2.bot.last_send()
-    assert "1680" in (rent["text"] or "")
     assert not any(("1680" in (lbl or "")) and ("Follow up" in (lbl or "") or "催租" in (lbl or "")) for lbl in _inline_labels(rent["reply_markup"]))
     acks = env2.bot.answers()
     assert (
@@ -481,7 +479,6 @@ def test_persisted_same_day_followup_mark_hides_action_everywhere(make_app):
     env.store.mark_daily(f"followup:9:{ph_local_date()}")
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     rent = env.bot.last_send()
-    assert "1680" in (rent["text"] or "")
     label = _label_for_unit(rent["reply_markup"], "1680")
     assert label
     assert "Followed up" in label or "今日已催" in label
@@ -514,7 +511,7 @@ def test_completed_followup_today_hides_action(make_app):
     backend = FollowupTruthBackend()
     backend.set_followup_task(
         status="COMPLETED",
-        completed_at="2026-08-18T10:30:00+08:00",
+        completed_at=f"{ph_local_date()}T10:30:00+08:00",
     )
     env = make_app(backend=backend)
     detail = _owner_open_rent_detail(env)
@@ -543,7 +540,7 @@ def test_followup_snapshot_never_renders_done_label_with_action(make_app):
     backend = FollowupTruthBackend()
     backend.set_followup_task(
         status="COMPLETED",
-        completed_at="2026-08-18T11:30:00+08:00",
+        completed_at=f"{ph_local_date()}T11:30:00+08:00",
     )
     env = make_app(backend=backend)
     detail = _owner_open_rent_detail(env)
@@ -558,7 +555,6 @@ def test_last_followup_today_keeps_quick_navigation_but_hides_followup_action(ma
     env = make_app(backend=FollowupLastTodayBackend())
     run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
     rent = env.bot.last_send()
-    assert "7789" in (rent["text"] or "")
     quick_label = _label_for_unit(rent["reply_markup"], "7789")
     assert quick_label
     assert "160,000" in quick_label
@@ -575,8 +571,8 @@ def test_last_followup_today_keeps_quick_navigation_but_hides_followup_action(ma
     assert "7789" in detail_text
     assert "Followed up today" in detail_text or "今日已催" in detail_text
     assert "160,000" in detail_text
-    assert "Last follow-up: 2026-08-18 18:40" in detail_text or "最近催租：2026-08-18 18:40" in detail_text
+    assert "Followed up today · 18:40" in detail_text or "今日已催 · 18:40" in detail_text
     detail_data = _inline_data(detail["reply_markup"])
     assert not any(d.split(":")[1] == "rfu" for d in detail_data)
-    assert any("Collect" in (lbl or "") or "收租" in (lbl or "") for lbl in _inline_labels(detail["reply_markup"]))
+    assert any("Record payment" in (lbl or "") or "登记付款" in (lbl or "") for lbl in _inline_labels(detail["reply_markup"]))
     assert any("History" in (lbl or "") or "记录" in (lbl or "") for lbl in _inline_labels(detail["reply_markup"]))

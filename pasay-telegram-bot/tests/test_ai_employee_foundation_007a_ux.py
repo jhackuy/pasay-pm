@@ -4,10 +4,9 @@ Pins:
 - A) deterministic buttons are fast-path (empty ACK, no "处理中" toast for fast
   nav/detail; the phase profile is recorded: callback_ack_ms / backend_fetch_ms
   / render_ms / telegram_edit_ms / total_ms).
-- B) HOME = global Operations Overview, BACK = business parent. Property /
-  Rent / Expense detail cards carry ``◀ <parent> | 🏠 Home``.
-- C) Global Home title: Owner zh ``运营总览``, Secretary en ``Pasay Operations``,
-  ``Pasay Property`` is gone; Home stays separate from Properties.
+- B) HOME is the compact command center; detail cards use back-only inline nav
+  because the fixed Reply Keyboard owns global navigation.
+- C) Home stays separate from Properties and uses the frozen summary layout.
 - D) ⚠️ Today uses the SAME digest builder + renderer as the scheduled job
   (get_digest + active_tasks_digest_card), never the quick-tasks path.
 """
@@ -47,7 +46,7 @@ def _home_edit(env):
 def test_global_home_title_owner_zh_operations_overview(make_app):
     env = make_app()
     edit = _home_edit(env)
-    assert "运营总览" in edit["text"]
+    assert "🏠 首页" in edit["text"]
     assert "Pasay Property" not in edit["text"]
 
 
@@ -55,20 +54,21 @@ def test_home_shows_collection_and_property_summary(make_app):
     env = make_app()
     edit = _home_edit(env)
     text = edit["text"]
-    assert "本月应收" in text or "Expected" in text
+    assert "应收" in text or "Expected" in text
     assert "收缴率" in text or "Collection rate" in text
-    assert "历史累计欠租" in text or "Total arrears" in text
-    assert "总房源" in text or "Total units" in text
+    assert "历史欠租" in text or "Historical arrears" in text
+    assert "套" in text or "units" in text
     assert "已出租" in text or "Occupied" in text
 
 
 def test_global_home_separate_from_properties(make_app):
-    """Home still carries the situational ⚠️ Today / 🔄 Refresh actions and is
-    a God View - it never merges into the Properties index."""
+    """Home keeps only situational summary actions and stays separate from Properties."""
     env = make_app()
     edit = _home_edit(env)
     labels = _labels(edit["reply_markup"])
-    assert "⚠️ Today" in labels and "🏢 Properties" in labels and "🔄 Refresh" in labels
+    assert "⚠️ Today" not in labels
+    assert ("🏢 房源" in labels or "🏢 Units" in labels)
+    assert "🔄 Refresh" in labels
 
 
 def test_home_properties_child_navigation(make_app):
@@ -78,7 +78,7 @@ def test_home_properties_child_navigation(make_app):
     run_updates(env, [make_callback_update(OWNER_ID, OWNER_ID, props_cb,
                                            message_id=edit["message_id"], bot=env.bot)])
     text = env.bot.edits()[-1]["text"]
-    assert "Property Overview" in text or "房源概况" in text
+    assert "🏢 房源" in text or "🏢 Units" in text
 
 
 # --- B) Back semantics (back = parent, home = global) -----------------
@@ -107,21 +107,21 @@ def test_property_quick_unit_view_back_and_home(make_app):
 
 
 def test_rent_detail_back_rent_and_home(make_app):
-    """Rent detail: ◀ 租金 | 🏠 Home."""
+    """Rent detail uses a back-only inline row; Home stays on the fixed menu."""
     from pasay_bot.keyboards import rent_detail_keyboard
     kb = rent_detail_keyboard(123, "zh")
     labels = _labels(kb)
     assert any("◀ 租金" in l for l in labels)
-    assert any("🏠 Home" in l for l in labels)
+    assert not any("🏠 Home" in l for l in labels)
 
 
 def test_expense_detail_back_expense_and_home(make_app):
-    """Expense detail: ◀ 支出 | 🏠 Home."""
+    """Expense detail uses a back-only inline row; Home stays on the fixed menu."""
     from pasay_bot.keyboards import expense_open_keyboard
     kb = expense_open_keyboard(7, status="approved", locale="zh")
     labels = _labels(kb)
     assert any("◀ 支出" in l for l in labels)
-    assert any("🏠 Home" in l for l in labels)
+    assert not any("🏠 Home" in l for l in labels)
 
 
 # --- D) Today uses the SAME digest builder+renderer --------------------

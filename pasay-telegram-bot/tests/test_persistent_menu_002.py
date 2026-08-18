@@ -25,10 +25,9 @@ from conftest import (
 
 GROUP_CHAT_ID = -1001234567890
 
-# one identical 4-button English menu for every role
-# (Home / Tasks / Rent / Expense), is_persistent=True.
-OWNER_LABELS = ["🏠 Home", "✅ Tasks", "💰 Rent", "💸 Expense"]
-SECRETARY_LABELS = OWNER_LABELS
+# Private chats keep role language; group chats pin one shared English 3x2 menu.
+OWNER_LABELS = ["🏠 首页", "🏘 房源", "✅ 待办", "💰 租金", "💸 支出", "📁 档案"]
+SECRETARY_LABELS = ["🏠 Home", "🏘 Properties", "✅ Tasks", "💰 Rent", "💸 Expense", "📁 Archive"]
 
 FORBIDDEN_PROMPTS = (
     "请输入 /start", "请输入/start", "type /start", "send /start",
@@ -197,7 +196,7 @@ def test_message_menu_init_independent_of_dashboard_failure(make_app):
     assert any("Hello" in (s["text"] or "") for s in env.bot.sends())
 
 
-# --- Owner / Secretary share the BOT-V1 menu --------------------------------
+# --- Owner / Secretary keep role-language menus ------------------------------
 
 def test_owner_and_secretary_share_bot_v1_menu(make_app):
     env = make_app()
@@ -214,7 +213,6 @@ def test_owner_and_secretary_share_bot_v1_menu(make_app):
     assert len(reply_sends) == 2
     assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
     assert _labels(reply_sends[1]["reply_markup"]) == SECRETARY_LABELS
-    # Identical V2 English Quick View menu for both roles.
     assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
     assert _labels(reply_sends[1]["reply_markup"]) == SECRETARY_LABELS
 
@@ -228,8 +226,8 @@ def test_new_member_unknown_gets_neutral_welcome_only(make_app):
     assert len(sends) == 1
     text = sends[0]["text"]
     assert "Welcome" in text and "欢迎" in text
-    # V2: the neutral fixed keyboard is attached (same menu for every role).
-    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
+    # Groups always pin the neutral English 3x2 menu.
+    assert _labels(sends[0]["reply_markup"]) == SECRETARY_LABELS
     _assert_no_start_prompt(text)
 
 
@@ -241,7 +239,7 @@ def test_new_member_identified_gets_neutral_welcome_no_role_menu(make_app):
     text = sends[0]["text"]
     assert "Welcome" in text and "欢迎" in text
     # Same neutral fixed menu as every other group member (no role leak).
-    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
+    assert _labels(sends[0]["reply_markup"]) == SECRETARY_LABELS
     for label in OWNER_LABELS:
         assert label not in text
     _assert_no_start_prompt(text)
@@ -253,7 +251,7 @@ def test_new_member_join_dedupes_multi_member_event(make_app):
     sends = env.bot.sends()
     assert len(sends) == 1  # one welcome per join event, no per-member spam
     assert "Welcome" in sends[0]["text"] and "欢迎" in sends[0]["text"]
-    assert _labels(sends[0]["reply_markup"]) == OWNER_LABELS
+    assert _labels(sends[0]["reply_markup"]) == SECRETARY_LABELS
 
 
 def test_group_text_message_self_heals_neutral_menu(make_app):
@@ -266,5 +264,5 @@ def test_group_text_message_self_heals_neutral_menu(make_app):
     )
     reply_sends = _reply_sends(env)
     assert len(reply_sends) == 1
-    assert _labels(reply_sends[0]["reply_markup"]) == OWNER_LABELS
+    assert _labels(reply_sends[0]["reply_markup"]) == SECRETARY_LABELS
     assert "menu.ready" not in "\n".join(env.bot.all_texts())

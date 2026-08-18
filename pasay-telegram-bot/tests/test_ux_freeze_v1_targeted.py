@@ -1,7 +1,7 @@
 """Pasay Telegram UX Freeze v1 targeted checks.
 
 Focused pins for this slice only:
-- frozen 4-button IA with role-language split;
+- frozen 6-button IA with role-language split;
 - Home / Tasks / Rent / Expense / Units rendering convergence;
 - Payments vs Activity separation;
 - detail keyboards remove inline Home;
@@ -87,20 +87,22 @@ def _expense_row(expense_id=7, amount="7000.00", purpose="Repair"):
 
 
 def test_owner_reply_keyboard_freeze_labels():
-    assert _labels(reply_keyboard(Role.OWNER)) == ["🏠 首页", "✅ 待办", "💰 租金", "💸 支出"]
+    assert _labels(reply_keyboard(Role.OWNER)) == ["🏠 首页", "🏘 房源", "✅ 待办", "💰 租金", "💸 支出", "📁 档案"]
 
 
 def test_secretary_reply_keyboard_freeze_labels():
-    assert _labels(reply_keyboard(Role.SECRETARY)) == ["🏠 Home", "✅ Tasks", "💰 Rent", "💸 Expense"]
+    assert _labels(reply_keyboard(Role.SECRETARY)) == ["🏠 Home", "🏘 Properties", "✅ Tasks", "💰 Rent", "💸 Expense", "📁 Archive"]
 
 
 @pytest.mark.parametrize(
     ("label", "route"),
     [
         ("🏠 首页", "home"),
+        ("🏘 房源", "properties"),
         ("✅ 待办", "tasks"),
         ("💰 租金", "rent"),
         ("💸 支出", "expense"),
+        ("📁 档案", "archive"),
     ],
 )
 def test_owner_fixed_menu_routes_are_frozen(label, route):
@@ -111,9 +113,11 @@ def test_owner_fixed_menu_routes_are_frozen(label, route):
     ("label", "route"),
     [
         ("🏠 Home", "home"),
+        ("🏘 Properties", "properties"),
         ("✅ Tasks", "tasks"),
         ("💰 Rent", "rent"),
         ("💸 Expense", "expense"),
+        ("📁 Archive", "archive"),
     ],
 )
 def test_secretary_fixed_menu_routes_are_frozen(label, route):
@@ -123,7 +127,8 @@ def test_secretary_fixed_menu_routes_are_frozen(label, route):
 def test_group_menu_ia_does_not_expose_properties():
     owner_labels = _labels(reply_keyboard(Role.OWNER))
     secretary_labels = _labels(reply_keyboard(Role.SECRETARY))
-    assert all("Properties" not in label for label in owner_labels + secretary_labels)
+    assert any("房源" in label for label in owner_labels)
+    assert any("Properties" in label for label in secretary_labels)
 
 
 def test_home_keyboard_only_has_units_and_refresh():

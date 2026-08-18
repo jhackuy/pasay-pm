@@ -11,7 +11,8 @@ from conftest import (
 )
 from pasay_bot.keyboards import ACTION_DETAIL, ACTION_HOME_NAV, ACTION_NAV, encode
 
-V2_LABELS = ["🏠 Home", "✅ Tasks", "💰 Rent", "💸 Expense"]
+OWNER_LABELS = ["🏠 首页", "🏘 房源", "✅ 待办", "💰 租金", "💸 支出", "📁 档案"]
+SECRETARY_LABELS = ["🏠 Home", "🏘 Properties", "✅ Tasks", "💰 Rent", "💸 Expense", "📁 Archive"]
 
 
 def _reply_labels(kb):
@@ -112,10 +113,12 @@ def test_existing_chat_receives_new_menu_on_next_interaction(make_app):
     for user_id in (OWNER_ID, SECRETARY_ID):
         env = make_app(backend=NavTask006BBackend())
         env.app.bot_data.setdefault("menu_init_chats", {})[user_id] = "legacy_menu_v1"
-        run_updates(env, [make_text_update(user_id, user_id, "💰 Rent", bot=env.bot)])
+        label = "💰 租金" if user_id == OWNER_ID else "💰 Rent"
+        run_updates(env, [make_text_update(user_id, user_id, label, bot=env.bot)])
         reply_sends = [s for s in env.bot.sends() if _reply_labels(s["reply_markup"])]
         assert reply_sends, "expected a menu migration send"
-        assert _reply_labels(reply_sends[0]["reply_markup"]) == V2_LABELS
+        expected = OWNER_LABELS if user_id == OWNER_ID else SECRETARY_LABELS
+        assert _reply_labels(reply_sends[0]["reply_markup"]) == expected
 
 
 def test_home_refresh_stays_home_and_has_no_today_button(make_app):
@@ -124,7 +127,7 @@ def test_home_refresh_stays_home_and_has_no_today_button(make_app):
     home_edit = env.bot.edits()[-1]
     labels = [b.text for b in _inline_buttons(home_edit["reply_markup"])]
     assert "⚠️ Today" not in labels
-    assert "🏢 Properties" in labels
+    assert ("🏢 房源" in labels or "🏢 Units" in labels)
     assert "🔄 Refresh" in labels
 
     run_updates(
@@ -132,7 +135,7 @@ def test_home_refresh_stays_home_and_has_no_today_button(make_app):
         [make_callback_update(OWNER_ID, OWNER_ID, encode(ACTION_HOME_NAV, "refresh"), message_id=home_edit["message_id"], update_id=2, bot=env.bot)],
     )
     refreshed = env.bot.edits()[-1]
-    assert "运营总览" in refreshed["text"] or "Operations Overview" in refreshed["text"]
+    assert "🏠 首页" in refreshed["text"] or "🏠 Home" in refreshed["text"]
     assert "Act now" not in refreshed["text"] and "Done today" not in refreshed["text"]
 
 
@@ -153,7 +156,7 @@ def test_tasks_uses_digest_authority_and_matches_home_action_count(make_app):
 def test_properties_renders_units_directly_and_archive_is_url_button(make_app):
     env = make_app(backend=NavTask006BBackend())
     env.settings.archive_chat_id = "-1001234567890"
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏘 房源", bot=env.bot)])
     send = env.bot.last_send()
     text = send["text"]
     assert "Property Overview" not in text and "房源概况" not in text
@@ -161,9 +164,7 @@ def test_properties_renders_units_directly_and_archive_is_url_button(make_app):
     for unit in ("7789", "2308", "1103"):
         assert unit in text
     buttons = _inline_buttons(send["reply_markup"])
-    archive = next(b for b in buttons if b.text == "📁 Open Property Archive")
-    assert archive.url == "https://t.me/c/1234567890"
-    assert archive.callback_data is None
+    assert all("Archive" not in (b.text or "") for b in buttons)
 
 
 def test_payment_record_includes_business_identity_fields(make_app):
@@ -173,11 +174,12 @@ def test_payment_record_includes_business_identity_fields(make_app):
         [make_callback_update(OWNER_ID, OWNER_ID, encode(ACTION_DETAIL, "inc", "46"), bot=env.bot)],
     )
     text = env.bot.edits()[-1]["text"]
-    assert "💰 付款记录" in text or "💰 Payment record" in text
-    assert "1680 · 2026-08 Rent" in text
-    assert "Tenant: Maria Santos" in text or "租客: Maria Santos" in text
-    assert "Amount: ₱25,000" in text or "金额: ₱25,000" in text
-    assert "Method: Bank" in text or "方式: Bank" in text
-    assert "Status: Confirmed" in text or "状态: 已确认" in text
-    assert "Date: 2026-08-14" in text or "日期: 2026-08-14" in text
-    assert "#46" in text
+    assert "💳 付款记录" in text or "💳 Payment record" in text
+    assert "房号：1680" in text or "Unit: 1680" in text
+    assert "期别 / 用途：2026-08 Rent" in text or "Period / Purpose: 2026-08 Rent" in text
+    assert "租客：Maria Santos" in text or "Tenant: Maria Santos" in text
+    assert "金额：₱25,000" in text or "Amount: ₱25,000" in text
+    assert "方式：Bank" in text or "Method: Bank" in text
+    assert "状态：已确认" in text or "Status: Confirmed" in text
+    assert "日期：2026-08-14" in text or "Date: 2026-08-14" in text
+    assert "审计 ID：46" in text or "Audit ID: 46" in text

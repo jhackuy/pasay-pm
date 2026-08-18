@@ -1,15 +1,12 @@
 """TELEGRAM-OPS-UX-CONVERGENCE-001 — regression tests.
 
-Pins the converged Telegram Operations UX:
-1. the fixed bottom Reply Keyboard never drifts by role/chat-type/language;
-2. Properties renders as a high-density one-line-per-unit index;
-3. no Owner/Secretary-visible text ever leaks `??` / raw placeholder / enum;
-4. Expense shows Category/Purpose with a safe unspecified fallback;
-5. Rent overdue rows are directly actionable (Follow up -> Rent detail);
-6. a waiting-payment expense gives the Secretary a working Remind Owner action
-   that sends exactly one reminder message with full context;
-7. inline detail navigation edits the tapped message instead of spamming the
-   group with new messages.
+Pins the converged Telegram Operations UX under the accepted UX Freeze v1:
+1. private chats keep role-language 6-button menus;
+2. group chats pin one shared English 6-button menu;
+3. quick pages are summary-first, with object rows on inline keyboards;
+4. no user-visible text leaks `??` / raw placeholder / enum;
+5. rent and expense detail actions stay directly actionable;
+6. inline detail navigation edits in place instead of spamming new messages.
 
 The fake backend lives in tests/conftest.py (integrator-owned); this file
 subclasses it locally like test_v2_ux.py does.
@@ -30,14 +27,14 @@ from conftest import (
     run_updates,
 )
 from pasay_bot.keyboards import (
-    FIXED_MENU_ROUTES,
     fixed_menu_route_for,
-    LEGACY_MENU_ROUTES,
     reply_keyboard,
 )
+from pasay_bot.roles import Role
 from pasay_bot.render.i18n import t
 
-V2_LABELS = ["🏠 Properties", "✅ Tasks", "💰 Rent", "💸 Expense"]
+OWNER_LABELS = ["🏠 首页", "🏘 房源", "✅ 待办", "💰 租金", "💸 支出", "📁 档案"]
+GROUP_LABELS = ["🏠 Home", "🏘 Properties", "✅ Tasks", "💰 Rent", "💸 Expense", "📁 Archive"]
 BANNED_TEXT = ("??", "None", "null", "undefined", "NoneType")
 GROUP_CHAT_ID = -1009876543210
 
@@ -172,70 +169,37 @@ class ConvergeBackend(FakeBackend):
 
 
 def test_fixed_keyboard_is_identical_and_english_for_all_roles(make_app):
-    """Section 一: the Reply Keyboard is one fixed English 4-button menu,
-    identical for Owner and Secretary and in every chat locale — no drift to
-    Chinese, no per-role re-generation."""
-    owner_menu = reply_keyboard(None)
-    assert _reply_labels(owner_menu) == V2_LABELS
-    # The English labels are the ONLY primary menu labels.
-    for row in owner_menu.keyboard:
-        for btn in row:
-            assert btn.text in V2_LABELS
+    """Private chats keep role language; group chats pin the shared English menu."""
+    assert _reply_labels(reply_keyboard(None)) == GROUP_LABELS
+    assert _reply_labels(reply_keyboard(Role.OWNER)) == OWNER_LABELS
+    assert _reply_labels(reply_keyboard(Role.SECRETARY)) == GROUP_LABELS
 
-    for role_author in (OWNER_ID, SECRETARY_ID):
-        env = make_app(backend=ConvergeBackend())
-        # Owner private (zh), Secretary private (en), and a group (bi).
-        for chat_id in (role_author, GROUP_CHAT_ID):
-            env2 = make_app(backend=ConvergeBackend())
-            run_updates(
-                env2,
-                [make_group_text_update(role_author, chat_id, "🏠 Properties", bot=env2.bot)]
-                if chat_id == GROUP_CHAT_ID
-                else [make_text_update(role_author, chat_id, "🏠 Properties", bot=env2.bot)],
-            )
-            sends = env2.bot.sends()
-            # find any reply keyboard sent on this tap flow
-            rk_labels = []
-            for s in sends:
-                rk = _reply_labels(s["reply_markup"])
-                if rk:
-                    rk_labels.append(rk)
-            # The persistent reply keyboard that any flow re-mounts is the
-            # fixed English menu (messages carrying inline keyboards keep the
-            # pinned reply menu unchanged).
-            for labels in rk_labels:
-                assert labels == V2_LABELS, f"drifting keyboard for {role_author}/chat {chat_id}: {labels}"
+    env = make_app(backend=ConvergeBackend())
+    run_updates(env, [make_group_text_update(OWNER_ID, GROUP_CHAT_ID, "hello", bot=env.bot)])
+    rk_labels = [_reply_labels(s["reply_markup"]) for s in env.bot.sends() if _reply_labels(s["reply_markup"])]
+    assert rk_labels
+    for labels in rk_labels:
+        assert labels == GROUP_LABELS
 
-    # Every fixed label routes deterministically; no fixed label is Chinese.
-    for label in V2_LABELS:
-        assert fixed_menu_route_for(label) in ("properties", "tasks", "rent", "expense")
-        assert label not in LEGACY_MENU_ROUTES
+    for label in OWNER_LABELS + GROUP_LABELS:
+        assert fixed_menu_route_for(label) in ("home", "properties", "tasks", "rent", "expense", "archive")
 
 
 def test_properties_index_one_unit_per_line_and_no_expansion(make_app):
-    """Section 二/三 + ZERO-LEARNING-004 §1 + TELEGRAM-OPS-REAL-WORLD-CLOSURE-005
-    §1: high-density index, ONE traffic light per unit, exceptions in WORDS,
-    normal units OK, no 💰⚠️ / 📄✅ / 🔧0 / 👁, per-unit SHORT buttons."""
+    """Properties stays summary-first: compact unit lines + short per-unit buttons."""
     env = make_app(backend=ConvergeBackend())
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏘 房源", bot=env.bot)])
     send = env.bot.last_send()
     text = send["text"]
     assert "Properties · 2" in text or "房源 · 2" in text
-    assert "🔴 1680" in text  # overdue + 1 open repair -> red
-    assert "欠租12天" in text or "Rent overdue 12d" in text
-    assert "待修1项" in text or "Repair 1" in text
-    assert "🟡 1702" in text and ("空置" in text or "Vacant" in text)  # vacant -> yellow
+    assert "1680" in text and "1702" in text
+    assert "👁" not in text
     assert text.count("\n\n") <= 3  # compact, high-density (not a tall card)
     for banned in BANNED_TEXT + ("💰⚠️", "📄✅", "🔧0", "👁", "⚪", "🔵"):
         assert banned not in text
     inline = _inline_labels(send["reply_markup"])
-
-    def has(label):
-        return any(label in lbl for lbl in inline)
-
-    assert has("1680") and has("1702")
-    assert not any("👁" in lbl for lbl in inline)
-    assert has("📄 Archive")
+    assert "1680" in inline and "1702" in inline
+    assert not any("Archive" in lbl for lbl in inline)
     # no expansion of full tenant / deposit / contract on the index screen
     assert "deposit" not in text.lower() and "tenant" not in text.lower()
 
@@ -254,16 +218,13 @@ def test_expense_safe_purpose_fallback_never_shows_placeholder(make_app):
     """Section 九/十: an APPROVED expense with a `??`/empty purpose resolves to
     its truthful payee, or to the neutral unspecified label — never `??`."""
     env = make_app(backend=ConvergeBackend())
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 Expense", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💸 支出", bot=env.bot)])
     text = env.bot.last_send()["text"]
     for banned in BANNED_TEXT:
         assert banned not in text
-    # E1 has a real payee -> the truthful payee surfaces.
-    assert "Aircon Repair Co" in text
-    # E1 and E2 each appear once (no duplicate rows).
-    assert text.count("E1") == 1 and text.count("E2") == 1
-    # E2 has no truthful purpose -> the neutral per-locale label, not `??`.
-    assert "Other" in text or "其他" in text
+    assert "本月支出" in text or "This month" in text
+    assert "待审批" in text or "Pending approval" in text
+    assert "待付款 2" in text or "Pending payment 2" in text
 
 
 def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
@@ -271,7 +232,7 @@ def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
     navigation entries that open a Rent detail with the executable follow-up
     action living on the detail card."""
     env = make_app(backend=ConvergeBackend())
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 Rent", bot=env.bot)])
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "💰 租金", bot=env.bot)])
     send = env.bot.last_send()
     inline = _inline_labels(send["reply_markup"])
 
@@ -279,7 +240,6 @@ def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
         return any(label in lbl for lbl in inline)
 
     assert has("1680")
-    assert any("Pending" in lbl or "待催" in lbl or "Followed up" in lbl or "已交秘书" in lbl for lbl in inline)
     # Tap the quick-row navigation -> Rent detail card with the 3 actions.
     data = _inline_data(send["reply_markup"])
     followup_cb = next(d for d in data if d.split(":")[1] == "rnq")
@@ -297,7 +257,7 @@ def test_rent_overdue_followup_reachable_and_detail_actionable(make_app):
         return any(label in lbl for lbl in detail_labels)
 
     assert any("催租" in lbl or "Follow up" in lbl for lbl in detail_labels)
-    assert any("收租" in lbl or "Collect" in lbl for lbl in detail_labels)
+    assert any("登记付款" in lbl or "Record payment" in lbl for lbl in detail_labels)
     assert any("记录" in lbl or "History" in lbl for lbl in detail_labels)
 
 
@@ -335,9 +295,9 @@ def test_secretary_remind_owner_waits_payment_sends_exactly_one(make_app):
     def has(label):
         return any(label in lbl for lbl in inline)
 
-    # The list must NOT carry the long per-row Remind buttons any more.
-    assert has("E1 · Open")
-    assert has("E2 · Open")
+    # The list carries summary rows; the Remind action lives on the detail card.
+    assert has("E1")
+    assert has("E2")
     assert not any("Remind Owner" in lbl for lbl in inline)
     data = _inline_data(send["reply_markup"])
     open_cb = next(d for d in data if d.split(":")[1] == "exo")
@@ -382,16 +342,8 @@ def test_secretary_remind_owner_waits_payment_sends_exactly_one(make_app):
 
 
 def test_property_archive_link_present(make_app):
-    """Section 三: the Properties index exposes the 📄 Property Archive deep
-    link to the archive channel (index in group, full archive in channel)."""
+    """Archive now lives on the fixed menu, not inside the Properties index."""
     env = make_app(backend=ConvergeBackend())
-    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "🏠 Properties", bot=env.bot)])
-    data = _inline_data(env.bot.last_send()["reply_markup"])
-    archive_cb = next(d for d in data if d.split(":")[1] == "par")
-    run_updates(
-        env,
-        [make_callback_update(OWNER_ID, OWNER_ID, archive_cb,
-                              message_id=env.bot.last_send()["message_id"], bot=env.bot)],
-    )
-    edit = env.bot.edits()[-1]
-    assert "Property Archive" in edit["text"]
+    run_updates(env, [make_text_update(OWNER_ID, OWNER_ID, "📁 档案", bot=env.bot)])
+    send = env.bot.last_send()
+    assert "Property Archive" in send["text"] or "房产档案" in send["text"]
