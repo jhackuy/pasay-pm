@@ -1,0 +1,11 @@
+{
+  "worker_name": "pasay-cf-smoke",
+  "cloudflare_account_id": "d07b0d2fdbce1d820bd215cc9c5f361c",
+  "workers_dev_subdomain": "d07b0d2fdbce1d820bd215cc9c5f361c",
+  "public_url": "https://pasay-cf-smoke.d07b0d2fdbce1d820bd215cc9c5f361c.workers.dev",
+  "health_endpoint": "https://pasay-cf-smoke.d07b0d2fdbce1d820bd215cc9c5f361c.workers.dev/health",
+  "probe_status": 200,
+  "probe_body": "PASAY_CF_SMOKE_OK",
+  "github_run_id": "32135720464",
+  "recorded_at_utc": "2026-08-18T12:14:19Z"
+}
