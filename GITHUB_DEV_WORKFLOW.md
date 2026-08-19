@@ -15,35 +15,42 @@ Owner -> ChatGPT
           |                  |
        dev route      design-dev route
           |                  |
-          |              OpenDesign
+   ready-for-dev         OpenDesign
+          |             approved handoff
+   Owner 在 TRAE IDE        |
+        输入 /nd            |
           |                  |
-   Owner 在 TRAE IDE 输入 /nd
+   TRAE 领取 ready-for-dev   |
           |                  |
-   TRAE 领取 ready-for-dev    |
-          |                  |
-   targeted tests            |
+   targeted tests           |
    commit / push             |
           |                  |
-          '-------------.----'
-                        |
-                       PR
-                        |  HANDOFF_COMPLETE
-                  .-----'-----.
-                  |           |
-             CodeRabbit   pasay-gate
-                  '-----.___.-'
-                        |
-                 Gate satisfied
-                        |
-              ChatGPT 总控审核
-                   /      \
-          RETURN（返修）  ready-for-owner
-                          |
-                        Owner
+          '-----.   TRAE  .---'
+                |   实现
+                v
+               PR
+               |  HANDOFF_COMPLETE
+         .-----'-----.
+         |           |
+    CodeRabbit   pasay-gate
+         '-----.___.-'
+               |
+        Gate satisfied
+               |
+     ChatGPT 总控审核
+          /      \
+   RETURN（返修）  ready-for-owner
+                   |
+                 Owner
 ```
 
-TRAE IDE `/nd`（Next Dev）是 `dev route` 的唯一执行入口：
+TRAE IDE `/nd`（Next Dev）是当前 `dev route` 的标准执行入口：
 `ready-for-dev Issue → TRAE IDE /nd → targeted tests → commit/push → PR → HANDOFF_COMPLETE → STOP`
+
+`design-dev route` 必须在 OpenDesign approved handoff 后进入 TRAE 实现：
+`GitHub Issue → OpenDesign approved handoff → TRAE → targeted tests → commit/push → PR`
+
+两个需要开发实现的 route 最终都必须经过 TRAE 后才能进入 PR。
 
 `HANDOFF_COMPLETE` 仅表示 PR handoff 完成：
 - ≠ Code Review PASS
