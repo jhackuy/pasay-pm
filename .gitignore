@@ -30,3 +30,10 @@ pasay-telegram-bot/.pytest_tmp/
 .audit/
 .build/
 .research/
+
+# PASAY-ARCH-CF-NEON-001: local Cloudflare Worker artifacts stay untracked
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+cloudflare-worker/.wrangler-config/
+cloudflare-worker/.dev.vars
+cloudflare-worker/.env

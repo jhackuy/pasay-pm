@@ -1,0 +1,50 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pasay-runtime-foundation",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "PASAY_APP_ENV": "local",
+    "PASAY_HEALTHCHECK_DB_CONNECTIVITY": "false"
+  },
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "00000000-0000-0000-0000-000000000000",
+      "localConnectionString": "postgres://pasay_pm:change-me-strong-password@127.0.0.1:5432/pasay_pm"
+    }
+  ],
+  "env": {
+    "development": {
+      "vars": {
+        "PASAY_APP_ENV": "development",
+        "PASAY_HEALTHCHECK_DB_CONNECTIVITY": "false"
+      },
+      "hyperdrive": [
+        {
+          "binding": "HYPERDRIVE",
+          "id": "00000000-0000-0000-0000-000000000000",
+          "localConnectionString": "postgres://pasay_pm:change-me-strong-password@127.0.0.1:5432/pasay_pm"
+        }
+      ]
+    },
+    "production": {
+      "vars": {
+        "PASAY_APP_ENV": "production",
+        "PASAY_HEALTHCHECK_DB_CONNECTIVITY": "false"
+      },
+      "hyperdrive": [
+        {
+          "binding": "HYPERDRIVE",
+          "id": "00000000-0000-0000-0000-000000000000",
+          "localConnectionString": "postgres://pasay_pm:change-me-strong-password@127.0.0.1:5432/pasay_pm"
+        }
+      ]
+    }
+  }
+}

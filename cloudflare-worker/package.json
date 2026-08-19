@@ -1,0 +1,17 @@
+{
+  "name": "pasay-cloudflare-worker-foundation",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "typegen": "wrangler types --include-runtime false",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.30.0"
+  }
+}

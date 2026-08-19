@@ -9,7 +9,6 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
 
 from app.api.routers import (
     attachments,
@@ -31,6 +30,8 @@ from app.api.routers import (
     viewings,
 )
 from app.database import engine
+from app.config import settings
+from app.runtime.health import build_health_payload
 
 app = FastAPI(
     title="PASay Property Management API",
@@ -61,9 +62,7 @@ app.include_router(viewings.router, prefix=API_PREFIX)
 
 @app.get("/health", summary="Health check (no auth)")
 def health():
-    try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-    except Exception:
-        return JSONResponse(status_code=503, content={"status": "unavailable"})
-    return {"status": "ok"}
+    status_code, payload = build_health_payload(settings=settings, engine=engine)
+    if status_code != 200:
+        return JSONResponse(status_code=status_code, content=payload)
+    return payload
