@@ -1,9 +1,10 @@
-from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
+from app.infrastructure.postgres import build_postgres_runtime_boundary, create_app_engine
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+database_boundary = build_postgres_runtime_boundary(settings)
+engine = create_app_engine(database_boundary)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

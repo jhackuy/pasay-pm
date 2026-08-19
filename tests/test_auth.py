@@ -6,7 +6,19 @@ API = "/api/v1"
 def test_health_no_auth(client):
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    assert resp.json() == {
+        "status": "ok",
+        "runtime": {"platform": "fastapi", "alive": True},
+        "application": {"boot": "ok"},
+        "database": {
+            "configured": True,
+            "provider": "postgres",
+            "application_connection_mode": "direct",
+            "migration_connection_mode": "direct",
+            "connectivity_checked": True,
+            "reachable": True,
+        },
+    }
 
 
 def test_auth_valid_key_returns_client_info(client, admin, admin_headers):

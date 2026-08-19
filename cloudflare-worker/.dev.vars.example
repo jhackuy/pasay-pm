@@ -1,0 +1,6 @@
+# Use this file only for local `wrangler dev`.
+# Do not commit real secrets. Prefer the environment variable form
+# `CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE` so local creds stay
+# out of source control.
+PASAY_APP_ENV=local
+PASAY_HEALTHCHECK_DB_CONNECTIVITY=false
