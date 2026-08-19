@@ -1,6 +1,6 @@
 # Pasay AI Development Workflow Rules — Canonical
 
-rules_version: 2026-08-19.1
+rules_version: 2026-08-19.2
 canonical_path: AI_WORKFLOW_RULES.md
 authority: Windows 是当前 canonical development authority；规则文件按 repo-relative `AI_WORKFLOW_RULES.md` 解析，禁止依赖任何用户目录绝对路径。
 last_updated: 2026-08-19
@@ -50,7 +50,8 @@ RULES_ACK role=LILY sha256=<hash>
 task_id: PASAY-XXX
 rules_path: AI_WORKFLOW_RULES.md
 rules_sha256: <sha256>
-role: MAX
+role: CODING_WORKER
+worker: <selected coding worker>
 objective: ...
 scope: ...
 allowed_paths: [...]
@@ -74,7 +75,7 @@ required_context: [...]
 * rules_version
 * rules_sha256
 
-禁止通过 ChatGPT → Fugui → Lily → Max 逐层重复粘贴整份规则。
+禁止通过 ChatGPT → transport/control node → supervisor → coding worker 逐层重复粘贴整份规则。
 
 ---
 
@@ -171,13 +172,15 @@ LLM 主要用于：
 
 负责：产品设计、架构、任务定义、风险边界、验收标准、最终审核、决定是否升级复杂任务。
 
-### Max / Codex（默认开发执行者）
+### Coding Worker（默认开发执行者）
 
 普通任务直接完成：查看必要代码、修改代码、targeted tests、修复失败、regression、输出结构化结果。
 
-普通 bug、普通 feature、重构、API、Bot UX、测试等，默认不经过 Lily。
+具体使用哪个 coding worker 由 task envelope 的 `worker` / `role` 指定；不要把任何临时 provider 名称写成永久唯一 authority。
 
-### Lily / Hermes（不再是每个任务的必经 planner）
+普通 bug、普通 feature、重构、API、Bot UX、测试等，默认不经过 Lily/Hermes。
+
+### Lily / Hermes（supervisor escalation only）
 
 仅在以下情况升级介入：
 
@@ -192,12 +195,12 @@ LLM 主要用于：
 
 原则：
 
-* Normal Path：ChatGPT → Max
-* Escalation Path：ChatGPT → Lily → Max
+* Normal Path：ChatGPT → deterministic transport/control node → selected coding worker
+* Escalation Path：仅在证据满足升级条件时，由 supervisor 介入
 
-### Fugui（Windows 控制节点，退出常规推理链）
+### Fugui / Bridge（deterministic transport/control node）
 
-负责：Windows 控制节点、Bridge、Windows 实机验证、Owner Telegram UX 测试、自动测试协调、日志/状态收集、结果回传、必要时通知 Owner 人工验收。
+负责：任务分发、环境控制、Windows 实机验证、Owner Telegram UX 测试、自动测试协调、日志/状态收集、结果回传、必要时通知 Owner 人工验收。
 
 不要重新分析 ChatGPT 已经明确的需求，也不要为了转发任务再次长篇总结。
 
@@ -277,7 +280,7 @@ LLM 负责分析错误原因，不负责人工从几千行日志里搜索错误�
 
 ## 10. 人工测试规则
 
-绝大多数测试由程序、Max、Fugui 自动完成。只有以下类型才通知 Owner：
+绝大多数测试由程序、coding worker、Fugui/Bridge 自动完成。只有以下类型才通知 Owner：
 
 * 真实 Telegram Owner UX
 * 必须人眼判断的界面体验
@@ -295,13 +298,13 @@ LLM 负责分析错误原因，不负责人工从几千行日志里搜索错误�
 默认最低成本路径：
 
 ```text
-ChatGPT → Max → automated tests → result → ChatGPT review
+ChatGPT → deterministic transport/control node → selected coding worker → automated tests → result → ChatGPT review
 ```
 
-如果 Max 连续失败、出现架构冲突、范围扩大或任务明显复杂：
+如果 primary coding worker 连续失败、出现架构冲突、范围扩大或任务明显复杂：
 
 ```text
-→ NEEDS_SUPERVISOR → Lily 介入
+→ NEEDS_SUPERVISOR → supervisor 介入
 ```
 
 禁止所有任务一开始就同时启动 Fugui + Lily + Max。
@@ -329,15 +332,15 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 
 ## 13. 程序化路由、升级阈值与成本控制（WF-003）
 
-### 13.1 Task Router（默认不经过 Lily）
+### 13.1 Task Router（默认不经过 supervisor）
 
 每个任务至少包含：task_id、task_type、risk_level、objective、allowed_paths、acceptance_criteria、requires_human_test、requires_supervisor、max_retry、test_level。
 
 程序化路由结果由程序产生：
 
 * `PROGRAMMATIC`：脚本/CLI/SQL/测试可完成 → 不启动 LLM
-* `MAX`：普通代码修改默认只启动 Max
-* `LILY`：仅当以下任一条件成立（禁止“任务比较复杂”这类模糊理由）：
+* `MAX`：普通代码修改默认走 primary coding worker path；具体 coding worker 由 task envelope 的 `worker` / `role` 指定，`MAX` 只是兼容现有 router 的内部标签
+* `LILY`：supervisor escalation only；仅当以下任一条件成立（禁止“任务比较复杂”这类模糊理由）：
   * requires_supervisor=true
   * 跨多个高风险模块且规则明确要求
   * Max 达到 max_retry
@@ -348,8 +351,8 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 ### 13.2 Single Max Session Per Task + Retry Limit
 
 * 一个 task 默认只允许一个 active Max session。
-* 默认 `max_retry=2`：第一次失败允许基于失败证据修复；第二次仍失败 → `NEEDS_SUPERVISOR`，停止烧 Token，之后才允许 Lily 介入。
-* 禁止：Max 无限重试、失败一次立刻启动 Lily、同时启动 Max + Lily 重复分析。
+* 默认 `max_retry=2`：第一次失败允许基于失败证据修复；第二次仍失败 → `NEEDS_SUPERVISOR`，停止烧 Token，之后才允许 supervisor 介入。
+* 禁止：coding worker 无限重试、失败一次立刻启动 supervisor、同时启动 coding worker + supervisor 重复分析。
 
 ### 13.3 Escalation Only On Evidence
 
@@ -415,9 +418,15 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 
 * 主工作区：Telegram Chat
 * 主要操作：Inline Action Buttons
-* 兜底导航：Persistent Reply Keyboard（🏠 房源 | ✅ 待办 / 💰 财务 | ☰ 更多）
+* Group canonical menu：English 3×2
+  `Home | Properties | Tasks`
+  `Rent | Expense | Archive`
+* Owner private canonical menu：Chinese 3×2，对应同一 IA
+* Secretary private canonical menu：English 3×2，对应同一 IA
+* `More` / `☰ 更多` 只允许作为 legacy compatibility alias，不再是 canonical top-level menu
 * 不得设计成 菜单 → 子菜单 → 子菜单 → 表单
-* 复杂信息未来进入 Telegram Mini App；Chat First, Mini App Second
+* Telegram Chat = 精简办公、高频操作、必要反馈
+* Mini App = 完整控制台 / 上帝视角、对象状态历史和设置
 
 ### 其他关键规则
 
@@ -440,15 +449,29 @@ ChatGPT → Max → automated tests → result → ChatGPT review
 
 ## 15. 安全底线（本任务与所有后续任务）
 
-禁止：
+默认禁止：
 
 * Pasay 新功能开发（除非任务明确指定）
 * 生产数据库写入 / 生产 Telegram 数据写入
-* 部署 / push / merge / 自动 commit
 * 修改业务数据
 * 删除任务开始前已有的未提交工作
-* 无范围限制的 git reset
+* destructive / production-impacting Git 操作
 * 让旧 Agent session 持续工作
+
+以下操作只有 task envelope 明确授权后才允许：
+
+* commit
+* push
+* merge
+* deployment
+
+永远禁止默认：
+
+* force push
+* force-with-lease
+* 无范围 `git reset --hard`
+* 覆盖共享历史
+* 删除未知远端 ref
 
 允许：
 
@@ -480,9 +503,18 @@ Git 保持可回滚。开发环境优先开发速度 > 流程完整度，但以�
 
 ### 16.2 完成后自动继续，禁止停在“等待下一张任务卡”
 
-只要下一产品功能已经明确：PASS → commit → 自动继续下一产品切片。
+默认流程：
 
-只有以下情况才停：
+`PASS → commit（仅任务允许时）→ result → task CLOSED / REVIEW_READY`
+
+只有以下情况才允许自动继续下一产品切片：
+
+* task envelope 明确 `auto_continue=true`
+* task envelope 明确给出 `next_task`
+
+否则 worker 必须停止在当前 task 的结果边界，由 orchestrator 再 dispatch 新 Task ID。
+
+停止条件：
 
 * USER_ACTION_REQUIRED
 * MANUAL_APPROVAL_REQUIRED
@@ -490,15 +522,15 @@ Git 保持可回滚。开发环境优先开发速度 > 流程完整度，但以�
 * TIMEOUT
 * 下一功能优先级确实不明确（NEXT_SLICE_PENDING）
 
-### 16.3 正常开发链固定
+### 16.3 正常开发链
 
 ```text
-ChatGPT → Fugui/Bridge 传输 → Lily → Max 开发 → targeted tests → commit → 下一任务
+ChatGPT → deterministic transport/control node → selected coding worker → targeted tests → result
 ```
 
-* Bridge 只负责传输。
-* Windows/Fugui 不重复测试 Mac 已经 PASS 的内容。
-* 普通开发不同步 Windows、不跑完整 Gate。
+* Bridge/Fugui 只负责 deterministic transport/control，不是默认 supervisor。
+* 普通任务不得默认先启动 Lily/Hermes。
+* commit / push 仅在 task envelope 明确授权时执行。
 * 不要重新执行历史 Gate、全仓库审计、全量测试或流程检查。
 ## 17. 工作流护栏（WF Guardrails，WF-GUARDRAILS-CANONICAL-SYNC-001）
 

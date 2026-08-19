@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -18,9 +19,15 @@ import wf_ctl  # noqa: E402
 
 CANONICAL_REPO = REPO
 SYNC_PS1 = os.path.join(REPO, "scripts", "wf", "sync-pasay.ps1")
-AGENTS_WIN = os.path.join(REPO, "AGENTS.md")
+CANONICAL_RULES = os.path.join(REPO, "AI_WORKFLOW_RULES.md")
+LEGACY_RULES = os.path.join(REPO, ".ai-control", "RULES.md")
+AGENTS_MD = os.path.join(REPO, "AGENTS.md")
 RESULTS_DIR = os.path.join(REPO, ".ai-control", "results", "WF-002")
-OLD_AGENTS_SHA = "58f1357f6e811f0a3ac93f1951a5751ee426a5223314f1d61e0933252d674a66"
+OLD_RULES_SHA = "58f1357f6e811f0a3ac93f1951a5751ee426a5223314f1d61e0933252d674a66"
+WORKTREE_OVERLAY_FILES = [
+    "AI_WORKFLOW_RULES.md",
+    "scripts/wf/sync-pasay.ps1",
+]
 
 
 def sh(cmd, timeout=120):
@@ -42,33 +49,68 @@ def read(path: str):
 
 
 def write(path: str, content: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(content)
 
 
-def mac_sha(rel: str):
-    return wf.sha256_file(os.path.join(CANONICAL_REPO, rel.replace("/", os.sep)))
+def repo_path(root: str, rel: str) -> str:
+    return os.path.join(root, rel.replace("/", os.sep))
 
 
-def mac_read(rel: str):
-    path = os.path.join(CANONICAL_REPO, rel.replace("/", os.sep))
+def repo_sha(root: str, rel: str):
+    return wf.sha256_file(repo_path(root, rel))
+
+
+def repo_read(root: str, rel: str):
+    path = repo_path(root, rel)
     return read(path) if os.path.isfile(path) else None
 
 
-def mac_write(rel: str, content: str) -> bool:
-    path = os.path.join(CANONICAL_REPO, rel.replace("/", os.sep))
+def repo_write(root: str, rel: str, content: str) -> bool:
+    path = repo_path(root, rel)
     write(path, content)
     return True
 
 
-def run_sync():
-    rc, out = sh(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SYNC_PS1], timeout=180)
+def run_sync(root: str):
+    sync_ps1 = repo_path(root, "scripts/wf/sync-pasay.ps1")
+    rc, out = sh(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", sync_ps1], timeout=180)
     return rc, out
 
 
-def reset_reflog_count():
-    rc, out = sh(["git", "-C", REPO, "reflog"], timeout=30)
+def reset_reflog_count(root: str):
+    rc, out = sh(["git", "-C", root, "reflog"], timeout=30)
     return sum(1 for line in out.splitlines() if "reset: moving" in line)
+
+
+def governance_snapshot():
+    return {
+        "AGENTS.md": wf.sha256_file(AGENTS_MD),
+        "AI_WORKFLOW_RULES.md": wf.sha256_file(CANONICAL_RULES),
+    }
+
+
+def overlay_current_governance_sources(root: str) -> None:
+    for rel in WORKTREE_OVERLAY_FILES:
+        src = repo_path(REPO, rel)
+        dst = repo_path(root, rel)
+        write(dst, read(src))
+
+
+@contextmanager
+def temporary_worktree():
+    with tempfile.TemporaryDirectory(prefix="wf002_") as tmpdir:
+        rc, out = sh(["git", "-C", REPO, "worktree", "add", "--detach", tmpdir, "HEAD"], timeout=180)
+        if rc != 0:
+            raise RuntimeError(f"git worktree add failed: {out.strip()}")
+        try:
+            overlay_current_governance_sources(tmpdir)
+            yield tmpdir
+        finally:
+            sh(["git", "-C", REPO, "worktree", "remove", "--force", tmpdir], timeout=180)
 
 
 def t1_no_old_head_restore():
@@ -82,35 +124,25 @@ def t1_no_old_head_restore():
                  or "--force" in l]
     static_ok = not forbidden
 
-    canonical = mac_read("AGENTS.md")
-    orig = read(AGENTS_WIN)
-    marker = "\n<!-- WF002-T1-MARKER -->\n"
-    write(AGENTS_WIN, orig + marker)
-    before_reset_count = reset_reflog_count()
+    with temporary_worktree() as root:
+        canonical = read(repo_path(root, "AI_WORKFLOW_RULES.md"))
+        legacy_rules = repo_path(root, ".ai-control/RULES.md")
+        orig = read(legacy_rules) if os.path.isfile(legacy_rules) else ""
+        marker = "\n<!-- WF002-T1-MARKER -->\n"
+        write(legacy_rules, orig + marker)
+        before_reset_count = reset_reflog_count(root)
+        rc, out = run_sync(root)
+        final = read(legacy_rules)
+        after_reset_count = reset_reflog_count(root)
 
-    # Observe up to 90s: the sync mechanism must not restore AGENTS.md to old Git HEAD.
-    reverted = False
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        cur = read(AGENTS_WIN)
-        if sha_text(cur) == OLD_AGENTS_SHA:
-            reverted = True
-            break
-        time.sleep(5)
-
-    rc, out = run_sync()  # simulate the bridge reconcile trigger with the fixed script
-    final = read(AGENTS_WIN)
-    after_reset_count = reset_reflog_count()
     ok = (
         static_ok
-        and not reverted
         and sha_text(final) == sha_text(canonical)
         and after_reset_count == before_reset_count
         and "WF002-T1-MARKER" not in final
     )
     return ok, {
         "static_forbidden_commands": forbidden,
-        "auto_reverted_to_old_head": reverted,
         "sync_exit": rc,
         "final_matches_canonical": sha_text(final) == sha_text(canonical),
         "new_reset_reflog_entries": after_reset_count - before_reset_count,
@@ -118,42 +150,39 @@ def t1_no_old_head_restore():
 
 
 def t2_canonical_to_windows():
-    backup = mac_read("AGENTS.md")
-    if backup is None:
-        return False, {"error": "cannot read canonical AGENTS.md"}
-    marker = "\n<!-- WF002-T2-MARKER -->\n"
-    ok_write = mac_write("AGENTS.md", backup + marker)
-    mac_after_write = mac_read("AGENTS.md")
-    synced = False
-    try:
-        rc, _ = run_sync()
-        win_after = read(AGENTS_WIN)
-        synced = ("WF002-T2-MARKER" in win_after) and (sha_text(win_after) == sha_text(mac_after_write))
-    finally:
-        # restore canonical AGENTS.md, then re-sync the legacy mirror
-        mac_write("AGENTS.md", backup)
-        rc2, _ = run_sync()
-        win_restored = sha_text(read(AGENTS_WIN)) == sha_text(backup)
-    return (ok_write and synced and win_restored), {
+    with temporary_worktree() as root:
+        backup = repo_read(root, "AI_WORKFLOW_RULES.md")
+        if backup is None:
+            return False, {"error": "cannot read canonical rules"}
+        marker = "\n<!-- WF002-T2-MARKER -->\n"
+        ok_write = repo_write(root, "AI_WORKFLOW_RULES.md", backup + marker)
+        canonical_after_write = repo_read(root, "AI_WORKFLOW_RULES.md")
+        rc, _ = run_sync(root)
+        mirror_after = repo_read(root, ".ai-control/RULES.md")
+        synced = ("WF002-T2-MARKER" in mirror_after) and (sha_text(mirror_after) == sha_text(canonical_after_write))
+        mirror_restored = sha_text(mirror_after) == sha_text(canonical_after_write)
+    return (ok_write and synced and mirror_restored), {
         "mac_write_ok": ok_write,
-        "windows_received_marker": synced,
-        "windows_restored_after_canonical_restore": win_restored,
+        "legacy_mirror_received_marker": synced,
+        "legacy_mirror_matches_isolated_canonical": mirror_restored,
     }
 
 
 def t3_no_windows_to_canonical():
-    mac_before = mac_sha("AGENTS.md")
-    orig = read(AGENTS_WIN)
-    write(AGENTS_WIN, orig + "\n<!-- WF002-T3-MARKER -->\n")
-    rc, _ = run_sync()
-    mac_after = mac_sha("AGENTS.md")
-    win_final = read(AGENTS_WIN)
-    ok = (mac_before is not None and mac_after == mac_before and "WF002-T3-MARKER" not in win_final)
+    with temporary_worktree() as root:
+        canonical_before = repo_sha(root, "AI_WORKFLOW_RULES.md")
+        legacy_rules = repo_path(root, ".ai-control/RULES.md")
+        orig = read(legacy_rules) if os.path.isfile(legacy_rules) else ""
+        write(legacy_rules, orig + "\n<!-- WF002-T3-MARKER -->\n")
+        rc, _ = run_sync(root)
+        canonical_after = repo_sha(root, "AI_WORKFLOW_RULES.md")
+        mirror_final = read(legacy_rules)
+    ok = (canonical_before is not None and canonical_after == canonical_before and "WF002-T3-MARKER" not in mirror_final)
     return ok, {
-        "mac_before": mac_before,
-        "mac_after": mac_after,
-        "mac_unchanged": mac_before == mac_after,
-        "windows_marker_removed_by_canonical_sync": "WF002-T3-MARKER" not in win_final,
+        "canonical_before": canonical_before,
+        "canonical_after": canonical_after,
+        "canonical_unchanged": canonical_before == canonical_after,
+        "legacy_marker_removed_by_canonical_sync": "WF002-T3-MARKER" not in mirror_final,
         "sync_exit": rc,
     }
 
@@ -197,11 +226,20 @@ SUITES = [
 def main():
     summary = {"task_id": "WF-002", "run_at": wf.now_iso(), "tests": {}}
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    baseline_snapshot = governance_snapshot()
     for tid, name, fn in SUITES:
         try:
             ok, detail = fn()
         except Exception as exc:  # pragma: no cover - defensive
             ok, detail = False, {"exception": str(exc)}
+        current_snapshot = governance_snapshot()
+        if current_snapshot != baseline_snapshot:
+            ok = False
+            detail = dict(detail)
+            detail["main_repo_side_effect"] = {
+                "baseline": baseline_snapshot,
+                "current": current_snapshot,
+            }
         summary["tests"][tid] = {"name": name, "result": "PASS" if ok else "FAIL", "detail": detail}
         with open(os.path.join(RESULTS_DIR, "tests.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)

@@ -424,11 +424,11 @@ def guard_worktree(task_id, session_id, worktree):
 
 
 def worktrees_root(repo=REPO):
-    return os.path.join(os.path.dirname(repo), os.path.basename(repo) + "-worktrees")
+    return os.path.join(repo, ".ai-control", "runtime-worktrees")
 
 
 def make_worktree(task_id, base_ref="HEAD", repo=REPO):
-    """Create a task-specific git worktree OUTSIDE the main working tree."""
+    """Create a task-specific git worktree in a managed runtime directory."""
     root = worktrees_root(repo)
     os.makedirs(root, exist_ok=True)
     wt_path = os.path.join(root, task_id)

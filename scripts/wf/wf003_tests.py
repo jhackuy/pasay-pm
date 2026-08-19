@@ -14,7 +14,7 @@ import wf_ctl  # noqa: E402
 
 RESULTS_DIR = os.path.join(wf.RESULTS_DIR, "WF-003")
 SYNC_PS1 = os.path.join(wf.REPO, "scripts", "wf", "sync-pasay.ps1")
-EXPECTED_RULES_VERSION = "2026-08-19.1"
+EXPECTED_RULES_VERSION = "2026-08-19.2"
 
 
 def base_task(**kw):

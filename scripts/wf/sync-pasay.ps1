@@ -9,8 +9,13 @@ function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $Repo '.git') -PathType Container)) {
-    throw "Pasay repository not found: $Repo"
+$gitDir = Join-Path $Repo '.git'
+if (-not (Test-Path -LiteralPath $gitDir)) {
+    $resolvedRepo = (& git -C $Repo rev-parse --show-toplevel 2>$null).Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resolvedRepo)) {
+        throw "Pasay repository not found: $Repo"
+    }
+    $Repo = $resolvedRepo
 }
 
 if (-not (Test-Path -LiteralPath $CanonicalRules -PathType Leaf)) {
