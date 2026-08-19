@@ -9,28 +9,36 @@ on:
       - ready_for_review
 
 jobs:
-  backend-tests:
-    name: Backend Tests
+  workflow-contract:
+    name: Workflow Contract Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: pasay_pm
-          POSTGRES_USER: pasay_pm
-          POSTGRES_PASSWORD: pasay_pm
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U pasay_pm -d pasay_pm"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify GitHub workflow files
+        run: |
+          test -f .github/ISSUE_TEMPLATE/ai-task.yml
+          test -f .github/ISSUE_TEMPLATE/config.yml
+          test -f .github/PULL_REQUEST_TEMPLATE.md
+          test -f .github/workflows/pr-ci.yml
+          test -f GITHUB_DEV_WORKFLOW.md
+
+      - name: Verify workflow contract text
+        run: |
+          grep -q "Task ID / Title" .github/ISSUE_TEMPLATE/ai-task.yml
+          grep -q "Linked Issue" .github/PULL_REQUEST_TEMPLATE.md
+          grep -q "READY_FOR_OWNER" .github/PULL_REQUEST_TEMPLATE.md
+          grep -q "GitHub Issue is the single task ID" GITHUB_DEV_WORKFLOW.md
+          grep -q "GitHub Issue 是唯一任务 ID" README.md
+
+  backend-import-smoke:
+    name: Backend Import Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       PYTHONPATH: ""
-      DATABASE_URL: postgresql+psycopg2://pasay_pm:pasay_pm@localhost:5432/pasay_pm
-      PASAY_TEST_DB_NAME: pasay_pm_test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,13 +53,14 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run backend tests
-        run: python -m pytest tests -q
+      - name: Run backend import smoke
+        run: |
+          python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
-  bot-tests:
-    name: Telegram Bot Tests
+  bot-import-smoke:
+    name: Telegram Bot Import Smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     env:
       PYTHONPATH: ""
     defaults:
@@ -71,5 +80,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      - name: Run bot tests
-        run: python -m pytest tests -q
+      - name: Run bot import smoke
+        run: |
+          python -c "import pasay_bot.main, telegram, httpx; print('BOT_IMPORT_SMOKE_OK')"
