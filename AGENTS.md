@@ -1,6 +1,6 @@
 # Pasay AI Development Control
 
-Canonical workflow rules: `/Users/jhackuy/Projects/pasay-pm/AI_WORKFLOW_RULES.md`
+Canonical workflow rules: `AI_WORKFLOW_RULES.md`
 
 Before any execution, the worker must pass rules preflight (implemented in `scripts/wf/wf_ctl.py preflight`).
 

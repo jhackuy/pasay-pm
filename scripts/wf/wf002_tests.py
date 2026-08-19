@@ -16,9 +16,8 @@ sys.path.insert(0, os.path.join(REPO, "scripts", "wf"))
 import wf_lib as wf  # noqa: E402
 import wf_ctl  # noqa: E402
 
-MAC_HOST = "macmini"
-MAC_REPO = "/Users/jhackuy/Projects/pasay-pm"
-SYNC_PS1 = r"D:\AI-Review\sync-pasay.ps1"
+CANONICAL_REPO = REPO
+SYNC_PS1 = os.path.join(REPO, "scripts", "wf", "sync-pasay.ps1")
 AGENTS_WIN = os.path.join(REPO, "AGENTS.md")
 RESULTS_DIR = os.path.join(REPO, ".ai-control", "results", "WF-002")
 OLD_AGENTS_SHA = "58f1357f6e811f0a3ac93f1951a5751ee426a5223314f1d61e0933252d674a66"
@@ -48,34 +47,18 @@ def write(path: str, content: str) -> None:
 
 
 def mac_sha(rel: str):
-    rc, out = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", MAC_HOST,
-                  f"sha256sum {MAC_REPO}/{rel}"], timeout=40)
-    return out.split()[0].lower() if rc == 0 and out.strip() else None
+    return wf.sha256_file(os.path.join(CANONICAL_REPO, rel.replace("/", os.sep)))
 
 
 def mac_read(rel: str):
-    tmp = tempfile.NamedTemporaryFile(prefix="wf002_mac_", delete=False)
-    tmp.close()
-    try:
-        rc, _ = sh(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                    f"{MAC_HOST}:{MAC_REPO}/{rel}", tmp.name], timeout=40)
-        if rc != 0:
-            return None
-        return read(tmp.name)
-    finally:
-        os.unlink(tmp.name)
+    path = os.path.join(CANONICAL_REPO, rel.replace("/", os.sep))
+    return read(path) if os.path.isfile(path) else None
 
 
 def mac_write(rel: str, content: str) -> bool:
-    tmp = tempfile.NamedTemporaryFile(prefix="wf002_win_", suffix=".tmp", delete=False)
-    tmp.close()
-    write(tmp.name, content)
-    try:
-        rc, _ = sh(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                    tmp.name, f"{MAC_HOST}:{MAC_REPO}/{rel}"], timeout=40)
-        return rc == 0
-    finally:
-        os.unlink(tmp.name)
+    path = os.path.join(CANONICAL_REPO, rel.replace("/", os.sep))
+    write(path, content)
+    return True
 
 
 def run_sync():
@@ -105,7 +88,7 @@ def t1_no_old_head_restore():
     write(AGENTS_WIN, orig + marker)
     before_reset_count = reset_reflog_count()
 
-    # Observe up to 90s: the OLD mechanism must not restore AGENTS.md to old Git HEAD.
+    # Observe up to 90s: the sync mechanism must not restore AGENTS.md to old Git HEAD.
     reverted = False
     deadline = time.time() + 90
     while time.time() < deadline:
@@ -137,7 +120,7 @@ def t1_no_old_head_restore():
 def t2_canonical_to_windows():
     backup = mac_read("AGENTS.md")
     if backup is None:
-        return False, {"error": "cannot read Mac AGENTS.md"}
+        return False, {"error": "cannot read canonical AGENTS.md"}
     marker = "\n<!-- WF002-T2-MARKER -->\n"
     ok_write = mac_write("AGENTS.md", backup + marker)
     mac_after_write = mac_read("AGENTS.md")
@@ -147,7 +130,7 @@ def t2_canonical_to_windows():
         win_after = read(AGENTS_WIN)
         synced = ("WF002-T2-MARKER" in win_after) and (sha_text(win_after) == sha_text(mac_after_write))
     finally:
-        # restore canonical on Mac, then re-sync Windows
+        # restore canonical AGENTS.md, then re-sync the legacy mirror
         mac_write("AGENTS.md", backup)
         rc2, _ = run_sync()
         win_restored = sha_text(read(AGENTS_WIN)) == sha_text(backup)

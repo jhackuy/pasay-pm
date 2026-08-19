@@ -359,21 +359,11 @@ def set_state(task_id, state, expected_from=None):
 DANGEROUS_PATTERNS = [
     ("git reset --hard", re.compile(r"git\s+(?:-C\s+\S+\s+)?reset\s+--hard"), "unscoped hard reset"),
     ("git checkout -B", re.compile(r"git\s+(?:-C\s+\S+\s+)?checkout\s+-B"), "force branch checkout"),
-    ("reset --hard (canonical)", re.compile(r"(?:macmini|/Users/jhackuy/Projects/pasay-pm).{0,80}reset\s+--hard", re.IGNORECASE), "canonical repo destructive reset"),
-    ("reverse overwrite to Mac", re.compile(r"(?:scp|rsync|ssh)\s+[^\n]*?\.?(?:md|py|ps1)\s+(?:macmini:)?/Users/jhackuy/Projects/pasay-pm", re.IGNORECASE), "Windows -> Mac overwrite"),
 ]
 
 # Explicit, reviewed safety exceptions (hardened sync alignment is guarded: no force,
 # fail-closed dirty tree, protected-file content sync only Mac -> Windows).
-SAFETY_ALLOWLIST = [
-    {"file": "scripts/wf/sync-pasay.ps1", "pattern": "git checkout -B",
-     "reason": "safe alignment: no -f, BLOCKED_DIRTY_WORKTREE fail-closed, protected files content-synced from canonical"},
-]
-
-# Deployed copies map to their canonical repo identity for allowlist matching.
-DEPLOYED_ALIASES = {
-    r"D:\AI-Review\sync-pasay.ps1": "scripts/wf/sync-pasay.ps1",
-}
+SAFETY_ALLOWLIST = []
 
 
 def safety_scan(roots=None):
@@ -384,7 +374,6 @@ def safety_scan(roots=None):
     """
     roots = roots or [
         os.path.join(wf.REPO, "scripts", "wf"),
-        r"D:\AI-Review\sync-pasay.ps1",
     ]
     violations = []
     seen_files = set()
@@ -404,8 +393,7 @@ def safety_scan(roots=None):
                 content = wf.read_file(path) or ""
             except OSError:
                 continue
-            rel = DEPLOYED_ALIASES.get(os.path.normpath(path),
-                                       os.path.relpath(path, wf.REPO)).replace("\\", "/")
+            rel = os.path.relpath(path, wf.REPO).replace("\\", "/")
             if os.path.basename(path) == "wf_ops.py":
                 continue  # scanner itself only defines patterns as literals
             code_lines = []

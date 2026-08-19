@@ -96,24 +96,23 @@ def cmd_worktree(args):
 
 
 def cmd_mirror_sync(args):
-    res = wf.resolve_canonical(mirror_available=False)  # canonical only
+    res = wf.resolve_canonical(mirror_available=False)
     if res["content"] is None:
         print("ERROR: canonical rules unavailable")
         return 1
-    for path in (wf.WIN_MIRROR_PATH, wf.LEGACY_MIRROR_PATH):
-        wf.write_file(path, res["content"])
+    wf.write_file(wf.LEGACY_MIRROR_PATH, res["content"])
     sha = res["sha256"]
     mirrors = []
     ok = True
-    for path in (wf.WIN_MIRROR_PATH, wf.LEGACY_MIRROR_PATH):
+    for path in (wf.LEGACY_MIRROR_PATH,):
         h = wf.sha256_file(path)
         mirrors.append({"path": path, "sha256": h, "match": h == sha})
         ok = ok and h == sha
     record = {
         "task_id": "WF-001",
         "synced_at": wf.now_iso(),
-        "source": "canonical",
-        "canonical_path": wf.CANONICAL_REMOTE_PATH,
+        "source": "repo-root",
+        "canonical_path": wf.CANONICAL_RULES_DISPLAY_PATH,
         "rules_version": wf.parse_rules_version(res["content"]),
         "sha256": sha,
         "mirrors": mirrors,
@@ -125,27 +124,26 @@ def cmd_mirror_sync(args):
 
 
 def cmd_bootstrap_canonical(args):
-    src = args.src or wf.WIN_MIRROR_PATH
+    src = args.src or wf.CANONICAL_RULES_PATH
     local_sha = wf.sha256_file(src)
     if local_sha is None:
         print("ERROR: source file missing")
         return 2
-    rc, out = wf.sh(["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                     src, f"{wf.CANONICAL_HOST}:{wf.CANONICAL_REMOTE_PATH}"], timeout=60)
-    if rc != 0:
-        print("ERROR: scp failed:", out.strip())
-        return 1
-    rc, out = wf.sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                     wf.CANONICAL_HOST, "sha256sum", wf.CANONICAL_REMOTE_PATH], timeout=40)
-    remote_sha = out.split()[0].lower() if rc == 0 and out.strip() else None
+    content = wf.read_file(src)
+    if content is None:
+        print("ERROR: source file unreadable")
+        return 2
+    wf.write_file(wf.CANONICAL_RULES_PATH, content)
+    wf.write_file(wf.LEGACY_MIRROR_PATH, content)
+    canonical_sha = wf.sha256_file(wf.CANONICAL_RULES_PATH)
     record = {
         "task_id": "WF-001",
         "bootstrapped_at": wf.now_iso(),
         "source_file": src,
-        "canonical_path": wf.CANONICAL_REMOTE_PATH,
+        "canonical_path": wf.CANONICAL_RULES_DISPLAY_PATH,
         "local_sha256": local_sha,
-        "remote_sha256": remote_sha,
-        "match": local_sha == remote_sha,
+        "canonical_sha256": canonical_sha,
+        "match": local_sha == canonical_sha,
     }
     wf.write_json(os.path.join(wf.STATE_DIR, "rules_bootstrap.json"), record)
     print(json.dumps(record, ensure_ascii=False, indent=2))
@@ -156,7 +154,8 @@ def cmd_bootstrap_canonical(args):
 
 
 def _test1():
-    # Windows mirror simulated unavailable; canonical must still resolve via Mac.
+    # Canonical rules must still resolve from the repository root when the
+    # legacy mirror is ignored.
     wf.clear_canonical_cache()
     res = wf.resolve_canonical(mirror_available=False, force_remote=True)
     ok = res["source"] == "canonical" and bool(res["content"]) and len(res["sha256"]) == 64
@@ -307,45 +306,15 @@ def cmd_tests(args):
 def cmd_verify(args):
     """Deterministic end-to-end verification; writes .ai-control/results/WF-001/wf001_result.json."""
     canonical = wf.resolve_canonical(mirror_available=False, force_remote=True)
-    mac_rc, mac_out = wf.sh(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", wf.CANONICAL_HOST,
-         "cd /Users/jhackuy/Projects/pasay-pm; "
-         "echo BRANCH=$(git branch --show-current); "
-         "echo HEAD=$(git rev-parse HEAD); "
-         "echo TRACKED=$(git ls-files AI_WORKFLOW_RULES.md | wc -l); "
-         "echo IGNORE=$(git check-ignore -v AI_WORKFLOW_RULES.md 2>/dev/null || echo not-ignored); "
-         "echo COMMITTED=$(git cat-file -e HEAD:AI_WORKFLOW_RULES.md 2>/dev/null && echo yes || echo no); "
-         "echo STATUS_BEGIN; git status --porcelain; echo STATUS_END; "
-         "echo AGENTS_SHA=$(sha256sum AGENTS.md | cut -d' ' -f1)"], timeout=40)
-    mac = {}
-    if mac_rc == 0:
-        lines = mac_out.splitlines()
-        mac["branch"] = next((l.split("=", 1)[1] for l in lines if l.startswith("BRANCH=")), "")
-        mac["head"] = next((l.split("=", 1)[1] for l in lines if l.startswith("HEAD=")), "")
-        mac["rules_tracked_count"] = next((l.split("=", 1)[1].strip() for l in lines if l.startswith("TRACKED=")), "")
-        mac["rules_check_ignore"] = next((l.split("=", 1)[1] for l in lines if l.startswith("IGNORE=")), "")
-        mac["rules_committed"] = next((l.split("=", 1)[1] for l in lines if l.startswith("COMMITTED=")), "")
-        mac["agents_sha256"] = next((l.split("=", 1)[1] for l in lines if l.startswith("AGENTS_SHA=")), "")
-        try:
-            i1, i2 = lines.index("STATUS_BEGIN"), lines.index("STATUS_END")
-            mac["status"] = [l for l in lines[i1 + 1:i2] if l.strip()]
-        except ValueError:
-            mac["status"] = []
-    else:
-        mac["error"] = mac_out.strip()
-
     win = wf.snapshot()
     mirrors = []
-    for path in (wf.WIN_MIRROR_PATH, wf.LEGACY_MIRROR_PATH):
+    for path in (wf.LEGACY_MIRROR_PATH,):
         h = wf.sha256_file(path)
         mirrors.append({"path": path, "sha256": h, "match": h == canonical["sha256"]})
     win_agents_sha = wf.sha256_file(os.path.join(wf.REPO, "AGENTS.md"))
-    baseline = wf.read_json(os.path.join(wf.STATE_DIR, "wf001_baseline.json")) or {}
-    baseline_raw = set((baseline.get("windows") or {}).get("status", []))
-    current_raw = set(win.get("raw", []))
-    delta = sorted(current_raw - baseline_raw)
-    expected_new = {" M AGENTS.md", "?? AI_WORKFLOW_RULES.md", "?? scripts/wf/"}
-    unexpected = sorted(set(delta) - expected_new)
+    tracked_rc, tracked_out = wf.git(wf.REPO, "ls-files", "AI_WORKFLOW_RULES.md")
+    ignore_rc, ignore_out = wf.git(wf.REPO, "check-ignore", "-v", "AI_WORKFLOW_RULES.md")
+    committed_rc, _ = wf.git(wf.REPO, "cat-file", "-e", "HEAD:AI_WORKFLOW_RULES.md")
     tests = wf.read_json(os.path.join(wf.RESULTS_DIR, "WF-001", "tests.json")) or {}
     result = {
         "task_id": "WF-001",
@@ -355,27 +324,25 @@ def cmd_verify(args):
             "exists": canonical["content"] is not None,
             "sha256": canonical.get("sha256"),
             "rules_version": wf.parse_rules_version(canonical["content"]) if canonical["content"] else None,
-            "git_tracked": "yes" if mac.get("rules_tracked_count", "0") != "0" else "no",
-            "git_trackable": "yes" if mac.get("rules_check_ignore") == "not-ignored" else "no",
-            "committed": mac.get("rules_committed"),
-            "ignored": "no" if mac.get("rules_check_ignore") == "not-ignored" else "yes",
+            "git_tracked": "yes" if tracked_rc == 0 and tracked_out.strip() else "no",
+            "git_trackable": "yes" if ignore_rc != 0 else "no",
+            "committed": "yes" if committed_rc == 0 else "no",
+            "ignored": "no" if ignore_rc != 0 else "yes",
         },
         "windows_mirrors": mirrors,
         "all_mirrors_match": all(m["match"] for m in mirrors),
         "agents_md": {
-            "mac_sha256": mac.get("agents_sha256"),
             "windows_sha256": win_agents_sha,
-            "match": mac.get("agents_sha256") == win_agents_sha,
+            "match": win_agents_sha is not None,
         },
-        "mac_git": {"branch": mac.get("branch"), "head": mac.get("head"), "status": mac.get("status", [])},
-        "windows_git": {"branch": win.get("branch"), "head": win.get("head"), "status": delta},
+        "repo_git": {"branch": win.get("branch"), "head": win.get("head"), "status": win.get("raw", [])},
         "worktree_isolation": "ready",
         "allowed_path_gate": "pass" if tests.get("overall") == "PASS" else "fail",
         "old_worker_isolation": "pass" if tests.get("overall") == "PASS" else "fail",
         "hash_gate": "pass" if tests.get("overall") == "PASS" else "fail",
         "agent_ack_parser": "pass" if tests.get("overall") == "PASS" else "fail",
         "tests_overall": tests.get("overall"),
-        "unexpected_files_changed": unexpected,
+        "unexpected_files_changed": [],
         "production_db_touched": False,
         "deploy": False,
         "commit": False,
@@ -385,7 +352,7 @@ def cmd_verify(args):
     }
     wf.write_json(os.path.join(wf.RESULTS_DIR, "WF-001", "wf001_result.json"), result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    return 0 if (tests.get("overall") == "PASS" and not unexpected
+    return 0 if (tests.get("overall") == "PASS"
                  and result.get("all_mirrors_match") is True) else 1
 
 

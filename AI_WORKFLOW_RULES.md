@@ -1,9 +1,9 @@
 # Pasay AI Development Workflow Rules — Canonical
 
-rules_version: 2026-08-13.4
-canonical_path: /Users/jhackuy/Projects/pasay-pm/AI_WORKFLOW_RULES.md
-authority: 唯一权威规则文件。任何 Windows 副本（例如 D:\AI-Review\pasay-pm\AI_WORKFLOW_RULES.md）只作为 mirror/cache，不作为权威。
-last_updated: 2026-08-13
+rules_version: 2026-08-19.1
+canonical_path: AI_WORKFLOW_RULES.md
+authority: Windows 是当前 canonical development authority；规则文件按 repo-relative `AI_WORKFLOW_RULES.md` 解析，禁止依赖任何用户目录绝对路径。
+last_updated: 2026-08-19
 
 ---
 
@@ -11,7 +11,7 @@ last_updated: 2026-08-13
 
 ### Rules Preflight（任何 LLM 调用之前必须执行）
 
-1. 定位 canonical 规则文件（本文件）。
+1. 从 repository root 动态定位 canonical 规则文件（`AI_WORKFLOW_RULES.md`）。
 2. 计算 SHA-256。
 3. 与 task envelope 中的 `rules_sha256` 比较。
 4. 结果状态：
@@ -48,7 +48,7 @@ RULES_ACK role=LILY sha256=<hash>
 
 ```yaml
 task_id: PASAY-XXX
-rules_path: <canonical path>
+rules_path: AI_WORKFLOW_RULES.md
 rules_sha256: <sha256>
 role: MAX
 objective: ...

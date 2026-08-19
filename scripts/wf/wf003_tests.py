@@ -13,7 +13,8 @@ import wf_ops  # noqa: E402
 import wf_ctl  # noqa: E402
 
 RESULTS_DIR = os.path.join(wf.RESULTS_DIR, "WF-003")
-EXPECTED_RULES_VERSION = "2026-08-13.2"
+SYNC_PS1 = os.path.join(wf.REPO, "scripts", "wf", "sync-pasay.ps1")
+EXPECTED_RULES_VERSION = "2026-08-19.1"
 
 
 def base_task(**kw):
@@ -155,7 +156,7 @@ def t9_workflow_regression():
     ok = ok and not violations
     # canonical -> Windows sync (WF-002)
     proc = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", r"D:\AI-Review\sync-pasay.ps1"],
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", SYNC_PS1],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
     rc = proc.returncode
     results["canonical_sync_exit"] = rc

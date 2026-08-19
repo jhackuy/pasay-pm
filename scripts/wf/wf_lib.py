@@ -18,9 +18,10 @@ import tempfile
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-CANONICAL_HOST = "macmini"
-CANONICAL_REMOTE_PATH = "/Users/jhackuy/Projects/pasay-pm/AI_WORKFLOW_RULES.md"
-WIN_MIRROR_PATH = os.path.join(REPO, "AI_WORKFLOW_RULES.md")
+RULES_REPO_REL_PATH = "AI_WORKFLOW_RULES.md"
+CANONICAL_RULES_PATH = os.path.join(REPO, RULES_REPO_REL_PATH)
+CANONICAL_RULES_DISPLAY_PATH = "<repo-root>/AI_WORKFLOW_RULES.md"
+WIN_MIRROR_PATH = CANONICAL_RULES_PATH
 LEGACY_MIRROR_PATH = os.path.join(REPO, ".ai-control", "RULES.md")
 STATE_DIR = os.path.join(REPO, ".ai-control", "state")
 RESULTS_DIR = os.path.join(REPO, ".ai-control", "results")
@@ -187,26 +188,14 @@ def read_json(path: str):
         return None
 
 
-def read_canonical_remote(host=CANONICAL_HOST, path=CANONICAL_REMOTE_PATH, timeout=40):
-    """Read the canonical rules file from the Mac repo (read-only, via scp). Returns (ok, content)."""
-    tmp = tempfile.NamedTemporaryFile(prefix="wf_canonical_", suffix=".md", delete=False)
-    tmp_name = tmp.name
-    tmp.close()
-    try:
-        rc, out = sh(
-            ["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-             f"{host}:{path}", tmp_name],
-            timeout=timeout,
-        )
-        if rc != 0:
-            return False, out
-        content = read_file(tmp_name)
-        return (True, content) if content is not None else (False, "read failed")
-    finally:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
+def read_canonical_remote(path=CANONICAL_RULES_PATH, timeout=40):
+    """Read the canonical rules file from the current repository root.
+
+    The `timeout` parameter is kept for API compatibility with older callers.
+    """
+    del timeout
+    content = read_file(path)
+    return (True, content) if content is not None else (False, "read failed")
 
 
 def clear_canonical_cache():
@@ -214,20 +203,20 @@ def clear_canonical_cache():
 
 
 def resolve_canonical(mirror_available=True, force_remote=False):
-    """Locate authoritative rules content. Priority: Mac canonical -> Windows mirror -> legacy mirror.
+    """Locate authoritative rules content from the repository root.
 
-    Canonical content is cached per process so repeated preflights only SSH once.
+    Canonical content is cached per process so repeated preflights only read once.
     """
     if not force_remote and _CANONICAL_CACHE:
         return dict(_CANONICAL_CACHE)
     ok, content = read_canonical_remote()
     if ok and content.strip():
-        res = {"source": "canonical", "path": CANONICAL_REMOTE_PATH, "content": content,
+        res = {"source": "canonical", "path": CANONICAL_RULES_DISPLAY_PATH, "content": content,
                "sha256": sha256_text(content)}
         _CANONICAL_CACHE.update(res)
         return res
     if mirror_available:
-        for label, path in (("mirror", WIN_MIRROR_PATH), ("legacy-mirror", LEGACY_MIRROR_PATH)):
+        for label, path in (("legacy-mirror", LEGACY_MIRROR_PATH),):
             content = read_file(path)
             if content is not None and content.strip():
                 res = {"source": label, "path": path, "content": content,
