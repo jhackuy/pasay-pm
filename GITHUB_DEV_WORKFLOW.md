@@ -17,22 +17,46 @@ Owner -> ChatGPT
           |                  |
           |              OpenDesign
           |                  |
+   Owner 在 TRAE IDE 输入 /nd
+          |                  |
+   TRAE 领取 ready-for-dev    |
+          |                  |
+   targeted tests            |
+   commit / push             |
+          |                  |
           '-------------.----'
                         |
-                       TRAE
-                        |
-                        PR
+                       PR
+                        |  HANDOFF_COMPLETE
                   .-----'-----.
                   |           |
              CodeRabbit   pasay-gate
                   '-----.___.-'
                         |
                  Gate satisfied
-          |
-                READY_FOR_OWNER
-                      |
-                    Owner
+                        |
+              ChatGPT 总控审核
+                   /      \
+          RETURN（返修）  ready-for-owner
+                          |
+                        Owner
 ```
+
+TRAE IDE `/nd`（Next Dev）是 `dev route` 的唯一执行入口：
+`ready-for-dev Issue → TRAE IDE /nd → targeted tests → commit/push → PR → HANDOFF_COMPLETE → STOP`
+
+`HANDOFF_COMPLETE` 仅表示 PR handoff 完成：
+- ≠ Code Review PASS
+- ≠ CI PASS
+- ≠ ready-for-owner
+- ≠ 可以 merge
+
+`/nd` 的边界：
+- 不等待 GitHub Actions
+- 不等待 CodeRabbit
+- 不 Review 自己的代码
+- 不设置 `ready-for-owner`
+- 永不 merge PR
 
 ## Core Contract
 
@@ -83,9 +107,10 @@ workspace in parallel.
 
 ## READY_FOR_OWNER
 
-After a PR is opened, CodeRabbit and `pasay-gate` run in parallel. Their
-results are independent evidence for the same PR.
+After a PR is opened by TRAE `/nd` (HANDOFF_COMPLETE), CodeRabbit and `pasay-gate` run in parallel. Their results are independent evidence for the same PR.
 
-`READY_FOR_OWNER` may be set to `YES` only when the task-specific design gate
-(if any), CodeRabbit, and `pasay-gate` evidence are all present and pass for
-the scope of the task. No PR may be auto-merged in this phase.
+Then **ChatGPT 总控审核** is performed. Only the 总控 may issue RETURN (返修) or advance to `ready-for-owner`.
+
+`ready-for-owner` label may be set only when the task-specific gate (if any), CodeRabbit, `pasay-gate`, and ChatGPT 总控审核 are all present and pass for the scope of the task. No PR may be auto-merged in this phase. Owner keeps final business acceptance authority.
+
+`/nd` itself shall never set `ready-for-owner`.
