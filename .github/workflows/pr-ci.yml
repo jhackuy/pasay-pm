@@ -1,0 +1,75 @@
+name: Pasay PR CI
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+jobs:
+  backend-tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: pasay_pm
+          POSTGRES_USER: pasay_pm
+          POSTGRES_PASSWORD: pasay_pm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pasay_pm -d pasay_pm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PYTHONPATH: ""
+      DATABASE_URL: postgresql+psycopg2://pasay_pm:pasay_pm@localhost:5432/pasay_pm
+      PASAY_TEST_DB_NAME: pasay_pm_test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run backend tests
+        run: python -m pytest tests -q
+
+  bot-tests:
+    name: Telegram Bot Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ""
+    defaults:
+      run:
+        working-directory: pasay-telegram-bot
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install bot dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run bot tests
+        run: python -m pytest tests -q

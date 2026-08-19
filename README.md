@@ -2,6 +2,13 @@
 
 小型物业管理后端（约 10 套出租房）：FastAPI + PostgreSQL 16，Bearer API Key 认证 + 简单 RBAC，佣金由纯函数引擎计算，全部关键操作写入审计日志。规格唯一来源：`BRIEF.md`。
 
+## GitHub Workflow
+
+- GitHub Issue 是唯一任务 ID 与任务事实源。
+- OpenDesign 是设计事实源；生产代码只通过 PR 交付。
+- CodeRabbit 与 GitHub Actions 提供独立 gate，不能由实现 Agent 自证替代。
+- 详细流程与 label contract 见 `GITHUB_DEV_WORKFLOW.md`。
+
 ## 架构（文字图）
 
 ```
