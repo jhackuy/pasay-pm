@@ -1,67 +1,41 @@
 ## Linked Issue
 
-- Issue: `Closes #<issue-number>`
+- `Closes #<issue-number>`
 
 ## Route
 
-- Route: `dev-only | design-only | design-then-dev | parallel-approved`
-
-## Branches
-
-- Base branch: `feature/telegram-ui-v2`
-- Head branch: `<your-branch>`
+- `dev | design-dev | design-only`
 
 ## Change Summary
 
 - What changed:
 - Why it changed:
-- What stayed unchanged:
 
 ## Files Changed
 
 - Key files:
 - Docs / workflow files:
 
-## Business Truth Preserved
-
-- Frozen rules preserved:
-- Explicitly untouched areas:
-
 ## Targeted Tests
 
-- Command:
+- Command(s):
 - Actual result:
-- Notes:
 
-## CI Status
+## Known Risk / Rollback
 
-- GitHub Actions:
-- Workflow run URL:
+- Known risk:
+- Rollback:
 
 ## CodeRabbit Status
 
-- Triggered: `YES | NO`
+- Triggered: `YES | NO | BLOCKED`
 - Evidence:
-- Conclusion:
 
-## Known Risks
+## CI Status
 
-- Risk 1:
-- Risk 2:
-
-## Rollback
-
-- Revert plan:
-- Safe fallback:
-
-## Owner Acceptance Checklist
-
-- [ ] Linked Issue is correct
-- [ ] Scope matches the Issue
-- [ ] Business truth is preserved
-- [ ] Targeted validation evidence is attached
-- [ ] CodeRabbit and CI evidence are attached
-- [ ] No auto-merge was performed
+- Check / workflow:
+- Actual result:
+- Evidence URL:
 
 ## READY_FOR_OWNER
 

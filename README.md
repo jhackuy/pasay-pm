@@ -6,8 +6,8 @@
 
 - GitHub Issue 是唯一任务 ID 与任务事实源。
 - OpenDesign 是设计事实源；生产代码只通过 PR 交付。
-- CodeRabbit 与 GitHub Actions 提供独立 gate，不能由实现 Agent 自证替代。
-- 详细流程与 label contract 见 `GITHUB_DEV_WORKFLOW.md`。
+- PR 创建后由 CodeRabbit 与 `pasay-gate` 并行提供独立 gate，不能由实现 Agent 自证替代。
+- 长期工程规则入口见 `AGENTS.md`，流程与最小 label contract 见 `GITHUB_DEV_WORKFLOW.md`。
 
 ## 架构（文字图）
 

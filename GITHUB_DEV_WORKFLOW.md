@@ -10,20 +10,28 @@ Owner -> ChatGPT
           |
           v
       GitHub Issue
+                    |
+          .---------'--------.
+          |                  |
+       dev route      design-dev route
+          |                  |
+          |              OpenDesign
+          |                  |
+          '-------------.----'
+                        |
+                       TRAE
+                        |
+                        PR
+                  .-----'-----.
+                  |           |
+             CodeRabbit   pasay-gate
+                  '-----.___.-'
+                        |
+                 Gate satisfied
           |
-     route decision
-       /       \
-OpenDesign    TRAE
-       \       /
-          PR
-          |
-      CodeRabbit
-          |
-   GitHub Actions
-          |
-  READY_FOR_OWNER
-          |
-        Owner
+                READY_FOR_OWNER
+                      |
+                    Owner
 ```
 
 ## Core Contract
@@ -41,45 +49,23 @@ OpenDesign    TRAE
 
 ## Supported Routes
 
-- `dev-only`: no UX or product-design change is required; TRAE can implement
+- `dev`: no UX or product-design change is required; TRAE can implement
   directly from the Issue.
 - `design-only`: only OpenDesign source-of-truth updates are required; no
   production code change is allowed.
-- `design-then-dev`: OpenDesign completes design and a structured handoff first;
+- `design-dev`: OpenDesign completes design and a structured handoff first;
   TRAE implements only after approval.
-- `parallel-approved`: reserved for frozen-contract work only; defined here but
-  blocked by default in phase one.
 
 ## Workflow Labels
 
-Use labels as the workflow status contract.
+Use only the minimal metadata that GitHub native state does not already cover.
 
-### Route labels
-
-- `route:dev-only`
-- `route:design-only`
-- `route:design-then-dev`
-- `route:parallel-approved`
-
-### Status labels
-
-- `status:needs-design`
-- `status:design-running`
-- `status:design-review`
-- `status:design-approved`
-- `status:ready-for-dev`
-- `status:dev-running`
-- `status:review`
-- `status:changes-requested`
-- `status:ci-running`
-- `status:ready-for-owner`
-- `status:owner-rejected`
-- `status:blocked`
-- `status:done`
+- Route labels: `route:dev`, `route:design-dev`, `route:design-only`
+- Workflow labels: `ready-for-dev`, `ready-for-owner`, `blocked`
 
 ## Design To Dev Handoff
 
-For `design-then-dev`, OpenDesign must leave a structured handoff in the same
+For `design-dev`, OpenDesign must leave a structured handoff in the same
 GitHub Issue or an approved linked artifact. The handoff must include:
 
 - GitHub Issue number
@@ -97,6 +83,9 @@ workspace in parallel.
 
 ## READY_FOR_OWNER
 
+After a PR is opened, CodeRabbit and `pasay-gate` run in parallel. Their
+results are independent evidence for the same PR.
+
 `READY_FOR_OWNER` may be set to `YES` only when the task-specific design gate
-(if any), CodeRabbit, and GitHub Actions evidence are all present and pass for
+(if any), CodeRabbit, and `pasay-gate` evidence are all present and pass for
 the scope of the task. No PR may be auto-merged in this phase.

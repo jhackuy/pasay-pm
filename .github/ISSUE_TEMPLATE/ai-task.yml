@@ -2,37 +2,26 @@ name: AI Task
 description: Single-source task for ChatGPT, OpenDesign, and TRAE delivery
 title: "[TASK] "
 body:
-  - type: input
-    id: task_id
-    attributes:
-      label: Task ID / Title
-      description: Use one GitHub Issue as the single task ID and title source.
-      placeholder: "PASAY-DEV-AUTOMATION-001 — Short task title"
-    validations:
-      required: true
-
   - type: dropdown
     id: route
     attributes:
       label: Route
-      description: Select the execution route for this task.
+      description: Select the minimal route for this task.
       options:
-        - dev-only
+        - dev
+        - design-dev
         - design-only
-        - design-then-dev
-        - parallel-approved
     validations:
       required: true
 
   - type: textarea
-    id: business_goal
+    id: goal
     attributes:
-      label: Business Goal
+      label: Goal
       description: Describe the business outcome this task must achieve.
       placeholder: |
         - Why this task exists
-        - Who benefits
-        - What business outcome must change
+        - What outcome must change
     validations:
       required: true
 
@@ -51,23 +40,12 @@ body:
   - type: textarea
     id: scope
     attributes:
-      label: Scope
-      description: List the files, modules, behaviors, or deliverables that are in scope.
-      placeholder: |
-        - Files / modules that may change
-        - Expected implementation or design outputs
-    validations:
-      required: true
-
-  - type: textarea
-    id: allowed_files
-    attributes:
-      label: Allowed Files / Areas
-      description: Be explicit about where the agent may work.
+      label: Scope / Allowed Areas
+      description: List the files, modules, behaviors, or areas the agent may touch.
       placeholder: |
         - app/...
-        - pasay-telegram-bot/...
         - .github/...
+        - Docs or design artifacts that are allowed
     validations:
       required: true
 
@@ -80,18 +58,6 @@ body:
         - No schema migration
         - No UX rewrite
         - No unrelated refactor
-    validations:
-      required: true
-
-  - type: textarea
-    id: design_source
-    attributes:
-      label: Design Source
-      description: Required when the route needs design input or approved handoff.
-      placeholder: |
-        - OpenDesign source of truth link or path
-        - Approved design handoff reference
-        - If not needed, write N/A
     validations:
       required: true
 
@@ -120,21 +86,9 @@ body:
       required: true
 
   - type: textarea
-    id: risk_rollback
-    attributes:
-      label: Risk / Rollback
-      description: Capture the main risks and the rollback plan.
-      placeholder: |
-        - Main failure risks
-        - Rollback approach
-        - Follow-up monitoring if needed
-    validations:
-      required: true
-
-  - type: textarea
     id: stop_conditions
     attributes:
-      label: Stop Conditions / Blockers
+      label: Stop Condition / Blocker
       description: State when the agent must stop and report BLOCKED.
       placeholder: |
         - Dirty worktree with unknown source
@@ -152,21 +106,5 @@ body:
         - [ ] Business behavior matches frozen truth
         - [ ] Scope respected
         - [ ] Validation evidence is attached
-    validations:
-      required: true
-
-  - type: textarea
-    id: final_report
-    attributes:
-      label: Final Report Requirements
-      description: Default report language is Chinese unless explicitly overridden.
-      value: |
-        默认中文。最终报告至少包含：
-        1. branch
-        2. base SHA / head SHA
-        3. 修改/新增文件
-        4. targeted validation 命令与结果
-        5. 风险与 blocker
-        6. READY_FOR_OWNER: YES / NO
     validations:
       required: true
