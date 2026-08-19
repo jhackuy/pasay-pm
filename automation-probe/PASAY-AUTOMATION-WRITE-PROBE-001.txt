@@ -1,0 +1,3 @@
+PASAY-AUTOMATION-WRITE-PROBE-001
+GitHub Issue -> TRAE MCP -> Branch -> Commit -> PR
+PASS
