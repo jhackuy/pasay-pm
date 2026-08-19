@@ -52,7 +52,8 @@ Description: Next Dev - 一键执行下一个已批准的开发任务
 
 7. 执行前安全状态检查：
    - 确认正确 repo：`jhackuy/pasay-pm`。
-   - 确认 authority / 远端 base（默认 main）本地同步。
+   - Git 查询必须使用非交互模式，禁止触发 pager 阻塞：所有可能触发 Git pager 的查询必须使用 `git --no-pager` 前缀，或等价设置 `GIT_PAGER=cat`。禁止因为 pager 等待人工按 q 导致无人值守流程卡死。
+   - 确认 authority / 远端 base 本地同步：authority / remote base 必须根据仓库事实确认。优先依据：1) Issue 明确指定的 base；2) origin/HEAD；3) 当前仓库已确认的治理事实。禁止仅凭 main/master/分支名称猜测 authority。如果 authority 无法唯一确认 → `BLOCKED_UNCLEAR_AUTHORITY` → STOP。不得 checkout 或同步猜测出来的 base。
    - 确认工作区安全：不覆盖其他人的 branch / worktree / 未提交修改。
    - 不满足 → `BLOCKED` → STOP。
 8. 将 Issue 标签从 `status:approved` 切换为 `status:in-progress`：
