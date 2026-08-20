@@ -50,7 +50,7 @@ Owner 在 TRAE IDE 中输入：
    - **0 个 OPEN PR** → 继续执行 New Dev 专属门禁：必须含 `ready-for-dev`；若缺少 → `BLOCKED` reason="New Dev requires ready-for-dev" STOP。
    - **恰好 1 个 OPEN PR** → 再检查该 PR 最新评论：
      - 存在最新 `ND_RETURN` 合同评论（由 Owner 签发）→ **Repair Mode**（Repair Mode 专属门禁在 Repair Mode 合同内部重新核验 `ready-for-dev` + 领取）。
-     - 不存在最新 `ND_RETURN` 合同评论 → `BLOCKED` reason="DEV_TASK_ALREADY_RUNNING: 1 OPEN PR but no latest ND_RETURN on the PR; must not create 2nd PR" STOP。不得进入 New Dev；不得创建第二个 PR。
+     - 不存在最新 `ND_RETURN` 合同评论 → `DEV_TASK_ALREADY_RUNNING` → STOP。不得进入 New Dev；不得创建第二个 PR。
    - **多个 OPEN PR** → `AMBIGUOUS_DEV_TASK` → STOP。
 4. Claim / 开发 / tests / commit / push / PR handoff：
    - 若判定 Repair → Repair Mode 合同：继续在现有 PR head branch 上最小返修。
@@ -229,7 +229,7 @@ PR 创建或返修 push 后：
 只允许：
 
 - `HANDOFF_COMPLETE`
-- `BLOCKED`（附 reason：UNCLEAR_CONTRACT / UNCLEAR_AUTHORITY / CLAIM_CONFLICT / TEST_FAILURE / DEV_TASK_ALREADY_RUNNING / 其他定制原因）
+- `BLOCKED`（附 reason：UNCLEAR_CONTRACT / UNCLEAR_AUTHORITY / CLAIM_CONFLICT / TEST_FAILURE / 其他定制原因）
 - `NO_APPROVED_DEV_TASK`
 - `AMBIGUOUS_DEV_TASK`
 - `DEV_TASK_ALREADY_RUNNING`
