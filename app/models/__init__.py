@@ -28,6 +28,14 @@ from app.models.identity import (
     Principal, PrincipalType, SecurityEvent, TelegramIdentityBinding,
 )
 from app.models.lease import Lease, LeaseStatus
+from app.models.membership import (
+    InviteState,
+    Membership,
+    MembershipState,
+    Organization,
+    OrganizationRole,
+    SecretaryInvite,
+)
 from app.models.operations import (
     NotificationOutbox,
     NotificationStatus,
@@ -57,16 +65,13 @@ from app.models.telegram_webhook import (
 from app.models.user import User, UserRole
 
 __all__ = [
-    "CLAIM_STALE_SECONDS",
-    "TelegramWebhookState",
-    "TelegramWebhookUpdate",
-
     "AgentRole",
     "Attachment",
     "AuditAction",
     "AuditLog",
     "AuditMixin",
     "Base",
+    "CLAIM_STALE_SECONDS",
     "CommissionRule",
     "CommissionRuleType",
     "CommissionSettlement",
@@ -85,9 +90,15 @@ __all__ = [
     "IncomeStatus",
     "ApiCredential", "CommunicationEndpoint", "CredentialLifecycle", "CredentialState",
     "Principal", "PrincipalType", "SecurityEvent", "TelegramIdentityBinding",
+    "InviteState",
     "Lease",
     "LeaseStatus",
+    "Membership",
+    "MembershipState",
     "NotificationOutbox",
+    "Organization",
+    "OrganizationRole",
+    "SecretaryInvite",
     "NotificationStatus",
     "OperationalTask",
     "OperationalTaskPriority",
@@ -108,6 +119,8 @@ __all__ = [
     "TaskStatus",
     "Tenant",
     "TenantContactStatus",
+    "TelegramWebhookState",
+    "TelegramWebhookUpdate",
     "Unit",
     "UnitLifecycleEvent",
     "UnitStatus",

@@ -91,6 +91,14 @@ class AuditAction(str, Enum):
     expense_requires_reapproval = "expense_requires_reapproval"
     expense_resubmitted = "expense_resubmitted"
     expense_rejected = "expense_rejected"  # explicit rejection with reason + version preserved
+    # PASAY-TASK-002 (appended only; never rename or reorder prior values):
+    # Membership/organization lifecycle audit actions.
+    org_created = "org_created"
+    org_first_owner_activated = "org_first_owner_activated"
+    secretary_invited = "secretary_invited"
+    secretary_invite_accepted = "secretary_invite_accepted"
+    secretary_invite_cancelled = "secretary_invite_cancelled"
+    secretary_removed = "secretary_removed"
 
 
 class AuditLog(AuditMixin, Base):
