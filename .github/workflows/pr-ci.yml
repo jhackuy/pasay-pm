@@ -92,7 +92,7 @@ jobs:
       - name: Run backend targeted pytest (Issue #18 + Issue #31)
         if: steps.changed.outputs.backend == 'true'
         env:
-          DATABASE_URL: "sqlite+aiosqlite://"
+          DATABASE_URL: "sqlite://"
           DATABASE_URL_UNPOOLED: "sqlite://"
           TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"

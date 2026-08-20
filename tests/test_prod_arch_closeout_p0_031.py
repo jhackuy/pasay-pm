@@ -59,20 +59,38 @@ def client_unit():
         # Tests under T8 still independently verify the migration file itself
         # exists, is on the single-head chain, and matches this exact DDL.
         try:
-            from app.database import SessionLocal
+            import sqlalchemy as sa
+            from sqlalchemy.dialects import postgresql
+
+            from app.database import SessionLocal, engine
+
+            meta = sa.MetaData()
+            ledger = sa.Table(
+                "pasay_scheduled_job_ledger",
+                meta,
+                sa.Column("event_id", sa.String(length=256), primary_key=True),
+                sa.Column("job_name", sa.String(length=128), nullable=False),
+                sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
+                sa.Column(
+                    "consumed_at",
+                    sa.DateTime(timezone=True),
+                    nullable=False,
+                    server_default=sa.func.now(),
+                ),
+                sa.Column(
+                    "payload",
+                    postgresql.JSONB(astext_type=sa.Text()),
+                    nullable=True,
+                ),
+            )
+            ledger.create(bind=engine, checkfirst=True)
 
             with SessionLocal() as s:
-                s.execute(text(
-                    "CREATE TABLE IF NOT EXISTS pasay_scheduled_job_ledger ("
-                    "  event_id VARCHAR(256) PRIMARY KEY,"
-                    "  job_name VARCHAR(128) NOT NULL,"
-                    "  occurred_at TIMESTAMPTZ NOT NULL,"
-                    "  consumed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-                    "  payload JSONB"
-                    ")"
-                ))
-                s.commit()
-                s.execute(text("TRUNCATE TABLE pasay_scheduled_job_ledger"))
+                dialect_name = engine.dialect.name
+                if dialect_name == "sqlite":
+                    s.execute(text("DELETE FROM pasay_scheduled_job_ledger"))
+                else:
+                    s.execute(text("TRUNCATE TABLE pasay_scheduled_job_ledger"))
                 s.commit()
         except Exception:
             pass
