@@ -1,0 +1,87 @@
+name: trae-auto-wake
+
+on:
+  issues:
+    types:
+      - labeled
+
+concurrency:
+  group: trae-auto-wake-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  gate-and-dispatch:
+    name: gate-and-dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event.label.name == 'ready-for-dev'
+    steps:
+      - name: Gate — verify route:dev and no blocked
+        id: gate
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const labels = issue.labels.map(l => l.name);
+            const hasRouteDev = labels.includes('route:dev');
+            const hasBlocked = labels.includes('blocked');
+            const isOpen = issue.state === 'open';
+            console.log(`issue=${issue.number} state=${issue.state} labels=${JSON.stringify(labels)}`);
+            if (!isOpen) {
+              core.setFailed('Issue is not open');
+              return;
+            }
+            if (!hasRouteDev) {
+              core.notice(`Skipping: no route:dev on #${issue.number}`);
+              core.setOutput('passed', 'false');
+              return;
+            }
+            if (hasBlocked) {
+              core.notice(`Skipping: blocked on #${issue.number}`);
+              core.setOutput('passed', 'false');
+              return;
+            }
+            core.setOutput('passed', 'true');
+            core.setOutput('issue_number', String(issue.number));
+            core.setOutput('issue_title', issue.title);
+            core.setOutput('issue_url', issue.html_url);
+            core.setOutput('repository', context.payload.repository.full_name);
+
+      - name: Emit auto-wake event payload (for local bridge pickup)
+        if: steps.gate.outputs.passed == 'true'
+        run: |
+          cat <<'PAYLOAD_EOF'
+          ==== TRAE_AUTO_WAKE_EVENT ====
+          repository: ${{ steps.gate.outputs.repository }}
+          issue_number: ${{ steps.gate.outputs.issue_number }}
+          issue_title: ${{ steps.gate.outputs.issue_title }}
+          issue_url: ${{ steps.gate.outputs.issue_url }}
+          triggered_by: label:ready-for-dev
+          event_time: ${{ github.event.issue.updated_at }}
+          ==============================
+          PAYLOAD_EOF
+
+      - name: Best-effort HTTP notify to TRAE_LOCAL_BRIDGE_URL (if configured)
+        if: steps.gate.outputs.passed == 'true' && env.TRAE_LOCAL_BRIDGE_URL != ''
+        continue-on-error: true
+        env:
+          TRAE_LOCAL_BRIDGE_URL: ${{ secrets.TRAE_LOCAL_BRIDGE_URL }}
+          TRAE_LOCAL_BRIDGE_TOKEN: ${{ secrets.TRAE_LOCAL_BRIDGE_TOKEN }}
+        run: |
+          if [ -z "$TRAE_LOCAL_BRIDGE_URL" ]; then
+            echo "TRAE_LOCAL_BRIDGE_URL not configured — skipping HTTP push notify."
+            echo "Owner can still run local bridge pull-mode to fetch pending issues."
+            exit 0
+          fi
+          PAYLOAD=$(jq -cn \
+            --arg repo "${{ steps.gate.outputs.repository }}" \
+            --arg num "${{ steps.gate.outputs.issue_number }}" \
+            --arg title "${{ steps.gate.outputs.issue_title }}" \
+            --arg url "${{ steps.gate.outputs.issue_url }}" \
+            --arg t "${{ github.event.issue.updated_at }}" \
+            '{repository:$repo, issue_number:($num|tonumber), issue_title:$title, issue_url:$url, triggered_by:"label:ready-for-dev", event_time:$t}')
+          echo "POST $TRAE_LOCAL_BRIDGE_URL/event"
+          curl -fsS --max-time 10 -X POST "$TRAE_LOCAL_BRIDGE_URL/event" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TRAE_LOCAL_BRIDGE_TOKEN" \
+            -d "$PAYLOAD" || echo "HTTP notify failed — bridge may be offline (expected for local-only deploy). Owner uses pull-mode below."
