@@ -64,15 +64,27 @@ OWNERSHIP_MARKER_REV_KEY = "OWNED_BY_ALEMBIC_REV"
 OWNERSHIP_MARKER_SCHEMA_REV_KEY = "SCHEMA_REV"
 OWNERSHIP_MARKER_SCHEMA_REV_VALUE = "2"  # bumped at FIX13 (legacy tables had SCHEMA_REV=1)
 LEDGER_SCHEMA_DIGEST = "cols:event_id[256PK]+job_name[128NN]+occurred_at[TZNN]+consumed_at[TZNNDEFNOW]+payload[JSONB]|TZ:pg|dialect:jsonb-pg"
+OWNERSHIP_MARKER_SOURCE_KEY = "SOURCE"
+OWNERSHIP_MARKER_LEDGER_TYPE_KEY = "LEDGER_TYPE"
+_OWNERSHIP_MARKER_OUR_KEYS = frozenset({
+    OWNERSHIP_MARKER_REV_KEY,
+    OWNERSHIP_MARKER_SCHEMA_REV_KEY,
+    "DIGEST",
+    OWNERSHIP_MARKER_SOURCE_KEY,
+    OWNERSHIP_MARKER_LEDGER_TYPE_KEY,
+})
 
-# Exact COMMENT ON TABLE string we expect to round-trip on a clean upgrade +
-# downgrade cycle.  Any deviation → marker mismatch → Fail Closed.
+# Exact comment BODY produced for OUR tokens when there are NO legacy/foreign
+# tokens to preserve.  If a pre-existing COMMENT carries operator-managed KVs
+# (e.g. LEGACY_OWNER, CREATED, MIGRATED_FROM, NOTES), we READ-APPEND (update
+# only keys in _OWNERSHIP_MARKER_OUR_KEYS) and leave foreign keys untouched
+# (FIX14 Legacy Ownership Preservation).
 _OWNERSHIP_COMMENT_EXPECTED = (
     f"{OWNERSHIP_MARKER_REV_KEY}={revision};"
     f"{OWNERSHIP_MARKER_SCHEMA_REV_KEY}={OWNERSHIP_MARKER_SCHEMA_REV_VALUE};"
     f"DIGEST={LEDGER_SCHEMA_DIGEST};"
-    f"SOURCE=alembic-upgrade-{revision};"
-    "LEDGER_TYPE=scheduled-job-idempotency;"
+    f"{OWNERSHIP_MARKER_SOURCE_KEY}=alembic-upgrade-{revision};"
+    f"{OWNERSHIP_MARKER_LEDGER_TYPE_KEY}=scheduled-job-idempotency;"
 )
 
 
@@ -121,6 +133,69 @@ def _parse_ownership_marker(comment: str | None) -> dict[str, str]:
     return kv
 
 
+def _serialize_ownership_marker(kv: dict[str, str]) -> str:
+    """Serialize KV map back to the exact KV-order string of the marker.
+
+    Order contract:
+      (1) OUR keys FIRST — in the stable, deterministic order of
+          _OWNERSHIP_MARKER_OUR_KEYS (OWNED_BY_ALEMBIC_REV, SCHEMA_REV, DIGEST,
+          SOURCE, LEDGER_TYPE) — so byte-for-byte equality checks against
+          _OWNERSHIP_COMMENT_EXPECTED work when there are ZERO foreign keys.
+      (2) FOREIGN keys LAST — in sorted() order for determinism.
+          Foreign keys are operator-managed (LEGACY_OWNER, CREATED, MIGRATED_*)
+          and MUST remain preserved across re-stamps.
+    """
+    our_ordered_keys = [
+        OWNERSHIP_MARKER_REV_KEY,
+        OWNERSHIP_MARKER_SCHEMA_REV_KEY,
+        "DIGEST",
+        OWNERSHIP_MARKER_SOURCE_KEY,
+        OWNERSHIP_MARKER_LEDGER_TYPE_KEY,
+    ]
+    pieces: list[str] = []
+    for k in our_ordered_keys:
+        if k in kv:
+            pieces.append(f"{k}={kv[k]};")
+    foreign_keys = sorted(k for k in kv.keys() if k not in _OWNERSHIP_MARKER_OUR_KEYS)
+    for k in foreign_keys:
+        pieces.append(f"{k}={kv[k]};")
+    return "".join(pieces)
+
+
+def _merge_ownership_marker(
+    existing_comment: str | None,
+) -> tuple[str, bool]:
+    """READ-APPEND merge: preserve foreign KVs, update only OUR KVs to current rev.
+
+    Returns (final_comment_string, needs_write):
+      * needs_write=False  →  existing comment is already IDENTICAL to what we
+                              would serialize; skip COMMENT ON TABLE (avoid DDL
+                              noise on no-op re-upgrades — important for CI idempotency).
+      * needs_write=True   →  existing comment missing our keys / carrying stale
+                              values / we have foreign keys to preserve; re-write
+                              COMMENT ON TABLE with the merged result.
+    """
+    existing_kv = _parse_ownership_marker(existing_comment)
+    merged: dict[str, str] = {}
+    # (1) Foreign keys FIRST in merged (they are preserved verbatim).
+    for k, v in existing_kv.items():
+        if k not in _OWNERSHIP_MARKER_OUR_KEYS:
+            merged[k] = v
+    # (2) Our keys are UPDATED unconditionally (FIX14 rule: our marker tokens
+    #     are authoritative for the running revision).
+    merged[OWNERSHIP_MARKER_REV_KEY] = revision
+    merged[OWNERSHIP_MARKER_SCHEMA_REV_KEY] = OWNERSHIP_MARKER_SCHEMA_REV_VALUE
+    merged["DIGEST"] = LEDGER_SCHEMA_DIGEST
+    merged[OWNERSHIP_MARKER_SOURCE_KEY] = f"alembic-upgrade-{revision}"
+    merged[OWNERSHIP_MARKER_LEDGER_TYPE_KEY] = "scheduled-job-idempotency"
+    final = _serialize_ownership_marker(merged)
+    # Fast-path no-op detection (skip DDL if final == existing trimmed already).
+    normalized_existing = (existing_comment or "").strip()
+    if normalized_existing == final.strip():
+        return final, False
+    return final, True
+
+
 def _assert_ownership_marker_ok(conn: Connection, expected_rev: str) -> None:
     """Fail-Closed on ownership-marker mismatch.
 
@@ -158,17 +233,33 @@ def _assert_ownership_marker_ok(conn: Connection, expected_rev: str) -> None:
 
 
 def _write_ownership_marker_if_pg(conn: Connection) -> None:
-    """Emit COMMENT ON TABLE for PostgreSQL.  SQLite: no-op.
+    """Emit COMMENT ON TABLE for PostgreSQL using READ-APPEND merge.  SQLite: no-op.
 
-    We use ``op.execute`` / ``exec_driver_sql`` with a fully quoted literal
-    so the COMMENT string is immune to SQL injection even if the constants
-    change in a future rev.  The marker itself contains no user data.
+    FIX14 Legacy Ownership Preservation rule:
+      * ALWAYS call _read_table_comment FIRST — do NOT blindly overwrite a
+        pre-existing pg_catalog COMMENT.
+      * Run `_merge_ownership_marker(existing_comment)`.  This:
+          (a) preserves all KVs whose key ∉ _OWNERSHIP_MARKER_OUR_KEYS (legacy
+              operator tokens like LEGACY_OWNER, CREATED, MIGRATED_FROM, NOTES),
+          (b) unconditionally sets OUR 5 KVs to current revision constants,
+          (c) returns needs_write=False when the post-merge serialized comment
+              is IDENTICAL to what's already in pg_catalog (so repeat
+              `alembic upgrade head` calls don't emit repeated COMMENT DDL).
+      * Only emit COMMENT ON TABLE when needs_write is True.
+
+    We use ``quote_literal`` on the final merged string so the COMMENT literal
+    is immune to injection even if operator-written foreign KV values contain
+    special SQL chars (semicolons, quotes, dashes, etc).
     """
     if not _is_postgresql(conn):
         return
-    # Fully escaped literal via explicit quote_literal:
+    existing_comment = _read_table_comment(conn, "pasay_scheduled_job_ledger")
+    final_comment, needs_write = _merge_ownership_marker(existing_comment)
+    if not needs_write:
+        return  # CI idempotency: pg_catalog already carries the merged-identical comment
+    # Fully escaped literal — quote_literal handles foreign-kv semicolons/quotes.
     quoted = conn.exec_driver_sql(
-        "SELECT quote_literal(%s) AS q", (_OWNERSHIP_COMMENT_EXPECTED,)
+        "SELECT quote_literal(%s) AS q", (final_comment,)
     ).scalar()
     if not quoted:
         raise RuntimeError("quote_literal failed — cannot write ownership marker.")

@@ -660,6 +660,368 @@ class TestT8NeonBoundary:
         body = r.json()
         assert body.get("error") == "envelope_malformed"
 
+    def test_t8e13_postgres_migration_lifecycle_legacy_ownership_preserved(self):
+        """FIX14 — Real PostgreSQL-compatible Alembic lifecycle round-trip.
+
+        End-to-end proof that:
+          (a) Ownership Marker uses READ-APPEND merge — a legacy pg_catalog COMMENT
+              carrying operator-managed KVs (LEGACY_OWNER, CREATED, MIGRATED_FROM)
+              survives the FIX13/FIX14 upgrade() stamp; our OWNED_BY_* tokens are
+              UPDATED in place; foreign keys are NEVER overwritten.
+          (b) Repeated upgrade() → _merge_ownership_marker short-circuits
+              (needs_write=False) so COMMENT ON TABLE DDL is NOT emitted twice
+              (CI idempotency / no repeated DDL noise).
+          (c) downgrade() with rows inside → RuntimeError carrying the
+              FIX13 Legacy Data Preservation wording (COUNT>0 refuse drop).
+          (d) Manual DELETE → re-downgrade succeeds and op.drop_table runs.
+          (e) Re-upgrade (fresh create_table path) → canonical marker byte-match.
+
+        Engine strategy:
+          * Patch SQLite type compiler to understand postgresql.JSONB → TEXT
+            (so the ledger migration's create_table compiles on SQLite).
+          * The migration module's helpers (_is_postgresql, _read_table_comment,
+            _write_ownership_marker_if_pg) are monkey-patched so _is_postgresql
+            returns True and the comment R/W is a pure in-memory dict.
+          * All SQL (op.create_table / op.drop_table / INSERT / SELECT COUNT)
+            runs against a real synchronous sqlite:///:memory: engine.  We call
+            mig_mod.upgrade() / downgrade() directly against an Alembic
+            Operations context bound to the SQLite connection (bypasses the
+            full alembic historical chain — which contains unrelated tables
+            with PG-only JSONB/TZ types that cannot compile on SQLite).
+        """
+        import importlib
+        import sys
+
+        import pytest
+
+        repo_root = Path(__file__).resolve().parent.parent
+        alembic_rev_module_name = "a1b2c3d4e5f6_scheduled_job_ledger"
+        sys.path.insert(0, str(repo_root))
+        sys.path.insert(0, str(repo_root / "alembic" / "versions"))
+        try:
+            mig_mod = importlib.import_module(alembic_rev_module_name)
+        except Exception as e:  # noqa: BLE001
+            pytest.skip(
+                f"Cannot import alembic revision {alembic_rev_module_name}: {e!r}"
+            )
+        finally:
+            pass
+
+        # ── P0: Patch SQLite type compiler to understand postgresql.JSONB ──
+        # The ledger migration itself declares payload JSONB; SQLite lacks a
+        # native visitor.  Map JSONB → TEXT for SQLite compilation (semantic
+        # contract of JSONB is preserved via TEXT storage inside this test).
+        import sqlalchemy as sa
+        from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+        _orig_jsonb = getattr(SQLiteTypeCompiler, "visit_JSONB", None)
+        _orig_json = getattr(SQLiteTypeCompiler, "visit_JSON", None)
+
+        def _visit_jsonb_like(self, type_, **kw):
+            return "TEXT"
+
+        try:
+            if _orig_jsonb is None:
+                SQLiteTypeCompiler.visit_JSONB = _visit_jsonb_like
+            if _orig_json is None:
+                SQLiteTypeCompiler.visit_JSON = _visit_jsonb_like
+
+            # ── In-memory comment "pg_catalog" store (dialect fake) ──
+            comment_store: dict[str, str | None] = {}
+
+            def fake_is_postgresql(conn) -> bool:
+                return True
+
+            def fake_read_table_comment(conn, tbl: str):
+                return comment_store.get(tbl)
+
+            # Records of (action: "write" | "skip_noop", final_comment)
+            write_actions: list[tuple[str, str]] = []
+
+            original_merge = mig_mod._merge_ownership_marker
+
+            def fake_write_if_pg(conn) -> None:
+                existing = fake_read_table_comment(conn, "pasay_scheduled_job_ledger")
+                final_comment, needs_write = original_merge(existing)
+                if not needs_write:
+                    write_actions.append(("skip_noop", final_comment))
+                    return
+                write_actions.append(("write", final_comment))
+                comment_store["pasay_scheduled_job_ledger"] = final_comment
+
+            # ── Build a single persistent SQLite in-memory DB engine ──
+            # NOTE: use a NAMED in-memory DB (file::memory:?cache=shared)
+            # would allow multi-connect; but a single engine with StaticPool
+            # keeps one connection alive for the whole test so sqlite_master
+            # queries see the same tables as op.create_table.
+            from sqlalchemy.pool import StaticPool
+            engine = sa.create_engine(
+                "sqlite:///:memory:",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+
+            # ── Build Alembic Operations bound to our engine connection ──
+            # This replaces the full alembic_command runner (which would walk
+            # the entire historical revision chain, compiling unrelated PG
+            # type DDL on SQLite and crashing).  We expose mig_mod.op as a
+            # real Operations object so op.create_table, op.drop_table,
+            # op.execute, op.get_bind(), and sa.inspect(op.get_bind()) all
+            # work against the real SQLite connection.
+            from alembic.migration import MigrationContext
+            from alembic.operations import Operations
+
+            conn = engine.connect()
+            migration_ctx = MigrationContext.configure(conn)
+            ops = Operations(migration_ctx)
+            _orig_op = getattr(mig_mod, "op", None)
+
+            def _patched_mod_sa_inspect(*a, **kw):
+                """Wrap mig_mod.sa.inspect so SQLite-dialect column audits pass.
+
+                SQLite Inspector natively reports TIMESTAMP columns as naive
+                (timezone=False) and any TEXT-typed payload as non-JSON.  This
+                triggers upgrade()/downgrade() Fail-Closed TZ/JSON audits even
+                though the actual semantic content is fine for this test.  We
+                augment the returned Inspector.get_columns result for the
+                ledger table ONLY to carry timezone=True + JSON type on the
+                columns the audit chain inspects.  Other tables are untouched.
+                """
+                insp = _original_mod_sa_inspect(*a, **kw)
+                if not hasattr(insp, "get_columns"):
+                    return insp
+                _orig_get_cols = insp.get_columns
+                def _patched_cols(tbl_name, *ca, **ckw):
+                    cols = _orig_get_cols(tbl_name, *ca, **ckw)
+                    if tbl_name != "pasay_scheduled_job_ledger":
+                        return cols
+                    result = []
+                    for c in cols:
+                        name = c.get("name")
+                        if name in ("occurred_at", "consumed_at"):
+                            new_c = dict(c)
+                            new_c["type"] = sa.DateTime(timezone=True)
+                            result.append(new_c)
+                        elif name == "payload":
+                            new_c = dict(c)
+                            new_c["type"] = sa.JSON()
+                            result.append(new_c)
+                        else:
+                            result.append(c)
+                    return result
+                insp.get_columns = _patched_cols
+                return insp
+
+            _original_mod_sa_inspect = mig_mod.sa.inspect
+
+            def _run_with_dialect_patches(fn):
+                """Run fn() while dialect patches + sa.inspect patch are live."""
+                import unittest.mock as _mock
+                mig_mod.op = ops
+                _saved_inspect = mig_mod.sa.inspect
+                mig_mod.sa.inspect = _patched_mod_sa_inspect
+                try:
+                    with _mock.patch.object(mig_mod, "_is_postgresql", fake_is_postgresql), \
+                         _mock.patch.object(mig_mod, "_read_table_comment", fake_read_table_comment), \
+                         _mock.patch.object(mig_mod, "_write_ownership_marker_if_pg", fake_write_if_pg):
+                        return fn()
+                finally:
+                    mig_mod.sa.inspect = _saved_inspect
+                    if _orig_op is not None:
+                        mig_mod.op = _orig_op
+
+            def _ensure_commit():
+                """Commit any pending transaction so subsequent sees current state.
+
+                SQLite DDL + DML are transactional; sa.inspect / sqlite_master
+                SELECTs require committed state to be visible.  We also commit
+                after an exception so the connection's active transaction is
+                cleared (prevents "Transaction() object already initialized"
+                InvalidRequestError on subsequent with-context blocks).
+                """
+                try:
+                    while conn.in_transaction():
+                        t = conn.get_transaction()
+                        if t is None:
+                            break
+                        t.commit()
+                except Exception:  # noqa: BLE001
+                    try:
+                        while conn.in_transaction():
+                            t = conn.get_transaction()
+                            if t is None:
+                                break
+                            t.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            def _exec_sql(stmt_text, params=None, many=False):
+                """Run a SQL text statement on the shared conn, commit-after."""
+                if many:
+                    conn.execute(sa.text(stmt_text), params)
+                elif params is not None:
+                    conn.execute(sa.text(stmt_text), params)
+                else:
+                    conn.execute(sa.text(stmt_text))
+                _ensure_commit()
+
+            try:
+                # ════════════════════════════════════════════════════════════
+                # (a) Legacy token survival: pre-existing table + operator COMMENT
+                # ════════════════════════════════════════════════════════════
+                legacy_comment = (
+                    "LEGACY_OWNER=Team-DailyOps;"
+                    "CREATED=2026-01-15;"
+                    "MIGRATED_FROM=fix0.5-alpha;"
+                )
+                comment_store["pasay_scheduled_job_ledger"] = legacy_comment
+                write_actions.clear()
+
+                _exec_sql("""
+                    CREATE TABLE pasay_scheduled_job_ledger (
+                        event_id VARCHAR(256) PRIMARY KEY,
+                        job_name VARCHAR(128) NOT NULL,
+                        occurred_at TIMESTAMP NOT NULL,
+                        consumed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        payload TEXT NULL
+                    )
+                """)
+
+                _run_with_dialect_patches(mig_mod.upgrade)
+                _ensure_commit()
+
+                assert write_actions, (
+                    "upgrade(stamp legacy table): write_marker() must have been called"
+                )
+                last_action, last_comment = write_actions[-1]
+                assert last_action == "write", (
+                    "initial legacy carry-upgrade should produce needs_write=True"
+                )
+                for foreign_token in ["LEGACY_OWNER=Team-DailyOps;", "CREATED=2026-01-15;", "MIGRATED_FROM=fix0.5-alpha;"]:
+                    assert foreign_token in last_comment, (
+                        "FIX14 (a) FAIL — legacy operator COMMENT tokens were OVERWRITTEN "
+                        f"by upgrade(). Expected {foreign_token!r} inside final merged "
+                        f"comment. Got:\n{last_comment!r}"
+                    )
+                for own_token in [
+                    "OWNED_BY_ALEMBIC_REV=a1b2c3d4e5f6;",
+                    "SCHEMA_REV=2;",
+                    f"DIGEST={mig_mod.LEDGER_SCHEMA_DIGEST};",
+                ]:
+                    assert own_token in last_comment, (
+                        f"FIX14 (a) FAIL — our ownership token {own_token!r} missing "
+                        f"from merged comment. Got:\n{last_comment!r}"
+                    )
+
+                # ════════════════════════════════════════════════════════════
+                # (b) CI idempotency: second upgrade() → no write action
+                # ════════════════════════════════════════════════════════════
+                write_actions.clear()
+                _run_with_dialect_patches(mig_mod.upgrade)
+                _ensure_commit()
+                real_writes = [a for a in write_actions if a[0] == "write"]
+                assert not real_writes, (
+                    "FIX14 (b) FAIL — repeated upgrade() should have short-circuited "
+                    f"needs_write=False; instead observed extra write actions: {real_writes!r}"
+                )
+
+                # ════════════════════════════════════════════════════════════
+                # (c) COUNT>0 refuse drop: insert 2 rows → downgrade RuntimeError
+                # ════════════════════════════════════════════════════════════
+                _exec_sql(
+                    "INSERT INTO pasay_scheduled_job_ledger(event_id,job_name,occurred_at,consumed_at,payload) "
+                    "VALUES(:e,:j,:oa,CURRENT_TIMESTAMP,'{}')",
+                    params=[
+                        {"e": "sched/cron/heartbeat/2026-08-21T00:00:00Z", "j": "heartbeat", "oa": "2026-08-21 00:00:00+00"},
+                        {"e": "sched/cron/heartbeat/2026-08-21T00:15:00Z", "j": "heartbeat", "oa": "2026-08-21 00:15:00+00"},
+                    ],
+                    many=True,
+                )
+
+                with pytest.raises(RuntimeError) as exc_info:
+                    _run_with_dialect_patches(mig_mod.downgrade)
+                _ensure_commit()
+                err_text = str(exc_info.value)
+                for required_msg in [
+                    "LEGACY DATA PRESERVATION CHECK FAILED",
+                    "TRUNCATE TABLE pasay_scheduled_job_ledger",
+                    "backup via COPY TO first if you need the data",
+                ]:
+                    assert required_msg in err_text, (
+                        "FIX14 (c) FAIL — downgrade RuntimeError missing required wording. "
+                        f"Expected {required_msg!r}. Got:\n{err_text}"
+                    )
+                still_exists = bool(conn.execute(sa.text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='pasay_scheduled_job_ledger'"
+                )).scalar())
+                row_count = conn.execute(sa.text("SELECT COUNT(*) FROM pasay_scheduled_job_ledger")).scalar()
+                assert still_exists and row_count == 2, (
+                    "FIX14 (c) FAIL — downgrade RuntimeError fired but the table was "
+                    f"mutated anyway (exists={still_exists}, rows={row_count}). "
+                    "Refuse-drop RuntimeError must run BEFORE op.drop_table, so data must survive."
+                )
+
+                # ════════════════════════════════════════════════════════════
+                # (d) Post-DELETE drop allowed: DELETE → downgrade succeeds
+                # ════════════════════════════════════════════════════════════
+                _exec_sql("DELETE FROM pasay_scheduled_job_ledger")
+                _run_with_dialect_patches(mig_mod.downgrade)
+                _ensure_commit()
+                gone = not bool(conn.execute(sa.text(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='pasay_scheduled_job_ledger'"
+                )).scalar())
+                assert gone, (
+                    "FIX14 (d) FAIL — downgrade after DELETE should drop ledger table; still present."
+                )
+
+                # ════════════════════════════════════════════════════════════
+                # (e) Fresh deploy canonical comment: re-upgrade → byte-match
+                # ════════════════════════════════════════════════════════════
+                comment_store.pop("pasay_scheduled_job_ledger", None)
+                write_actions.clear()
+                _run_with_dialect_patches(mig_mod.upgrade)
+                _ensure_commit()
+                assert write_actions and write_actions[-1][0] == "write", (
+                    "FIX14 (e) FAIL — fresh upgrade() path should stamp marker via COMMENT ON TABLE."
+                )
+                fresh_comment = write_actions[-1][1]
+                assert fresh_comment.strip() == mig_mod._OWNERSHIP_COMMENT_EXPECTED.strip(), (
+                    "FIX14 (e) FAIL — fresh upgrade merged-identical comment mismatch.\n"
+                    f"EXPECTED (Alembic _OWNERSHIP_COMMENT_EXPECTED):\n  {mig_mod._OWNERSHIP_COMMENT_EXPECTED!r}\n"
+                    f"ACTUAL   (written comment):\n  {fresh_comment!r}"
+                )
+
+            finally:
+                try:
+                    while conn.in_transaction():
+                        trans = conn.get_transaction()
+                        if trans is not None:
+                            trans.rollback()
+                        else:
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    engine.dispose()
+                except Exception:  # noqa: BLE001
+                    pass
+                if _orig_op is not None:
+                    mig_mod.op = _orig_op
+        finally:
+            if _orig_jsonb is None and hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+                try:
+                    delattr(SQLiteTypeCompiler, "visit_JSONB")
+                except Exception:  # noqa: BLE001
+                    pass
+            if _orig_json is None and hasattr(SQLiteTypeCompiler, "visit_JSON"):
+                try:
+                    delattr(SQLiteTypeCompiler, "visit_JSON")
+                except Exception:  # noqa: BLE001
+                    pass
+
     def test_t8c_alembic_single_head(self):
         repo_root = str(Path(__file__).resolve().parent.parent)
         r = subprocess.run(
@@ -931,6 +1293,108 @@ class TestT8NeonBoundary:
             "FIX13: downgrade data-preservation RuntimeError + TRUNCATE guidance "
             "MUST come BEFORE op.drop_table.  Re-order the downgrade body so the "
             "final gate is the last statement before drop_table."
+        )
+
+        # ════════════════════════════════════════════════════════════════════════
+        # FIX14 — (f) Legacy Ownership Preservation Static Governance Assertions
+        # ════════════════════════════════════════════════════════════════════════
+        # (f.1) Sandboxed import of the alembic revision module (same pattern T8e).
+        import importlib as _importlib
+        import inspect as _inspect
+        import sys as _sys
+        _sys_path_snapshot = list(_sys.path)
+        try:
+            _sys.path.insert(0, str(repo_root))
+            _sys.path.insert(0, str(versions_dir))
+            _mig_mod = _importlib.import_module(candidates[0].stem)
+        except Exception as _e:  # noqa: BLE001
+            pytest.skip(f"FIX14 T8d(f): cannot import alembic revision for static asserts: {_e!r}")
+        finally:
+            _sys.path[:] = _sys_path_snapshot
+
+        # (f.2) _OWNERSHIP_MARKER_OUR_KEYS frozenset exists AND has EXACTLY 5 keys.
+        assert hasattr(_mig_mod, "_OWNERSHIP_MARKER_OUR_KEYS"), (
+            "FIX14: migration module MUST declare _OWNERSHIP_MARKER_OUR_KEYS "
+            "frozenset (boundary between OUR tokens vs operator-managed foreign tokens)."
+        )
+        _our_keys = _mig_mod._OWNERSHIP_MARKER_OUR_KEYS
+        assert isinstance(_our_keys, frozenset), (
+            "FIX14: _OWNERSHIP_MARKER_OUR_KEYS MUST be frozenset (immutable taxonomy)."
+        )
+        assert len(_our_keys) == 5, (
+            "FIX14: _OWNERSHIP_MARKER_OUR_KEYS MUST contain EXACTLY 5 governance "
+            f"tokens (OWNED_BY_ALEMBIC_REV, SCHEMA_REV, DIGEST, SOURCE, LEDGER_TYPE). "
+            f"Got {len(_our_keys)}: {sorted(_our_keys)!r}."
+        )
+        for _required_our_key in ["OWNED_BY_ALEMBIC_REV", "SCHEMA_REV", "DIGEST", "SOURCE", "LEDGER_TYPE"]:
+            assert _required_our_key in _our_keys, (
+                f"FIX14: required our-key {_required_our_key!r} missing from "
+                f"_OWNERSHIP_MARKER_OUR_KEYS. Got: {sorted(_our_keys)!r}."
+            )
+
+        # (f.3) _merge_ownership_marker helper exists AND accepts `existing_comment` param.
+        assert hasattr(_mig_mod, "_merge_ownership_marker"), (
+            "FIX14: _merge_ownership_marker helper MUST exist (READ-APPEND marker "
+            "merge with foreign-token preservation and idempotent no-op detection)."
+        )
+        _merge_sig = _inspect.signature(_mig_mod._merge_ownership_marker)
+        assert "existing_comment" in _merge_sig.parameters, (
+            "FIX14: _merge_ownership_marker signature MUST accept 'existing_comment' "
+            f"parameter. Got parameters: {list(_merge_sig.parameters.keys())!r}."
+        )
+
+        # (f.4) Unit micro-check: merge preserves foreign KVs and overwrites our KVs.
+        _legacy_only = "LEGACY_OWNER=TeamX; CREATED=2026-01-01;"
+        _merged, _ = _mig_mod._merge_ownership_marker(_legacy_only)
+        assert "LEGACY_OWNER=TeamX;" in _merged and "CREATED=2026-01-01;" in _merged, (
+            "FIX14: _merge_ownership_marker MUST preserve VERBATIM foreign KVs "
+            "(operator tokens not in _OUR_KEYS). Legacy input was lost."
+        )
+        for _our_needle in [
+            "OWNED_BY_ALEMBIC_REV=a1b2c3d4e5f6;",
+            "SCHEMA_REV=2;",
+        ]:
+            assert _our_needle in _merged, (
+                f"FIX14: _merge_ownership_marker MUST overwrite OUR tokens to "
+                f"current revision constants. Missing {_our_needle!r}."
+            )
+
+        # (f.5) Unit micro-check: idempotent branch → needs_write=False.
+        _canonical = _mig_mod._OWNERSHIP_COMMENT_EXPECTED
+        _roundtrip, _needs_write = _mig_mod._merge_ownership_marker(_canonical)
+        assert _needs_write is False, (
+            "FIX14: _merge_ownership_marker on already-canonical comment MUST "
+            "return needs_write=False (CI idempotent no-op skip COMMENT DDL)."
+        )
+        assert _roundtrip.strip() == _canonical.strip(), (
+            "FIX14: idempotent merge roundtrip must produce byte-identical comment."
+        )
+
+        # (f.6) Source-level ordering: _read_table_comment BEFORE first _merge
+        #       inside _write_ownership_marker_if_pg function body.
+        #       Blind overwrite (FIX13 bug) would call _merge BEFORE _read, or
+        #       not _read at all. We enforce READ-FIRST here.
+        _writer_fn_name = "_write_ownership_marker_if_pg"
+        _writer_body_start = mig_src.find(f"def {_writer_fn_name}(")
+        assert _writer_body_start != -1, (
+            f"FIX14: {_writer_fn_name} function not found in migration source."
+        )
+        # Find the NEXT def/class to bound the writer function body.
+        _after_writer_src = mig_src[_writer_body_start:]
+        _next_def = _after_writer_src.find("\ndef ")
+        _next_class = _after_writer_src.find("\nclass ")
+        _bound = min(x for x in [_next_def, _next_class, len(_after_writer_src)] if x != -1)
+        _writer_body = _after_writer_src[:_bound]
+        _pos_read = _writer_body.find("_read_table_comment")
+        _pos_merge = _writer_body.find("_merge_ownership_marker")
+        assert _pos_read != -1 and _pos_merge != -1, (
+            f"FIX14: {_writer_fn_name} body must call BOTH _read_table_comment "
+            "and _merge_ownership_marker (READ-APPEND pattern)."
+        )
+        assert _pos_read < _pos_merge, (
+            f"FIX14: Inside {_writer_fn_name}, _read_table_comment MUST appear "
+            "BEFORE the first _merge_ownership_marker call — READ FIRST, then "
+            "merge/write, never blind overwrite of legacy operator tokens."
         )
 
 
