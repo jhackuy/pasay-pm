@@ -1,0 +1,24 @@
+name = "pasay-cloudflare-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# ── Queue binding (single unified queue for telegram + cron) ──
+[[queues.producers]]
+  queue = "pasay-events"
+  binding = "PASAY_QUEUE"
+
+[[queues.consumers]]
+  queue = "pasay-events"
+  max_batch_size = 10
+  max_batch_timeout = 1
+  max_retries = 5
+  dead_letter_queue = "pasay-events-dlq"
+
+# ── Cloudflare Container binding (single Python runtime) ──
+# Operator fills these in at deploy time; code must fail-closed if missing.
+# [container_bindings]
+#   PASAY_CONTAINER = { name = "pasay-container" }
+
+# ── Secrets (set via wrangler secret put) ──
+# TELEGRAM_WEBHOOK_SECRET  — matches backend TELEGRAM_WEBHOOK_SECRET
+# PASAY_CONTAINER_INGEST_TOKEN — shared secret for container internal ingestion

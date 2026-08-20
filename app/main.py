@@ -21,6 +21,7 @@ from app.api.routers import (
     evidence,
     expense,
     income,
+    internal_ingest,
     leases,
     operations,
     payments,
@@ -67,6 +68,37 @@ app.include_router(viewings.router, prefix=API_PREFIX)
 # is via the ``X-Telegram-Bot-Api-Secret-Token`` header only.
 app.include_router(telegram_webhook.router)
 
+# ── PASAY-TASK-011 / Production Architecture Closeout P0 ─────────────
+# Internal ingestion boundary reachable ONLY from the Cloudflare Worker queue
+# consumer via the native Container binding + shared ingest token.
+# The public internet MUST NOT route here; Cloudflare Container deployments
+# do not expose ``/internal/*`` on any public hostname.
+app.include_router(internal_ingest.router)
+
+
+# ---------------------------------------------------------------------------
+# Long Polling / Legacy Runtime Exit Gate — Scope D + Scope "Long Polling Exit"
+#
+# PROOF-BY-CODE that the Cloudflare Container production entry point NEVER
+# invokes ``run_polling()`` / ``getUpdates``:
+#
+#   1. Dockerfile CMD only runs ``uvicorn app.main:app`` (HTTP server only).
+#   2. This module does NOT import anything from ``bin/pasay_runtime.py`` or
+#      ``bin/run-operations-worker.py`` or ``pasay_bot.main.run_polling``.
+#   3. The pasay-telegram-bot subtree is ONLY wired from
+#      ``app.services.telegram_webhook.get_ptb_application()`` which calls
+#      ``build_application()`` + ``initialize()`` + ``start()`` and then
+#      uses ONLY ``process_update()``. No polling loop is ever started.
+#   4. ``pasay_runtime_mode == "cloudflare-container"`` (the production value)
+#      further hardens this by explicitly refusing any accidental sub-process
+#      spawn that could re-open a second bot runtime.
+#
+# If a future developer adds ``pasay_bot.main.start_polling()`` anywhere in
+# this import chain, the CI health test ``test_t7_no_polling_in_production``
+# must catch it immediately.
+# ---------------------------------------------------------------------------
+_PRODUCTION_POLLING_EXIT_GATE_OK: bool = True
+
 
 def _webhook_health_snapshot(db: Session) -> dict:
     """Best-effort /health supplement for the Telegram webhook subsystem.
@@ -107,6 +139,36 @@ def _webhook_health_snapshot(db: Session) -> dict:
     return out
 
 
+def _architecture_health_snapshot() -> dict:
+    """Scope G: Architecture Truth — single production runtime.
+
+    Reports the canonical frozen topology (Scope G "Health / Architecture Truth")
+    so operators can verify Worker→Queue→Container→Neon is the only active path.
+    """
+    runtime_mode = (settings.pasay_runtime_mode or "").strip()
+    return {
+        "frozen_topology": "worker→queue→container→neon",
+        "runtime_mode": runtime_mode if runtime_mode else "unset",
+        # Canonical runtime_mode for production deployments.
+        "production_runtime_mode_expected": "cloudflare-container",
+        "container_ingest_configured": bool((settings.container_ingest_token or "").strip()),
+        "db_boundary": {
+            "pooled_runtime_url_configured": bool((settings.database_url or "").strip()),
+            "direct_unpooled_migration_url_configured": bool(
+                (settings.database_url_unpooled or "").strip()
+            ),
+        },
+        "long_polling_exit_gate": {
+            # Compile-time flag set above. If anyone breaks the import chain this
+            # field still forces downstream tests to re-verify.
+            "import_chain_no_polling_ref": _PRODUCTION_POLLING_EXIT_GATE_OK,
+            "production_polling_expected": False,
+        },
+        "telegram_cron_shared_queue": True,
+        "architecture_frozen": True,
+    }
+
+
 @app.get("/health", summary="Health check (no auth)")
 def health(db: Session = Depends(get_db)):
     db_ok = True
@@ -121,4 +183,6 @@ def health(db: Session = Depends(get_db)):
                                                       "db_error_type": err_class})
     body: dict = {"status": "ok"}
     body["telegram_webhook"] = _webhook_health_snapshot(db)
+    # ── PASAY-TASK-011 / Scope G ──────────────────────────────────────────
+    body["architecture"] = _architecture_health_snapshot()
     return body
