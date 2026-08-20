@@ -159,14 +159,27 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
 
-      - name: Cloudflare Worker — tsc --noEmit (typecheck gate)
+      - name: Cloudflare Worker — typecheck gate (real src + mock tests, separate tsconfigs)
         if: steps.changed.outputs.cloudflare == 'true'
         working-directory: cloudflare-worker
         run: |
-          npx --no-install tsc --noEmit
+          # (1) REAL build — no mock paths, use the PUBLISHED @cloudflare/containers
+          # 0.3.7 types directly.  This FAILS CLOSED if the src code imports or
+          # declares types incompatible with the REAL npm package (earlier
+          # versions of tsconfig.json pointed @cloudflare/containers at a local
+          # mock, giving a false-green typecheck).
+          npm run types:src
+          # (2) TEST build — with paths mock, so the test-only import graph
+          # resolves @cloudflare/containers through ./tests/mock_containers.ts
+          # (the runtime platform is absent during `npx tsx` on the host).
+          npm run types:tests
 
-      - name: Cloudflare Worker — TS spec runner (real handler E2E)
+      - name: Cloudflare Worker — TS spec runner (real handler E2E, with paths mock)
         if: steps.changed.outputs.cloudflare == 'true'
         working-directory: cloudflare-worker
         run: |
-          npx --yes tsx tests/index.spec.ts
+          # Spec runtime MUST point tsconfig at the tests tsconfig so the
+          # @cloudflare/containers paths alias resolves to the mock (the
+          # real package cannot be loaded in Node.js because it imports
+          # the Cloudflare-only virtual module "cloudflare:workers").
+          npx tsx --tsconfig tsconfig.tests.json tests/index.spec.ts

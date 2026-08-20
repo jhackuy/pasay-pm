@@ -1089,17 +1089,29 @@ class TestT10WorkerTargetedValidation:
                     "npm install failed on this host — skipping tsc compile gate. "
                     f"npm stderr: {r_install.stderr[:500]}"
                 )
-        r_tsc = subprocess.run(
-            [npx, "--no-install", "tsc", "--noEmit"],
+        r_types_src = subprocess.run(
+            [npm, "run", "types:src"],
             cwd=worker_root_str,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
         )
-        assert r_tsc.returncode == 0, (
-            f"tsc --noEmit failed for cloudflare-worker.\n"
-            f"stdout:\n{r_tsc.stdout}\nstderr:\n{r_tsc.stderr}"
+        assert r_types_src.returncode == 0, (
+            f"npm run types:src failed for cloudflare-worker (real src compile, no mock paths).\n"
+            f"stdout:\n{r_types_src.stdout}\nstderr:\n{r_types_src.stderr}"
+        )
+        r_types_tests = subprocess.run(
+            [npm, "run", "types:tests"],
+            cwd=worker_root_str,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert r_types_tests.returncode == 0, (
+            f"npm run types:tests failed for cloudflare-worker (tests-mock paths alias compile).\n"
+            f"stdout:\n{r_types_tests.stdout}\nstderr:\n{r_types_tests.stderr}"
         )
 
     def test_t10_3b_worker_ts_spec_runs_and_passes(self):
@@ -1139,7 +1151,7 @@ class TestT10WorkerTargetedValidation:
         # skipping — tsx is a lightweight execute-only runner that does not
         # need type-checking (tsc already handles that).
         r_spec = subprocess.run(
-            [npx, "--yes", "tsx", "tests/index.spec.ts"],
+            [npx, "--no-install", "tsx", "--tsconfig", "tsconfig.tests.json", "tests/index.spec.ts"],
             cwd=worker_root_str,
             capture_output=True,
             text=True,

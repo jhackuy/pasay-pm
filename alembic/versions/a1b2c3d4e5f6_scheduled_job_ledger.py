@@ -158,4 +158,52 @@ def downgrade() -> None:
             "Refusing to drop a mismatched legacy table. Please manually reconcile."
         )
 
+    # ── FIX11 Ledger downgrade safety: payload + consumed_at column audits ──────
+    # Earlier versions only audited PK + col names + event_id + occurred_at.
+    # If an operator manually ALTER TABLE ... ALTER COLUMN consumed_at TYPE TIMESTAMP
+    # (naive) or ALTER COLUMN payload TYPE TEXT (non-JSON), the earlier audit
+    # would still drop the table, destroying data whose in-memory format no
+    # longer matches the contract this migration chain can reproduce via upgrade().
+
+    consumed_at_col = existing_cols["consumed_at"]
+    ca_type = consumed_at_col.get("type")
+    ca_is_tz = getattr(ca_type, "timezone", None) if ca_type is not None else None
+    if ca_type is not None and ca_is_tz is False:
+        raise RuntimeError(
+            "pasay_scheduled_job_ledger.consumed_at must be TIMESTAMPTZ "
+            f"(timezone-aware); got a naive datetime column type: {ca_type!r}. "
+            "Refusing to drop a mismatched legacy table. Please manually reconcile."
+        )
+
+    payload_col = existing_cols.get("payload")
+    if payload_col is not None:
+        payload_raw_type = payload_col.get("type")
+        payload_dialect_name = ""
+        try:
+            payload_dialect_name = (
+                payload_raw_type.compile(dialect=postgresql.dialect())
+                if payload_raw_type is not None
+                else ""
+            )
+        except Exception:
+            payload_dialect_name = ""
+        payload_is_json_compat = (
+            payload_dialect_name.upper().startswith("JSON")
+            or "JSON" in type(payload_raw_type).__name__.upper()
+        )
+        # The upgrade() schema declares payload JSONB NULL.  If a user has
+        # manually swapped this column to a non-JSON type, the column could
+        # carry non-reconstructable data (e.g. BLOB, TEXT) — we refuse to
+        # drop instead of silently losing it.
+        if (
+            payload_raw_type is not None
+            and getattr(payload_raw_type, "_isnull", False) is False
+            and not payload_is_json_compat
+        ):
+            raise RuntimeError(
+                "pasay_scheduled_job_ledger.payload must be JSON/JSONB-compatible "
+                f"for JSONB cast; got {payload_raw_type!r}. Refusing to drop a "
+                "mismatched legacy table. Please manually reconcile."
+            )
+
     op.drop_table("pasay_scheduled_job_ledger")

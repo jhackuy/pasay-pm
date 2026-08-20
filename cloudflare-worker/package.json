@@ -10,8 +10,10 @@
     "build": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "types": "tsc --noEmit",
-    "test": "tsx tests/index.spec.ts"
+    "types:src": "tsc --noEmit -p tsconfig.json",
+    "types:tests": "tsc --noEmit -p tsconfig.tests.json",
+    "types": "npm run types:src && npm run types:tests",
+    "test": "tsx --tsconfig tsconfig.tests.json tests/index.spec.ts"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"

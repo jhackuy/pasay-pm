@@ -8,6 +8,20 @@
  * import statement ``import { Container, getContainer } from "@cloudflare/containers"``
  * resolves to this test mock.
  *
+ * FIX11: This module MUST mirror the REAL runtime-shape signatures exported
+ * by @cloudflare/containers@0.3.7 as closely as possible.
+ *   - Container.envVars    -> Record<string, string> (REAL — no function vals)
+ *   - Container.sleepAfter -> string | number         (REAL — non-optional)
+ *   - getContainer(binding, name?)  -> second arg is OPTIONAL (REAL)
+ *
+ * TYPE BRAND NOTE:
+ *   The Cloudflare workers-types package uses a PACKAGE-LOCAL unique symbol
+ *   for `Rpc.DurableObjectBranded`.  This mock cannot replicate the EXACT
+ *   same unique symbol (by definition of "unique symbol"), so for the TEST
+ *   tsconfig build we widen the generic signatures with `any` to keep the
+ *   structural contract test-friendly while the REAL build (tsconfig.json,
+ *   no mock) exercises the exact branded generics.
+ *
  * Test callers drive behaviour via the exported mutable globals:
  *   - lastGetContainerArgs: capture (doNamespace, instanceId) tuples
  *   - containerInstances[instanceId] = fakeContainer whose fetch() tests can assert on
@@ -15,16 +29,20 @@
 
 export abstract class Container {
   /** Default HTTP port the container image listens on. */
-  defaultPort: number = 8000;
-  /** Instance sleep-after-idle timeout (Cloudflare runtime only; no-op in tests). */
-  sleepAfter?: string;
+  defaultPort?: number = 8000;
+
+  /** Instance sleep-after-idle timeout — REAL @cloudflare/containers 0.3.7: `string | number`. */
+  sleepAfter: string | number = "15m";
+
   /**
-   * Optional environment-variable provisioning table (Cloudflare Containers
-   * runtime feature).  Worker code declares envVars on the Container
-   * subclass; the mock base class accepts any record so tests can assert
-   * on the declared map without needing a live Cloudflare build.
+   * Environment-variable provisioning table (Cloudflare Containers runtime).
+   *
+   * REAL @cloudflare/containers@0.3.7 signature: Record<string, string>.
+   * Worker secrets / wrangler.toml [vars] are AUTOMATICALLY propagated into
+   * the Container process by the Cloudflare platform; subclassers set ONLY
+   * static string-valued tags here, never function-valued maps.
    */
-  envVars?: Record<string, (env: any) => string>;
+  envVars: Record<string, string> = {};
 }
 
 export interface MockContainerHandle {
@@ -36,7 +54,7 @@ export interface MockContainerHandle {
 }
 
 export const containerInstances = new Map<string, MockContainerHandle>();
-export const lastGetContainerArgs: Array<[any, string]> = [];
+export const lastGetContainerArgs: Array<[any, string?]> = [];
 
 export function makeMockContainerHandle(initialStatus = 200): MockContainerHandle {
   const h: MockContainerHandle = {
@@ -77,12 +95,26 @@ export function makeMockContainerHandle(initialStatus = 200): MockContainerHandl
  * to prove the real Worker code calls the real @cloudflare/containers entrypoint
  * (albeit pointed here by the tsconfig paths alias) with the correct Durable
  * Object namespace binding + singleton instance id.
+ *
+ * REAL @cloudflare/containers@0.3.7:
+ *   getContainer<T extends Container>(binding, name?) -> DurableObjectStub<T>
+ *
+ * The local mock accepts any DurableObjectNamespace binding via `any` widening
+ * because tests compile with the mock paths alias — unique-symbol brand checks
+ * are exercised by the src build (tsconfig.json, real package types, no mock).
+ *
+ * @param binding - Container's Durable Object namespace binding
+ * @param name    - Optional instance name; defaults to "cf-singleton-container".
  */
-export function getContainer(doNamespace: any, instanceId: string): MockContainerHandle {
-  lastGetContainerArgs.push([doNamespace, instanceId]);
-  const existing = containerInstances.get(instanceId);
+export function getContainer(
+  binding: any,
+  name?: string,
+): MockContainerHandle {
+  lastGetContainerArgs.push([binding, name]);
+  const key = name ?? "cf-singleton-container";
+  const existing = containerInstances.get(key);
   if (existing) return existing;
   const fresh = makeMockContainerHandle(200);
-  containerInstances.set(instanceId, fresh);
+  containerInstances.set(key, fresh);
   return fresh;
 }
