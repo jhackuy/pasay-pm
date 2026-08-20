@@ -64,6 +64,12 @@ jobs:
             echo "bot=false" >> "$GITHUB_OUTPUT"
           fi
 
+          if printf '%s\n' "$files" | grep -Eq '^(cloudflare-worker/)'; then
+            echo "cloudflare=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "cloudflare=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Verify GitHub workflow files
         run: |
           test -f AGENTS.md
@@ -87,13 +93,13 @@ jobs:
           grep -q "pasay-gate" README.md
 
       - name: Set up Python
-        if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.bot == 'true'
+        if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.bot == 'true' || steps.changed.outputs.cloudflare == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install backend dependencies
-        if: steps.changed.outputs.backend == 'true'
+        if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.cloudflare == 'true'
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
@@ -104,7 +110,7 @@ jobs:
           python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
       - name: Run backend targeted pytest (Issue #18 + Issue #31)
-        if: steps.changed.outputs.backend == 'true'
+        if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.cloudflare == 'true'
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
@@ -132,3 +138,27 @@ jobs:
         working-directory: pasay-telegram-bot
         run: |
           python -c "import pasay_bot.main, telegram, httpx; print('BOT_IMPORT_SMOKE_OK')"
+
+      - name: Set up Node.js (Cloudflare Worker TS Gate)
+        if: steps.changed.outputs.cloudflare == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cloudflare Worker — install dependencies
+        if: steps.changed.outputs.cloudflare == 'true'
+        working-directory: cloudflare-worker
+        run: |
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+
+      - name: Cloudflare Worker — tsc --noEmit (typecheck gate)
+        if: steps.changed.outputs.cloudflare == 'true'
+        working-directory: cloudflare-worker
+        run: |
+          npx --no-install tsc --noEmit
+
+      - name: Cloudflare Worker — TS spec runner (real handler E2E)
+        if: steps.changed.outputs.cloudflare == 'true'
+        working-directory: cloudflare-worker
+        run: |
+          npx --yes tsx tests/index.spec.ts
