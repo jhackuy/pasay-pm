@@ -263,21 +263,32 @@ async def get_ptb_application():
             _PTB_LAST_FAIL_AT = None
             return app
         except Exception as exc:  # noqa: BLE001
-            # ND_RETURN #3: best-effort teardown of partially-built resources so
-            # the next boot attempt (after cooldown or caller retry) doesn't
-            # inherit leaked sockets / state files / half-open DB connections.
+            # ND_RETURN #3 + FIX-3: best-effort teardown of partially-built
+            # resources. Every individual cleanup step logs its own failure so
+            # teardown problems do not silently hide state/socket leaks
+            # (Ruff S110 cleared). A per-step failure MUST NOT block later
+            # steps and MUST NOT overwrite the original boot exception.
             if app is not None:
                 try:
                     try:
                         await app.stop()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as teardown_exc:  # noqa: BLE001
+                        logger.debug(
+                            "ptb teardown: app.stop() failed during partial cleanup (%s); continuing",
+                            teardown_exc,
+                        )
                     try:
                         await app.shutdown()
-                    except Exception:  # noqa: BLE001
-                        pass
-                except Exception:  # noqa: BLE001
-                    pass
+                    except Exception as teardown_exc:  # noqa: BLE001
+                        logger.debug(
+                            "ptb teardown: app.shutdown() failed during partial cleanup (%s); continuing",
+                            teardown_exc,
+                        )
+                except Exception as teardown_exc:  # noqa: BLE001
+                    logger.debug(
+                        "ptb teardown: outer app.* cleanup wrapper failed (%s); continuing to non-app resources",
+                        teardown_exc,
+                    )
             # PasayApiClient typically has no .close() contract today; keep the
             # branch for future-proofing without hard-requiring the method.
             for _c in (job_api_client, admin_api_client, api_client):
@@ -287,15 +298,21 @@ async def get_ptb_application():
                 if callable(_closer):
                     try:
                         _closer()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as teardown_exc:  # noqa: BLE001
+                        logger.warning(
+                            "ptb teardown: PasayApiClient.close() failed for %s (%s); continuing",
+                            type(_c).__name__, teardown_exc,
+                        )
             if store is not None:
                 _sclose = getattr(store, "close", None)
                 if callable(_sclose):
                     try:
                         _sclose()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as teardown_exc:  # noqa: BLE001
+                        logger.warning(
+                            "ptb teardown: StateStore.close() failed (%s); continuing",
+                            teardown_exc,
+                        )
 
             perm, cls_name, msg = _classify_ptb_boot_exception(exc)
             _PTB_APP = None
@@ -665,8 +682,13 @@ async def process_telegram_update_payload(
       * 401 — TELEGRAM_WEBHOOK_SECRET not configured (fail closed).
     """
     now = now or datetime.now(timezone.utc)
+    # ND_RETURN FIX-3: both budgets floor at 2 so a single NetworkError / temp
+    # PTB boot failure does NOT exhaust the cross-request budget on the first
+    # HTTP 503. This keeps Telegram's replay loop alive long enough for a
+    # transient issue (DB restart / cooldown) to clear while still capping
+    # attempts when Telegram max_attempts is legitimately large.
     max_attempts_cross = max(
-        1, int(_backend_settings.telegram_webhook_max_attempts or 1)
+        2, int(_backend_settings.telegram_webhook_max_attempts or 2)
     )
     # In-process attempts are capped at the same budget but kept short so the
     # response doesn't block Telegram's redelivery timer.

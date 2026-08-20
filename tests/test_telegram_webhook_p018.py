@@ -1114,3 +1114,77 @@ def test_t16_cas_win_refresh_fail_fallback_none_is_db_transient(db_session):
     # Sanity-check: both failure paths were actually exercised (not shortcut).
     assert refresh_called["n"] == 1, "refresh failure path not reached"
     assert fallback_select_hit["n"] == 1, "fallback-select None path not reached"
+
+
+# ---------------------------------------------------------------------------
+# T17 ND_RETURN FIX-3 Blocker #1: retry budget floor = 2 even when
+#      telegram_webhook_max_attempts is configured to 1. The first temporary
+#      failure (NetworkError) MUST NOT exhaust the cross-request budget on
+#      delivery 1 (that would return HTTP 200 failed and kill Telegram's
+#      replay loop causing silent update loss). Fix floors both budgets at 2.
+#      So cfg=1 ⇒ actual effective budget=2:
+#         Delivery 1 → cross_attempt=1 < 2 → HTTP 503 retryable
+#         Delivery 2 → cross_attempt=2 == 2 → HTTP 200 failed
+# ---------------------------------------------------------------------------
+
+def test_t17_max_attempts_1_still_allows_one_safe_replay(webhook_client, db_session):
+    from telegram.error import NetworkError
+
+    calls = {"n": 0}
+
+    async def _raise_temp(u):
+        calls["n"] += 1
+        raise NetworkError("PasayApiClient transient timeout")
+
+    boot = _stub_ptb_app(_raise_temp)
+    # Configure telegram_webhook_max_attempts=1. FIX-3 floor = max(2, cfg) = 2,
+    # so even with cfg=1 we get one safe replay window before giving up.
+    with patch.object(settings, "telegram_webhook_max_attempts", 1):
+        with patch.object(wh_service, "get_ptb_application", side_effect=boot):
+            with patch("app.services.telegram_webhook.asyncio.sleep", new_callable=AsyncMock):
+                r1 = webhook_client.post(
+                    _WH_URL,
+                    json=_make_update_payload(update_id=100017),
+                    headers={_SECRET_HEADER: _TEST_SECRET},
+                )
+                r2 = webhook_client.post(
+                    _WH_URL,
+                    json=_make_update_payload(update_id=100017),
+                    headers={_SECRET_HEADER: _TEST_SECRET},
+                )
+
+    # DELIVERY 1: cfg=1 + floor=2 applied ⇒ attempt_cross(1) < budget(2)
+    #             ⇒ HTTP 503 retryable (Telegram WILL redeliver).
+    # PRE-FIX-3 BUG: floor was 1, so this delivery would immediately become
+    #                HTTP 200/failed and Telegram stops replaying → DATA LOSS.
+    assert r1.status_code == 503, (
+        f"FIX-3 budget-floor regression: cfg=1 first NetworkError must be "
+        f"HTTP 503 retryable (floor=2 lets Telegram replay once), got "
+        f"{r1.status_code}: {r1.text}"
+    )
+    b1 = r1.json()
+    assert b1["state"] == TelegramWebhookState.retryable.value
+    assert b1["retryable"] is True
+    assert b1["cross_attempt"] == 1
+
+    # DELIVERY 2: cross_attempt(2) == budget(2) → spent → HTTP 200 failed.
+    assert r2.status_code == 200, f"r2={r2.status_code}:{r2.text}"
+    b2 = r2.json()
+    assert b2["state"] == TelegramWebhookState.failed.value
+    assert b2["retryable"] is False
+    assert b2["cross_attempt"] == 2
+
+    # 2 cross deliveries × 2 in-process attempts (budget floor propagates to
+    # in-process too via max_in_process = max_attempts_cross) = 4 total
+    # process_update dispatches.
+    assert calls["n"] == 4, (
+        f"expected 4 process_update calls (2 deliveries × 2 in-process floor=2), "
+        f"got {calls['n']}"
+    )
+
+    db_session.expire_all()
+    row = db_session.get(TelegramWebhookUpdate, 100017)
+    assert row.delivery_count == 2, f"expected delivery_count=2, got {row.delivery_count}"
+    # 2 deliveries × 2 attempts each = 4.
+    assert row.attempt_count == 4, f"expected attempt_count=4, got {row.attempt_count}"
+    assert row.state == TelegramWebhookState.failed.value
