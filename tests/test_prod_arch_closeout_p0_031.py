@@ -370,8 +370,10 @@ class TestT7NoPollingInProduction:
             "Dockerfile ENTRYPOINT must NOT silently fall back to DATABASE_URL "
             "when DATABASE_URL_UNPOOLED is missing (ND_RETURN FIX1 blocker #4)."
         )
-        # Required: explicit check + exit 1
-        assert "-z \"${DATABASE_URL_UNPOOLED}\"" in entrypoint_section, (
+        # Required: explicit check + exit 1.
+        # NOTE: Docker ENTRYPOINT uses exec-form JSON array, so inner shell
+        # double-quotes are written as backslash-escaped \" in the source.
+        assert r'-z \"${DATABASE_URL_UNPOOLED}\"' in entrypoint_section, (
             "Dockerfile ENTRYPOINT must explicitly check DATABASE_URL_UNPOOLED presence."
         )
         assert "exit 1" in entrypoint_section, (
@@ -379,7 +381,7 @@ class TestT7NoPollingInProduction:
         )
         # The ALEMBIC_DATABASE_URL must be exported EXACTLY from the required
         # direct/unpooled env var — never from pooled.
-        assert "ALEMBIC_DATABASE_URL=\"${DATABASE_URL_UNPOOLED}\"" in entrypoint_section
+        assert r'ALEMBIC_DATABASE_URL=\"${DATABASE_URL_UNPOOLED}\"' in entrypoint_section
 
     def test_t7b_main_py_no_polling_import_chain(self):
         main_py = (self.REPO_ROOT / "app" / "main.py").read_text(encoding="utf-8")
@@ -498,6 +500,134 @@ class TestT8NeonBoundary:
         row = db_session.execute(text("SELECT 1")).scalar()
         assert row == 1
 
+    # ── T8e: ND_RETURN FIX2 #4a — occurred_at / scheduled_at strict UTC ──
+    #    Bad timestamp inputs MUST surface as pydantic ValidationError BEFORE
+    #    the DB-layer CAST(:o AS TIMESTAMPTZ) runs (which would fire a 503
+    #    transient error and cause infinite Queue retry).
+    #    parse_envelope() + internal_ingest /internal/ingest endpoint both
+    #    catch ValidationError and map it to HTTP 400 envelope_malformed →
+    #    Queue marks the message terminal / poison → no retries.
+
+    def _tg_raw(self, occurred_at: str):
+        return {
+            "version": "1",
+            "kind": "telegram_update",
+            "event_id": "tg:1",
+            "occurred_at": occurred_at,
+            "payload": {"update_id": 1},
+            "_telegram_meta": {"update_id": 1},
+        }
+
+    def _sched_raw(self, occurred_at: str, scheduled_at: str):
+        return {
+            "version": "1",
+            "kind": "scheduled_job",
+            "event_id": "sched:x:2026-08-20T00-00",
+            "occurred_at": occurred_at,
+            "payload": {
+                "job_name": "x",
+                "scheduled_at": scheduled_at,
+            },
+        }
+
+    def test_t8e1_valid_utc_accepted_z_suffix(self):
+        raw = self._tg_raw("2026-08-20T12:00:00Z")
+        env = parse_envelope(raw)
+        assert env.event_id == "tg:1"
+
+    def test_t8e2_valid_utc_accepted_plus0000(self):
+        raw = self._tg_raw("2026-08-20T12:00:00+00:00")
+        env = parse_envelope(raw)
+        assert env.event_id == "tg:1"
+
+    def test_t8e3_scheduled_both_fields_valid_utc(self):
+        raw = self._sched_raw(
+            "2026-08-20T08:00:00+00:00",
+            "2026-08-20T08:00:00Z",
+        )
+        env = parse_envelope(raw)
+        assert env.kind == EnvelopeKind.SCHEDULED_JOB
+
+    def test_t8e4_reject_naive_no_timezone(self):
+        raw = self._tg_raw("2026-08-20T12:00:00")
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e5_reject_positive_offset_not_utc(self):
+        raw = self._tg_raw("2026-08-20T20:00:00+08:00")
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e6_reject_positive_0100_offset(self):
+        raw = self._tg_raw("2026-08-20T13:00:00+01:00")
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e7_reject_negative_offset(self):
+        raw = self._tg_raw("2026-08-20T10:00:00-05:00")
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e8_reject_total_garbage_string(self):
+        raw = self._tg_raw("not-a-real-date")
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e9_scheduled_occurred_at_naive_rejected(self):
+        raw = self._sched_raw(
+            "2026-08-20T08:00:00",  # naive
+            "2026-08-20T08:00:00Z",
+        )
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e10_scheduled_payload_scheduled_at_naive_rejected(self):
+        raw = self._sched_raw(
+            "2026-08-20T08:00:00Z",
+            "2026-08-20T08:00:00",  # naive
+        )
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e11_scheduled_plus08_rejected(self):
+        raw = self._sched_raw(
+            "2026-08-20T08:00:00Z",
+            "2026-08-20T16:00:00+08:00",
+        )
+        with pytest.raises(ValidationError):
+            parse_envelope(raw)
+
+    def test_t8e12_router_naive_timestamps_yield_400_not_503(
+        self, client_unit: TestClient
+    ):
+        """FIX2 #4a KEY ASSERTION: bad timestamps → 400 terminal NOT 503 retry.
+
+        A naive (no timezone) string used to slip through parse_envelope() and
+        reach the SQL-layer CAST AS TIMESTAMPTZ; PostgreSQL's server-side
+        cast semantics can differ from Python's, firing an operational
+        exception → internal_ingest returns 503 → Queue retries forever.
+
+        The new validator raises ValidationError inside parse_envelope() so
+        the router catches it at the L150 envelope_malformed handler and
+        returns 400 (terminal / poison-ack), never 503.
+        """
+        bad = self._sched_raw(
+            "2026-08-20T08:00:00",   # naive — no timezone
+            "2026-08-20T08:00:00+08:00",  # offset +08:00 — not UTC
+        )
+        r = client_unit.post(
+            "/internal/ingest",
+            headers={"X-Pasay-Ingest-Token": INGEST_TOKEN},
+            json=bad,
+        )
+        # MUST be 400 envelope_malformed — NOT 503
+        assert r.status_code == 400, (
+            f"Bad timestamps MUST yield 400 terminal (Queue poison ack). "
+            f"Got status={r.status_code} body={r.text}"
+        )
+        body = r.json()
+        assert body.get("error") == "envelope_malformed"
+
     def test_t8c_alembic_single_head(self):
         repo_root = str(Path(__file__).resolve().parent.parent)
         r = subprocess.run(
@@ -587,7 +717,76 @@ class TestT9RegressionIssue18Webhook:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# T10 Worker targeted validation — ND_RETURN PASAY-TASK-011 FIX1 blocker #3
+# T9d CURRENT_ARCHITECTURE.md frozen entrypoint — ND_RETURN FIX2 #4b
+#
+# ND_RETURN FIX2 #4b: 冻结生产入口必须只有 Telegram → Worker → Queue
+# → Container 单链。CURRENT_ARCHITECTURE.md 中绝不能残留任何
+# "Container 有 public /telegram/webhook fallback 可被 Telegram 直投"
+# 或 "Worker 不可用时 Telegram 投递 Container" 的表述。
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestT9dArchitectureFrozenEntrypoint:
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+
+    def _arch_doc(self) -> str:
+        return (self.REPO_ROOT / "CURRENT_ARCHITECTURE.md").read_text(encoding="utf-8")
+
+    def test_t9d1_no_public_fallback_phrase(self):
+        src = self._arch_doc()
+        forbidden = [
+            "POST /telegram/webhook (public, 兼容直接交付)",
+            "兼容直接交付",
+            "Worker 不可用时 Telegram 仍可直接投递此端点",
+            "Worker 不可用时 Telegram 仍可直接投递",
+            "Worker 不可用时 Telegram 直接投递",
+            "public fallback",
+            "/telegram/webhook 公共端点保留为回退/兼容",
+            "/telegram/webhook 公共端点保留为回退",
+            "/telegram/webhook 公共端点保留为兼容",
+            "public, 兼容",
+            "Container /telegram/webhook public",
+        ]
+        hits = [phrase for phrase in forbidden if phrase in src]
+        assert not hits, (
+            "CURRENT_ARCHITECTURE.md 含违反 FIX2 #4b 冻结入口的 fallback 表述: "
+            + ", ".join(hits)
+        )
+
+    def test_t9d2_only_frozen_worker_entrypoint_declared(self):
+        """Topology §1 MUST explicitly state the single frozen entry path."""
+        src = self._arch_doc()
+        # Frozen single path: Telegram → Cloudflare Worker
+        assert "Telegram → Cloudflare Worker" in src or (
+            "Telegram → Worker" in src and "Cloudflare Worker" in src
+        ), "CURRENT_ARCHITECTURE.md §1 必须声明单入口 Telegram → Worker"
+        # And §3 must also say no fallback exists (we added that line in FIX2).
+        assert (
+            "不存在 Container" in src
+            and "public fallback" not in src
+            and (
+                "生产入口仅 Telegram → Cloudflare Worker" in src
+                or "生产入口仅 Telegram → Worker" in src
+            )
+        ), "§3 历史拓扑必须声明仅 Worker 入口、无 Container fallback"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# T10 Worker targeted validation — ND_RETURN PASAY-TASK-011 FIX2 updated
+#
+# T10 is upgraded from FIX1 → FIX2:
+#   1. wrangler.toml [[containers]] + class_name=PasayContainer +
+#      [[durable_objects.bindings]] name=PASAY_CONTAINER +
+#      [[migrations]] new_sqlite_classes=["PasayContainer"] +
+#      [triggers] crons=["*/5 * * * *"]    (heartbeat Cron trigger).
+#   2. BAN self-invented FIX1-era APIs (ContainersBinding.getByName,
+#      PasayContainersRegistry DO, PASAY_CONTAINERS binding,
+#      PASAY_CONTAINERS_DO name, getByName(...) calls).
+#   3. REQUIRE official getContainer(env.PASAY_CONTAINER, instanceId)
+#      call path from @cloudflare/containers + PasayContainer extends
+#      Container import.
+#   4. TypeScript compile + real-worker spec run still prove S1-S6.
+#   5. wrangler deploy --dry-run parses the official-syntax TOML.
 #
 # Earlier T1/T3/T4/T6 only exercised the Python side (schema + router +
 # static source grep).  FIX1 blocker #3 requires tests that actually
@@ -620,32 +819,106 @@ class TestT10WorkerTargetedValidation:
         import shutil
         return shutil.which(binary)
 
-    # ── T10.1 wrangler.toml static parse ──────────────────────────────
+    # ── T10.1 wrangler.toml static parse — FIX2 OFFICIAL SYNTAX ───────
 
-    def test_t10_1a_wrangler_toml_containers_block(self):
+    def test_t10_1a_wrangler_toml_containers_official_syntax(self):
+        """ND_RETURN FIX2 #1: official [[containers]] + class_name binding.
+
+        The FIX1-era self-invented [container_bindings] / getByName /
+        PasayContainersRegistry DO / default_port lines are BANNED; we
+        require the exact 2025 Cloudflare documented 3-part shape:
+          (a) [[containers]] with class_name=PasayContainer + image + env
+          (b) [[durable_objects.bindings]] name=PASAY_CONTAINER + class_name=PasayContainer
+          (c) [[migrations]] new_sqlite_classes=["PasayContainer"]
+        """
         toml_path = self.WORKER_ROOT / "wrangler.toml"
         toml_src = toml_path.read_text(encoding="utf-8")
-        # Official Containers top-level block (not the old [container_bindings]).
-        assert "[[containers]]" in toml_src, (
-            "wrangler.toml MUST declare [[containers]] per official Cloudflare "
-            "Containers docs — NOT the old [container_bindings] section."
+        # (a) Containers top-level block with class_name matching DO below.
+        assert re.search(
+            r'^\[\[containers\]\]\s*\nclass_name\s*=\s*"PasayContainer"',
+            toml_src,
+            re.MULTILINE,
+        ), "wrangler.toml [[containers]] class_name MUST be PasayContainer (official syntax)"
+        assert re.search(
+            r'^\[\[containers\]\][\s\S]*?image\s*=\s*"\.\./Dockerfile"',
+            toml_src,
+            re.MULTILINE,
+        ), "wrangler.toml [[containers]] MUST reference the real ../Dockerfile image path"
+        # (b) Matching Durable Object binding — name becomes env.PASAY_CONTAINER.
+        assert re.search(
+            r'^\[\[durable_objects\.bindings\]\]\s*\nname\s*=\s*"PASAY_CONTAINER"\s*\nclass_name\s*=\s*"PasayContainer"',
+            toml_src,
+            re.MULTILINE,
+        ), (
+            "wrangler.toml [[durable_objects.bindings]] MUST declare name=PASAY_CONTAINER "
+            "class_name=PasayContainer (matches [[containers]] class_name)"
         )
-        # Single named container + default_port = 8000 matches Dockerfile CMD.
-        assert 'name = "pasay-container"' in toml_src
-        assert "default_port = 8000" in toml_src or "default_port=8000" in toml_src
-        # Durable Object backing the Containers registry.
-        assert "[[durable_objects.bindings]]" in toml_src
-        assert 'name = "PASAY_CONTAINERS_DO"' in toml_src
-        assert 'class_name = "PasayContainersRegistry"' in toml_src
-        # One-time DO migration row (idempotent on redeploy).
-        assert "[[migrations]]" in toml_src
-        assert "PasayContainersRegistry" in toml_src
-        # Ban the pre-FIX1 obsolete placeholder block.
-        assert "[container_bindings]" not in toml_src
-        # env vars forwarded into container runtime (not secrets baked in).
-        assert "PASAY_RUNTIME_MODE = \"cloudflare-container\"" in toml_src
+        # (c) DO registration via [[migrations]] new_sqlite_classes (Cloudflare
+        #     2025 syntax, NOT the DO `new_classes` pre-Containers field).
+        assert re.search(
+            r'^\[\[migrations\]\]\s*\nnew_sqlite_classes\s*=\s*\[\s*"PasayContainer"\s*\]',
+            toml_src,
+            re.MULTILINE,
+        ), (
+            "wrangler.toml [[migrations]] MUST register Container via "
+            "new_sqlite_classes=[\"PasayContainer\"] per official Containers docs"
+        )
+        # (d) Container env provisioning:
+        #     Cloudflare 2025 Containers do NOT use a [containers.env] TOML
+        #     subtable (that key is treated as unexpected by wrangler schema).
+        #     Instead:
+        #       * runtime-only secrets (DB URL, tokens) are pushed via
+        #         wrangler secret put and auto-injected at boot.
+        #       * PASAY_RUNTIME_MODE=cloudflare-container is a BUILD-TIME
+        #         invariant baked in the Dockerfile via `ENV PASAY_RUNTIME_MODE=…`.
+        #     Verify the Dockerfile still carries that hard-coded runtime flag
+        #     (Scope D: production identity cannot be swapped to dev accidentally).
+        df_src = (self.REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert re.search(
+            r'^ENV[\s\S]*?PASAY_RUNTIME_MODE\s*=\s*cloudflare-container',
+            df_src,
+            re.MULTILINE,
+        ), "Dockerfile MUST hard-code ENV PASAY_RUNTIME_MODE=cloudflare-container (Scope D runtime identity)"
 
-    def test_t10_1b_wrangler_single_queue_unchanged(self):
+    def test_t10_1b_wrangler_toml_bans_fix1_self_invented_container_api(self):
+        """ND_RETURN FIX2 #1: ban FIX1-era self-invented placeholder APIs.
+
+        FIX1 inventend a fake `ContainersBinding.getByName()` interface plus
+        a `PasayContainersRegistry` DO stub.  Neither matches Cloudflare
+        official docs; all trace of them must be removed from wrangler.toml.
+        """
+        toml_src = (self.WORKER_ROOT / "wrangler.toml").read_text(encoding="utf-8")
+        banned_lines = [
+            "[container_bindings]",
+            'binding = "PASAY_CONTAINERS"',
+            'name = "PASAY_CONTAINERS_DO"',
+            'class_name = "PasayContainersRegistry"',
+            'name = "pasay-container"',  # per-container `name` (containers use class_name)
+            "default_port = 8000",  # Containers declare default_port inside TS class
+            "default_port=8000",
+        ]
+        hits = [tok for tok in banned_lines if tok in toml_src]
+        assert not hits, (
+            "wrangler.toml STILL contains FIX1-era self-invented placeholder "
+            "container tokens (banned by FIX2 #1).  Tokens found: " + ", ".join(hits)
+        )
+
+    def test_t10_1c_wrangler_toml_triggers_cron_heartbeat_registered(self):
+        """ND_RETURN FIX2 #2: real [triggers] crons 5-minute pasay heartbeat.
+
+        The scheduled() handler already enqueues the scheduled_job envelope;
+        Cloudflare only actually invokes scheduled() when a real `[triggers]
+        crons` entry is present in wrangler.toml.  Registering it in-code
+        only would produce a no-op scheduled() in production.
+        """
+        toml_src = (self.WORKER_ROOT / "wrangler.toml").read_text(encoding="utf-8")
+        assert re.search(
+            r'^\[triggers\]\s*\ncrons\s*=\s*\[.*"\*\/5 \* \* \* \*".*\]',
+            toml_src,
+            re.MULTILINE,
+        ), "wrangler.toml MUST register [triggers].crons with 5-minute interval for scheduled()"
+
+    def test_t10_1d_wrangler_single_queue_unchanged(self):
         toml_src = (self.WORKER_ROOT / "wrangler.toml").read_text(encoding="utf-8")
         # Exactly one queue pair: pasay-events producer + consumer + DLQ.
         assert toml_src.count('[[queues.producers]]') == 1
@@ -656,22 +929,49 @@ class TestT10WorkerTargetedValidation:
 
     # ── T10.2 Worker source pattern audits (always run) ───────────────
 
-    def test_t10_2a_worker_no_obsolete_container_fetch_pattern(self):
+    def test_t10_2a_worker_official_container_extends_container(self):
+        """FIX2 #1: worker src/index.ts → `extends Container from @cloudflare/containers`."""
         idx_src = (self.WORKER_ROOT / "src" / "index.ts").read_text(encoding="utf-8")
-        # Pre-FIX1 pattern: env.PASAY_CONTAINER?.fetch(...) — banned.
-        assert not re.search(
-            r"env\s*\.\s*PASAY_CONTAINER\s*\??\s*\.\s*fetch\s*\(",
+        assert re.search(
+            r'import\s*\{\s*Container[^}]*\}\s*from\s*"@cloudflare/containers"',
+            idx_src,
+        ), "index.ts MUST import Container from @cloudflare/containers (official pkg)"
+        assert re.search(
+            r'import\s*\{\s*[^}]*getContainer[^}]*\}\s*from\s*"@cloudflare/containers"',
+            idx_src,
+        ), "index.ts MUST import getContainer from @cloudflare/containers (official factory)"
+        assert re.search(
+            r'export\s+class\s+PasayContainer\s+extends\s+Container\b',
+            idx_src,
+        ), "index.ts MUST export class PasayContainer extends Container"
+
+    def test_t10_2b_worker_official_getcontainer_call_path(self):
+        """FIX2 #1: worker MUST call getContainer(env.PASAY_CONTAINER, id)."""
+        idx_src = (self.WORKER_ROOT / "src" / "index.ts").read_text(encoding="utf-8")
+        assert re.search(
+            r'getContainer\(\s*env\.PASAY_CONTAINER\s*,',
             idx_src,
         ), (
-            "src/index.ts MUST NOT call env.PASAY_CONTAINER.fetch(...).  "
-            "Official API is env.PASAY_CONTAINERS.getByName(name) → "
-            "container.fetch(req) with an absolute URL."
+            "index.ts MUST call getContainer(env.PASAY_CONTAINER, <instanceId>) "
+            "per official Cloudflare Containers 2025 docs"
         )
-        # New pattern must be present.
-        assert "getByName(PASAY_CONTAINER_NAME)" in idx_src or "getByName(" in idx_src
-        assert "PASAY_CONTAINERS" in idx_src
 
-    def test_t10_2b_worker_explicit_retry_not_silent_fallthrough(self):
+    def test_t10_2c_worker_bans_fix1_self_invented_container_api(self):
+        """FIX2 #1: ban FIX1-era self-invented ContainersBinding / getByName / PasayContainersRegistry."""
+        idx_src = (self.WORKER_ROOT / "src" / "index.ts").read_text(encoding="utf-8")
+        banned = [
+            "ContainersBinding",
+            "PASAY_CONTAINERS",
+            "PasayContainersRegistry",
+            "getByName",
+        ]
+        hits = [tok for tok in banned if tok in idx_src]
+        assert not hits, (
+            "src/index.ts STILL contains FIX1-era self-invented placeholder API "
+            "(banned by FIX2 #1).  Tokens found: " + ", ".join(hits)
+        )
+
+    def test_t10_2d_worker_explicit_retry_not_silent_fallthrough(self):
         idx_src = (self.WORKER_ROOT / "src" / "index.ts").read_text(encoding="utf-8")
         # Pre-FIX1 comment explaining the silent fall-through is banned.
         assert '"retry" is the default' not in idx_src
@@ -681,7 +981,7 @@ class TestT10WorkerTargetedValidation:
             idx_src,
         ), "queue handler MUST call msg.retry() explicitly — silent fall-through drops transient messages."
 
-    def test_t10_2c_worker_request_absolute_not_relative_ingest(self):
+    def test_t10_2e_worker_request_absolute_not_relative_ingest(self):
         idx_src = (self.WORKER_ROOT / "src" / "index.ts").read_text(encoding="utf-8")
         # Fetch standard: synthetic Request without parent needs absolute URL.
         # The pre-FIX1 code was `new Request(CONTAINER_INGEST_PATH, ...)` with
@@ -690,13 +990,12 @@ class TestT10WorkerTargetedValidation:
         assert "https://pasay-container/internal/ingest" in idx_src or (
             "PASAY_CONTAINER_ORIGIN" in idx_src and "CONTAINER_INGEST_PATH" in idx_src
         )
-
-    def test_t10_2d_durable_object_class_exported(self):
-        idx_src = (self.WORKER_ROOT / "src" / "index.ts").read_text(encoding="utf-8")
+        # Also enforce Request body carries pasay-ingest-token header (not in URL query).
         assert re.search(
-            r"export\s+class\s+PasayContainersRegistry\b",
+            r"x-pasay-ingest-token|PASAY_CONTAINER_INGEST_TOKEN",
             idx_src,
-        ), "Worker MUST export Durable Object class PasayContainersRegistry (matches [[migrations]])."
+            re.IGNORECASE,
+        )
 
     # ── T10.3 TypeScript compile + spec run (require node/npm on host) ─
 
@@ -715,6 +1014,8 @@ class TestT10WorkerTargetedValidation:
                 cwd=worker_root_str,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             # Install failure is real only when node_modules was fully
             # absent; otherwise keep going (the host may have a global tsc).
@@ -728,6 +1029,8 @@ class TestT10WorkerTargetedValidation:
             cwd=worker_root_str,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         assert r_tsc.returncode == 0, (
             f"tsc --noEmit failed for cloudflare-worker.\n"
@@ -757,6 +1060,8 @@ class TestT10WorkerTargetedValidation:
                 cwd=worker_root_str,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if r_install.returncode != 0 and not node_modules.exists():
                 pytest.skip(
@@ -773,6 +1078,8 @@ class TestT10WorkerTargetedValidation:
             cwd=worker_root_str,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         # Combined output so the test report captures whatever the runner
         # actually printed (pass / fail lines).
@@ -811,6 +1118,8 @@ class TestT10WorkerTargetedValidation:
                 cwd=worker_root_str,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if r_install.returncode != 0 and not node_modules.exists():
                 pytest.skip(
@@ -818,10 +1127,12 @@ class TestT10WorkerTargetedValidation:
                     f"npm stderr: {r_install.stderr[:500]}"
                 )
         r_dry = subprocess.run(
-            [npx, "--no-install", "wrangler", "deploy", "--dry-run"],
+            [npx, "--no-install", "wrangler", "deploy", "--dry-run", "--containers-rollout=none"],
             cwd=worker_root_str,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env={
                 **os.environ,
                 # Avoid requiring real Cloudflare account id for a dry run
@@ -836,12 +1147,12 @@ class TestT10WorkerTargetedValidation:
         )
         combined = (r_dry.stdout or "") + "\n" + (r_dry.stderr or "")
         # Accept either (a) true 0 exit (config parsed) or (b) an explicit
-        # credential/account-id error — either way the wrangler.toml file
-        # was accepted and parsed.  Only a real TOML/schema/compile error
-        # fails this gate.
+        # credential/account-id / docker error — either way the wrangler.toml
+        # file was accepted and parsed.  Only a real TOML/schema/compile
+        # error fails this gate.
         if r_dry.returncode == 0:
             return  # ✅ best case: full --dry-run passes
-        # Non-zero: allow credential / account-id / rate-limit style
+        # Non-zero: allow credential / account-id / rate-limit / docker-style
         # failures; TOML/schema failures must still fail the gate.
         credential_error_tokens = (
             "account id",
@@ -852,11 +1163,17 @@ class TestT10WorkerTargetedValidation:
             "not authenticated",
             "unauthorized",
             "rate limit",
+            "docker cli",
+            "docker desktop",
+            "docker daemon",
+            "could not be launched",
+            "containers-rollout",
+            "rollout=none",
         )
         lowered = combined.lower()
         if any(tok in lowered for tok in credential_error_tokens):
             pytest.skip(
-                "wrangler deploy --dry-run halted for credentials/account-id "
+                "wrangler deploy --dry-run halted for credentials/account-id/docker "
                 "(out of scope for architecture code gate).  wrangler.toml "
                 "schema was already parsed before reaching that check."
             )

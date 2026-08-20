@@ -54,11 +54,6 @@ Telegram api.telegram.org
 │  │   (INSERT ON CONFLICT DO NOTHING → 200/208)          │ │
 │  └──────────────────────────────────────────────────────┘ │
 │                                                          │
-│  ┌─ POST /telegram/webhook (public, 兼容直接交付) ─────┐ │
-│  │ • Worker 不可用时，Telegram 仍可直接投递此端点         │ │
-│  │ • 相同 service 层，相同幂等语义                       │ │
-│  └──────────────────────────────────────────────────────┘ │
-│                                                          │
 │  ┌─ GET /health ───────────────────────────────────────┐ │
 │  │ • DB liveness + webhook 统计 + architecture 快照      │ │
 │  │ • architecture.frozen_topology = worker→queue→…      │ │
@@ -110,9 +105,9 @@ Python Pydantic 镜像：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas
    - Dockerfile / Cloudflare Container startup **永不引用**这些脚本
    - 仅供本地 dev/debug，Operator 手动运行，不参与生产链路
 
-3. **Webhook 与 polling 同时作为生产入口的"双主架构"**
+3. **Webhook 与 polling 同时作为生产入口的"双主架构"
    - Issue #31 后已取消：生产只保留 Worker→Queue→Container 单链
-   - `/telegram/webhook` 公共端点保留为回退/兼容，但不是首选生产路径。
+   - 生产入口仅 Telegram → Cloudflare Worker，不存在 Container 对外暴露的 `/telegram/webhook` 公共回退路径，也不允许 Telegram 绕过 Worker 直接投递 Container。
 
 ---
 

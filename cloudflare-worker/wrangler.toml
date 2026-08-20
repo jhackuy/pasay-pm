@@ -1,38 +1,43 @@
 name = "pasay-cloudflare-worker"
 main = "src/index.ts"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-08-20"
 
-# ── Cloudflare Containers — official native binding (ND_RETURN FIX1 #1) ──
-# Single pasay-container (FastAPI/Pasay Python runtime).
-# default_port = 8000 matches Dockerfile CMD "uvicorn ... --port 8000".
-# env vars forwarded into the container at startup (operator populates
-# via wrangler secret put / wrangler env / Cloudflare dashboard).
+# ── Cloudflare Containers — OFFICIAL native binding (ND_RETURN FIX2 #1) ──
+# Container class is declared in src/index.ts as "export class PasayContainer extends Container"
+# with defaultPort=8000 matching Dockerfile CMD "uvicorn ... --port 8000".
+# Each container instance is a Durable Object (DO) with idFromName → id, so we can
+# route to a globally unique pasay-singleton instance by getContainer(env.PASAY_CONTAINER, "pasay-singleton").
 [[containers]]
-  binding = "PASAY_CONTAINERS"
-  containers = [
-    { name = "pasay-container", default_port = 8000 }
-  ]
+class_name = "PasayContainer"
+image = "../Dockerfile"
+max_instances = 5
+instance_type = "basic"
 
-# Container env vars (Secrets bound from wrangler secret put pasay-database-url etc.)
-[containers.env]
-  DATABASE_URL = "${DATABASE_URL}"
-  DATABASE_URL_UNPOOLED = "${DATABASE_URL_UNPOOLED}"
-  TELEGRAM_BOT_TOKEN = "${TELEGRAM_BOT_TOKEN}"
-  TELEGRAM_WEBHOOK_SECRET = "${TELEGRAM_WEBHOOK_SECRET}"
-  CONTAINER_INGEST_TOKEN = "${PASAY_CONTAINER_INGEST_TOKEN}"
-  PASAY_RUNTIME_MODE = "cloudflare-container"
+# Container env vars: provisioned via wrangler secret put BEFORE deploy.
+# Cloudflare 2025 Containers auto-inject secret values into the container
+# runtime; do NOT hardcode secrets here.  Operator instructions listed in
+# the Secrets block below apply to both Worker + Container equally.
 
-# Durable Object binding used by the Containers runtime to expose
-# getContainer(name) → Container instance per the official API.
+# Durable Object binding used as the Container backing DO namespace.
+# Name "PASAY_CONTAINER" matches what getContainer(env.PASAY_CONTAINER, ...)
+# expects; class_name "PasayContainer" MUST match the exported Container subclass.
 [[durable_objects.bindings]]
-  name = "PASAY_CONTAINERS_DO"
-  class_name = "PasayContainersRegistry"
+name = "PASAY_CONTAINER"
+class_name = "PasayContainer"
 
-# One-time migration to register the Containers DO namespace.
-# Operator runs `wrangler deploy` once; this row is idempotent.
+# One-time migration to register the Container DO class.
+# "new_sqlite_classes" is the OFFICIAL required key for Container DO migrations
+# (per Cloudflare Containers 2025 docs).
 [[migrations]]
-  tag = "v1-pasay-containers-registry"
-  new_classes = ["PasayContainersRegistry"]
+new_sqlite_classes = [ "PasayContainer" ]
+tag = "v1-pasay-container"
+
+# ── Cron trigger — OFFICIAL pasay_heartbeat production cron (FIX2 #2) ──
+# Cloudflare fires scheduled() every 5 minutes UTC, which routes a single
+# scheduled_job envelope through PASAY_QUEUE → Container ingest path, same
+# queue contract as Telegram ingress.
+[triggers]
+crons = ["*/5 * * * *"]
 
 # ── Queue binding (single unified queue for telegram + cron) ──
 [[queues.producers]]

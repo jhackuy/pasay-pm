@@ -7,14 +7,14 @@
     "build": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "types": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@cloudflare/containers": "^1.0.0"
+    "types": "tsc --noEmit",
+    "test": "tsx tests/index.spec.ts"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20241201.0",
+    "@cloudflare/workers-types": "^5.20260815.1",
+    "@types/node": "^20.11.0",
+    "tsx": "^4.16.0",
     "typescript": "^5.3.0",
-    "wrangler": "^3.99.0"
+    "wrangler": "^4.124.0"
   }
 }

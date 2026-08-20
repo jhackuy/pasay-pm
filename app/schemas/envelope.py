@@ -6,16 +6,70 @@ Two schemas MUST stay byte-symmetric on ``version`` / ``kind`` / ``event_id`` /
 
 Used ONLY by the internal ``/internal/ingest`` endpoint.
 Exposed publicly; Telegram never hits this directly.
+
+ND_RETURN FIX2 #4a — shared UTC timestamp validator:
+  occurred_at (both envelope kinds) and scheduled_at (inside scheduled_job
+  payload) all go through one validator that rejects: unparsable strings,
+  naive (tz-unaware) datetimes, and datetimes whose UTC offset is anything
+  other than 00:00 (strict UTC).  Failures surface as ValidationError during
+  parse_envelope(), BEFORE any DB claim, so the Container endpoint returns
+  HTTP 400 (terminal) instead of HTTP 503 (retry).
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic_core import PydanticCustomError
 
 ENVELOPE_VERSION: str = "1"
+
+
+ZERO = timedelta(0)
+
+
+def _validate_utc_iso8601(value: Any) -> str:
+    """Shared strict UTC ISO-8601 validator (ND_RETURN FIX2 #4a).
+
+    Raises pydantic_core.PydanticCustomError for any string that is not:
+      (a) a parseable ISO-8601 timestamp,
+      (b) timezone-aware (not naive), and
+      (c) anchored at UTC (offset == timedelta(0)).
+
+    Accepts trailing ``Z`` (converted to ``+00:00`` for fromisoformat).
+    PydanticCustomError ensures ``ValidationError.errors()[*]['ctx']``
+    contains only JSON-serializable values (strings) so FastAPI can
+    serialize the 400 response without a secondary TypeError.
+    """
+    if not isinstance(value, str) or not value:
+        raise PydanticCustomError(
+            "timestamp_empty",
+            "timestamp must be a non-empty ISO-8601 string",
+            {"input_type": type(value).__name__ if value is not None else "null"},
+        )
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as exc:
+        raise PydanticCustomError(
+            "timestamp_not_iso8601",
+            "timestamp not a parseable ISO-8601 datetime string: {reason}",
+            {"reason": str(exc), "raw": value},
+        ) from exc
+    if parsed.tzinfo is None or parsed.tzinfo.utcoffset(parsed) is None:
+        raise PydanticCustomError(
+            "timestamp_naive",
+            "timestamp must be timezone-aware (suffix Z or +00:00 required; naive datetime forbidden)",
+            {"raw": value},
+        )
+    if parsed.tzinfo.utcoffset(parsed) != ZERO:
+        raise PydanticCustomError(
+            "timestamp_not_utc",
+            "timestamp must be strict UTC (offset must equal 00:00 or suffix Z; non-zero offsets like +08:00 forbidden)",
+            {"raw": value, "observed_offset": str(parsed.tzinfo.utcoffset(parsed))},
+        )
+    return value
 
 
 class EnvelopeKind(str, Enum):
@@ -52,15 +106,19 @@ class TelegramUpdateEnvelope(BaseModel):
 
     @field_validator("occurred_at")
     @classmethod
-    def _iso8601(cls, v: str) -> str:
-        datetime.fromisoformat(v.replace("Z", "+00:00"))
-        return v
+    def _occurred_at_utc(cls, v: str) -> str:
+        return _validate_utc_iso8601(v)
 
 
 class ScheduledJobPayload(BaseModel):
     job_name: str = Field(min_length=1, max_length=128)
     scheduled_at: str
     params: dict[str, Any] | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def _scheduled_at_utc(cls, v: str) -> str:
+        return _validate_utc_iso8601(v)
 
 
 class ScheduledJobEnvelope(BaseModel):
@@ -76,6 +134,11 @@ class ScheduledJobEnvelope(BaseModel):
         if not v.startswith("sched:"):
             raise ValueError("scheduled_job event_id must start with 'sched:'")
         return v
+
+    @field_validator("occurred_at")
+    @classmethod
+    def _occurred_at_utc(cls, v: str) -> str:
+        return _validate_utc_iso8601(v)
 
 
 PasayQueueEnvelope = Union[TelegramUpdateEnvelope, ScheduledJobEnvelope]
