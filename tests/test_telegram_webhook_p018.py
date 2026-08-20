@@ -927,10 +927,15 @@ def test_t15_lock_inner_cooldown_recheck_prevents_duplicate_doomed_boot(webhook_
     # inner-lock cooldown line before any pasay_bot imports.
 
 
-def test_t15b_partial_resources_cleaned_on_boot_exception_in_middle(webhook_client, db_session):
+def test_t15b_partial_resources_cleaned_on_boot_exception_in_middle(webhook_client, db_session, monkeypatch):
     """If boot fails AFTER StateStore + PasayApiClient + Application.initialize
     have already started, the exception path must call best-effort teardown
-    so sockets/state don't leak."""
+    so sockets/state don't leak.
+
+    ND_RETURN FIX-2: this test MUST use pytest monkeypatch.setitem() for ALL
+    sys.modules stub entries. After teardown pytest auto-restores: existing
+    modules revert to original value; keys that did not pre-exist are removed.
+    No cross-test contamination of the `pasay_bot` subtrees."""
 
     stop_log = []
     shutdown_log = []
@@ -972,6 +977,10 @@ def test_t15b_partial_resources_cleaned_on_boot_exception_in_middle(webhook_clie
     # Instead we pre-seed sys.modules["pasay_bot.X"] with stub modules that
     # export our fake classes/functions. The internal imports will find the
     # stub module on their next `from ... import`.
+    #
+    # ND_RETURN FIX-2: use monkeypatch.setitem() for every entry. pytest
+    # automatically rolls these back after test (undoing setdefault-style
+    # first-seed + explicit reassignment both correctly).
     import types, sys
     stub_config = types.ModuleType("pasay_bot.config")
     def _fake_get_settings():
@@ -983,22 +992,27 @@ def test_t15b_partial_resources_cleaned_on_boot_exception_in_middle(webhook_clie
         s.telegram_admin_ids = [1]
         return s
     stub_config.get_settings = _fake_get_settings
-    sys.modules.setdefault("pasay_bot", types.ModuleType("pasay_bot"))
-    sys.modules["pasay_bot.config"] = stub_config
+    # `pasay_bot` top-level package: if absent → create empty module; if
+    # present → leave it alone (no overwrite). setitem ensures rollback of
+    # whichever case applies.
+    if "pasay_bot" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "pasay_bot", types.ModuleType("pasay_bot"))
+    monkeypatch.setitem(sys.modules, "pasay_bot.config", stub_config)
 
     stub_api = types.ModuleType("pasay_bot.api_client")
     stub_api.PasayApiClient = lambda *a, **kw: _FakeApiClient()
-    sys.modules["pasay_bot.api_client"] = stub_api
+    monkeypatch.setitem(sys.modules, "pasay_bot.api_client", stub_api)
 
     stub_state = types.ModuleType("pasay_bot.state")
-    sys.modules.setdefault("pasay_bot.state", stub_state)
+    if "pasay_bot.state" not in sys.modules:
+        monkeypatch.setitem(sys.modules, "pasay_bot.state", stub_state)
     stub_store_mod = types.ModuleType("pasay_bot.state.store")
     stub_store_mod.StateStore = _FakeStore
-    sys.modules["pasay_bot.state.store"] = stub_store_mod
+    monkeypatch.setitem(sys.modules, "pasay_bot.state.store", stub_store_mod)
 
     stub_main = types.ModuleType("pasay_bot.main")
     stub_main.build_application = _fake_build
-    sys.modules["pasay_bot.main"] = stub_main
+    monkeypatch.setitem(sys.modules, "pasay_bot.main", stub_main)
 
     _reset_ptb_module_state()
 
