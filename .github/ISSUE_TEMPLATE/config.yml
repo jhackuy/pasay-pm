@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Pasay GitHub Workflow
+    url: https://github.com/jhackuy/pasay-pm/blob/feature/telegram-ui-v2/GITHUB_DEV_WORKFLOW.md
+    about: Read the repository workflow contract before opening non-standard requests.

@@ -1,0 +1,19 @@
+{
+  "action": "created",
+  "delivery": "fx-02",
+  "_expected": {"verdict": "NO_DISPATCH", "state": "NO_DISPATCH"},
+  "repository": {"name": "pasay-pm", "owner": {"login": "jhackuy"}},
+  "issue": {
+    "number": 4,
+    "state": "open",
+    "title": "PASAY-EXPENSE-VNEXT-001",
+    "body": "Expense redesign scope.",
+    "labels": [{"name": "route:dev"}]
+  },
+  "comment": {
+    "id": 1002,
+    "body": "OWNER_APPROVED_FOR_OPENDESIGN\nApproved.",
+    "created_at": "2026-08-20T00:00:01Z"
+  },
+  "sender": {"login": "jhackuy", "id": 1, "type": "User"}
+}

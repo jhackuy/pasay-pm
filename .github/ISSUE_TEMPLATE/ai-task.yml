@@ -1,0 +1,110 @@
+name: AI Task
+description: Single-source task for ChatGPT, OpenDesign, and TRAE delivery
+title: "[TASK] "
+body:
+  - type: dropdown
+    id: route
+    attributes:
+      label: Route
+      description: Select the minimal route for this task.
+      options:
+        - dev
+        - design-dev
+        - design-only
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: Describe the business outcome this task must achieve.
+      placeholder: |
+        - Why this task exists
+        - What outcome must change
+    validations:
+      required: true
+
+  - type: textarea
+    id: business_truth
+    attributes:
+      label: Business Truth / Frozen Rules
+      description: Record the rules that must not be reinterpreted by downstream agents.
+      placeholder: |
+        - Canonical rules
+        - Frozen contracts
+        - Permissions / copy / state rules that must remain true
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope / Allowed Areas
+      description: List the files, modules, behaviors, or areas the agent may touch.
+      placeholder: |
+        - app/...
+        - .github/...
+        - Docs or design artifacts that are allowed
+    validations:
+      required: true
+
+  - type: textarea
+    id: out_of_scope
+    attributes:
+      label: Out of Scope
+      description: Record forbidden changes and nearby work that must not be pulled in.
+      placeholder: |
+        - No schema migration
+        - No UX rewrite
+        - No unrelated refactor
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Define the exact conditions for completion.
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+        - [ ] Criterion 3
+    validations:
+      required: true
+
+  - type: textarea
+    id: targeted_tests
+    attributes:
+      label: Targeted Tests
+      description: List the specific validation expected for this task.
+      placeholder: |
+        - Command(s)
+        - Scope of validation
+        - Expected result
+    validations:
+      required: true
+
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop Condition / Blocker
+      description: State when the agent must stop and report BLOCKED.
+      placeholder: |
+        - Dirty worktree with unknown source
+        - Authority branch conflict
+        - Missing dependency / permission / design approval
+    validations:
+      required: true
+
+  - type: textarea
+    id: owner_acceptance
+    attributes:
+      label: Owner Acceptance Checklist
+      description: Checklist for final human acceptance.
+      placeholder: |
+        - [ ] Business behavior matches frozen truth
+        - [ ] Scope respected
+        - [ ] Validation evidence is attached
+    validations:
+      required: true
