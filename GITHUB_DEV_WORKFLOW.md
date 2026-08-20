@@ -97,7 +97,23 @@ handoff for `route:design-dev` issues. Trigger contract, status
 states, and PR-stage fixture validation are documented in
 `docs/opendesign-dispatch.md`. The dispatcher is event-driven; it
 does NOT poll, does NOT run on a schedule, and does NOT use a second
-database. Until Owner configures either a self-hosted runner or an
-`OD_DISPATCH_URL` secret, every approval event records a
-`BLOCKED_FOR_PRODUCT_DECISION` status comment so the missing step is
-auditable.
+database.
+
+### OpenDesign Dispatcher Prerequisite
+
+For the live production issue_comment path to do anything other than
+record `BLOCKED_FOR_PRODUCT_DECISION`, Owner MUST configure ONE of:
+
+- **Windows GitHub self-hosted runner** registered to this repo with
+  the OpenDesign `od` CLI on PATH (and `OD_DAEMON_URL` pointing at
+  the local daemon). This is the only path that works today.
+- **Reserved for future use:** Repo secret `OD_DISPATCH_URL` (a base
+  URL for a documented OpenDesign webhook) AND repo secret
+  `OD_TOOL_TOKEN` (bearer). OpenDesign 0.19.2 does NOT expose a
+  webhook endpoint; setting these without a documented target will
+  fail closed with `DISPATCH_FAILED`.
+
+No approval event ever silently falls through to a stub. If neither
+prerequisite is configured, every approval produces an explicit
+`BLOCKED_FOR_PRODUCT_DECISION` status comment with the exact
+missing-step reason.
