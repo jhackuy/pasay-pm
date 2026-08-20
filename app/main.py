@@ -22,6 +22,7 @@ from app.api.routers import (
     expense,
     income,
     leases,
+    onboarding,
     operations,
     payments,
     properties,
@@ -45,6 +46,7 @@ app = FastAPI(
 API_PREFIX = "/api/v1"
 
 app.include_router(auth.router, prefix=API_PREFIX)
+app.include_router(onboarding.router, prefix=API_PREFIX)
 app.include_router(properties.router, prefix=API_PREFIX)
 app.include_router(units.router, prefix=API_PREFIX)
 app.include_router(tenants.router, prefix=API_PREFIX)
