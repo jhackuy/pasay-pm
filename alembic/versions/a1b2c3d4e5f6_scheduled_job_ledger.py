@@ -38,20 +38,59 @@ def upgrade() -> None:
     inspector = sa.inspect(conn)
     if inspector.has_table("pasay_scheduled_job_ledger"):
         existing_pk = inspector.get_pk_constraint("pasay_scheduled_job_ledger")
-        pk_cols = (existing_pk or {}).get("constrained_columns") or []
-        if "event_id" not in pk_cols:
+        pk_cols = sorted((existing_pk or {}).get("constrained_columns") or [])
+        if pk_cols != ["event_id"]:
             raise RuntimeError(
-                "pasay_scheduled_job_ledger already exists but PRIMARY KEY is not (event_id). "
-                "Please manually reconcile the legacy table with this migration's schema."
+                "pasay_scheduled_job_ledger already exists but PRIMARY KEY is not "
+                f"EXACTLY the single column (event_id). Got PK columns: {pk_cols!r}. "
+                "The ledger uses INSERT … ON CONFLICT (event_id) DO NOTHING and "
+                "requires a single-column unique PK on event_id. Please manually "
+                "reconcile the legacy table with this migration's schema."
             )
-        existing_cols = {c["name"] for c in inspector.get_columns("pasay_scheduled_job_ledger")}
-        required = {"event_id", "job_name", "occurred_at", "consumed_at", "payload"}
-        missing = required - existing_cols
+        existing_cols = {c["name"]: c for c in inspector.get_columns("pasay_scheduled_job_ledger")}
+        required_names = {"event_id", "job_name", "occurred_at", "consumed_at", "payload"}
+        missing = required_names - set(existing_cols.keys())
         if missing:
             raise RuntimeError(
                 f"pasay_scheduled_job_ledger already exists but is missing required columns: {sorted(missing)}. "
                 "Please manually reconcile the legacy table with this migration's schema."
             )
+        event_id_col = existing_cols["event_id"]
+        event_id_type = getattr(event_id_col.get("type", None), "python_type", None)
+        if event_id_type is not None and not issubclass(event_id_type, str):
+            raise RuntimeError(
+                f"pasay_scheduled_job_ledger.event_id column must be a string type compatible with VARCHAR(256); got python_type={event_id_type!r}. "
+                "Please manually reconcile the legacy table with this migration's schema."
+            )
+        occurred_at_col = existing_cols["occurred_at"]
+        oa_type = occurred_at_col.get("type")
+        oa_is_tz = getattr(oa_type, "timezone", None) if oa_type is not None else None
+        if oa_type is not None and oa_is_tz is False:
+            raise RuntimeError(
+                "pasay_scheduled_job_ledger.occurred_at must be TIMESTAMPTZ (timezone-aware); "
+                f"got a naive datetime column type: {oa_type!r}. "
+                "Please manually reconcile the legacy table with this migration's schema."
+            )
+        payload_col = existing_cols.get("payload")
+        if payload_col is not None:
+            payload_raw_type = payload_col.get("type")
+            payload_dialect_name = ""
+            try:
+                payload_dialect_name = payload_raw_type.compile(dialect=postgresql.dialect()) if payload_raw_type is not None else ""
+            except Exception:
+                payload_dialect_name = ""
+            payload_is_json_compat = (
+                payload_dialect_name.upper().startswith("JSON")
+                or "JSON" in type(payload_raw_type).__name__.upper()
+            )
+            if payload_raw_type is not None and payload_raw_type._isnull is False and not payload_is_json_compat:
+                raise RuntimeError(
+                    f"pasay_scheduled_job_ledger.payload must be JSON/JSONB-compatible for JSONB cast; got {payload_raw_type!r}. "
+                    "Please manually reconcile the legacy table with this migration's schema."
+                )
+        consumed_at_col = existing_cols["consumed_at"]
+        if consumed_at_col.get("default") is None and consumed_at_col.get("server_default") is None:
+            pass
         return
 
     op.create_table(

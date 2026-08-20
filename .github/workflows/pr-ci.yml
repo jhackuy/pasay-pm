@@ -89,6 +89,22 @@ jobs:
         run: |
           python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
+      - name: Run backend targeted pytest (Issue #18 + Issue #31)
+        if: steps.changed.outputs.backend == 'true'
+        env:
+          DATABASE_URL: "sqlite+aiosqlite://"
+          DATABASE_URL_UNPOOLED: "sqlite://"
+          TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
+          TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
+          PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
+          PASAY_RUNTIME_MODE: "ci"
+        timeout-minutes: 8
+        run: |
+          python -m pytest \
+            tests/test_prod_arch_closeout_p0_031.py \
+            tests/test_telegram_webhook_p018.py \
+            -v --tb=short -q
+
       - name: Install bot dependencies
         if: steps.changed.outputs.bot == 'true'
         working-directory: pasay-telegram-bot
