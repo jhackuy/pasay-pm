@@ -110,4 +110,52 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if not inspector.has_table("pasay_scheduled_job_ledger"):
+        return
+
+    existing_pk = inspector.get_pk_constraint("pasay_scheduled_job_ledger")
+    pk_cols = sorted((existing_pk or {}).get("constrained_columns") or [])
+    if pk_cols != ["event_id"]:
+        raise RuntimeError(
+            "pasay_scheduled_job_ledger exists but PRIMARY KEY is not EXACTLY "
+            f"the single column (event_id). Got PK columns: {pk_cols!r}. "
+            "Refusing to drop a table that may contain legacy ledger data "
+            "created outside this migration. Please manually reconcile before "
+            "running downgrade."
+        )
+
+    existing_cols = {c["name"]: c for c in inspector.get_columns("pasay_scheduled_job_ledger")}
+    required_names = {"event_id", "job_name", "occurred_at", "consumed_at", "payload"}
+    present = set(existing_cols.keys())
+    if present != required_names:
+        extra = present - required_names
+        missing = required_names - present
+        raise RuntimeError(
+            "pasay_scheduled_job_ledger column set does not EXACTLY match the "
+            f"schema created by this migration. Extra columns: {sorted(extra)!r}. "
+            f"Missing columns: {sorted(missing)!r}. Refusing to drop to preserve "
+            "existing data. Please manually reconcile."
+        )
+
+    event_id_col = existing_cols["event_id"]
+    event_id_type = getattr(event_id_col.get("type", None), "python_type", None)
+    if event_id_type is not None and not issubclass(event_id_type, str):
+        raise RuntimeError(
+            f"pasay_scheduled_job_ledger.event_id column must be a string type "
+            f"compatible with VARCHAR(256); got python_type={event_id_type!r}. "
+            "Refusing to drop a mismatched legacy table. Please manually reconcile."
+        )
+
+    occurred_at_col = existing_cols["occurred_at"]
+    oa_type = occurred_at_col.get("type")
+    oa_is_tz = getattr(oa_type, "timezone", None) if oa_type is not None else None
+    if oa_type is not None and oa_is_tz is False:
+        raise RuntimeError(
+            "pasay_scheduled_job_ledger.occurred_at must be TIMESTAMPTZ "
+            f"(timezone-aware); got a naive datetime column type: {oa_type!r}. "
+            "Refusing to drop a mismatched legacy table. Please manually reconcile."
+        )
+
     op.drop_table("pasay_scheduled_job_ledger")
