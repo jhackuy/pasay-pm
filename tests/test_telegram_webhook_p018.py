@@ -992,20 +992,22 @@ def test_t15b_partial_resources_cleaned_on_boot_exception_in_middle(webhook_clie
         s.telegram_admin_ids = [1]
         return s
     stub_config.get_settings = _fake_get_settings
-    # `pasay_bot` top-level package: if absent → create empty module; if
-    # present → leave it alone (no overwrite). setitem ensures rollback of
-    # whichever case applies.
     if "pasay_bot" not in sys.modules:
-        monkeypatch.setitem(sys.modules, "pasay_bot", types.ModuleType("pasay_bot"))
+        _pb_stub = types.ModuleType("pasay_bot")
+    else:
+        _pb_stub = sys.modules["pasay_bot"]
+    monkeypatch.setitem(sys.modules, "pasay_bot", _pb_stub)
     monkeypatch.setitem(sys.modules, "pasay_bot.config", stub_config)
 
     stub_api = types.ModuleType("pasay_bot.api_client")
     stub_api.PasayApiClient = lambda *a, **kw: _FakeApiClient()
     monkeypatch.setitem(sys.modules, "pasay_bot.api_client", stub_api)
 
-    stub_state = types.ModuleType("pasay_bot.state")
     if "pasay_bot.state" not in sys.modules:
-        monkeypatch.setitem(sys.modules, "pasay_bot.state", stub_state)
+        stub_state = types.ModuleType("pasay_bot.state")
+    else:
+        stub_state = sys.modules["pasay_bot.state"]
+    monkeypatch.setitem(sys.modules, "pasay_bot.state", stub_state)
     stub_store_mod = types.ModuleType("pasay_bot.state.store")
     stub_store_mod.StateStore = _FakeStore
     monkeypatch.setitem(sys.modules, "pasay_bot.state.store", stub_store_mod)
