@@ -55,20 +55,42 @@ def _test_url():
 
 @pytest.fixture(scope="session")
 def test_engine():
-    """Create the dedicated `pasay_pm_test` database once per session."""
-    admin_url = make_url(settings.database_url).set(database="postgres")
-    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
-    with admin_engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": TEST_DB_NAME}
-        ).scalar()
-        if not exists:
-            conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
-    admin_engine.dispose()
+    """Create the dedicated test database once per session.
 
-    engine = create_engine(_test_url())
-    yield engine
-    engine.dispose()
+    PostgreSQL: connect as admin, `CREATE DATABASE` the isolated test DB, then
+    return an engine bound to it.
+    SQLite: has no `CREATE DATABASE`.  We build the test URL (which pins the
+    DB name / file path via `_test_url()`) and return an engine bound there
+    directly — the fixture-level schema DDL in `db_session` handles the rest.
+    """
+    base_url = make_url(settings.database_url)
+    base_dialect = base_url.get_dialect().name
+
+    if base_dialect == "postgresql":
+        admin_url = base_url.set(database="postgres")
+        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with admin_engine.connect() as conn:
+                exists = conn.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                    {"name": TEST_DB_NAME},
+                ).scalar()
+                if not exists:
+                    conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
+        finally:
+            admin_engine.dispose()
+        engine = create_engine(_test_url())
+    elif base_dialect == "sqlite":
+        engine = create_engine(_test_url())
+    else:
+        raise RuntimeError(
+            "tests/conftest.py test_engine: unsupported dialect %r" % base_dialect
+        )
+
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture()
