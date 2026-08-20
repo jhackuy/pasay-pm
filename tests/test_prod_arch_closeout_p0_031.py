@@ -47,43 +47,24 @@ def client_unit():
     try:
         settings.container_ingest_token = INGEST_TOKEN
         settings.telegram_webhook_secret = TELEGRAM_SECRET
-        # ND_RETURN FIX1 blocker #4: pasay_scheduled_job_ledger is NOW owned
-        # by the Alembic migration ``a1b2c3d4e5f6_scheduled_job_ledger``.
-        # No more runtime lazy-DDL path.
+        # ND_RETURN FIX1 blocker #4 + FIX12 final closeout:
+        # pasay_scheduled_job_ledger is NOW owned by:
+        #   (a) Alembic migration ``a1b2c3d4e5f6_scheduled_job_ledger`` (DDL authority)
+        #   (b) ORM model ``app.models.scheduled_job.ScheduledJobLedger`` (Python authority)
+        # No more runtime lazy-DDL or inline sa.Table() re-declarations anywhere.
         #
         # In unit-test environments we may not have run alembic (e.g. when
-        # tests use ORM Base.metadata.create_all for other tables).  The
-        # migration itself is the schema authority; here we just mirror its
-        # DDL into the unit-test DB so the ingestion tests can run against
-        # a real table without demanding a full `alembic upgrade head` pass.
-        # Tests under T8 still independently verify the migration file itself
-        # exists, is on the single-head chain, and matches this exact DDL.
+        # tests use ORM Base.metadata.create_all for other tables).  Here we
+        # derive the test DDL *directly from the ORM model's __table__* so
+        # the unit-test mirror is itself sourced from the single Python
+        # truth source (not a second inline copy).  Tests under T8 still
+        # independently verify the migration file itself exists, is on the
+        # single-head chain, and matches the ORM contract exactly.
         try:
-            import sqlalchemy as sa
-            from sqlalchemy.dialects import postgresql
-
             from app.database import SessionLocal, engine
+            from app.models import ScheduledJobLedger
 
-            meta = sa.MetaData()
-            ledger = sa.Table(
-                "pasay_scheduled_job_ledger",
-                meta,
-                sa.Column("event_id", sa.String(length=256), primary_key=True),
-                sa.Column("job_name", sa.String(length=128), nullable=False),
-                sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
-                sa.Column(
-                    "consumed_at",
-                    sa.DateTime(timezone=True),
-                    nullable=False,
-                    server_default=sa.func.now(),
-                ),
-                sa.Column(
-                    "payload",
-                    postgresql.JSONB(astext_type=sa.Text()),
-                    nullable=True,
-                ),
-            )
-            ledger.create(bind=engine, checkfirst=True)
+            ScheduledJobLedger.__table__.create(bind=engine, checkfirst=True)
 
             with SessionLocal() as s:
                 s.execute(text("TRUNCATE TABLE pasay_scheduled_job_ledger"))
@@ -697,31 +678,37 @@ class TestT8NeonBoundary:
         )
 
     def test_t8d_scheduled_job_ledger_owned_by_alembic_not_runtime_lazy_ddl(self):
-        """ND_RETURN FIX1 blocker #4: pasay_scheduled_job_ledger via Alembic only.
+        """ND_RETURN FIX1 blocker #4 + FIX12 final closeout: ledger ownership.
 
         The runtime path previously did ``CREATE TABLE IF NOT EXISTS`` inside
-        the hot ingestion request handler, bypassing Alembic.  Two things must
-        now be true:
+        the hot ingestion request handler, bypassing Alembic.
+
+        AFTER FIX12 the ownership contract is EXACTLY:
           a) the migration file exists, declares the table columns, and is
-             attached as child of the latest Membership head.
+             attached as child of the latest Membership head (DDL authority).
           b) the Python module app.api.routers.internal_ingest no longer
-             defines or calls ``_ensure_scheduled_idempotency_table``.
+             defines or calls lazy ``_ensure_scheduled_idempotency_table`` or
+             an inline ``sa.Table("pasay_scheduled_job_ledger", ...)``
+             redeclaration.
+          c) an ORM model exists (Python authority) at
+             ``app.models.scheduled_job.ScheduledJobLedger`` whose column
+             contract (names / PK / types / nullable / server_default)
+             exactly matches the Alembic DDL; the model is exported through
+             ``app.models.__init__`` so ``Base.metadata`` discovers it.
+
+        There are exactly TWO authority sources (Alembic DDL + ORM model);
+        any third inline declaration anywhere else in Python source is a
+        contract violation because it opens a silent drift vector.
         """
         repo_root = Path(__file__).resolve().parent.parent
-        # (a) migration file present with correct revision / down_revision.
+        # ── (a) migration file present with correct revision / down_revision
         versions_dir = repo_root / "alembic" / "versions"
         candidates = list(versions_dir.glob("*_scheduled_job_ledger.py"))
         assert candidates, "no *_scheduled_job_ledger.py migration file found"
         mig_src = candidates[0].read_text(encoding="utf-8")
-        # Revision is on the single-head chain starting from z9a8b7c6d5e4.
         import re as _re
 
         assert 'revision: str = "a1b2c3d4e5f6"' in mig_src
-        # The exact parent may change when future migrations are reordered
-        # during a rebase / chain extension; single-head integrity is
-        # already proven in test_t8c_alembic_single_head above.  We only
-        # require that down_revision is declared and non-empty so this
-        # migration stays attached to some valid head.
         dr_match = _re.search(
             r'down_revision[^=]*=\s*"([^"]+)"',
             mig_src,
@@ -730,14 +717,13 @@ class TestT8NeonBoundary:
             "migration must declare a non-null down_revision to stay on the single-head chain"
         )
         assert dr_match.group(1).strip(), "down_revision value must be non-empty"
-        # Exact columns mirror the original lazy-DDL contract.
         assert "pasay_scheduled_job_ledger" in mig_src
         assert "event_id" in mig_src and "VARCHAR(256)" in mig_src
         assert "job_name" in mig_src and "VARCHAR(128)" in mig_src
         assert "occurred_at" in mig_src and "TIMESTAMPTZ" in mig_src
         assert "consumed_at" in mig_src and "TIMESTAMPTZ" in mig_src
         assert "JSONB" in mig_src
-        # (b) internal ingestion module has removed the lazy path.
+        # ── (b) runtime module has removed lazy path AND inline sa.Table()
         ii_src = (repo_root / "app" / "api" / "routers" / "internal_ingest.py").read_text(
             encoding="utf-8"
         )
@@ -747,6 +733,65 @@ class TestT8NeonBoundary:
         )
         assert "CREATE TABLE IF NOT EXISTS pasay_scheduled_job_ledger" not in ii_src
         assert "_SCHEDULED_IDEMPOTENCY_TABLE_EXISTS" not in ii_src
+        # FIX12 new: inline sa.Table re-declaration banned — drift vector.
+        assert 'sa.Table("pasay_scheduled_job_ledger"' not in ii_src and (
+            "sa.Table(\n" not in ii_src or "pasay_scheduled_job_ledger" not in ii_src
+        ), (
+            "internal_ingest.py must NOT inline-declare sa.Table(\"pasay_scheduled_job_ledger\", ...). "
+            "Reference the single Python authority ScheduledJobLedger.__table__ instead "
+            "(ND_RETURN FIX12: Ledger Ownership Final Closeout)."
+        )
+        # Also confirm it actually imports the ORM authority.
+        assert (
+            "from app.models import ScheduledJobLedger" in ii_src
+            or "import ScheduledJobLedger" in ii_src
+        ), (
+            "internal_ingest.py must import ScheduledJobLedger from app.models so "
+            "ledger contract changes propagate to the INSERT clause."
+        )
+        # ── (c) ORM model: file present, exported, and column contract matches DDL.
+        model_file = repo_root / "app" / "models" / "scheduled_job.py"
+        assert model_file.exists(), (
+            "FIX12: app/models/scheduled_job.py MUST exist (Python authority for ledger schema)."
+        )
+        # Import model directly via package path; inspect Python contract.
+        from app.models import ScheduledJobLedger as _SJL
+        from app.models.__init__ import __all__ as _models_all
+        assert "ScheduledJobLedger" in _models_all, (
+            "FIX12: ScheduledJobLedger must be exported in app.models.__all__ so "
+            "Base.metadata and all downstream importers can discover it."
+        )
+        assert _SJL.__tablename__ == "pasay_scheduled_job_ledger"
+        # Column contract check: names match + PK is EXACTLY [event_id].
+        model_cols = {c.name: c for c in _SJL.__table__.columns}
+        mig_cols = {"event_id", "job_name", "occurred_at", "consumed_at", "payload"}
+        assert set(model_cols.keys()) == mig_cols, (
+            "FIX12: ScheduledJobLedger ORM column set does NOT exactly match "
+            f"Alembic DDL. ORM cols={sorted(model_cols)}; DDL cols={sorted(mig_cols)}."
+        )
+        pk_cols = [c.name for c in _SJL.__table__.primary_key.columns]
+        assert pk_cols == ["event_id"], (
+            f"FIX12: ScheduledJobLedger PK must be EXACTLY [event_id]; got {pk_cols}"
+        )
+        # Column type + nullable contract mirror (enough to catch major drift):
+        def _str_len(col) -> int | None:
+            from sqlalchemy import String as _SAString
+            t = col.type
+            if isinstance(t, _SAString):
+                return t.length
+            return None
+        assert _str_len(model_cols["event_id"]) == 256, "event_id ORM string length != 256"
+        assert _str_len(model_cols["job_name"]) == 128, "job_name ORM string length != 128"
+        assert getattr(model_cols["occurred_at"].type, "timezone", None) is True, (
+            "occurred_at ORM must be timezone-aware DateTime"
+        )
+        assert getattr(model_cols["consumed_at"].type, "timezone", None) is True, (
+            "consumed_at ORM must be timezone-aware DateTime"
+        )
+        assert model_cols["consumed_at"].server_default is not None, (
+            "consumed_at ORM must declare server_default func.now()"
+        )
+        assert model_cols["payload"].nullable is True, "payload ORM must be nullable"
 
 
 # ──────────────────────────────────────────────────────────────────────

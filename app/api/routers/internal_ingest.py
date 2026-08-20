@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
+from app.models import ScheduledJobLedger
 from app.schemas.envelope import (
     EnvelopeKind,
     PasayQueueEnvelope,
@@ -68,28 +69,26 @@ def _try_claim_scheduled_job(
     ``event_id``.  Production path only (PASAY-TASK-011 FIX8: SQLite
     dialect branches were the wrong CI direction and have been removed
     from the production ingestion boundary).
+
+    CRITICAL — Ledger ownership (FIX12 final closeout):
+    The ``pasay_scheduled_job_ledger`` table has exactly TWO authoritative
+    sources of truth, and this function MUST reference neither of them
+    via inline ``sa.Table(...)`` re-declaration:
+      (1) Alembic revision ``a1b2c3d4e5f6_scheduled_job_ledger`` — DDL authority.
+      (2) ORM model ``app.models.scheduled_job.ScheduledJobLedger`` — Python
+          side column contract authority, imported above.
+    Here we reference ``ScheduledJobLedger.__table__`` for the SQLAlchemy
+    Core table, which propagates any future column contract change to
+    the INSERT/ON CONFLICT clause *automatically*.  Re-declaring columns
+    inline inside this handler would create a silent-drift anti-pattern
+    banned by Scope E (Alembic single-head + runtime ownership contract).
     """
     import json as _json
 
-    import sqlalchemy as sa
     from sqlalchemy.dialects import postgresql
 
     try:
-        meta = sa.MetaData()
-        ledger = sa.Table(
-            "pasay_scheduled_job_ledger",
-            meta,
-            sa.Column("event_id", sa.String(length=256), primary_key=True),
-            sa.Column("job_name", sa.String(length=128), nullable=False),
-            sa.Column("occurred_at", sa.DateTime(timezone=True), nullable=False),
-            sa.Column(
-                "consumed_at",
-                sa.DateTime(timezone=True),
-                nullable=False,
-                server_default=sa.func.now(),
-            ),
-            sa.Column("payload", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-        )
+        ledger = ScheduledJobLedger.__table__
         oa_str = occurred_at.replace("Z", "+00:00")
         payload_json = _json.dumps(payload) if payload is not None else None
 
