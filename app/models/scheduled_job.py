@@ -10,6 +10,14 @@ Python schema truth source that could silently drift against the Alembic
 DDL — that is exactly the anti-pattern banned by ND_RETURN PASAY-TASK-011
 FIX1 blocker #4 ("Ledger owned by Alembic, not runtime lazy DDL").
 
+FIX13 — Ownership Marker + Legacy Data Preservation:
+  The Alembic migration writes a PostgreSQL ``COMMENT ON TABLE`` machine
+  token with ``OWNED_BY_ALEMBIC_REV=a1b2c3d4e5f6`` and ``SCHEMA_REV=2``.
+  The ORM ``__table_args__`` comment field below MUST match the expected
+  marker text EXACTLY — test_t8d asserts them byte-for-byte identical so
+  a future edit that forgets to bump the Alembic marker or the ORM
+  comment Fails Closed immediately (no silent drift).
+
 Contract (must exactly match ``a1b2c3d4e5f6_scheduled_job_ledger`` DDL):
   * PK: ``event_id``  — VARCHAR(256), single column.  INSERT … ON CONFLICT
     (event_id) DO NOTHING is the idempotency mechanism.
@@ -34,8 +42,27 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.models.base import Base
 
 
+ALEMBIC_OWNERSHIP_REV: str = "a1b2c3d4e5f6"
+SCHEMA_REV: str = "2"
+LEDGER_SCHEMA_DIGEST: str = (
+    "cols:event_id[256PK]+job_name[128NN]+occurred_at[TZNN]+consumed_at[TZNNDEFNOW]+payload[JSONB]"
+    "|TZ:pg|dialect:jsonb-pg"
+)
+
+EXPECTED_TABLE_COMMENT: str = (
+    f"OWNED_BY_ALEMBIC_REV={ALEMBIC_OWNERSHIP_REV};"
+    f"SCHEMA_REV={SCHEMA_REV};"
+    f"DIGEST={LEDGER_SCHEMA_DIGEST};"
+    f"SOURCE=alembic-upgrade-{ALEMBIC_OWNERSHIP_REV};"
+    "LEDGER_TYPE=scheduled-job-idempotency;"
+)
+
+
 class ScheduledJobLedger(Base):
     __tablename__ = "pasay_scheduled_job_ledger"
+    __table_args__ = {
+        "comment": EXPECTED_TABLE_COMMENT,
+    }
 
     event_id: Mapped[str] = mapped_column(String(length=256), primary_key=True)
     job_name: Mapped[str] = mapped_column(String(length=128), nullable=False)

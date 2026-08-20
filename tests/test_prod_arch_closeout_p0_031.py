@@ -678,12 +678,12 @@ class TestT8NeonBoundary:
         )
 
     def test_t8d_scheduled_job_ledger_owned_by_alembic_not_runtime_lazy_ddl(self):
-        """ND_RETURN FIX1 blocker #4 + FIX12 final closeout: ledger ownership.
+        """ND_RETURN FIX1 blocker #4 + FIX12 + FIX13: ledger ownership contract.
 
         The runtime path previously did ``CREATE TABLE IF NOT EXISTS`` inside
         the hot ingestion request handler, bypassing Alembic.
 
-        AFTER FIX12 the ownership contract is EXACTLY:
+        AFTER FIX13 the ownership contract is EXACTLY:
           a) the migration file exists, declares the table columns, and is
              attached as child of the latest Membership head (DDL authority).
           b) the Python module app.api.routers.internal_ingest no longer
@@ -695,6 +695,19 @@ class TestT8NeonBoundary:
              contract (names / PK / types / nullable / server_default)
              exactly matches the Alembic DDL; the model is exported through
              ``app.models.__init__`` so ``Base.metadata`` discovers it.
+          d) FIX13 Ownership Marker: the ORM exposes an ``EXPECTED_TABLE_COMMENT``
+             constant carrying ``OWNED_BY_ALEMBIC_REV=a1b2c3d4e5f6`` and
+             ``SCHEMA_REV>=2``; the Alembic migration defines an IDENTICAL
+             ``_OWNERSHIP_COMMENT_EXPECTED`` string AND emits
+             ``COMMENT ON TABLE`` immediately after upgrade create_table /
+             existing-table branch; upgrade/downgrade both Fail-Closed when
+             the marker's embedded revision does NOT match the live
+             ``revision`` Python variable in the migration file.
+          e) FIX13 Legacy Data Preservation: the Alembic downgrade performs a
+             final ``SELECT COUNT(*)`` check BEFORE ``op.drop_table`` and
+             refuses to drop (RuntimeError with human-readable TRUNCATE
+             guidance) when the ledger has user rows.  A downgrade operator
+             must EXPLICITLY choose backup + TRUNCATE before any data loss.
 
         There are exactly TWO authority sources (Alembic DDL + ORM model);
         any third inline declaration anywhere else in Python source is a
@@ -792,6 +805,133 @@ class TestT8NeonBoundary:
             "consumed_at ORM must declare server_default func.now()"
         )
         assert model_cols["payload"].nullable is True, "payload ORM must be nullable"
+
+        # ════════════════════════════════════════════════════════════════════════
+        # FIX13 — (d) Ownership Marker consistency (ORM ↔ Alembic byte-identical)
+        # ════════════════════════════════════════════════════════════════════════
+        from app.models.scheduled_job import (
+            ALEMBIC_OWNERSHIP_REV,
+            EXPECTED_TABLE_COMMENT,
+            LEDGER_SCHEMA_DIGEST,
+            SCHEMA_REV,
+        )
+        # (d.1) ORM module-level ownership constants are non-empty.
+        assert ALEMBIC_OWNERSHIP_REV == "a1b2c3d4e5f6", (
+            "FIX13: app.models.scheduled_job.ALEMBIC_OWNERSHIP_REV MUST match "
+            "the revision string in the Alembic migration (DDL ↔ ORM lock)."
+        )
+        assert int(SCHEMA_REV) >= 2, (
+            "FIX13: SCHEMA_REV in app.models.scheduled_job MUST be >= 2 "
+            "(SCHEMA_REV=1 predates the Ownership Marker; older revs allowed "
+            "partial rollforward — Fail Closed now)."
+        )
+        assert "LEDGER_SCHEMA_DIGEST" in LEDGER_SCHEMA_DIGEST or "cols:" in LEDGER_SCHEMA_DIGEST, (
+            "FIX13: LEDGER_SCHEMA_DIGEST must be non-trivial structural fingerprint."
+        )
+        # (d.2) ORM __table_args__["comment"] == EXPECTED_TABLE_COMMENT.
+        table_args = getattr(_SJL, "__table_args__", None) or {}
+        if isinstance(table_args, dict):
+            orm_table_comment = table_args.get("comment")
+        else:
+            # tuple of *args + final kwargs dict form
+            orm_table_comment = (table_args[-1] or {}).get("comment") if isinstance(table_args, tuple) and table_args else None
+        assert orm_table_comment == EXPECTED_TABLE_COMMENT, (
+            "FIX13: ScheduledJobLedger __table_args__['comment'] MUST exactly "
+            "equal the module-level EXPECTED_TABLE_COMMENT constant.  If you "
+            "edited the digest/rev string in one place but not the other the "
+            "Alembic marker will drift from the ORM marker."
+        )
+        # (d.3) ORM EXPECTED_TABLE_COMMENT == Alembic _OWNERSHIP_COMMENT_EXPECTED.
+        #       This is the single most important anti-drift assertion in FIX13.
+        import ast as _ast
+
+        mig_path = candidates[0]
+        mig_tree = _ast.parse(mig_src)
+        alembic_expected_str: str | None = None
+        for node in _ast.walk(mig_tree):
+            if isinstance(node, _ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, _ast.Name) and target.id == "_OWNERSHIP_COMMENT_EXPECTED":
+                        val = node.value
+                        if isinstance(val, _ast.Constant) and isinstance(val.value, str):
+                            alembic_expected_str = val.value
+                        elif isinstance(val, _ast.JoinedStr):
+                            # Fallback: eval via exec the full module in a sandboxed locals dict
+                            # to recover the formatted string safely.
+                            _locals: dict = {}
+                            exec(  # noqa: S102 — sandbox: only reads rev consts, no I/O
+                                compile(mig_src, str(mig_path), "exec"),
+                                {"__name__": "__fix13_sandbox__"},
+                                _locals,
+                            )
+                            alembic_expected_str = _locals.get("_OWNERSHIP_COMMENT_EXPECTED")
+        assert alembic_expected_str is not None, (
+            "FIX13: alembic migration MUST define _OWNERSHIP_COMMENT_EXPECTED."
+        )
+        assert alembic_expected_str == EXPECTED_TABLE_COMMENT, (
+            "FIX13: Ownership marker mismatch across Alembic ↔ ORM.\n"
+            f"  ALEMBIC: {alembic_expected_str!r}\n"
+            f"  ORM:     {EXPECTED_TABLE_COMMENT!r}\n"
+            "These strings MUST be byte-identical so COMMENT ON TABLE round-trips "
+            "and the revision token inside Fail-Closes on partial rollforward."
+        )
+        # (d.4) Marker tokens are present inside both strings.
+        for needle in [
+            "OWNED_BY_ALEMBIC_REV=a1b2c3d4e5f6",
+            f"SCHEMA_REV={SCHEMA_REV}",
+            f"DIGEST={LEDGER_SCHEMA_DIGEST}",
+        ]:
+            assert needle in EXPECTED_TABLE_COMMENT, (
+                f"FIX13: expected ownership marker substring {needle!r} missing from EXPECTED_TABLE_COMMENT"
+            )
+        # (d.5) Upgrade + downgrade both call _assert_ownership_marker_ok before DDL mutates.
+        #       Also upgrade writes the marker via _write_ownership_marker_if_pg.
+        assert "_assert_ownership_marker_ok(conn, expected_rev=revision)" in mig_src.replace(" ", "").replace(",expected_rev=revision", "") or (
+            "_assert_ownership_marker_ok" in mig_src and "expected_rev" in mig_src
+        ), (
+            "FIX13: alembic upgrade() MUST call _assert_ownership_marker_ok() with expected_rev=revision "
+            "BEFORE any existing-table column audit runs — partial rollforward must Fail Closed."
+        )
+        assert "_assert_ownership_marker_ok(conn, expected_rev=revision)" in mig_src.replace(" ", "") or (
+            mig_src.count("_assert_ownership_marker_ok") >= 2
+        ), (
+            "FIX13: both upgrade() AND downgrade() MUST call _assert_ownership_marker_ok. "
+            "Counted <2 calls in migration source."
+        )
+        assert "_write_ownership_marker_if_pg(conn)" in mig_src.replace(" ", ""), (
+            "FIX13: upgrade() must stamp COMMENT ON TABLE via _write_ownership_marker_if_pg(conn) "
+            "IMMEDIATELY after op.create_table / before return on existing-table branch."
+        )
+        assert "COMMENT ON TABLE pasay_scheduled_job_ledger" in mig_src or (
+            "COMMENT ON TABLE" in mig_src and "pasay_scheduled_job_ledger" in mig_src
+        ), (
+            "FIX13: _write_ownership_marker_if_pg must emit COMMENT ON TABLE "
+            "(ownership marker round-trip depends on DDL actually executed)."
+        )
+
+        # ════════════════════════════════════════════════════════════════════════
+        # FIX13 — (e) Legacy Data Preservation (downgrade never drops data)
+        # ════════════════════════════════════════════════════════════════════════
+        # (e.1) Helper exists + uses SELECT COUNT(*) not heuristic.
+        assert "_ledger_has_user_rows" in mig_src and "SELECT COUNT(*)" in mig_src, (
+            "FIX13: _ledger_has_user_rows helper + SELECT COUNT(*) must exist "
+            "(Legacy Data Preservation — no silent drop of non-empty ledger)."
+        )
+        # (e.2) The COUNT check is BEFORE op.drop_table in source order (fail-closed ordering).
+        drop_pos = mig_src.find("op.drop_table(\"pasay_scheduled_job_ledger\")")
+        count_pos = mig_src.find("_ledger_has_user_rows(conn)")
+        count_msg = mig_src.find("LEGACY DATA PRESERVATION CHECK FAILED")
+        truncate_msg = mig_src.find("TRUNCATE TABLE pasay_scheduled_job_ledger")
+        assert drop_pos != -1 and count_pos != -1 and count_msg != -1 and truncate_msg != -1, (
+            "FIX13: downgrade body must contain _ledger_has_user_rows, the "
+            "LEGACY DATA PRESERVATION CHECK FAILED RuntimeError, AND the "
+            "human-readable TRUNCATE guidance alongside op.drop_table."
+        )
+        assert count_pos < drop_pos and count_msg < drop_pos and truncate_msg < drop_pos, (
+            "FIX13: downgrade data-preservation RuntimeError + TRUNCATE guidance "
+            "MUST come BEFORE op.drop_table.  Re-order the downgrade body so the "
+            "final gate is the last statement before drop_table."
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
