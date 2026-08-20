@@ -135,7 +135,9 @@ def _classify_ptb_boot_exception(exc: BaseException) -> tuple[bool, str, str]:
     low_msg = msg.lower()
     if any(s in low_msg for s in missing_sentinels):
         return True, cls_name, msg
-    return True, cls_name, msg
+    # ND_RETURN #2: unclassified exceptions default to TEMPORARY. Only explicit
+    # token/auth/config evidence above can classify as permanent.
+    return False, cls_name, msg
 
 
 async def get_ptb_application():
@@ -182,10 +184,25 @@ async def get_ptb_application():
             raise RuntimeError(
                 f"PTB application boot failed permanently: {_PTB_INIT_ERR_CLASS}: {_PTB_INIT_ERR_MSG}"
             )
+        # ND_RETURN #3 (lock-inner cooldown recheck): after waiting for the
+        # lock another caller may have recorded a temp-fail cooldown. Respect
+        # it here so we don't duplicate a doomed boot that just finished.
+        now_epoch_inner = time.time()
+        if (_PTB_APP_READY and not _PTB_INIT_FAIL_PERMANENT
+                and _PTB_LAST_FAIL_AT is not None
+                and (now_epoch_inner - _PTB_LAST_FAIL_AT) < _PTB_RETRY_COOLDOWN_SECONDS):
+            raise RuntimeError(
+                f"PTB boot failed recently (temp); cooldown active (inner recheck): {_PTB_INIT_ERR_CLASS}: {_PTB_INIT_ERR_MSG}"
+            )
         # Reset state so a temp failure from a previous epoch does not poison.
         _PTB_APP = None
         _PTB_APP_READY = False
 
+        store = None
+        api_client = None
+        admin_api_client = None
+        job_api_client = None
+        app = None
         try:
             _import_pasay_bot_subtree()
             from pasay_bot.api_client import PasayApiClient  # type: ignore
@@ -212,14 +229,12 @@ async def get_ptb_application():
                 api_key=bot_settings.pasay_api_key,
                 timeout=bot_settings.pasay_http_timeout_seconds,
             )
-            admin_api_client = None
             if bot_settings.pasay_admin_api_key:
                 admin_api_client = PasayApiClient(
                     base_url=bot_settings.pasay_api_base,
                     api_key=bot_settings.pasay_admin_api_key,
                     timeout=bot_settings.pasay_http_timeout_seconds,
                 )
-            job_api_client = None
             if bot_settings.pasay_job_api_key:
                 job_api_client = PasayApiClient(
                     base_url=bot_settings.pasay_api_base,
@@ -248,6 +263,40 @@ async def get_ptb_application():
             _PTB_LAST_FAIL_AT = None
             return app
         except Exception as exc:  # noqa: BLE001
+            # ND_RETURN #3: best-effort teardown of partially-built resources so
+            # the next boot attempt (after cooldown or caller retry) doesn't
+            # inherit leaked sockets / state files / half-open DB connections.
+            if app is not None:
+                try:
+                    try:
+                        await app.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        await app.shutdown()
+                    except Exception:  # noqa: BLE001
+                        pass
+                except Exception:  # noqa: BLE001
+                    pass
+            # PasayApiClient typically has no .close() contract today; keep the
+            # branch for future-proofing without hard-requiring the method.
+            for _c in (job_api_client, admin_api_client, api_client):
+                if _c is None:
+                    continue
+                _closer = getattr(_c, "close", None)
+                if callable(_closer):
+                    try:
+                        _closer()
+                    except Exception:  # noqa: BLE001
+                        pass
+            if store is not None:
+                _sclose = getattr(store, "close", None)
+                if callable(_sclose):
+                    try:
+                        _sclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+
             perm, cls_name, msg = _classify_ptb_boot_exception(exc)
             _PTB_APP = None
             _PTB_APP_READY = True
@@ -491,6 +540,14 @@ def claim_update_or_short_circuit(
             )).scalar_one_or_none()
         except SQLAlchemyError:
             return ReplayOutcome.DB_TRANSIENT, None
+    # ND_RETURN #4: CAS UPDATE succeeded but the row object can't be re-read
+    # (identity_map corruption, extreme DB race, or the fallback SELECT also
+    # got nothing). Treat the update as "not deterministically claimed" and
+    # return DB_TRANSIENT → HTTP 503 → Telegram replays. We MUST NOT fall
+    # through to RETRY_ALLOWED None because the caller treats (row=None) as
+    # "live peer owns it → HTTP 200 → Telegram drops delivery permanently".
+    if existing is None:
+        return ReplayOutcome.DB_TRANSIENT, None
     return ReplayOutcome.RETRY_ALLOWED, existing
 
 
@@ -645,7 +702,6 @@ async def process_telegram_update_payload(
             _PTB_INIT_FAIL_PERMANENT or err_type in perm_cls_names
         )
         temp_fail = not perm_fail
-        http_status = 200
         final_state = TelegramWebhookState.retryable.value if temp_fail else TelegramWebhookState.failed.value
         if raw_update_id is not None:
             try:
@@ -687,6 +743,23 @@ async def process_telegram_update_payload(
                 outcome, _row = claim_update_or_short_circuit(
                     db, uid_int, chat_id, user_id, utype
                 )
+                # ND_RETURN #1: terminal replay preservation. If the row was
+                # already in a terminal state (done/failed), the boot failure
+                # this attempt MUST NOT overwrite it. Telegram replay of a
+                # completed update gets the standard terminal short-circuit
+                # response (HTTP 200), not the boot-error rewrite.
+                if outcome in {ReplayOutcome.DONE, ReplayOutcome.FAILED}:
+                    logger.info(
+                        "webhook PTB boot unavailable but row already terminal update_id=%s state=%s — NOT overwriting",
+                        uid_int, outcome,
+                    )
+                    if outcome == ReplayOutcome.DONE:
+                        return 200, {"ok": True, "replay": True, "state": "done"}
+                    else:
+                        return 200, {
+                            "ok": False, "replay": True, "state": "failed",
+                            "error_type": _row.last_error_type if _row else None,
+                        }
                 if outcome != ReplayOutcome.DB_TRANSIENT:
                     err_str = str(exc)
                     if len(err_str) > 10_000:

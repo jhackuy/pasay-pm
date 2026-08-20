@@ -719,3 +719,382 @@ def test_t12_permanent_boot_fail_is_failed_200_temp_is_503(webhook_client, db_se
     rowB = db_session.get(TelegramWebhookUpdate, 100013)
     assert rowB is not None
     assert rowB.state == TelegramWebhookState.retryable.value
+
+
+# ---------------------------------------------------------------------------
+# T13 ND_RETURN #1 — PTB boot failure MUST NOT overwrite existing terminal
+#      states (done/failed). Terminal replay stays terminal with HTTP 200.
+# ---------------------------------------------------------------------------
+
+def test_t13_boot_failure_does_not_overwrite_done_state(webhook_client, db_session):
+    # Pre-plant a row in DONE terminal state for update_id=100014.
+    now = datetime.now(timezone.utc)
+    db_session.add(TelegramWebhookUpdate(
+        update_id=100014,
+        chat_id=200014,
+        user_id=300014,
+        update_type="message",
+        state=TelegramWebhookState.done.value,
+        attempt_count=1,
+        delivery_count=1,
+        created_at=now,
+        updated_at=now,
+        processed_at=now,
+        last_error_type=None,
+        last_error=None,
+        handler_result_summary="pre-existing done terminal",
+    ))
+    db_session.commit()
+
+    from telegram.error import NetworkError
+
+    async def _boom_temp():
+        raise NetworkError("PTB boot temp failure — T13")
+
+    with patch.object(wh_service, "get_ptb_application", side_effect=_boom_temp):
+        resp = webhook_client.post(
+            _WH_URL,
+            json=_make_update_payload(update_id=100014, chat_id=200014, user_id=300014),
+            headers={_SECRET_HEADER: _TEST_SECRET},
+        )
+
+    # Terminal replay: HTTP 200 (accepted, NOT 503 which would trigger replay).
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("state") == "done"
+    assert body.get("replay") is True
+    assert body.get("ok") is True
+
+    # CRITICAL: the DONE terminal state in DB is UNTOUCHED.
+    db_session.expire_all()
+    row = db_session.get(TelegramWebhookUpdate, 100014)
+    assert row.state == TelegramWebhookState.done.value
+    assert row.last_error_type is None
+    assert row.handler_result_summary == "pre-existing done terminal"
+    assert row.attempt_count == 1, "terminal replay must not bump attempt_count"
+    assert row.delivery_count == 1, "terminal replay must not bump delivery_count"
+
+
+def test_t13b_boot_failure_does_not_overwrite_failed_state(webhook_client, db_session):
+    now = datetime.now(timezone.utc)
+    db_session.add(TelegramWebhookUpdate(
+        update_id=100015,
+        chat_id=200015,
+        user_id=300015,
+        update_type="message",
+        state=TelegramWebhookState.failed.value,
+        attempt_count=2,
+        delivery_count=3,
+        created_at=now,
+        updated_at=now,
+        processed_at=now,
+        last_error_type="BadRequest",
+        last_error="pre-existing permanent failure",
+        handler_result_summary=None,
+    ))
+    db_session.commit()
+
+    from telegram.error import InvalidToken
+
+    async def _boom_perm():
+        raise InvalidToken("PTB boot perm failure — T13b")
+
+    with patch.object(wh_service, "get_ptb_application", side_effect=_boom_perm):
+        resp = webhook_client.post(
+            _WH_URL,
+            json=_make_update_payload(update_id=100015, chat_id=200015, user_id=300015),
+            headers={_SECRET_HEADER: _TEST_SECRET},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body.get("state") == "failed"
+    assert body.get("replay") is True
+    # Must echo the ORIGINAL terminal error type, NOT the boot failure one.
+    assert body.get("error_type") == "BadRequest"
+
+    db_session.expire_all()
+    row = db_session.get(TelegramWebhookUpdate, 100015)
+    assert row.state == TelegramWebhookState.failed.value
+    assert row.last_error_type == "BadRequest"
+    assert row.last_error == "pre-existing permanent failure"
+    assert row.attempt_count == 2
+    assert row.delivery_count == 3
+
+
+# ---------------------------------------------------------------------------
+# T14 ND_RETURN #2 — _classify_ptb_boot_exception defaults unknown to TEMPORARY.
+#      Only explicit token/config/auth evidence classifies as permanent.
+# ---------------------------------------------------------------------------
+
+def test_t14_classify_unknown_exception_defaults_temporary():
+    class _UnknownWeirdError(Exception):
+        pass
+
+    exc = _UnknownWeirdError("something broke, no explicit auth/config signal")
+    permanent, cls_name, msg = wh_service._classify_ptb_boot_exception(exc)
+    assert permanent is False, f"unknown {cls_name} must default TEMPORARY, got permanent={permanent}"
+    assert cls_name == "_UnknownWeirdError"
+    assert msg == "something broke, no explicit auth/config signal"
+
+
+def test_t14_explicit_token_error_still_permanent():
+    # Explicit "token" in message (e.g. "environment variable TELEGRAM_BOT_TOKEN not set").
+    exc = RuntimeError("environment variable TELEGRAM_BOT_TOKEN is required and not set")
+    permanent, _cls, _msg = wh_service._classify_ptb_boot_exception(exc)
+    assert permanent is True, "'token' in error message must classify permanent"
+
+
+def test_t14_invalid_token_class_still_permanent():
+    from telegram.error import InvalidToken
+    exc = InvalidToken("Conflicting use of the same token")
+    permanent, _cls, _msg = wh_service._classify_ptb_boot_exception(exc)
+    assert permanent is True
+
+
+def test_t14_network_class_still_temporary():
+    from telegram.error import NetworkError
+    exc = NetworkError("DNS failure")
+    permanent, _cls, _msg = wh_service._classify_ptb_boot_exception(exc)
+    assert permanent is False
+
+
+# ---------------------------------------------------------------------------
+# T15 ND_RETURN #3 — PTB_INIT_LOCK inner re-check of temp-fail cooldown +
+#      cleanup of partial PTB/store/client resources on boot failure.
+# ---------------------------------------------------------------------------
+
+def test_t15_lock_inner_cooldown_recheck_prevents_duplicate_doomed_boot(webhook_client, db_session):
+    """Simulate: Coroutine A enters boot, hits temp fail, records cooldown.
+    Coroutine B was waiting on _PTB_INIT_LOCK. After A releases the lock, B
+    must see the cooldown inside the lock and re-raise WITHOUT doing another
+    doomed store.init() / build_application() cycle."""
+
+    # We can't easily simulate true concurrent async inside a sync test. Instead
+    # we verify the *structural* contract by:
+    #   (a) pre-setting the temp-failure cooldown state (simulating a preceding
+    #       boot failure that just wrote _PTB_LAST_FAIL_AT)
+    #   (b) patching time.time() to return a 2-call sequence that simulates a
+    #       race: OUTER CHECK (pre-lock) observes cooldown already EXPIRED so
+    #       it proceeds to lock-acquire; then once INSIDE the lock the inner
+    #       recheck observes cooldown ACTIVE (simulating that another coroutine
+    #       wrote/rewrote the cooldown state during the time B was queueing on
+    #       _PTB_INIT_LOCK). In this case we must raise the inner-recheck variant
+    #       of the error — that's the textual proof we hit the INNER guard.
+    #   (c) verifying the RuntimeError explicitly contains "(inner recheck)".
+    import time as _time_mod, itertools as _it
+    T0 = _time_mod.time()
+    wh_service._PTB_APP_READY = True
+    wh_service._PTB_INIT_FAIL_PERMANENT = False
+    wh_service._PTB_INIT_ERR_CLASS = "NetworkError"
+    wh_service._PTB_INIT_ERR_MSG = "simulated preceding temp failure"
+    wh_service._PTB_LAST_FAIL_AT = T0
+
+    # Build a 2-call sequence: the 1st time.time() is from the OUTER pre-lock
+    # cooldown check → return far-in-future (cooldown looks expired → outer
+    # check passed through → we proceed to acquire the lock). The 2nd
+    # time.time() inside the lock → returns close-to-T0 (cooldown active).
+    _cooldown = wh_service._PTB_RETRY_COOLDOWN_SECONDS  # default 15
+    _time_seq = _it.chain(
+        iter([T0 + _cooldown + 1]),     # outer: now - T0 = 16 >= 15 -> expired
+        _it.repeat(T0 + 1),             # inner + any later: now - T0 = 1 < 15 -> active
+    )
+    def _fake_time():
+        return next(_time_seq)
+
+    # No StateStore/PasayApiClient/build_application patches needed at all:
+    # the inner cooldown recheck is at the TOP of _PTB_INIT_LOCK body, before
+    # the try/except that contains the lazy subtree imports. If the code
+    # accidentally reaches those imports without a stub module, we'll fail
+    # with ImportError — which is the canary that the cooldown recheck was
+    # accidentally removed or mis-ordered.
+    with patch("app.services.telegram_webhook._import_pasay_bot_subtree"), \
+         patch("app.services.telegram_webhook.time.time", side_effect=_fake_time):
+        with pytest.raises(RuntimeError, match="cooldown active \\(inner recheck\\)"):
+            # Python 3.11+: get_event_loop() raises if no loop is bound to the
+            # current thread (vs. older versions which auto-created one).
+            # Match the service's own _ensure_event_loop() pattern.
+            import asyncio as _aio
+            try:
+                _loop = _aio.get_event_loop()
+            except RuntimeError:
+                _loop = _aio.new_event_loop()
+                _aio.set_event_loop(_loop)
+            _loop.run_until_complete(wh_service.get_ptb_application())
+
+    # No structural canary (StateStore/build_application) needed: the fact we
+    # raised RuntimeError (NOT ImportError) proves execution stopped at the
+    # inner-lock cooldown line before any pasay_bot imports.
+
+
+def test_t15b_partial_resources_cleaned_on_boot_exception_in_middle(webhook_client, db_session):
+    """If boot fails AFTER StateStore + PasayApiClient + Application.initialize
+    have already started, the exception path must call best-effort teardown
+    so sockets/state don't leak."""
+
+    stop_log = []
+    shutdown_log = []
+    api_close_log = []
+    store_close_log = []
+
+    class _FakeApp:
+        async def initialize(self): return None
+        async def start(self):
+            # App is started; NOW simulate the failure (e.g. DB transient on
+            # some post-start bot wiring). This is the "middle of boot" case.
+            raise OperationalError(
+                statement="fake post-start transient",
+                params=(),
+                orig=RuntimeError("server closed the connection unexpectedly"),
+            )
+        async def stop(self):
+            stop_log.append(1)
+        async def shutdown(self):
+            shutdown_log.append(1)
+
+    def _fake_build(*a, **kw):
+        return _FakeApp()
+
+    class _FakeApiClient:
+        def close(self):
+            api_close_log.append(1)
+
+    class _FakeStore:
+        def __init__(self, *_a, **_kw): pass
+        def init(self): pass
+        def close(self):
+            store_close_log.append(1)
+
+    # StateStore/PasayApiClient/build_application are imported LAZILY inside
+    # get_ptb_application (function-local 'from pasay_bot.X import Y'). So
+    # patching them on the telegram_webhook module fails: the module-level
+    # attributes don't exist until after get_ptb_application imports them.
+    # Instead we pre-seed sys.modules["pasay_bot.X"] with stub modules that
+    # export our fake classes/functions. The internal imports will find the
+    # stub module on their next `from ... import`.
+    import types, sys
+    stub_config = types.ModuleType("pasay_bot.config")
+    def _fake_get_settings():
+        s = MagicMock(name="FakeSettings")
+        s.telegram_bot_token = "fake:token"
+        s.telegram_webhook_secret = None
+        s.postgres = MagicMock()
+        s.postgres.database_url = "sqlite:///unused"
+        s.telegram_admin_ids = [1]
+        return s
+    stub_config.get_settings = _fake_get_settings
+    sys.modules.setdefault("pasay_bot", types.ModuleType("pasay_bot"))
+    sys.modules["pasay_bot.config"] = stub_config
+
+    stub_api = types.ModuleType("pasay_bot.api_client")
+    stub_api.PasayApiClient = lambda *a, **kw: _FakeApiClient()
+    sys.modules["pasay_bot.api_client"] = stub_api
+
+    stub_state = types.ModuleType("pasay_bot.state")
+    sys.modules.setdefault("pasay_bot.state", stub_state)
+    stub_store_mod = types.ModuleType("pasay_bot.state.store")
+    stub_store_mod.StateStore = _FakeStore
+    sys.modules["pasay_bot.state.store"] = stub_store_mod
+
+    stub_main = types.ModuleType("pasay_bot.main")
+    stub_main.build_application = _fake_build
+    sys.modules["pasay_bot.main"] = stub_main
+
+    _reset_ptb_module_state()
+
+    # Python 3.11+: get_event_loop() raises if no loop bound to current thread.
+    import asyncio as _aio
+    try:
+        _loop = _aio.get_event_loop()
+    except RuntimeError:
+        _loop = _aio.new_event_loop()
+        _aio.set_event_loop(_loop)
+
+    with pytest.raises(OperationalError):
+        _loop.run_until_complete(wh_service.get_ptb_application())
+
+    # Contract: stop/shutdown/app/close/store.close were attempted.
+    assert stop_log == [1], "app.stop() must be called on mid-boot failure"
+    assert shutdown_log == [1], "app.shutdown() must be called on mid-boot failure"
+    # Multiple PasayApiClient() instances may be constructed (for pasay_http, job_http,
+    # admin_client, etc.) — the contract is each one got close() called at least once.
+    assert len(api_close_log) >= 1, "api_client.close() must be called on mid-boot failure"
+    assert store_close_log == [1], "store.close() must be called on mid-boot failure"
+
+
+# ---------------------------------------------------------------------------
+# T16 ND_RETURN #4 — stale reclaim CAS winner: if refresh fails AND the
+#      fallback select also returns None, claim function returns DB_TRANSIENT
+#      (HTTP 503 → Telegram replays) instead of RETRY_ALLOWED None which
+#      would be misinterpreted as claimed_elsewhere (HTTP 200 → DROP UPDATE).
+# ---------------------------------------------------------------------------
+
+def test_t16_cas_win_refresh_fail_fallback_none_is_db_transient(db_session):
+    # Pre-plant a stale claimed row.
+    old_time = datetime.now(timezone.utc) - timedelta(seconds=CLAIM_STALE_SECONDS + 60)
+    db_session.add(TelegramWebhookUpdate(
+        update_id=100016,
+        chat_id=200016,
+        user_id=300016,
+        update_type="message",
+        state=TelegramWebhookState.claimed.value,
+        attempt_count=1,
+        delivery_count=1,
+        created_at=old_time,
+        updated_at=old_time,
+    ))
+    db_session.commit()
+
+    refresh_called = {"n": 0}
+    fallback_select_hit = {"n": 0}      # count of SELECTs where we faked None
+
+    original_refresh = db_session.refresh
+    original_execute = db_session.execute
+
+    def _evil_refresh(obj, *a, **kw):
+        # The FIRST refresh (after CAS UPDATE win) → OperationalError.
+        if getattr(obj, "update_id", None) == 100016 and refresh_called["n"] == 0:
+            refresh_called["n"] += 1
+            raise OperationalError(
+                statement="SELECT refresh query",
+                params=(),
+                orig=RuntimeError("server closed the connection unexpectedly"),
+            )
+        return original_refresh(obj, *a, **kw)
+
+    def _evil_execute(stmt, *a, **kw):
+        # Sequencing: AFTER the CAS-winning refresh() raises OperationalError,
+        # claim_update_or_short_circuit rolls back and performs a fallback
+        # SELECT to re-read the row. We make THAT select return None (simulating
+        # a flaky DB that answers UPDATE but then loses the subsequent read).
+        # We must NOT fake the initial pre-CAS SELECT that reads `existing` the
+        # first time — that would mean no existing row and a totally different
+        # code path. So the guard is: only fake if refresh_called["n"] >= 1.
+        text = str(stmt)
+        is_select = text.lstrip().upper().startswith("SELECT")
+        if (is_select
+                and "telegram_webhook_updates.update_id" in text
+                and refresh_called["n"] >= 1
+                and fallback_select_hit["n"] == 0):
+            fallback_select_hit["n"] += 1
+            fake_res = MagicMock(name="FakeResult_None")
+            fake_res.scalar_one_or_none.return_value = None
+            return fake_res
+        return original_execute(stmt, *a, **kw)
+
+    with patch.object(db_session, "refresh", side_effect=_evil_refresh), \
+         patch.object(db_session, "execute", side_effect=_evil_execute):
+        outcome, row = wh_service.claim_update_or_short_circuit(
+            db_session, 100016, 200016, 300016, "message",
+        )
+
+    # CONTRACT: must be DB_TRANSIENT (→ 503 → Telegram replays).
+    # If this returned RETRY_ALLOWED row=None, caller would say "claimed_elsewhere
+    # → HTTP 200 → Telegram drops delivery PERMANENTLY" = DATA LOSS BUG.
+    assert outcome == wh_service.ReplayOutcome.DB_TRANSIENT, (
+        f"CAS win + refresh fail + fallback-None must be DB_TRANSIENT to force Telegram replay, got {outcome!r}"
+    )
+    assert row is None
+    # Sanity-check: both failure paths were actually exercised (not shortcut).
+    assert refresh_called["n"] == 1, "refresh failure path not reached"
+    assert fallback_select_hit["n"] == 1, "fallback-select None path not reached"
