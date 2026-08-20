@@ -3,17 +3,31 @@ name: opendesign-dispatch
 # PASAY-OPENDESIGN-AUTO-DISPATCH-001
 #
 # Event-driven handoff from a GitHub Issue (route:design-dev) to OpenDesign.
-# The dispatcher refuses to call OpenDesign unless ALL of the following hold:
 #
-#   1. Issue is open
-#   2. Issue carries the label `route:design-dev`
-#   3. A trusted Owner (allowlisted login) posted a comment containing the
-#      exact marker `OWNER_APPROVED_FOR_OPENDESIGN`
-#   4. The same approval event has not already been dispatched (idempotency)
-#   5. Repository matches the configured $OD_EXPECTED_REPO
+# Real OpenDesign non-UI handoff is documented to be `od automation source
+# ingest` + `od automation create` + `od automation run` against the local
+# daemon. There is NO documented `/api/opendesign/dispatch` HTTP endpoint
+# in OpenDesign 0.19.2; HTTP transport is reserved for a future official
+# webhook surface and is disabled by default.
 #
-# The dispatcher does NOT use scheduled polling. It does NOT use a second
-# database. It does NOT use UI automation.
+# Trigger contract (all required):
+#   1. event.action == "created"
+#   2. event.repository.full_name == $OD_EXPECTED_REPO
+#   3. event.issue.pull_request is FALSY  (PR conversation comments excluded)
+#   4. event.issue.state == "open"
+#   5. event.issue.labels contains route:design-dev
+#   6. event.comment.body contains OWNER_APPROVED_FOR_OPENDESIGN
+#   7. event.sender.login is in OD_OWNER_ALLOWLIST
+#   8. No persisted DISPATCHED record for the same dispatch_id within 24h
+#
+# The dispatcher NEVER uses scheduled polling, UI automation, or a second
+# database. The only transport used in the production issue_comment path is
+# the `od` CLI invoked via the Windows self-hosted runner. The stub
+# transport is used only by workflow_dispatch (PR fixture validation).
+#
+# If OD_DISPATCH_URL is set AND a documented OpenDesign webhook endpoint
+# is verified by Owner, HTTP transport becomes available. Otherwise the
+# only valid transport is the Windows self-hosted runner + `od` CLI.
 
 on:
   issue_comment:
@@ -56,22 +70,36 @@ jobs:
         shell: bash
         run: |
           echo "event_name=${{ github.event_name }}" >> "$GITHUB_OUTPUT"
+          echo "is_pr=${{ github.event.issue.pull_request && 'true' || 'false' }}" >> "$GITHUB_OUTPUT"
 
-      - name: Run PR-stage fixture validation (workflow_dispatch)
+      # PR-stage fixture validation (workflow_dispatch) is the only path
+      # that runs on ubuntu-latest with the in-process StubTransport. It
+      # exercises the contract without contacting any real OpenDesign.
+      - name: Run PR-stage fixture validation
         if: steps.detect.outputs.event_name == 'workflow_dispatch'
         shell: bash
         run: |
+          set -o pipefail
           python3 scripts/opendesign/run_pr_fixture.py \
             --fixture-dir .github/fixtures/opendesign-dispatch \
             --mode "${{ inputs.od_stub_mode || 'accept' }}" \
             --expected-repo "${{ github.repository }}" \
             --owner-allowlist "${{ vars.OD_OWNER_ALLOWLIST || 'jhackuy' }}" \
-            --run-id "wf-dispatch-${{ github.run_id }}" \
+            --run-id "wf-fixture-${{ github.run_id }}" \
             --strict | tee fixture-summary.json
           echo "fixture-summary.json written"
 
+      # Production issue_comment path. Requires:
+      #   - a Windows self-hosted runner with the `od` CLI on PATH
+      #     (and OD_DAEMON_URL pointing at the local daemon), OR
+      #   - OD_DISPATCH_URL pointing at a future official webhook
+      #     surface (none exists in OpenDesign 0.19.2 today).
+      # If neither is present the step records BLOCKED_FOR_PRODUCT_DECISION
+      # and writes a status comment so the missing step is auditable.
       - name: Dispatch OpenDesign handoff (issue_comment)
-        if: steps.detect.outputs.event_name == 'issue_comment'
+        if: >-
+          steps.detect.outputs.event_name == 'issue_comment' &&
+          steps.detect.outputs.is_pr != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -81,14 +109,18 @@ jobs:
           OD_TOOL_TOKEN: ${{ secrets.OD_TOOL_TOKEN }}
           OD_RUN_ID: wf-dispatch-${{ github.run_id }}
           OD_EVENT_PATH: ${{ github.event_path }}
+          WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -euo pipefail
           python3 - <<'PY'
           import json, os, sys, traceback
           sys.path.insert(0, '.')
           sys.path.insert(0, 'scripts')
           from scripts.opendesign import runner as R
+          from scripts.opendesign import contract as C
+          from scripts.opendesign import persisted_history as PH
+          from scripts.opendesign.dispatch_odcli import OdCliTransport
           from scripts.opendesign.dispatch_http import HttpTransport
-          from scripts.opendesign.dispatch_stub import StubTransport
 
           event_path = os.environ['OD_EVENT_PATH']
           with open(event_path, encoding='utf-8') as f:
@@ -98,63 +130,109 @@ jobs:
           expected = os.environ.get('OD_EXPECTED_REPO') or None
           run_id = os.environ.get('OD_RUN_ID') or 'wf-unknown'
 
-          base_url = os.environ.get('OD_DISPATCH_URL', '').strip()
-          token = os.environ.get('OD_TOOL_TOKEN', '').strip()
-          if base_url:
-              transport = HttpTransport(base_url=base_url, token=token)
-          else:
-              transport = StubTransport(mode='accept')
+          extracted = C.extract_event(event)
+          repo_full = extracted['repository']['full_name']
+          issue_n = extracted['issue']['number']
 
-          log = []
-          def _w(r):
-              log.append(r)
+          def _writeback(record):
               try:
                   R.gh_writeback(
-                      state=r['state'],
-                      issue_number=r['issue_number'],
-                      repository_full_name=r['repository'],
-                      trigger_actor=r['trigger_actor'],
-                      trigger_timestamp=r['trigger_timestamp'],
-                      run_id=r['run_id'],
-                      dispatch_id=r.get('dispatch_id', ''),
-                      workflow_run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
-                      open_design_target=r.get('open_design_target', ''),
-                      design_commit_sha=r.get('design_commit_sha', ''),
-                      changed_files=r.get('changed_files', []),
-                      design_gate_result=r.get('design_gate_result', ''),
+                      state=record['state'],
+                      issue_number=record['issue_number'],
+                      repository_full_name=record['repository'],
+                      trigger_actor=record['trigger_actor'],
+                      trigger_timestamp=record['trigger_timestamp'],
+                      run_id=record['run_id'],
+                      dispatch_id=record.get('dispatch_id', ''),
+                      workflow_run_url=os.environ.get('WORKFLOW_RUN_URL', ''),
+                      open_design_target=record.get('open_design_target', ''),
+                      design_commit_sha=record.get('design_commit_sha', ''),
+                      changed_files=record.get('changed_files', []),
+                      design_gate_result=record.get('design_gate_result', ''),
                       extra_lines=[
-                          '_Reason:_ ' + r.get('reason', ''),
-                          '_Verdict:_ ' + r.get('verdict', ''),
+                          '_Reason:_ ' + record.get('reason', ''),
+                          '_Verdict:_ ' + record.get('verdict', ''),
                       ],
                       gh_token=os.environ.get('GH_TOKEN'),
                       dry_run=False,
                   )
               except Exception as exc:
-                  log.append({'writeback_exception': repr(exc)})
+                  print('WRITEBACK_EXCEPTION:', exc)
 
-          try:
-              rec = R.run(
-                  event=event,
-                  owner_allowlist=allowlist,
-                  idempotency_records=[w for w in log if w.get('dispatch_id')],
-                  run_id=run_id,
-                  expected_repo_full_name=expected,
-                  transport=transport,
-                  writeback_fn=_w,
-              )
-          except Exception as exc:
-              print('RUNNER_EXCEPTION:', exc)
-              traceback.print_exc()
-              sys.exit(1)
+          # Cross-run idempotency: load prior status comments from the Issue.
+          persisted = PH.load_history(
+              repository_full_name=repo_full,
+              issue_number=issue_n,
+              gh_token=os.environ.get('GH_TOKEN'),
+          )
+          if persisted is None:
+              # Could not fetch history. Fail closed: refuse dispatch so
+              # the Owner is forced to investigate.
+              record = {
+                  'state': C.STATE_BLOCKED_FOR_PRODUCT_DECISION,
+                  'verdict': C.VERDICT_BLOCKED,
+                  'issue_number': issue_n,
+                  'repository': repo_full,
+                  'trigger_actor': extracted['actor']['login'],
+                  'trigger_timestamp': R.now_iso(),
+                  'run_id': run_id,
+                  'dispatch_id': '',
+                  'reason': 'persisted history unavailable (gh api failed); refusing dispatch',
+              }
+              _writeback(record)
+              print('FINAL_STATE:', record['state'])
+              print('FINAL_REASON:', record['reason'])
+              sys.exit(0)
 
+          # Choose the real transport. HTTP is reserved for a future
+          # official webhook surface; today only the od CLI works.
+          http_url = os.environ.get('OD_DISPATCH_URL', '').strip()
+          transport = None
+          transport_label = 'none'
+          if http_url:
+              try:
+                  transport = HttpTransport(base_url=http_url, token=os.environ.get('OD_TOOL_TOKEN', '').strip())
+                  transport_label = 'http'
+              except Exception as exc:
+                  print('HTTP_TRANSPORT_REFUSED:', exc)
+          if transport is None:
+              # Try the real od CLI transport. Requires self-hosted runner
+              # with `od` on PATH. If `od` is not present OdCliTransport
+              # submit() will surface a clear error.
+              transport = OdCliTransport()
+              transport_label = 'od-cli'
+
+          rec = R.run(
+              event=event,
+              owner_allowlist=allowlist,
+              idempotency_records=persisted,
+              run_id=run_id,
+              expected_repo_full_name=expected,
+              transport=transport,
+              writeback_fn=_writeback,
+          )
+          print('TRANSPORT:', transport_label)
           print('FINAL_STATE:', rec.get('state'))
           print('FINAL_VERDICT:', rec.get('verdict'))
           print('FINAL_REASON:', rec.get('reason'))
           sys.exit(0)
           PY
 
+      # Fail closed if the event was an issue_comment but the target was
+      # actually a PR conversation (pull_request truthy).
+      - name: Skip PR conversation comments
+        if: >-
+          steps.detect.outputs.event_name == 'issue_comment' &&
+          steps.detect.outputs.is_pr == 'true'
+        shell: bash
+        run: |
+          echo "event is a PR conversation comment; OpenDesign dispatcher does not handle PRs"
+          echo "is_pr=${{ steps.detect.outputs.is_pr }}"
+
       - name: No-op (other events)
-        if: steps.detect.outputs.event_name != 'workflow_dispatch' && steps.detect.outputs.event_name != 'issue_comment'
+        if: >-
+          steps.detect.outputs.event_name != 'workflow_dispatch' &&
+          steps.detect.outputs.event_name != 'issue_comment'
         shell: bash
         run: |
           echo "Event type ${{ github.event_name }} is not handled by this workflow. Skipping."

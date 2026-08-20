@@ -1,10 +1,21 @@
-"""PASAY-OPENDESIGN-AUTO-DISPATCH-001 stub transport for PR-stage fixture.
+"""PASAY-OPENDESIGN-AUTO-DISPATCH-001 stub transport.
 
-Records every dispatch attempt into a JSONL log and returns a
-deterministic DispatchAck. The mode is decided by OD_STUB_MODE env var:
-    accept  - all dispatches succeed (default)
-    reject  - all dispatches fail with fake "endpoint unreachable"
-    fail    - transport.submit() raises (network simulation)
+Used ONLY by:
+  1. PR-stage fixture validation (`run_pr_fixture.py`, `workflow_dispatch`).
+  2. Unit tests for the runner.
+
+This transport NEVER participates in the production issue_comment path.
+The production path must either:
+  - call the real `od` CLI via a Windows self-hosted runner, OR
+  - refuse to dispatch with BLOCKED_FOR_PRODUCT_DECISION.
+
+Modes:
+  accept  - dispatch always succeeds (default for tests).
+  reject  - dispatch always fails with a fake "endpoint unreachable".
+  fail    - transport.submit() raises (network simulation).
+
+Unknown modes raise ValueError at construction time so they cannot
+silently fall back to `accept`.
 """
 
 from __future__ import annotations
@@ -17,12 +28,20 @@ from typing import Any, Dict, List
 
 STUB_LOG_DEFAULT = ".ai-control/results/opendesign-dispatch/stub.jsonl"
 
+_VALID_MODES = ("accept", "reject", "fail")
+
 
 class StubTransport:
-    """In-process OpenDesign transport stub."""
+    """In-process OpenDesign transport stub (test/fixture only)."""
 
     def __init__(self, mode=None, log_path=None, target=None):
-        self.mode = (mode or os.environ.get("OD_STUB_MODE", "accept")).lower()
+        resolved = (mode or os.environ.get("OD_STUB_MODE", "accept")).lower()
+        if resolved not in _VALID_MODES:
+            raise ValueError(
+                "StubTransport: unsupported mode " + repr(resolved)
+                + " (valid: " + ",".join(_VALID_MODES) + ")"
+            )
+        self.mode = resolved
         self.log_path = log_path or os.environ.get("OD_STUB_LOG", STUB_LOG_DEFAULT)
         self.target = target or os.environ.get(
             "OD_STUB_TARGET", "D:\\AI-DESIGN\\projects\\pasay-stub"
@@ -59,6 +78,7 @@ class StubTransport:
                 "run_id": "",
                 "error": "stub mode=reject: simulated endpoint unreachable",
             }
+        # accept (default)
         return {
             "ok": True,
             "target": self.target,

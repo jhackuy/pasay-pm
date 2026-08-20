@@ -30,3 +30,7 @@ pasay-telegram-bot/.pytest_tmp/
 .audit/
 .build/
 .research/
+
+# PASAY-OPENDESIGN-AUTO-DISPATCH-001: scratch / generated files
+tests/opendesign/_*.py
+scripts/opendesign/_*.py

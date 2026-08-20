@@ -1,7 +1,9 @@
 """PASAY-OPENDESIGN-AUTO-DISPATCH-001 PR-stage fixture runner.
 
-Usage:
-    python scripts/opendesign/run_pr_fixture.py [--fixture-dir DIR] [--mode accept|reject|fail]
+Walks every fixture event under `.github/fixtures/opendesign-dispatch/`,
+runs it through the dispatcher, and asserts the expected verdict / state.
+Expectations are mode-aware: the same fixture may be expected to
+DISPATCH in `accept` mode and DISPATCH_FAILED in `reject` mode.
 """
 
 from __future__ import annotations
@@ -30,22 +32,33 @@ def _load_fixture(path):
         return json.load(f)
 
 
+def _expected_for_mode(fixture, mode):
+    expected = fixture.get("_expected")
+    if not expected:
+        return None
+    if mode in expected and isinstance(expected[mode], dict):
+        return expected[mode]
+    if isinstance(expected.get("_default"), dict):
+        return expected["_default"]
+    if "verdict" in expected or "state" in expected:
+        return expected
+    return None
+
+
 def main():
     p = argparse.ArgumentParser(description="PR-stage fixture runner")
     p.add_argument(
         "--fixture-dir",
         default=os.path.join(REPO, ".github", "fixtures", "opendesign-dispatch"),
-        help="directory containing issue_comment fixture JSON files",
     )
     p.add_argument(
         "--mode",
         default=os.environ.get("OD_STUB_MODE", "accept"),
-        help="StubTransport mode: accept|reject|fail",
+        choices=["accept", "reject", "fail"],
     )
     p.add_argument(
         "--owner-allowlist",
         default=os.environ.get("OD_OWNER_ALLOWLIST", "jhackuy"),
-        help="comma-separated GitHub logins allowed to trigger dispatch",
     )
     p.add_argument(
         "--expected-repo",
@@ -78,7 +91,7 @@ def main():
     writeback_log = []
 
     def _writeback(record):
-        writeback_log.append(record)
+        writeback_log.append(dict(record))
 
     for path in fixtures:
         event = _load_fixture(path)
@@ -94,19 +107,21 @@ def main():
         rec["_fixture"] = os.path.basename(path)
         results.append(rec)
 
-        expected = event.get("_expected")
+        expected = _expected_for_mode(event, args.mode)
         if expected:
             want_verdict = expected.get("verdict")
             want_state = expected.get("state")
             if want_verdict and rec.get("verdict") != want_verdict:
                 unexpected.append({
                     "fixture": os.path.basename(path),
+                    "mode": args.mode,
                     "got_verdict": rec.get("verdict"),
                     "want_verdict": want_verdict,
                 })
             if want_state and rec.get("state") != want_state:
                 unexpected.append({
                     "fixture": os.path.basename(path),
+                    "mode": args.mode,
                     "got_state": rec.get("state"),
                     "want_state": want_state,
                 })

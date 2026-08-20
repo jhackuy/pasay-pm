@@ -29,6 +29,7 @@ def _base_event():
             "title": "PASAY-EXPENSE-VNEXT-001",
             "body": "Body.",
             "labels": [{"name": "route:design-dev"}],
+            "pull_request": None,
         },
         "comment": {
             "id": 1000,
@@ -46,7 +47,7 @@ def _allowlist():
 def _writeback_log():
     log = []
     def _w(r):
-        log.append(r)
+        log.append(dict(r))
     return log, _w
 
 
@@ -128,7 +129,7 @@ def test_runner_no_dispatch_path_writes_record():
         writeback_fn=w,
     )
     assert rec["verdict"] == C.VERDICT_NO_DISPATCH
-    assert rec["state"] == C.STATE_APPROVED_NOT_DISPATCHED
+    assert rec["state"] == C.STATE_NO_DISPATCH
 
 
 def test_runner_writeback_exception_does_not_crash():
@@ -148,6 +149,66 @@ def test_runner_writeback_exception_does_not_crash():
     assert "writeback_error" in rec
 
 
+def test_runner_does_not_mutate_writeback_record():
+    """Regression for CodeRabbit finding: runner must NOT pass the same
+    dict reference to the writeback consumer. The first snapshot must
+    capture APPROVED_NOT_DISPATCHED, not the post-transport DISPATCHED.
+    """
+    event = _base_event()
+    captured = []
+    def w(r):
+        captured.append(r["state"])
+    rec = R.run(
+        event=event,
+        owner_allowlist=_allowlist(),
+        idempotency_records=[],
+        run_id="r-1",
+        expected_repo_full_name="jhackuy/pasay-pm",
+        transport=StubTransport(mode="accept"),
+        writeback_fn=w,
+    )
+    # Two writebacks: APPROVED_NOT_DISPATCHED then DISPATCHED.
+    assert captured[0] == C.STATE_APPROVED_NOT_DISPATCHED
+    assert captured[1] == C.STATE_DISPATCHED
+
+
+def test_runner_persisted_records_are_passed_through():
+    """If a persisted DISPATCHED record is supplied for the same
+    dispatch_id, the runner must NOT re-dispatch.
+    """
+    event = _base_event()
+    probe = R.run(
+        event=event,
+        owner_allowlist=_allowlist(),
+        idempotency_records=[],
+        run_id="r-1",
+        expected_repo_full_name="jhackuy/pasay-pm",
+        transport=None,
+        writeback_fn=None,
+    )
+    persisted = [
+        {
+            "dispatch_id": probe["dispatch_id"],
+            "state": C.STATE_DISPATCHED,
+            "ts": "2026-08-20T00:00:00Z",
+            "run_id": "earlier-run",
+            "trigger_actor": "jhackuy",
+        }
+    ]
+    rec = R.run(
+        event=event,
+        owner_allowlist=_allowlist(),
+        idempotency_records=persisted,
+        run_id="r-2",
+        expected_repo_full_name="jhackuy/pasay-pm",
+        transport=StubTransport(mode="accept"),
+        writeback_fn=None,
+    )
+    assert rec["verdict"] == C.VERDICT_NO_DISPATCH
+    assert rec["state"] == C.STATE_NO_DISPATCH
+    assert "idempotency" in rec["reason"].lower()
+
+
 def _run_all():
     failures = []
     fns = [
@@ -157,6 +218,8 @@ def _run_all():
         test_runner_stub_transport_fail_records_dispatch_failed,
         test_runner_no_dispatch_path_writes_record,
         test_runner_writeback_exception_does_not_crash,
+        test_runner_does_not_mutate_writeback_record,
+        test_runner_persisted_records_are_passed_through,
     ]
     for fn in fns:
         try:

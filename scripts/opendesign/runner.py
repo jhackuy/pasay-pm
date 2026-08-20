@@ -1,13 +1,18 @@
 """PASAY-OPENDESIGN-AUTO-DISPATCH-001 runner.
 
-Orchestrates: validate event -> compute dispatch -> call OpenDesign ->
+Orchestrates: validate event -> compute dispatch -> call transport ->
 record result. Pure stdlib. No LLM. No second database.
 
-The runner is transport-agnostic. The transport layer is provided by
-dispatch_http (HTTP / daemon URL) or dispatch_stub (PR-stage fixture).
-The runner sees a single Transport object exposing one method:
+The runner is transport-agnostic. The transport layer is provided by:
+  - `dispatch_stub.StubTransport` (PR fixture / unit tests ONLY).
+  - `dispatch_odcli.OdCliTransport` (production path via Windows
+    self-hosted runner; invokes `od` CLI against the local daemon).
+  - `dispatch_http.HttpTransport` (reserved for a future documented
+    OpenDesign webhook surface; disabled by default).
 
-    transport.submit(dispatch_input) -> DispatchAck
+The runner never builds a shell command from user-controlled text.
+The only shell command it ever runs is `gh api` for writeback, and even
+that is mediated by `gh_writeback()` which encodes the JSON safely.
 """
 
 from __future__ import annotations
@@ -23,6 +28,18 @@ from . import contract as C
 
 def now_iso():
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _emit(writeback_fn, record, error_key):
+    """Call writeback_fn with a COPY of record so subsequent mutation
+    cannot pollute history. Append the error to the original record.
+    """
+    if writeback_fn is None:
+        return
+    try:
+        writeback_fn(dict(record))
+    except Exception as exc:
+        record[error_key] = repr(exc)
 
 
 def run(
@@ -64,33 +81,28 @@ def run(
         record["state"] = state
         record["reason"] = verdict["reason"]
         record["verdict"] = verdict["verdict"]
-        if writeback_fn is not None:
-            try:
-                writeback_fn(record)
-            except Exception as exc:
-                record["writeback_error"] = repr(exc)
+        _emit(writeback_fn, record, "writeback_error")
         return record
 
     dispatch_input = verdict["dispatch_input"]
     record = dict(base_record)
     record["state"] = C.STATE_APPROVED_NOT_DISPATCHED
-    record["reason"] = "all gates passed; submitted to OpenDesign"
+    record["reason"] = "all gates passed; awaiting OpenDesign dispatch"
     record["verdict"] = verdict["verdict"]
     record["dispatch_input"] = dispatch_input
-    if writeback_fn is not None:
-        try:
-            writeback_fn(record)
-        except Exception as exc:
-            record["writeback_error"] = repr(exc)
+    _emit(writeback_fn, record, "writeback_error")
 
     if transport is None:
+        # No transport at all -> refuse. The caller is expected to use
+        # BLOCKED_FOR_PRODUCT_DECISION only when Owner needs to act (e.g.
+        # self-hosted runner install). For other no-transport cases the
+        # caller may override this default by providing a transport.
         record["state"] = C.STATE_BLOCKED_FOR_PRODUCT_DECISION
-        record["reason"] = "no transport configured; Owner must set OD_DISPATCH_URL or self-hosted runner"
-        if writeback_fn is not None:
-            try:
-                writeback_fn(record)
-            except Exception as exc:
-                record["writeback_error_2"] = repr(exc)
+        record["reason"] = (
+            "no transport configured; Owner must set OD_DISPATCH_URL "
+            "or install a self-hosted runner with `od` on PATH"
+        )
+        _emit(writeback_fn, record, "writeback_error_2")
         return record
 
     try:
@@ -98,22 +110,14 @@ def run(
     except Exception as exc:
         record["state"] = C.STATE_DISPATCH_FAILED
         record["reason"] = "transport raised: " + repr(exc)
-        if writeback_fn is not None:
-            try:
-                writeback_fn(record)
-            except Exception as exc2:
-                record["writeback_error_3"] = repr(exc2)
+        _emit(writeback_fn, record, "writeback_error_3")
         return record
 
     if not ack.get("ok"):
         record["state"] = C.STATE_DISPATCH_FAILED
         record["reason"] = "OpenDesign rejected: " + repr(ack.get("error"))
         record["open_design_ack"] = ack
-        if writeback_fn is not None:
-            try:
-                writeback_fn(record)
-            except Exception as exc:
-                record["writeback_error_4"] = repr(exc)
+        _emit(writeback_fn, record, "writeback_error_4")
         return record
 
     record["state"] = C.STATE_DISPATCHED
@@ -123,11 +127,7 @@ def run(
     record["design_commit_sha"] = ack.get("design_commit_sha", "")
     record["changed_files"] = list(ack.get("changed_files", []))
     record["design_gate_result"] = ack.get("design_gate_result", "")
-    if writeback_fn is not None:
-        try:
-            writeback_fn(record)
-        except Exception as exc:
-            record["writeback_error_5"] = repr(exc)
+    _emit(writeback_fn, record, "writeback_error_5")
     return record
 
 

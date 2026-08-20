@@ -15,7 +15,7 @@ for p in (SCRIPTS_DIR, REPO):
         sys.path.insert(0, p)
 
 from scripts.opendesign.dispatch_stub import StubTransport
-from scripts.opendesign.dispatch_http import HttpTransport
+from scripts.opendesign.dispatch_http import HttpTransport, _validate_url
 
 
 def _stub_dispatch_input():
@@ -33,6 +33,9 @@ def _stub_dispatch_input():
         },
         "frozen_rules_path": "AI_WORKFLOW_RULES.md",
     }
+
+
+# ----- StubTransport -----
 
 
 def test_stub_accept_records_attempt():
@@ -61,6 +64,15 @@ def test_stub_fail_raises_runtime_error():
         raise AssertionError("expected RuntimeError")
 
 
+def test_stub_unknown_mode_raises_value_error():
+    try:
+        StubTransport(mode="bogus")
+    except ValueError as exc:
+        assert "unsupported mode" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for unknown stub mode")
+
+
 def test_stub_appends_log_file():
     log = os.path.join(".ai-control", "results", "opendesign-dispatch", "_test_stub.jsonl")
     if os.path.exists(log):
@@ -76,14 +88,48 @@ def test_stub_appends_log_file():
     os.remove(log)
 
 
-def test_http_transport_refuses_without_url():
-    t = HttpTransport(base_url="", token="x")
+# ----- HttpTransport -----
+
+
+def test_http_validate_url_accepts_http_and_https():
+    assert _validate_url("http://127.0.0.1:7456") == "http://127.0.0.1:7456"
+    assert _validate_url("https://example.com/path") == "https://example.com/path"
+
+
+def test_http_validate_url_rejects_empty():
     try:
-        t.submit(_stub_dispatch_input())
-    except RuntimeError as exc:
-        assert "OD_DISPATCH_URL" in str(exc)
+        _validate_url("")
+    except ValueError as exc:
+        assert "empty" in str(exc)
     else:
-        raise AssertionError("expected RuntimeError when URL is missing")
+        raise AssertionError("expected ValueError for empty URL")
+
+
+def test_http_validate_url_rejects_file_scheme():
+    try:
+        _validate_url("file:///etc/passwd")
+    except ValueError as exc:
+        assert "scheme not allowed" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for file:// scheme")
+
+
+def test_http_validate_url_rejects_no_host():
+    try:
+        _validate_url("http:///path")
+    except ValueError as exc:
+        assert "missing host" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for URL without host")
+
+
+def test_http_transport_constructor_rejects_bad_url():
+    try:
+        HttpTransport(base_url="file:///etc/passwd", token="x")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError at construction")
 
 
 def test_http_transport_refuses_to_unreachable_host():
@@ -99,8 +145,13 @@ def _run_all():
         test_stub_accept_records_attempt,
         test_stub_reject_yields_failure,
         test_stub_fail_raises_runtime_error,
+        test_stub_unknown_mode_raises_value_error,
         test_stub_appends_log_file,
-        test_http_transport_refuses_without_url,
+        test_http_validate_url_accepts_http_and_https,
+        test_http_validate_url_rejects_empty,
+        test_http_validate_url_rejects_file_scheme,
+        test_http_validate_url_rejects_no_host,
+        test_http_transport_constructor_rejects_bad_url,
         test_http_transport_refuses_to_unreachable_host,
     ]
     for fn in fns:
