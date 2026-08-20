@@ -6,7 +6,22 @@ API = "/api/v1"
 def test_health_no_auth(client):
     resp = client.get("/health")
     assert resp.status_code == 200
-    assert resp.json() == {"status": "ok"}
+    body = resp.json()
+    # Core contract: the backend declares itself healthy.
+    assert body["status"] == "ok"
+    # V1.3 PASAY-WEBHOOK-ARCH-P0-001: /health now additionally surfaces a
+    # ``telegram_webhook`` diagnostic sub-object so operators can see the
+    # webhook subsystem's state without prying into logs.
+    assert "telegram_webhook" in body
+    diag = body["telegram_webhook"]
+    assert set(diag.keys()) >= {
+        "webhook_configured",
+        "telegram_bot_token_configured",
+        "window_seconds",
+        "states_24h",
+        "recent_errors",
+        "total_processed_done",
+    }
 
 
 def test_auth_valid_key_returns_client_info(client, admin, admin_headers):

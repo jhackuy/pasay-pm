@@ -57,6 +57,11 @@ from app.models.repair import (
 )
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.tenant import Tenant, TenantContactStatus
+from app.models.telegram_webhook import (
+    CLAIM_STALE_SECONDS,
+    TelegramWebhookState,
+    TelegramWebhookUpdate,
+)
 from app.models.user import User, UserRole
 
 __all__ = [
@@ -66,6 +71,7 @@ __all__ = [
     "AuditLog",
     "AuditMixin",
     "Base",
+    "CLAIM_STALE_SECONDS",
     "CommissionRule",
     "CommissionRuleType",
     "CommissionSettlement",
@@ -113,6 +119,8 @@ __all__ = [
     "TaskStatus",
     "Tenant",
     "TenantContactStatus",
+    "TelegramWebhookState",
+    "TelegramWebhookUpdate",
     "Unit",
     "UnitLifecycleEvent",
     "UnitStatus",
