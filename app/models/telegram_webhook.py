@@ -73,6 +73,16 @@ class TelegramWebhookUpdate(Base):
     state: Mapped[str] = mapped_column(
         String(20), nullable=False, default=TelegramWebhookState.claimed.value,
     )
+    # delivery_count: how many times Telegram has *delivered* this update_id
+    # to the backend (i.e. how many times we have CLAIMED it via INSERT/CAS).
+    # Used exclusively for cross-request budget (F7): max_attempts_cross is
+    # compared against this value, so in-process backoff attempts do NOT
+    # prematurely exhaust the budget.
+    delivery_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    # attempt_count: TOTAL number of times process_update was (or will be)
+    # invoked for this update_id across *all* cross-request attempts.
+    #   = Σ per_request (1 claim + max(0, in_process_attempts - 1))
+    # Purely diagnostic / owner visibility.
     attempt_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     last_error_type: Mapped[str | None] = mapped_column(String(200), nullable=True)

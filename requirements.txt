@@ -6,6 +6,9 @@ psycopg2-binary==2.9.12
 pydantic==2.13.4
 pydantic-settings==2.14.2
 python-multipart==0.0.32
+# Telegram bot SDK (shared between pasay-telegram-bot subtree and the
+# webhook dispatch layer; kept in sync with pasay-telegram-bot/pyproject).
+python-telegram-bot==22.8
 
 # testing
 pytest==9.1.1

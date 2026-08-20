@@ -6,6 +6,16 @@ Scope (per PASAY-WEBHOOK-ARCH-P0-001):
   * 异常隔离 (DB/Telegram/handler/unsupported/malformed 不导致服务退出)
   * 仅安全可重试的临时失败有限重试
   * 结构化日志 (update_id / chat_id / 状态 / 错误类型)
+
+Key contracts (after Owner review — Issue #18 PR #19 fixes):
+  * Telegram webhook redelivery: Telegram RETRIES when the HTTP response is
+    NOT a 2xx. Therefore retryable outcomes (temp failure, cross-request
+    budget not exhausted) return HTTP 503 so Telegram replays the update
+    later. Only terminal outcomes (done, permanently failed, claim lost to
+    a live peer, replay short-circuits) return 2xx.
+  * Stale-claim detection uses ``updated_at`` (NOT ``created_at``). A stale
+    reclaim atomically bumps ``updated_at`` via CAS-style conditional UPDATE
+    so no two concurrent replays both think they own the row.
 """
 from __future__ import annotations
 
@@ -17,9 +27,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError
-from sqlalchemy import func, select, update
-from telegram import Update as TelegramUpdate
+from sqlalchemy.exc import DBAPIError, IntegrityError, OperationalError, SQLAlchemyError
+from sqlalchemy import DateTime, func, select, update
+from telegram import Bot, Update as TelegramUpdate
 from telegram.error import (
     BadRequest,
     Conflict,
@@ -47,10 +57,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # PTB pasay_bot wiring. We import lazily so the test suite / backend can boot
 # without the pasay-telegram-bot subtree actually being importable.
+# Concurrent-first-call protection: module-level asyncio.Lock + re-check after
+# acquisition so exactly one coroutine runs the boot sequence.
 # ---------------------------------------------------------------------------
 _PTB_APP_READY = False
-_PTB_APP = None
-_PTB_APP_INIT_ERR: str | None = None
+_PTB_APP: Any = None
+_PTB_INIT_ERR_CLASS: str | None = None     # "NetworkError" / "InvalidToken" / ...
+_PTB_INIT_ERR_MSG: str | None = None
+_PTB_INIT_FAIL_PERMANENT: bool = False    # True = config/auth error, never retry
+_PTB_LAST_FAIL_AT: float | None = None    # epoch seconds, used for a tiny
+                                          # cooldown so temp failures do not
+                                          # hammer boot on every single request
+_PTB_INIT_LOCK = asyncio.Lock()
+# After a *temporary* boot failure we wait at least this many seconds before
+# re-attempting the full boot sequence. Prevents concurrent requests from
+# duplicating doomed boot work.
+_PTB_RETRY_COOLDOWN_SECONDS = 15.0
 
 
 def _import_pasay_bot_subtree() -> None:
@@ -80,85 +102,164 @@ def _build_bot_settings_overlay() -> Any:
     return get_settings()
 
 
+def _classify_ptb_boot_exception(exc: BaseException) -> tuple[bool, str, str]:
+    """Return (permanent, class_name, message) for a PTB boot exception.
+
+    ``permanent=True`` means retrying later will never help (e.g. the bot token
+    is invalid or the operator forgot to set one). ``permanent=False`` means
+    the next request (after a cooldown) MAY succeed (e.g. network blip,
+    PasayApiClient timeout, Neon connection issue).
+    """
+    cls_name = type(exc).__name__
+    msg = str(exc)
+    if isinstance(exc, (InvalidToken, Forbidden, BadRequest)):
+        return True, cls_name, msg
+    # Telegram-side transients.
+    if isinstance(exc, (NetworkError, TimedOut, RetryAfter, Conflict)):
+        return False, cls_name, msg
+    # DB transients.
+    if isinstance(exc, OperationalError):
+        return False, cls_name, msg
+    if isinstance(exc, DBAPIError):
+        if any(k in cls_name.lower() for k in ("timeout", "connection")):
+            return False, cls_name, msg
+    # PasayApiClient / httpx transients (duck-typed by class name to avoid a
+    # hard import of the bot subtree here).
+    low = cls_name.lower()
+    if "timeout" in low or "network" in low or "connect" in low:
+        return False, cls_name, msg
+    # Missing TOKEN / missing pasay_bot subtree / broken config files are
+    # permanent from our POV; operator must intervene.
+    missing_sentinels = ("token", "not set", "not configured", "could not be parsed",
+                         "no module named 'pasay_bot", "environment variable")
+    low_msg = msg.lower()
+    if any(s in low_msg for s in missing_sentinels):
+        return True, cls_name, msg
+    return True, cls_name, msg
+
+
 async def get_ptb_application():
     """Return the singleton PTB Application, booting it on first call.
 
-    The application is built exactly once per process. Any wiring error is
-    captured and re-raised to the caller on every subsequent request; this
-    keeps the process alive and lets operators fix configuration without a
-    crash-loop.
+    Concurrency safe:
+      * Fast path without lock when boot is known-good.
+      * Slow path serialised under ``_PTB_INIT_LOCK`` with a re-check after
+        acquisition (double-checked locking pattern for async). Exactly ONE
+        coroutine runs the boot; everybody else waits then uses the result.
+
+    Boot outcome classification (affects subsequent retry policy):
+      * SUCCESS                 → cache app, return it forever.
+      * TEMPORARY failure       → cache failure info, but only refuse re-boots
+                                  for ``_PTB_RETRY_COOLDOWN_SECONDS`` seconds.
+      * PERMANENT failure       → cache failure forever; callers receive a
+                                  RuntimeError with the original class/message.
     """
-    global _PTB_APP_READY, _PTB_APP, _PTB_APP_INIT_ERR
-    if _PTB_APP_READY:
-        if _PTB_APP is None:
-            raise RuntimeError(
-                f"PTB application boot failed previously: {_PTB_APP_INIT_ERR}"
-            )
+    # --- Fast path (no lock, outside contention). ---
+    global _PTB_APP_READY, _PTB_APP, _PTB_INIT_ERR_CLASS, _PTB_INIT_ERR_MSG
+    global _PTB_INIT_FAIL_PERMANENT, _PTB_LAST_FAIL_AT
+    if _PTB_APP_READY and _PTB_APP is not None:
         return _PTB_APP
-
-    try:
-        _import_pasay_bot_subtree()
-        from pasay_bot.api_client import PasayApiClient  # type: ignore
-        from pasay_bot.main import build_application  # type: ignore
-        from pasay_bot.state.store import StateStore  # type: ignore
-
-        bot_settings = _build_bot_settings_overlay()
-
-        # build_application() returns an *uninitialized* Application. We need
-        # the store + api clients so handlers reach the backend; we do NOT call
-        # run_polling() here — inbound updates come from the HTTP webhook.
-        store = StateStore(bot_settings.state_db)
-        store.init()
-        # Recovery: any stale in-flight idempotency marks in the bot's OWN
-        # idempotency table (conversation/daily marks) are reset on startup so
-        # crashes do not permanently pin a conversation key.
-        try:
-            store.recover_stale_in_flight()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("store.recover_stale_in_flight failed: %s", exc)
-
-        api_client = PasayApiClient(
-            base_url=bot_settings.pasay_api_base,
-            api_key=bot_settings.pasay_api_key,
-            timeout=bot_settings.pasay_http_timeout_seconds,
+    if _PTB_APP_READY and _PTB_INIT_FAIL_PERMANENT:
+        raise RuntimeError(
+            f"PTB application boot failed permanently: {_PTB_INIT_ERR_CLASS}: {_PTB_INIT_ERR_MSG}"
         )
-        admin_api_client = None
-        if bot_settings.pasay_admin_api_key:
-            admin_api_client = PasayApiClient(
-                base_url=bot_settings.pasay_api_base,
-                api_key=bot_settings.pasay_admin_api_key,
-                timeout=bot_settings.pasay_http_timeout_seconds,
-            )
-        job_api_client = None
-        if bot_settings.pasay_job_api_key:
-            job_api_client = PasayApiClient(
-                base_url=bot_settings.pasay_api_base,
-                api_key=bot_settings.pasay_job_api_key,
-                timeout=bot_settings.pasay_http_timeout_seconds,
-            )
-
-        app = build_application(
-            settings=bot_settings,
-            api_client=api_client,
-            store=store,
-            admin_api_client=admin_api_client,
-            job_api_client=job_api_client,
+    now_epoch = time.time()
+    if (_PTB_APP_READY and not _PTB_INIT_FAIL_PERMANENT and _PTB_LAST_FAIL_AT is not None
+            and (now_epoch - _PTB_LAST_FAIL_AT) < _PTB_RETRY_COOLDOWN_SECONDS):
+        # Temporary boot failure + still within cooldown: re-raise so the
+        # caller can mark the update retryable and Telegram will replay later.
+        raise RuntimeError(
+            f"PTB boot failed recently (temp); cooldown active: {_PTB_INIT_ERR_CLASS}: {_PTB_INIT_ERR_MSG}"
         )
-        # ``process_update`` requires the Application to have been through
-        # initialize() + start() so bot_data / bot / job_queue etc. are ready.
-        await app.initialize()
-        await app.start()
 
-        _PTB_APP = app
-        _PTB_APP_READY = True
-        _PTB_APP_INIT_ERR = None
-        return app
-    except Exception as exc:  # noqa: BLE001
+    # --- Slow path: serialise under the module-level lock. ---
+    async with _PTB_INIT_LOCK:
+        # Re-check AFTER acquiring the lock — the winning coroutine may have
+        # finished booting while we were waiting.
+        if _PTB_APP_READY and _PTB_APP is not None:
+            return _PTB_APP
+        if _PTB_APP_READY and _PTB_INIT_FAIL_PERMANENT:
+            raise RuntimeError(
+                f"PTB application boot failed permanently: {_PTB_INIT_ERR_CLASS}: {_PTB_INIT_ERR_MSG}"
+            )
+        # Reset state so a temp failure from a previous epoch does not poison.
         _PTB_APP = None
-        _PTB_APP_READY = True  # do not keep retrying boot per request
-        _PTB_APP_INIT_ERR = f"{type(exc).__name__}: {exc}"
-        logger.error("PTB application boot failed: %s", _PTB_APP_INIT_ERR, exc_info=True)
-        raise
+        _PTB_APP_READY = False
+
+        try:
+            _import_pasay_bot_subtree()
+            from pasay_bot.api_client import PasayApiClient  # type: ignore
+            from pasay_bot.main import build_application  # type: ignore
+            from pasay_bot.state.store import StateStore  # type: ignore
+
+            bot_settings = _build_bot_settings_overlay()
+
+            # build_application() returns an *uninitialized* Application. We need
+            # the store + api clients so handlers reach the backend; we do NOT call
+            # run_polling() here — inbound updates come from the HTTP webhook.
+            store = StateStore(bot_settings.state_db)
+            store.init()
+            # Recovery: any stale in-flight idempotency marks in the bot's OWN
+            # idempotency table (conversation/daily marks) are reset on startup so
+            # crashes do not permanently pin a conversation key.
+            try:
+                store.recover_stale_in_flight()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("store.recover_stale_in_flight failed: %s", exc)
+
+            api_client = PasayApiClient(
+                base_url=bot_settings.pasay_api_base,
+                api_key=bot_settings.pasay_api_key,
+                timeout=bot_settings.pasay_http_timeout_seconds,
+            )
+            admin_api_client = None
+            if bot_settings.pasay_admin_api_key:
+                admin_api_client = PasayApiClient(
+                    base_url=bot_settings.pasay_api_base,
+                    api_key=bot_settings.pasay_admin_api_key,
+                    timeout=bot_settings.pasay_http_timeout_seconds,
+                )
+            job_api_client = None
+            if bot_settings.pasay_job_api_key:
+                job_api_client = PasayApiClient(
+                    base_url=bot_settings.pasay_api_base,
+                    api_key=bot_settings.pasay_job_api_key,
+                    timeout=bot_settings.pasay_http_timeout_seconds,
+                )
+
+            app = build_application(
+                settings=bot_settings,
+                api_client=api_client,
+                store=store,
+                admin_api_client=admin_api_client,
+                job_api_client=job_api_client,
+            )
+            # ``process_update`` requires the Application to have been through
+            # initialize() + start() so bot_data / bot / job_queue etc. are ready.
+            await app.initialize()
+            await app.start()
+
+            # HAPPY PATH: publish the singleton. All subsequent fast-paths win.
+            _PTB_APP = app
+            _PTB_APP_READY = True
+            _PTB_INIT_ERR_CLASS = None
+            _PTB_INIT_ERR_MSG = None
+            _PTB_INIT_FAIL_PERMANENT = False
+            _PTB_LAST_FAIL_AT = None
+            return app
+        except Exception as exc:  # noqa: BLE001
+            perm, cls_name, msg = _classify_ptb_boot_exception(exc)
+            _PTB_APP = None
+            _PTB_APP_READY = True
+            _PTB_INIT_ERR_CLASS = cls_name
+            _PTB_INIT_ERR_MSG = msg
+            _PTB_INIT_FAIL_PERMANENT = perm
+            _PTB_LAST_FAIL_AT = time.time()
+            logger.error(
+                "PTB application boot failed (perm=%s): %s: %s",
+                perm, cls_name, msg, exc_info=True,
+            )
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +273,11 @@ class ReplayOutcome:
     DONE = "done"                   # already finished; short-circuit 200 OK
     FAILED = "failed"               # terminal failure recorded; short-circuit
     RETRY_ALLOWED = "retry_allowed" # retryable state / stale claim re-claimed
+                                    #   with row = None  ⇒ live peer owns it
+                                    #   with row != None ⇒ we now own it
+    DB_TRANSIENT = "db_transient"   # claim step hit a DB transient; caller
+                                    #   returns HTTP 503 to trigger Telegram
+                                    #   replay WITHOUT persisting any row state
 
 
 def _effective_chat_user(update: TelegramUpdate) -> tuple[int | None, int | None, str | None]:
@@ -204,6 +310,16 @@ def _effective_chat_user(update: TelegramUpdate) -> tuple[int | None, int | None
     return chat_id, user_id, utype
 
 
+def _safe_rollback(db) -> None:
+    """Roll back the session; swallow and log any secondary error so a DB
+    failure never propagates out of this module."""
+    try:
+        db.rollback()
+    except Exception as inner:  # noqa: BLE001
+        logger.error("claim_update_or_short_circuit session rollback failed: %s: %s",
+                     type(inner).__name__, inner)
+
+
 def claim_update_or_short_circuit(
     db,
     update_id: int,
@@ -218,20 +334,39 @@ def claim_update_or_short_circuit(
     decision must be persisted to the DB *before* we run any handler so a
     concurrent replay cannot slip through.
 
+    DB failure policy (Issue #18 Owner review F4):
+      * ANY DB exception (IntegrityError, OperationalError, or other
+        SQLAlchemyError) is caught, the session is rolled back, and the
+        caller receives ``(DB_TRANSIENT, None)`` so the endpoint returns
+        HTTP 503 — Telegram will replay, and no leaked broken state is
+        visible to the outer layers. No SQLAlchemyError reaches the router.
+
+    Stale reclaim policy (Issue #18 Owner review F8):
+      * Staleness is measured against ``updated_at`` (NOT ``created_at``),
+        and every reclaim atomically bumps ``updated_at`` via a conditional
+        UPDATE so two concurrent replays cannot both "win" the same row.
+      * A live claim (``updated_at >= cutoff``) is never stolen; we return
+        ``(RETRY_ALLOWED, None)`` so the caller short-circuits.
+
     Returns (outcome, row):
-      * ``(NEW, row)``            — caller should dispatch handlers
-      * ``(DONE/FAILED, row)``    — terminal; caller returns 200 OK without dispatch
-      * ``(RETRY_ALLOWED, row)``  — stale claim / retryable state; caller dispatches
-      * ``(RETRY_ALLOWED, None)`` — concurrent claim race lost (rare)
+      * ``(NEW, row)``           — first time seen; caller should dispatch
+      * ``(DONE/FAILED, row)``   — terminal; caller returns 200 no dispatch
+      * ``(RETRY_ALLOWED, row)`` — stale/retryable; caller now owns it, dispatch
+      * ``(RETRY_ALLOWED, None)``— live peer owns it, caller returns 200 no dispatch
+      * ``(DB_TRANSIENT, None)`` — DB transient, caller returns 503 no dispatch
     """
     cutoff = TelegramWebhookUpdate.claim_stale_cutoff()
-    # Fast path: INSERT the claim. Primary key violation = we've seen it.
+
+    # ------------------------------------------------------------------
+    # 1) Fast path: INSERT the claim. PK violation = we've seen it before.
+    # ------------------------------------------------------------------
     row = TelegramWebhookUpdate(
         update_id=update_id,
         chat_id=chat_id,
         user_id=user_id,
         update_type=update_type,
         state=TelegramWebhookState.claimed.value,
+        delivery_count=1,
         attempt_count=1,
     )
     db.add(row)
@@ -240,15 +375,44 @@ def claim_update_or_short_circuit(
         db.refresh(row)
         return ReplayOutcome.NEW, row
     except IntegrityError:
-        db.rollback()
+        _safe_rollback(db)
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "webhook claim_insert DB transient update_id=%s %s: %s",
+            update_id, type(exc).__name__, exc,
+        )
+        _safe_rollback(db)
+        return ReplayOutcome.DB_TRANSIENT, None
+    except Exception as exc:  # noqa: BLE001 - absolute safety net
+        logger.exception("webhook claim_insert unexpected error update_id=%s", update_id)
+        _safe_rollback(db)
+        return ReplayOutcome.DB_TRANSIENT, None
 
-    # Conflict => row exists; load it and decide.
-    stmt = select(TelegramWebhookUpdate).where(
-        TelegramWebhookUpdate.update_id == update_id
-    )
-    existing = db.execute(stmt).scalar_one_or_none()
+    # ------------------------------------------------------------------
+    # 2) Conflict => row exists; load it and classify.
+    # ------------------------------------------------------------------
+    existing: TelegramWebhookUpdate | None
+    try:
+        stmt = select(TelegramWebhookUpdate).where(
+            TelegramWebhookUpdate.update_id == update_id
+        )
+        existing = db.execute(stmt).scalar_one_or_none()
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "webhook claim_select DB transient update_id=%s %s: %s",
+            update_id, type(exc).__name__, exc,
+        )
+        _safe_rollback(db)
+        return ReplayOutcome.DB_TRANSIENT, None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("webhook claim_select unexpected error update_id=%s", update_id)
+        _safe_rollback(db)
+        return ReplayOutcome.DB_TRANSIENT, None
+
     if existing is None:
-        return ReplayOutcome.NEW, None
+        # Extremely rare race: another thread committed + deleted between our
+        # failed INSERT and our SELECT. Let caller short-circuit cleanly.
+        return ReplayOutcome.RETRY_ALLOWED, None
 
     state = existing.state
     if state in (TelegramWebhookState.done.value, TelegramWebhookState.failed.value):
@@ -257,55 +421,136 @@ def claim_update_or_short_circuit(
             existing,
         )
 
-    # claimed or retryable => only re-claim if we are past the staleness window
-    if state == TelegramWebhookState.claimed.value and existing.created_at >= cutoff:
-        # Another live worker has it: do NOT steal. Tell caller "retry allowed
-        # with no row" => caller returns 200 OK, Telegram will replay later.
+    # Live (non-stale) claim by peer => never steal.
+    # STALENESS USES updated_at (Issue #18 F8). updated_at is touched on every
+    # state transition and every reclaim so a long-lived row can't be "born
+    # stale" the moment CLAIM_STALE_SECONDS elapses since creation.
+    if state == TelegramWebhookState.claimed.value and existing.updated_at >= cutoff:
         return ReplayOutcome.RETRY_ALLOWED, None
 
-    # Either: retryable state, or stale claimed. Bump attempt_count and re-claim.
-    new_count = int(existing.attempt_count or 0) + 1
-    existing.state = TelegramWebhookState.claimed.value
-    existing.attempt_count = new_count
-    existing.last_error = None
-    existing.last_error_type = None
-    db.add(existing)
+    # ------------------------------------------------------------------
+    # 3) Either retryable OR stale claimed. Atomically re-claim via CAS
+    #    UPDATE so at most one concurrent request wins this row.
+    # ------------------------------------------------------------------
+    new_attempt_count = int(existing.attempt_count or 0) + 1
+    new_delivery_count = int(existing.delivery_count or 0) + 1
+    # Conditional UPDATE: row must STILL be in (claimed, retryable) AND still
+    # stale, otherwise another request already grabbed it. updated_at bumps
+    # via func.now() so the winner immediately becomes "freshly claimed" and
+    # the next concurrent requester sees updated_at >= cutoff and backs off.
     try:
+        upd_stmt = (
+            update(TelegramWebhookUpdate)
+            .where(TelegramWebhookUpdate.update_id == update_id)
+            .where(TelegramWebhookUpdate.state.in_(
+                (TelegramWebhookState.claimed.value, TelegramWebhookState.retryable.value)
+            ))
+            # If state==claimed: updated_at must be stale. For retryable rows
+            # we allow reclaim regardless (Telegram redelivery semantics).
+            .where(
+                (TelegramWebhookUpdate.state == TelegramWebhookState.retryable.value)
+                | (TelegramWebhookUpdate.updated_at < cutoff)
+            )
+            .values(
+                state=TelegramWebhookState.claimed.value,
+                delivery_count=new_delivery_count,
+                attempt_count=new_attempt_count,
+                last_error=None,
+                last_error_type=None,
+                updated_at=func.now(),
+            )
+            .execution_options(synchronize_session=False)
+        )
+        result = db.execute(upd_stmt)
         db.commit()
-        db.refresh(existing)
-        return ReplayOutcome.RETRY_ALLOWED, existing
-    except Exception:
-        db.rollback()
+    except SQLAlchemyError as exc:
+        logger.warning(
+            "webhook claim_reclaim DB transient update_id=%s %s: %s",
+            update_id, type(exc).__name__, exc,
+        )
+        _safe_rollback(db)
+        return ReplayOutcome.DB_TRANSIENT, None
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("webhook claim_reclaim unexpected error update_id=%s", update_id)
+        _safe_rollback(db)
+        return ReplayOutcome.DB_TRANSIENT, None
+
+    rows_affected = int(getattr(result, "rowcount", 0) or 0)
+    if rows_affected <= 0:
+        # CAS lost → a live peer won the race.
         return ReplayOutcome.RETRY_ALLOWED, None
+
+    # We won! Re-read the row so the caller has attempt_count/etc.
+    try:
+        db.refresh(existing)
+    except SQLAlchemyError:
+        _safe_rollback(db)
+        try:
+            existing = db.execute(select(TelegramWebhookUpdate).where(
+                TelegramWebhookUpdate.update_id == update_id
+            )).scalar_one_or_none()
+        except SQLAlchemyError:
+            return ReplayOutcome.DB_TRANSIENT, None
+    return ReplayOutcome.RETRY_ALLOWED, existing
 
 
 def transition_update(db, update_id: int, state: str, *, last_error: str | None = None,
                       last_error_type: str | None = None,
-                      handler_result_summary: str | None = None) -> None:
+                      handler_result_summary: str | None = None,
+                      bump_attempt: bool = False,
+                      add_attempt: int = 0) -> None:
+    """Persist the result of a dispatch.
+
+    ``bump_attempt`` is used when cross-request redelivery semantics require
+    the attempt count to reflect THIS attempt (the claim layer already bumped
+    once for the fresh claim, but dispatch failures may add per-request
+    in-process attempt deltas via ``add_attempt``).
+
+    ``updated_at`` is ALWAYS set via ``func.now()`` at the SQL layer so ORM
+    ``onupdate`` semantics (which do not fire for bulk UPDATE) are honoured.
+    Staleness in the reclaim path depends on this field being fresh.
+    """
+    values: dict[str, Any] = {
+        "state": state,
+        "updated_at": func.now(),
+    }
+    if last_error is not None:
+        values["last_error"] = last_error
+    if last_error_type is not None:
+        values["last_error_type"] = last_error_type
+    if handler_result_summary is not None:
+        values["handler_result_summary"] = handler_result_summary
+    if bump_attempt or add_attempt > 0:
+        from sqlalchemy import literal_column
+        incr = 1 if bump_attempt else 0
+        incr += int(add_attempt)
+        values["attempt_count"] = TelegramWebhookUpdate.attempt_count + literal_column(str(incr))
+    if state in (TelegramWebhookState.done.value, TelegramWebhookState.failed.value):
+        values["processed_at"] = func.now()
     stmt = (
         update(TelegramWebhookUpdate)
         .where(TelegramWebhookUpdate.update_id == update_id)
-        .values(
-            state=state,
-            last_error=last_error,
-            last_error_type=last_error_type,
-            handler_result_summary=handler_result_summary,
-            processed_at=func.now() if state in (
-                TelegramWebhookState.done.value,
-                TelegramWebhookState.failed.value,
-            ) else None,
-        )
+        .values(**values)
         .execution_options(synchronize_session=False)
     )
-    db.execute(stmt)
-    db.commit()
+    try:
+        db.execute(stmt)
+        db.commit()
+    except Exception as inner:  # noqa: BLE001 — never propagate secondary DB errors
+        _safe_rollback(db)
+        logger.error(
+            "webhook update_id=%s transition_update state=%s failed %s: %s",
+            update_id, state, type(inner).__name__, inner,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Temporary vs permanent error classification.
-# Only TEMPORARY failures get retried (either immediately in-process with
-# small backoff, or via Telegram's delivery replay once we return 200 and leave
-# the row in ``retryable``).
+# Only TEMPORARY failures get retried. Two retry tiers exist:
+#   (a) IN-PROCESS small backoff (0.2s … 1.0s capped) — inside the same HTTP
+#       request, before returning — used for fast transients (flaky TCP).
+#   (b) CROSS-REQUEST via Telegram's webhook redelivery (HTTP 503 + state=retryable)
+#       — used when the in-process budget was not enough.
 # ---------------------------------------------------------------------------
 
 def _is_temporary_error(exc: BaseException) -> bool:
@@ -352,13 +597,23 @@ async def process_telegram_update_payload(
     pipeline). All state mutations go through this session so test fixtures and
     production share the same wiring.
 
-    Returns (HTTP status code, JSON body). The endpoint contract is:
-      * 200   — accepted (dispatched or replay-short-circuited or permanently failed)
-      * 400   — malformed / unknown payload
-      * 401   — webhook disabled / not configured
-      * 500   — boot wiring broken (operator action required)
+    HTTP status contract (Issue #18 Owner review F7 — critical):
+      * 200 — terminal / delivered: dispatch succeeded, permanent failure,
+              replay-short-circuit (done/failed), or live peer owns the claim.
+              Telegram considers these updates DELIVERED and moves on.
+      * 503 — retryable: claim hit a DB transient, PTB boot is temporarily
+              down, or the handler returned a temporary failure AND we still
+              have cross-request attempt budget left. Telegram WILL redeliver.
+      * 400 — malformed / unsupported payload (de_json failure / None update).
+      * 401 — TELEGRAM_WEBHOOK_SECRET not configured (fail closed).
     """
     now = now or datetime.now(timezone.utc)
+    max_attempts_cross = max(
+        1, int(_backend_settings.telegram_webhook_max_attempts or 1)
+    )
+    # In-process attempts are capped at the same budget but kept short so the
+    # response doesn't block Telegram's redelivery timer.
+    max_in_process = max_attempts_cross
 
     # 1) Configuration gating: if no secret is set the operator MUST NOT enable
     #    webhooks; fail closed.
@@ -367,10 +622,111 @@ async def process_telegram_update_payload(
         logger.error("TELEGRAM_WEBHOOK_SECRET not configured — rejecting webhook (fail closed)")
         return 401, {"ok": False, "error": "webhook_not_configured"}
 
-    # 2) Parse payload into a Telegram.Update object. Failure here = malformed,
-    #    short-circuit with 400 and never touch the idempotency table.
+    # 2) Boot PTB application ONCE before deserialization so we have a bound
+    #    Bot object to pass into TelegramUpdate.de_json. This fixes Issue #18
+    #    F5: CallbackQuery.answer() shortcuts require get_bot() to resolve.
+    #
+    #    Order: boot → de_json(bot=ptb_app.bot). If boot is temporarily down
+    #    we return HTTP 503 so Telegram replays after our cooldown. If boot
+    #    is permanently broken (token invalid etc.) we return HTTP 500 and
+    #    mark update as permanently failed (same payload would fail again).
     try:
-        tg_update = TelegramUpdate.de_json(raw_json, None)
+        ptb_app = await get_ptb_application()
+    except Exception as exc:  # noqa: BLE001
+        # We haven't parsed the update yet, so we don't know update_id. If
+        # raw_json has one we still try to write a state row for audit logs;
+        # if claim fails for any reason we just log it and fall through.
+        raw_update_id = raw_json.get("update_id") if isinstance(raw_json, dict) else None
+        err_type = type(exc).__name__
+        perm_cls_names = {"InvalidToken", "Forbidden", "BadRequest"}
+        # Use cooldown/permanent flag saved by get_ptb_application: if the
+        # failure was permanent => mark permanently failed once we have update_id
+        perm_fail = (raw_update_id is not None) and (
+            _PTB_INIT_FAIL_PERMANENT or err_type in perm_cls_names
+        )
+        temp_fail = not perm_fail
+        http_status = 200
+        final_state = TelegramWebhookState.retryable.value if temp_fail else TelegramWebhookState.failed.value
+        if raw_update_id is not None:
+            try:
+                uid_int = int(raw_update_id)
+            except (TypeError, ValueError):
+                uid_int = None
+            if uid_int is not None:
+                try:
+                    chat_id = user_id = utype = None
+                    # Minimal extraction from raw JSON without de_json.
+                    if isinstance(raw_json, dict):
+                        msg = raw_json.get("message")
+                        if isinstance(msg, dict):
+                            ch = msg.get("chat")
+                            fr = msg.get("from")
+                            if isinstance(ch, dict) and "id" in ch:
+                                try: chat_id = int(ch["id"])
+                                except Exception: pass  # noqa: E722
+                            if isinstance(fr, dict) and "id" in fr:
+                                try: user_id = int(fr["id"])
+                                except Exception: pass  # noqa: E722
+                            utype = "message"
+                        cq = raw_json.get("callback_query")
+                        if isinstance(cq, dict):
+                            fr = cq.get("from")
+                            msg = cq.get("message")
+                            if isinstance(fr, dict) and "id" in fr:
+                                try: user_id = int(fr["id"])
+                                except Exception: pass  # noqa: E722
+                            if isinstance(msg, dict):
+                                ch = msg.get("chat")
+                                if isinstance(ch, dict) and "id" in ch:
+                                    try: chat_id = int(ch["id"])
+                                    except Exception: pass  # noqa: E722
+                            utype = "callback_query"
+                except Exception:  # noqa: BLE001
+                    chat_id = user_id = utype = None
+                # Try to claim (no-op if already present).
+                outcome, _row = claim_update_or_short_circuit(
+                    db, uid_int, chat_id, user_id, utype
+                )
+                if outcome != ReplayOutcome.DB_TRANSIENT:
+                    err_str = str(exc)
+                    if len(err_str) > 10_000:
+                        err_str = err_str[:10_000]
+                    # Claim may have succeeded/failed via any route; force a
+                    # terminal state write for permanent boot failures so
+                    # the same broken payload doesn't 503 forever.
+                    try:
+                        transition_update(
+                            db, uid_int,
+                            state=final_state,
+                            last_error=err_str,
+                            last_error_type=err_type,
+                            bump_attempt=False,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+        logger.error(
+            "webhook PTB boot unavailable perm=%s update_id=%s %s: %s",
+            perm_fail, raw_update_id, err_type, exc,
+        )
+        if temp_fail:
+            # Cross-request replay wanted: HTTP 503 triggers Telegram redelivery.
+            http_status = 503
+        else:
+            # Permanent config issue: accept the delivery so Telegram stops.
+            http_status = 200
+        body = {
+            "ok": False,
+            "error": "bot_wiring_unavailable",
+            "error_type": err_type,
+            "state": final_state,
+            "retryable": temp_fail,
+        }
+        return http_status, body
+
+    # 3) Parse payload into a Telegram.Update object bound to ptb_app.bot.
+    bot: Bot | None = getattr(ptb_app, "bot", None)
+    try:
+        tg_update = TelegramUpdate.de_json(raw_json, bot)
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "webhook malformed update payload: %s: %s",
@@ -386,7 +742,7 @@ async def process_telegram_update_payload(
     update_id: int = int(tg_update.update_id)
     chat_id, user_id, utype = _effective_chat_user(tg_update)
 
-    # 3) Idempotency / staleness decision BEFORE any handler runs.
+    # 4) Idempotency / staleness decision BEFORE any handler runs.
     outcome, row = claim_update_or_short_circuit(
         db,
         update_id=update_id,
@@ -394,6 +750,15 @@ async def process_telegram_update_payload(
         user_id=user_id,
         update_type=utype,
     )
+    if outcome == ReplayOutcome.DB_TRANSIENT:
+        # Claim layer hit a DB transient → return HTTP 503, Telegram replays.
+        # Do NOT persist any row because we can't trust session state.
+        logger.warning(
+            "webhook update_id=%s chat_id=%s claim DB transient → returning 503 to Telegram",
+            update_id, chat_id,
+        )
+        return 503, {"ok": False, "error": "db_transient", "retryable": True,
+                     "state": TelegramWebhookState.retryable.value}
     if outcome == ReplayOutcome.DONE:
         logger.info(
             "webhook replay update_id=%s chat_id=%s state=done short_circuit=yes",
@@ -408,43 +773,23 @@ async def process_telegram_update_payload(
         return 200, {"ok": False, "replay": True, "state": "failed",
                      "error_type": row.last_error_type if row else None}
     if outcome == ReplayOutcome.RETRY_ALLOWED and row is None:
-        # Concurrent live claim lost — return 200 OK silently; Telegram's
-        # delivery mechanism will replay when our peer finishes.
+        # Concurrent live claim lost — return 200 OK (delivery accepted); the
+        # winning peer dispatches and Telegram doesn't need to replay.
         logger.info(
             "webhook update_id=%s chat_id=%s claimed elsewhere (not stale) short_circuit=yes",
             update_id, chat_id,
         )
         return 200, {"ok": True, "replay": False, "state": "claimed_elsewhere"}
 
-    attempt_no = int(row.attempt_count) if row else 1
-
-    # 4) Boot PTB application (once per process). Any error here is a wiring
-    #    problem; we mark the update retryable so a fixed deployment can pick
-    #    it back up via Telegram replay.
-    try:
-        ptb_app = await get_ptb_application()
-    except Exception as exc:  # noqa: BLE001
-        err_type = type(exc).__name__
-        logger.error(
-            "webhook update_id=%s chat_id=%s PTB boot failed: %s: %s",
-            update_id, chat_id, err_type, exc,
-        )
-        _finalize_after_dispatch_error(
-            db,
-            update_id=update_id, attempt_no=attempt_no, exc=exc,
-            is_temp=True, force_failed=True,
-        )
-        return 200, {"ok": False, "error": "bot_wiring_unavailable",
-                     "error_type": err_type}
+    attempt_cross = int(row.delivery_count) if row else 1
 
     # 5) Dispatch to existing handlers (the EXACT same code path polling uses,
     #    via ``Application.process_update``).
-    max_attempts = max(1, int(_backend_settings.telegram_webhook_max_attempts or 1))
-    attempt = 0
+    attempt_in = 0
     last_exc: BaseException | None = None
     last_temp = False
-    while attempt < max_attempts:
-        attempt += 1
+    while attempt_in < max_in_process:
+        attempt_in += 1
         started = time.perf_counter()
         try:
             await ptb_app.process_update(tg_update)
@@ -456,96 +801,88 @@ async def process_telegram_update_payload(
                 handler_result_summary=f"process_update ok in {dur_ms}ms",
             )
             logger.info(
-                "webhook update_id=%s chat_id=%s user_id=%s type=%s state=done attempt=%d/%d dur_ms=%d",
-                update_id, chat_id, user_id, utype, attempt, max_attempts, dur_ms,
+                "webhook update_id=%s chat_id=%s user_id=%s type=%s state=done attempts_in=%d/%d cross_attempt=%d dur_ms=%d",
+                update_id, chat_id, user_id, utype, attempt_in, max_in_process, attempt_cross, dur_ms,
             )
-            return 200, {"ok": True, "state": "done", "attempts": attempt,
-                         "dur_ms": dur_ms}
+            return 200, {"ok": True, "state": "done", "attempts": attempt_in,
+                         "cross_attempt": attempt_cross, "dur_ms": dur_ms}
         except Exception as exc:  # noqa: BLE001 - 异常隔离: 任何 handler 异常都不能带出进程
             dur_ms = int((time.perf_counter() - started) * 1000)
             last_exc = exc
             last_temp = _is_temporary_error(exc)
             err_type = type(exc).__name__
             logger.warning(
-                "webhook update_id=%s chat_id=%s attempt=%d/%d state=exception temp=%s dur_ms=%s %s: %s",
-                update_id, chat_id, attempt, max_attempts, last_temp, dur_ms, err_type, exc,
+                "webhook update_id=%s chat_id=%s in_attempt=%d/%d state=exception temp=%s dur_ms=%s %s: %s",
+                update_id, chat_id, attempt_in, max_in_process, last_temp, dur_ms, err_type, exc,
                 exc_info=False,
             )
             if not last_temp:
                 # Permanent failure: no point retrying in-process.
                 break
-            # Backoff before in-process retry.
-            sleep_s = min(2 ** (attempt - 1), 5)
-            await asyncio.sleep(sleep_s)
+            if attempt_in < max_in_process:
+                # CodeRabbit + Owner guidance: keep in-request backoff SHORT
+                # so Telegram redelivery handles longer waits (cross-request).
+                # Also honour RetryAfter.retry_after explicitly if present.
+                sleep_s = min(0.2 * (2 ** (attempt_in - 1)), 1.0)
+                if isinstance(exc, RetryAfter):
+                    override = getattr(exc, "retry_after", None)
+                    if override is not None:
+                        try:
+                            override_f = float(override)
+                            sleep_s = min(override_f, 1.0)
+                        except Exception:  # noqa: BLE001
+                            pass
+                await asyncio.sleep(sleep_s)
 
     # 6) Post-loop: either permanent failure or temp budget exhausted.
     assert last_exc is not None
-    # Permanent failure OR in-process retries used the full budget => mark
-    # permanently failed so Telegram stops replaying it. If we still have
-    # budget via *cross-request* replays (attempt_no from the claim counter),
-    # leave retryable so the next Telegram delivery picks it up (fresh claim
-    # will bump attempt_count and give us another in-process budget cycle).
-    budget_spent_this_request = attempt >= max_attempts
-    cross_request_budget_spent = attempt_no >= max_attempts
-    force_failed = (not last_temp) or budget_spent_this_request or cross_request_budget_spent
-    _finalize_after_dispatch_error(
-        db,
-        update_id=update_id,
-        attempt_no=attempt_no,
-        exc=last_exc,
-        is_temp=last_temp,
-        force_failed=force_failed,
-    )
-    err_type = type(last_exc).__name__
-    final_state = (
-        TelegramWebhookState.failed.value
-        if force_failed else TelegramWebhookState.retryable.value
-    )
-    logger.error(
-        "webhook update_id=%s chat_id=%s final_state=%s attempts=%d/%d error_type=%s temp=%s",
-        update_id, chat_id, final_state, attempt, max_attempts, err_type, last_temp,
-    )
-    return 200, {
-        "ok": False,
-        "state": final_state,
-        "error_type": err_type,
-        "attempts": attempt,
-        "retryable": not force_failed,
-    }
-
-
-def _finalize_after_dispatch_error(
-    db,
-    *,
-    update_id: int,
-    attempt_no: int,
-    exc: BaseException,
-    is_temp: bool,
-    force_failed: bool,
-) -> None:
-    max_attempts = max(1, int(_backend_settings.telegram_webhook_max_attempts or 1))
-    next_state: str
-    if force_failed or attempt_no >= max_attempts:
-        next_state = TelegramWebhookState.failed.value
-    else:
-        next_state = (
-            TelegramWebhookState.retryable.value
-            if is_temp else TelegramWebhookState.failed.value
-        )
-    err_str = str(exc)
+    last_err_type = type(last_exc).__name__
+    err_str = str(last_exc)
     if len(err_str) > 10_000:
         err_str = err_str[:10_000]
+
+    # Classification:
+    #   * permanent handler error                 → force failed (HTTP 200)
+    #   * cross_request budget spent (attempt_cross >= max_attempts_cross)
+    #                                              → force failed (HTTP 200)
+    #   * otherwise temp + budget left             → retryable (HTTP 503)
+    permanent_fail = not last_temp
+    cross_budget_spent = attempt_cross >= max_attempts_cross
+    force_failed = permanent_fail or cross_budget_spent
+
+    if force_failed:
+        final_state = TelegramWebhookState.failed.value
+        http_status = 200
+    else:
+        final_state = TelegramWebhookState.retryable.value
+        http_status = 503  # triggers Telegram webhook redelivery (Issue #18 F7)
+
+    # Transition state. attempt_count is already bumped by the reclaim/claim
+    # step that loaded this request; we ADD our in-process attempts so a row
+    # that ran N in-process attempts reflects the true effort spent.
     try:
         transition_update(
             db,
             update_id,
-            next_state,
+            final_state,
             last_error=err_str,
-            last_error_type=type(exc).__name__,
+            last_error_type=last_err_type,
+            add_attempt=max(0, attempt_in - 1),
         )
-    except Exception as inner:  # noqa: BLE001
-        # Never ever propagate DB write errors back to the caller.
-        logger.error(
-            "webhook update_id=%s failed to persist error state: %s: %s",
-            update_id, type(inner).__name__, inner,
-        )
+    except Exception:  # noqa: BLE001
+        # transition_update already catches and logs, but we add another safety
+        # net so the HTTP response never 500s for state-persist reasons.
+        pass
+    logger.error(
+        "webhook update_id=%s chat_id=%s final_state=%s http=%s cross_attempt=%d/%d in_attempt=%d error_type=%s temp=%s",
+        update_id, chat_id, final_state, http_status, attempt_cross, max_attempts_cross,
+        attempt_in, last_err_type, last_temp,
+    )
+    return http_status, {
+        "ok": False,
+        "state": final_state,
+        "error_type": last_err_type,
+        "attempts": attempt_in,
+        "cross_attempt": attempt_cross,
+        "retryable": not force_failed,
+    }

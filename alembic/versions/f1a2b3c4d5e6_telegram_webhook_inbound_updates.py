@@ -1,14 +1,14 @@
 """Telegram webhook inbound update log + idempotency table.
 
 Revision ID: f1a2b3c4d5e6
-Revises: e3b4c5d6e7f8
+Revises: e2a114b2f9d0
 Create Date: 2026-08-20 09:30:00.000000
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "f1a2b3c4d5e6"
-down_revision = "e3b4c5d6e7f8"
+down_revision = "e2a114b2f9d0"
 branch_labels = None
 depends_on = None
 
@@ -25,6 +25,9 @@ def upgrade() -> None:
             sa.String(length=20),
             nullable=False,
             server_default="claimed",
+        ),
+        sa.Column(
+            "delivery_count", sa.BigInteger(), nullable=False, server_default="1",
         ),
         sa.Column(
             "attempt_count", sa.BigInteger(), nullable=False, server_default="1",
