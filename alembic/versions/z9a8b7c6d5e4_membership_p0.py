@@ -1,10 +1,10 @@
-"""PASAY-TASK-002 — Membership P0: Organization / Membership / Secretary Invite.
+"""PASAY-TASK-002 FIX1 — Membership P0: Organization / Membership / Secretary Invite.
 
 Revision ID: z9a8b7c6d5e4
-Revises: e2a114b2f9d0
+Revises: f1a2b3c4d5e6
 Create Date: 2026-08-20
 
-Scope (from PASAY-TASK-002 contract):
+Scope (from PASAY-TASK-002 contract + FIX1 amendments):
 1. ``organizations`` — minimal org entity (name + display_name + audit cols).
 2. ``memberships`` — User<->Org links with role (OWNER/SECRETARY), state
    (ACTIVE/REMOVED), audit timestamps, and a partial unique index enforcing
@@ -18,7 +18,7 @@ Scope (from PASAY-TASK-002 contract):
    Membership lifecycle events (appended; never renumbered/renamed).
 
 Rollback:
-    alembic downgrade e2a114b2f9d0
+    alembic downgrade f1a2b3c4d5e6
 """
 from typing import Union
 
@@ -27,7 +27,7 @@ import sqlalchemy as sa
 
 
 revision: str = "z9a8b7c6d5e4"
-down_revision: Union[str, None] = "e2a114b2f9d0"
+down_revision: Union[str, None] = "f1a2b3c4d5e6"
 branch_labels = None
 depends_on = None
 
@@ -40,6 +40,43 @@ AUDIT_ACTION_APPENDS = (
     "secretary_invite_cancelled",
     "secretary_removed",
 )
+
+_BASE_ALLOWED = (
+    "create,update,soft_delete,confirm,approve,reject,pay,reverse,"
+    "task_created,task_completed,task_cancelled,task_snoozed,"
+    "rule_created,rule_updated,rule_disabled,"
+    "task_auto_completed,task_auto_cancelled,task_backfilled,"
+    "task_reminder_redelivered,outbox_dropped,copilot_context_built,"
+    "copilot_proposal_created,copilot_proposal_confirmed,"
+    "copilot_proposal_cancelled,copilot_proposal_expired,"
+    "copilot_proposal_confirm_rejected,copilot_proposal_executing,"
+    "copilot_proposal_executed,copilot_proposal_execution_rejected,"
+    "task_reassigned,task_updated,task_completed_via_approval,"
+    "task_completed_via_rejection,task_completed_via_payment,"
+    "task_reminded,task_escalated,task_acknowledged,"
+    "phone_direct_update,blocked_created,blocked_resolved,"
+    "payment_promise_recorded,promise_fulfilled,promise_missed_refollow,"
+    "action_assigned,rent_followup_sent,"
+    "repair_created,proposal_submitted,proposal_approved,"
+    "proposal_rejected,repair_completed_pending_verification,"
+    "repair_closed_after_verification,repair_cancelled,"
+    "expense_claim_created,expense_claim_verified,"
+    "expense_claim_failed,expense_claim_reversed,"
+    "expense_amount_mismatch,expense_partially_paid,"
+    "expense_fully_paid,expense_requires_reapproval,"
+    "expense_resubmitted,expense_rejected"
+)
+
+
+def _set_audit_action_allowlist(conn, allowed_csv: str) -> None:
+    conn.execute(
+        sa.text("ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS ck_audit_logs_action")
+    )
+    values_sql = ",".join("'%s'" % v for v in allowed_csv.split(","))
+    conn.execute(sa.text(
+        "ALTER TABLE audit_logs ADD CONSTRAINT ck_audit_logs_action CHECK "
+        "(action IN (%s))" % values_sql
+    ))
 
 
 def upgrade() -> None:
@@ -54,7 +91,7 @@ def upgrade() -> None:
         sa.Column("updated_by", sa.BigInteger(), nullable=True),
         sa.CheckConstraint("length(btrim(name)) > 0", name="ck_organizations_name_nonblank"),
     )
-    op.create_index("ix_organizations_name_trgm", "organizations", ["name"])
+    op.create_index("ix_organizations_name", "organizations", ["name"])
 
     op.create_table(
         "memberships",
@@ -78,10 +115,6 @@ def upgrade() -> None:
             "(state = 'ACTIVE' AND removed_at IS NULL) OR "
             "(state = 'REMOVED' AND removed_at IS NOT NULL)",
             name="ck_memberships_state_removed_at",
-        ),
-        sa.UniqueConstraint(
-            "organization_id", "user_id", "role",
-            name="uq_memberships_org_user_role",
         ),
     )
     op.create_index("ix_memberships_organization_id", "memberships", ["organization_id"])
@@ -133,89 +166,15 @@ def upgrade() -> None:
     op.create_index("ix_secretary_invites_created_by_membership_id", "secretary_invites", ["created_by_membership_id"])
     op.create_index("ix_secretary_invites_state", "secretary_invites", ["state"])
     op.create_index("ix_secretary_invites_accepted_by_user_id", "secretary_invites", ["accepted_by_user_id"])
-    op.create_index(
-        "uq_secretary_invites_code_active",
-        "secretary_invites",
-        ["code"],
-        unique=True,
-        postgresql_where=sa.text("state = 'PENDING'"),
-    )
 
     conn = op.get_bind()
-    for value in AUDIT_ACTION_APPENDS:
-        conn.execute(
-            sa.text(
-                "ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS ck_audit_logs_action"
-            )
-        )
-        allowed = (
-            "create,update,soft_delete,confirm,approve,reject,pay,reverse,"
-            "task_created,task_completed,task_cancelled,task_snoozed,"
-            "rule_created,rule_updated,rule_disabled,"
-            "task_auto_completed,task_auto_cancelled,task_backfilled,"
-            "task_reminder_redelivered,outbox_dropped,copilot_context_built,"
-            "copilot_proposal_created,copilot_proposal_confirmed,"
-            "copilot_proposal_cancelled,copilot_proposal_expired,"
-            "copilot_proposal_confirm_rejected,copilot_proposal_executing,"
-            "copilot_proposal_executed,copilot_proposal_execution_rejected,"
-            "task_reassigned,task_updated,task_completed_via_approval,"
-            "task_completed_via_rejection,task_completed_via_payment,"
-            "task_reminded,task_escalated,task_acknowledged,"
-            "phone_direct_update,blocked_created,blocked_resolved,"
-            "payment_promise_recorded,promise_fulfilled,promise_missed_refollow,"
-            "action_assigned,rent_followup_sent,"
-            "repair_created,proposal_submitted,proposal_approved,"
-            "proposal_rejected,repair_completed_pending_verification,"
-            "repair_closed_after_verification,repair_cancelled,"
-            "expense_claim_created,expense_claim_verified,"
-            "expense_claim_failed,expense_claim_reversed,"
-            "expense_amount_mismatch,expense_partially_paid,"
-            "expense_fully_paid,expense_requires_reapproval,"
-            "expense_resubmitted,expense_rejected,"
-            "org_created,org_first_owner_activated,secretary_invited,"
-            "secretary_invite_accepted,secretary_invite_cancelled,"
-            "secretary_removed"
-        )
-        conn.execute(sa.text(
-            "ALTER TABLE audit_logs ADD CONSTRAINT ck_audit_logs_action CHECK "
-            "(action IN (%s))" % ",".join("'%s'" % v for v in allowed.split(","))
-        ))
+    expanded = _BASE_ALLOWED + "," + ",".join(AUDIT_ACTION_APPENDS)
+    _set_audit_action_allowlist(conn, expanded)
 
 
 def downgrade() -> None:
     conn = op.get_bind()
-    conn.execute(sa.text(
-        "ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS ck_audit_logs_action"
-    ))
-    base_allowed = (
-        "create,update,soft_delete,confirm,approve,reject,pay,reverse,"
-        "task_created,task_completed,task_cancelled,task_snoozed,"
-        "rule_created,rule_updated,rule_disabled,"
-        "task_auto_completed,task_auto_cancelled,task_backfilled,"
-        "task_reminder_redelivered,outbox_dropped,copilot_context_built,"
-        "copilot_proposal_created,copilot_proposal_confirmed,"
-        "copilot_proposal_cancelled,copilot_proposal_expired,"
-        "copilot_proposal_confirm_rejected,copilot_proposal_executing,"
-        "copilot_proposal_executed,copilot_proposal_execution_rejected,"
-        "task_reassigned,task_updated,task_completed_via_approval,"
-        "task_completed_via_rejection,task_completed_via_payment,"
-        "task_reminded,task_escalated,task_acknowledged,"
-        "phone_direct_update,blocked_created,blocked_resolved,"
-        "payment_promise_recorded,promise_fulfilled,promise_missed_refollow,"
-        "action_assigned,rent_followup_sent,"
-        "repair_created,proposal_submitted,proposal_approved,"
-        "proposal_rejected,repair_completed_pending_verification,"
-        "repair_closed_after_verification,repair_cancelled,"
-        "expense_claim_created,expense_claim_verified,"
-        "expense_claim_failed,expense_claim_reversed,"
-        "expense_amount_mismatch,expense_partially_paid,"
-        "expense_fully_paid,expense_requires_reapproval,"
-        "expense_resubmitted,expense_rejected"
-    )
-    conn.execute(sa.text(
-        "ALTER TABLE audit_logs ADD CONSTRAINT ck_audit_logs_action CHECK "
-        "(action IN (%s))" % ",".join("'%s'" % v for v in base_allowed.split(","))
-    ))
+    _set_audit_action_allowlist(conn, _BASE_ALLOWED)
 
     op.drop_table("secretary_invites")
     op.drop_table("memberships")

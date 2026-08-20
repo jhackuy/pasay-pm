@@ -35,6 +35,7 @@ from app.models.membership import (
 from app.models.user import User, UserRole
 from app.services.identity import resolve_telegram_human
 from app.services.membership import (
+    AlreadyMember,
     BootstrapBlocked,
     InviteBlocked,
     InviteConsumed,
@@ -374,7 +375,7 @@ class TestInviteAccept:
         accept_secretary_invite(db_session, bob.id, invite1.code)
         # A second invite for the same org + user should fail on accept (not on invite creation).
         invite2 = create_secretary_invite(db_session, alice.id, org.id)
-        with pytest.raises(BootstrapBlocked):
+        with pytest.raises(AlreadyMember):
             accept_secretary_invite(db_session, bob.id, invite2.code)
 
     def test_accept_rejects_inactive_user(self, db_session, user_a):
@@ -638,3 +639,252 @@ class TestHappyPathEndToEnd:
         assert is_secretary(db_session, bob.id, org.id) is False
         with pytest.raises(LookupError):
             resolve_telegram_org_membership(db_session, TEL_B, org.id)
+
+
+# ---------------------------------------------------------------------------
+# 7. PASAY-TASK-002 FIX1 Targeted Regression Tests
+#    a) Alembic single head
+#    b) Invite concurrent accept 最多成功一次
+#    c) EXPIRED 在新 Session 中真实持久化
+#    d) REMOVED Secretary 未来允许重新加入 (历史 UniqueConstraint 已移除)
+# ---------------------------------------------------------------------------
+
+class TestAlembicSingleHead:
+    def test_alembic_script_produces_exactly_one_head(self):
+        """FIX1: alembic/versions/ chain must converge to exactly 1 head; no
+        dangling branches caused by the former down_revision pointing to a
+        non-webhook parent."""
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(here)
+        alembic_ini = os.path.join(project_root, "alembic.ini")
+        cfg = Config(alembic_ini)
+        cfg.set_main_option("script_location", os.path.join(project_root, "alembic"))
+        script = ScriptDirectory.from_config(cfg)
+        heads = script.get_heads()
+        assert isinstance(heads, list)
+        assert len(heads) == 1, (
+            f"expected exactly 1 alembic head, got {len(heads)}: {heads}"
+        )
+
+
+import os  # noqa: E402  (placed after TestAlembicSingleHead to keep sections tidy)
+import threading  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
+
+
+class TestInviteConcurrentAccept:
+    def _make_scenario(self, test_engine, db_session, user_a, user_b, user_c):
+        alice, _ = user_a
+        bob, _ = user_b
+        carol, _ = user_c
+        org, _ = bootstrap_first_owner(db_session, alice.id, "RaceLand")
+        invite = create_secretary_invite(db_session, alice.id, org.id)
+        # Ensure state is flushed and visible to other sessions
+        db_session.expire_all()
+        return test_engine, alice.id, bob.id, carol.id, org.id, invite.code
+
+    def test_concurrent_accept_of_same_invite_produces_exactly_one_secretary(
+        self, test_engine, db_session, user_a, user_b, user_c
+    ):
+        """FIX1: 同一 invite 并发 accept，最多 1 次成功。
+        两个独立 Session 分别由不同用户（Bob vs Carol）并发 accept；
+        必须恰好 1 人成功创建 ACTIVE SECRETARY，另 1 人抛 InviteConsumed；
+        最终 DB 只有 1 条 SECRETARY Membership。
+        """
+        engine, _, bob_id, carol_id, org_id, code = self._make_scenario(
+            test_engine, db_session, user_a, user_b, user_c
+        )
+
+        results: list[dict] = []
+        lock = threading.Lock()
+
+        def worker(wid: int, uid: int):
+            Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+            s = Session()
+            try:
+                m = accept_secretary_invite(s, uid, code)
+                with lock:
+                    results.append({"worker": wid, "ok": True, "mid": m.id, "uid": uid})
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    results.append({
+                        "worker": wid,
+                        "ok": False,
+                        "uid": uid,
+                        "exc_type": type(exc).__name__,
+                        "exc": str(exc),
+                    })
+            finally:
+                s.close()
+
+        t1 = threading.Thread(target=worker, args=(1, bob_id))
+        t2 = threading.Thread(target=worker, args=(2, carol_id))
+        t1.start()
+        t2.start()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+
+        # Both workers completed
+        assert len(results) == 2
+        oks = [r for r in results if r["ok"]]
+        fails = [r for r in results if not r["ok"]]
+        # Exactly one success, exactly one failure
+        assert len(oks) == 1, f"expected 1 success, got {len(oks)}: {results}"
+        assert len(fails) == 1, f"expected 1 failure, got {len(fails)}: {results}"
+        # Failure is InviteConsumed (not IntegrityError / raw DB error leaked)
+        assert fails[0]["exc_type"] == "InviteConsumed", fails
+        # DB: only one SECRETARY membership ever created for (org, this invite's acceptor)
+        q = (
+            db_session.query(Membership)
+            .filter(
+                Membership.organization_id == org_id,
+                Membership.role == OrganizationRole.SECRETARY,
+            )
+        )
+        all_rows = q.all()
+        active_rows = q.filter(Membership.state == MembershipState.ACTIVE).all()
+        assert len(active_rows) == 1, f"active secretary rows: {len(active_rows)}"
+        assert len(all_rows) == 1, f"any secretary rows: {len(all_rows)}; invite=once only"
+
+
+class TestExpiredInvitePersists:
+    def test_expired_state_durable_across_fresh_session_after_accept_fails(
+        self, test_engine, db_session, user_a, user_b
+    ):
+        """FIX1: PENDING->EXPIRED 必须真实写入数据库。即使 accept 最终抛
+        InviteConsumed，新 Session 再读取也必须是 EXPIRED，而不是 PENDING。
+        """
+        alice, _ = user_a
+        bob, _ = user_b
+        org, _ = bootstrap_first_owner(db_session, alice.id, "StaleLand")
+        invite = create_secretary_invite(
+            db_session, alice.id, org.id,
+            ttl=timedelta(minutes=1),
+        )
+        code = invite.code
+        future_now = invite.expires_at + timedelta(seconds=10)
+
+        # Session 1: accept -> InviteConsumed (expired transition fired)
+        with pytest.raises(InviteConsumed):
+            accept_secretary_invite(db_session, bob.id, code, now=future_now)
+        # Sanity check within Session 1 for diagnostics only
+        db_session.expire_all()
+        db_invite_s1 = get_invite_by_code(db_session, code)
+        assert db_invite_s1 is not None
+        assert db_invite_s1.state == InviteState.EXPIRED
+
+        # Session 2: brand-new Session — read EXPIRED, never PENDING
+        Session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+        s2 = Session()
+        try:
+            db_invite_s2 = get_invite_by_code(s2, code)
+            assert db_invite_s2 is not None, "invite row disappeared across sessions"
+            assert db_invite_s2.state == InviteState.EXPIRED, (
+                f"expected EXPIRED durable across sessions, got {db_invite_s2.state.value}"
+            )
+        finally:
+            s2.close()
+
+    def test_expired_state_durable_across_fresh_session_after_cancel_fails(
+        self, test_engine, db_session, user_a, user_b
+    ):
+        """FIX1: cancel 路径的 stale EXPIRED 转换也必须持久化到 DB。"""
+        alice, _ = user_a
+        bob, _ = user_b
+        org, _ = bootstrap_first_owner(db_session, alice.id, "CancelStaleLand")
+        invite = create_secretary_invite(
+            db_session, alice.id, org.id,
+            ttl=timedelta(minutes=1),
+        )
+        invite_id = invite.id
+        future_now = invite.expires_at + timedelta(seconds=1)
+
+        with pytest.raises(InviteConsumed):
+            cancel_secretary_invite(db_session, alice.id, invite_id, now=future_now)
+
+        Session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+        s2 = Session()
+        try:
+            row = s2.get(SecretaryInvite, invite_id)
+            assert row is not None
+            assert row.state == InviteState.EXPIRED
+        finally:
+            s2.close()
+
+
+class TestRemovedSecretaryCanRejoin:
+    def test_removed_secretary_can_be_reinvited_to_active_secretary(
+        self, db_session, user_a, user_b
+    ):
+        """FIX1: uq_memberships_org_user_role 历史唯一约束必须不存在；
+        Secretary REMOVED 后允许重新 invite → 新建 ACTIVE SECRETARY Membership。
+        """
+        alice, _ = user_a
+        bob, _ = user_b
+        org, _ = bootstrap_first_owner(db_session, alice.id, "RejoinLand")
+
+        # --- First tenure ---
+        invite_v1 = create_secretary_invite(db_session, alice.id, org.id)
+        m1 = accept_secretary_invite(db_session, bob.id, invite_v1.code)
+        assert m1.role == OrganizationRole.SECRETARY
+        assert m1.state == MembershipState.ACTIVE
+        removed = remove_secretary(db_session, alice.id, org.id, bob.id, reason="r1")
+        assert removed.id == m1.id
+        assert removed.state == MembershipState.REMOVED
+        # Old REMOVED history still preserved
+        history_removed = (
+            db_session.query(Membership)
+            .filter(
+                Membership.organization_id == org.id,
+                Membership.user_id == bob.id,
+                Membership.state == MembershipState.REMOVED,
+            ).all()
+        )
+        assert len(history_removed) == 1
+
+        # --- Second tenure (the real FIX1 assertion: uq_org_user_role gone) ---
+        invite_v2 = create_secretary_invite(db_session, alice.id, org.id)
+        m2 = accept_secretary_invite(db_session, bob.id, invite_v2.code)
+        assert m2.id != m1.id, "re-invite must create a NEW membership row, not revive"
+        assert m2.role == OrganizationRole.SECRETARY
+        assert m2.state == MembershipState.ACTIVE
+        # Total rows for (org, bob) = REMOVED v1 + ACTIVE v2 = 2
+        all_bob = (
+            db_session.query(Membership)
+            .filter(
+                Membership.organization_id == org.id,
+                Membership.user_id == bob.id,
+            ).order_by(Membership.id.asc()).all()
+        )
+        assert len(all_bob) == 2, f"expected 2 rows, got {len(all_bob)}"
+        assert all_bob[0].state == MembershipState.REMOVED
+        assert all_bob[1].state == MembershipState.ACTIVE
+        assert is_secretary(db_session, bob.id, org.id) is True
+
+    def test_removed_secretary_telegram_chain_recovers_after_rejoin(
+        self, db_session, user_a, user_b
+    ):
+        """FIX1: 重新加入后 Telegram 解析链应重新解析到 ACTIVE Membership。"""
+        alice, _ = user_a
+        bob, _ = user_b
+        org, _ = bootstrap_first_owner(db_session, alice.id, "TeleRejoinLand")
+
+        invite_v1 = create_secretary_invite(db_session, alice.id, org.id)
+        accept_secretary_invite(db_session, bob.id, invite_v1.code)
+        remove_secretary(db_session, alice.id, org.id, bob.id)
+        # Removed: chain fails
+        with pytest.raises(LookupError):
+            resolve_telegram_org_membership(db_session, TEL_B, org.id)
+
+        invite_v2 = create_secretary_invite(db_session, alice.id, org.id)
+        accept_secretary_invite(db_session, bob.id, invite_v2.code)
+        # Rejoined: chain succeeds, SECRETARY
+        u, p, m = resolve_telegram_org_membership(
+            db_session, TEL_B, org.id, role=OrganizationRole.SECRETARY,
+        )
+        assert u.id == bob.id
+        assert m.role == OrganizationRole.SECRETARY
+        assert m.state == MembershipState.ACTIVE

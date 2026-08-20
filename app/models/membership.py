@@ -1,4 +1,4 @@
-"""PASAY-TASK-002 — Organization / Membership / Secretary Invite foundation.
+"""PASAY-TASK-002 FIX1 — Organization / Membership / Secretary Invite foundation.
 
 Implements the minimal personnel identity loop:
     Organization -> Membership (OWNER/SECRETARY) -> User -> HUMAN Principal
@@ -9,9 +9,13 @@ Design rules (CONFIRMED BY ISSUE CONTRACT):
   the authoritative chain stays:
       TelegramIdentityBinding -> HUMAN Principal -> User -> Membership
 - Membership.role ∈ {OWNER, SECRETARY}; Membership.state ∈ {ACTIVE, REMOVED}.
-- A User may hold at most one ACTIVE Membership per Organization.
+- A User may hold at most one ACTIVE Membership per Organization
+  (uq_memberships_active_user_org partial unique index enforces this at DB layer).
 - An Organization allows 1..N OWNER, 0..N SECRETARY.
 - Secretary removals flip state -> REMOVED (audit fact preserved; no hard delete).
+  REMOVED Secretary can be re-invited later and re-join as ACTIVE SECRETARY
+  (historical REMOVED rows are preserved; the uq_memberships_org_user_role
+  historical-unique constraint was deliberately removed in FIX1).
 - Invites are one-time, single-consumption, expirable; an used/expired
   invite never produces a second Membership.
 """
@@ -26,7 +30,6 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -56,7 +59,7 @@ class Organization(AuditMixin, Base):
     __table_args__ = (
         CheckConstraint("length(btrim(name)) > 0", name="ck_organizations_name_nonblank"),
     )
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
     display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
@@ -75,10 +78,6 @@ class Membership(AuditMixin, Base):
             "(state = 'ACTIVE' AND removed_at IS NULL) OR "
             "(state = 'REMOVED' AND removed_at IS NOT NULL)",
             name="ck_memberships_state_removed_at",
-        ),
-        UniqueConstraint(
-            "organization_id", "user_id", "role",
-            name="uq_memberships_org_user_role",
         ),
         Index(
             "uq_memberships_active_user_org",
@@ -131,8 +130,6 @@ class SecretaryInvite(AuditMixin, Base):
             name="ck_secretary_invites_state_timestamps",
         ),
         CheckConstraint("expires_at > created_at", name="ck_secretary_invites_expires_after_created"),
-        Index("uq_secretary_invites_code_active", "code", unique=True,
-              postgresql_where=text("state = 'PENDING'")),
     )
     code: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     organization_id: Mapped[int] = mapped_column(

@@ -1,4 +1,4 @@
-"""PASAY-TASK-002 — Membership service: bootstrap, invite, accept, remove, auth helpers.
+"""PASAY-TASK-002 FIX1 — Membership service: bootstrap, invite, accept, remove, auth helpers.
 
 Authoritative identity chain (CONFIRMED BY CODE):
     Telegram external_user_id
@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction
@@ -116,6 +117,16 @@ def active_owner_count(db: Session, organization_id: int) -> int:
 
 class BootstrapBlocked(ValueError):
     """The user is already bound to an Organization and cannot bootstrap a new one."""
+
+
+class AlreadyMember(ValueError):
+    """Raised in invite-accept path when the user already holds an ACTIVE
+    membership in the target organization (prevent double-membership).
+
+    Deliberately distinct from ``BootstrapBlocked`` so callers can tell apart
+    ``cannot bootstrap a new Organization`` from ``already a member, invite
+    rejected``.
+    """
 
 
 def bootstrap_first_owner(
@@ -292,9 +303,18 @@ def get_invite_by_code(db: Session, code: str) -> SecretaryInvite | None:
     return db.query(SecretaryInvite).filter(SecretaryInvite.code == code).one_or_none()
 
 
-def _mark_invite_expired_if_stale(db: Session, invite: SecretaryInvite, now: datetime) -> None:
+def _mark_invite_expired_if_stale(db: Session, invite: SecretaryInvite, now: datetime) -> bool:
+    """Transition PENDING->EXPIRED when ``expires_at <= now``.
+
+    Returns ``True`` if a state transition actually happened so the caller
+    knows it must persist the change (commit) even if it will later raise an
+    exception to the caller — the visible state must be durable across new
+    sessions, not just within the current Unit-of-Work.
+    """
     if invite.state == InviteState.PENDING and invite.expires_at <= now:
         invite.state = InviteState.EXPIRED
+        return True
+    return False
 
 
 def accept_secretary_invite(
@@ -307,28 +327,61 @@ def accept_secretary_invite(
     """Accept a PENDING invite as ``user_id`` and create an ACTIVE SECRETARY
     Membership.
 
-    Idempotency: if the same user tries to accept **the same** invite code a
-    second time, the existing Membership is returned unchanged. Any other
-    terminal state (ACCEPTED by a different user, CANCELLED, EXPIRED) raises
-    InviteConsumed.
+    Concurrency contract (FIX1):
+      * The invite row is locked with ``SELECT ... FOR UPDATE`` inside the
+        transaction so concurrent acceptors serialize.
+      * ``created_membership_id`` is backed by a UNIQUE FK constraint at DB
+        layer; if a second transaction somehow wins before the lock takes
+        effect, the resulting ``IntegrityError`` is re-raised as
+        ``InviteConsumed`` so the caller never sees a DB error.
+      * Exactly ONE successful accept ever produces a Membership.
+
+    Stale-expiry contract (FIX1):
+      * If the invite is PENDING-but-expired on arrival, ``state`` is
+        transitioned to ``EXPIRED`` and **committed durably** before raising
+        ``InviteConsumed``.  A second caller using a brand-new ``Session``
+        will observe ``EXPIRED`` (never ``PENDING``), which is the required
+        visible invariant.
+
+    Idempotency:
+      * If the accepting **same user** re-enters an already ``ACCEPTED``
+        invite, and the linked Membership is still ``ACTIVE``, we return the
+        existing Membership. If that membership has since been REMOVED the
+        invite is considered consumed (it is a one-time key and we do not
+        regenerate memberships off stale ACCEPTED invites — the Owner must
+        create a fresh invite).
     """
     now = now or datetime.now(timezone.utc)
-    invite = get_invite_by_code(db, code)
+
+    # Step 1: Lock the invite row with FOR UPDATE so concurrent acceptors
+    # serialize.  Even if two requests race, the row-level exclusive lock
+    # forces one to wait until the other commits or rolls back.
+    invite_q = (
+        db.query(SecretaryInvite)
+        .filter(SecretaryInvite.code == code)
+        .with_for_update(key_share=False)
+    )
+    invite = invite_q.one_or_none()
     if invite is None:
         raise InviteConsumed(f"invite code {code!r} does not exist")
 
-    _mark_invite_expired_if_stale(db, invite, now)
-    db.flush()
+    # Step 2: Transition to EXPIRED if stale. If the state changed we must
+    # persist it before raising so future sessions read EXPIRED, not PENDING.
+    stale_transitioned = _mark_invite_expired_if_stale(db, invite, now)
+    if stale_transitioned:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.refresh(invite)
 
+    # Step 3: Handle ACCEPTED terminal state idempotent re-enter.
     if invite.state == InviteState.ACCEPTED:
         if invite.accepted_by_user_id != user_id:
             raise InviteConsumed(
                 f"invite {code!r} already consumed by user_id={invite.accepted_by_user_id!r}"
             )
-        # Same user re-accepting: deterministically return the membership we
-        # already produced for this exact invite. created_membership_id is
-        # UNIQUE, so an ACCEPTED invite without a linked row would be a data
-        # integrity failure — we do NOT silently paper over that.
         if invite.created_membership_id is None:
             raise RuntimeError(
                 f"invite {code!r} is ACCEPTED but has no created_membership_id"
@@ -338,69 +391,92 @@ def accept_secretary_invite(
             raise RuntimeError(
                 f"invite {code!r} created_membership_id={invite.created_membership_id!r} no longer exists"
             )
+        # FIX1: Accidental stale data guard — the ACCEPTED invite links to an
+        # existing Membership row but a downstream admin may have REMOVED that
+        # membership. The invite's one-time property is already consumed; we
+        # do NOT treat the ACCEPTED invite as a re-activation key. Instead
+        # InviteConsumed is raised and owners must issue a new invite.
+        if membership.state != MembershipState.ACTIVE:
+            raise InviteConsumed(
+                f"invite {code!r} ACCEPTED but linked membership state is {membership.state.value!r}; "
+                f"issue a new invite"
+            )
         return membership
+
     if invite.state != InviteState.PENDING:
+        # EXPIRED or CANCELLED: already durable above. Raise.
         raise InviteConsumed(f"invite {code!r} is {invite.state.value}")
 
+    # Step 4: Validate acceptor user (active / exists).
     user = db.get(User, user_id)
     if user is None or not user.is_active:
         raise LookupError("accepting user does not exist or is inactive")
 
-    # Fail-fast if the user already holds an ACTIVE membership of any role in
-    # the target org. Membership is the authority; we do not allow a second
-    # ACTIVE row for the same (org, user).
+    # Step 5: Fail-fast if the acceptor already has any ACTIVE membership in
+    # the target org. Use a precise exception class for the invite-accept
+    # context (AlreadyMember) so callers never confuse it with the bootstrap
+    # path's BootstrapBlocked.
     if has_active_membership(db, user_id, invite.organization_id) is not None:
-        raise BootstrapBlocked(
+        raise AlreadyMember(
             f"user_id={user_id!r} already has an ACTIVE membership in org={invite.organization_id!r}"
         )
 
-    invite.state = InviteState.ACCEPTED
-    invite.accepted_at = now
-    invite.accepted_by_user_id = user_id
+    # Step 6: Atomically produce the Membership, link it to the invite, write
+    # audit and commit. Use IntegrityError on the UNIQUE created_membership_id
+    # as the final back-stop.
+    try:
+        invite.state = InviteState.ACCEPTED
+        invite.accepted_at = now
+        invite.accepted_by_user_id = user_id
+        creator_membership = db.get(Membership, invite.created_by_membership_id)
 
-    creator_membership = db.get(Membership, invite.created_by_membership_id)
+        membership = Membership(
+            organization_id=invite.organization_id,
+            user_id=user_id,
+            role=OrganizationRole.SECRETARY,
+            state=MembershipState.ACTIVE,
+            invited_by_membership_id=(creator_membership.id if creator_membership else None),
+            joined_at=now,
+        )
+        db.add(membership)
+        db.flush()  # assigns membership.id
 
-    membership = Membership(
-        organization_id=invite.organization_id,
-        user_id=user_id,
-        role=OrganizationRole.SECRETARY,
-        state=MembershipState.ACTIVE,
-        invited_by_membership_id=(creator_membership.id if creator_membership else None),
-        joined_at=now,
-    )
-    db.add(membership)
-    db.flush()
+        invite.created_membership_id = membership.id
+        db.flush()  # UNIQUE constraint on created_membership_id asserts here
 
-    invite.created_membership_id = membership.id
-    db.flush()
+        record_audit(
+            db,
+            table_name="secretary_invites",
+            record_id=invite.id,
+            action=AuditAction("secretary_invite_accepted"),
+            actor_id=user_id,
+            new_value={
+                "accepted_by_user_id": user_id,
+                "accepted_at": now.isoformat(),
+                "created_membership_id": membership.id,
+            },
+        )
+        record_audit(
+            db,
+            table_name="memberships",
+            record_id=membership.id,
+            action=AuditAction("secretary_invite_accepted"),
+            actor_id=user_id,
+            new_value={
+                "organization_id": membership.organization_id,
+                "user_id": membership.user_id,
+                "role": OrganizationRole.SECRETARY.value,
+                "state": MembershipState.ACTIVE.value,
+                "invite_code": code,
+            },
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise InviteConsumed(
+            f"invite {code!r} concurrently consumed by another request"
+        ) from exc
 
-    record_audit(
-        db,
-        table_name="secretary_invites",
-        record_id=invite.id,
-        action=AuditAction("secretary_invite_accepted"),
-        actor_id=user_id,
-        new_value={
-            "accepted_by_user_id": user_id,
-            "accepted_at": now.isoformat(),
-            "created_membership_id": membership.id,
-        },
-    )
-    record_audit(
-        db,
-        table_name="memberships",
-        record_id=membership.id,
-        action=AuditAction("secretary_invite_accepted"),
-        actor_id=user_id,
-        new_value={
-            "organization_id": membership.organization_id,
-            "user_id": membership.user_id,
-            "role": OrganizationRole.SECRETARY.value,
-            "state": MembershipState.ACTIVE.value,
-            "invite_code": code,
-        },
-    )
-    db.commit()
     db.refresh(invite)
     db.refresh(membership)
     return membership
@@ -424,7 +500,16 @@ def cancel_secretary_invite(
         raise InviteBlocked(
             f"caller user_id={owner_user_id!r} is not an ACTIVE OWNER in org={invite.organization_id!r}"
         )
-    _mark_invite_expired_if_stale(db, invite, now)
+    # Handle EXPIRED transition first — if the invite was PENDING-but-stale we
+    # persist EXPIRED so future sessions see the truth.
+    stale_transitioned = _mark_invite_expired_if_stale(db, invite, now)
+    if stale_transitioned:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        db.refresh(invite)
     if invite.state != InviteState.PENDING:
         raise InviteConsumed(f"invite id={invite_id!r} is {invite.state.value}, cannot cancel")
     invite.state = InviteState.CANCELLED
@@ -466,16 +551,16 @@ def remove_secretary(
 ) -> Membership:
     """Transition the target Secretary's Membership to REMOVED.
 
-    Authorities enforced:
-      * Caller must be an ACTIVE OWNER in the same organization.
-      * Target must be an ACTIVE SECRETARY in that organization.
-      * A Secretary may NEVER remove an OWNER (even if somehow the call was
-        routed incorrectly — the role check below is exhaustive, and the
-        target's SECRETARY role is explicit).
-      * Attempting to remove an OWNER via this helper returns RemovalBlocked
-        with a distinct message so audits/logs never conflate the two.
-    Idempotency: if the same target has already been REMOVED by the same
-    owner (within the same org) the existing row is returned unchanged.
+    Lookup strategy (FIX1):
+      1. First try to find the **ACTIVE SECRETARY** row. If found, this is
+         the removal target — we never accidentally remove an OWNER because
+         the role=SECRETARY filter is exhaustive.
+      2. If no ACTIVE SECRETARY row exists, fall back to the **latest row
+         of any role/state** for (org, user). This second lookup provides
+         the friendly idempotent behaviour when the caller repeats a removal
+         request for a Secretary that has already been REMOVED: we inspect
+         the latest row and either return REMOVED (idempotent no-op) or
+         surface the real reason (role != SECRETARY or impossible state).
     """
     now = now or datetime.now(timezone.utc)
     owner_membership = has_active_membership(
@@ -489,7 +574,17 @@ def remove_secretary(
     target_membership = db.query(Membership).filter(
         Membership.organization_id == organization_id,
         Membership.user_id == secretary_user_id,
-    ).order_by(Membership.id.desc()).first()
+        Membership.role == OrganizationRole.SECRETARY,
+        Membership.state == MembershipState.ACTIVE,
+    ).one_or_none()
+
+    if target_membership is None:
+        # No ACTIVE SECRETARY row — check latest row for idempotent messaging.
+        target_membership = db.query(Membership).filter(
+            Membership.organization_id == organization_id,
+            Membership.user_id == secretary_user_id,
+        ).order_by(Membership.id.desc()).first()
+
     if target_membership is None:
         raise LookupError(
             f"user_id={secretary_user_id!r} has no membership in org={organization_id!r}"
@@ -566,11 +661,12 @@ def resolve_telegram_org_membership(
     user, human_principal = resolve_telegram_human(db, external_telegram_user_id)
     membership = has_active_membership(db, user.id, organization_id, role=role)
     if membership is None:
-        want = (
-            OrganizationRole.OWNER.value
-            if isinstance(role, OrganizationRole)
-            else ("/".join(r.value for r in role) if role else "ANY")
-        )
+        if isinstance(role, OrganizationRole):
+            want = role.value
+        elif role:
+            want = "/".join(r.value for r in role)
+        else:
+            want = "ANY"
         raise LookupError(
             f"telegram_id={external_telegram_user_id!r} (user_id={user.id!r}) "
             f"has no ACTIVE {want} membership in org={organization_id!r}"
