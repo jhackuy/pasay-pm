@@ -9,12 +9,12 @@ Description: Next Dev - 一键执行下一个开发任务或返修任务。支�
 
 Owner 在 TRAE IDE 中输入：
 
-- `\ND` → 自动发现唯一任务（现有行为，零变更）
-- `\ND {ISSUE_NUMBER}` → 显式选择 GitHub Issue（PASAY-TASK-005 新增）
+- `/ND` → 自动发现唯一任务（现有行为，零变更）
+- `/ND {ISSUE_NUMBER}` → 显式选择 GitHub Issue（PASAY-TASK-005 新增）
 
 例如：
-- `\ND 20` → 精准选择 `jhackuy/pasay-pm` 的 GitHub Issue #20
-- `\ND 22` → 精准选择 Issue #22
+- `/ND 20` → 精准选择 `jhackuy/pasay-pm` 的 GitHub Issue #20
+- `/ND 22` → 精准选择 Issue #22
 
 治理边界：
 
@@ -26,7 +26,7 @@ Owner 在 TRAE IDE 中输入：
 
 ## 任务优先级
 
-### A. 无参数模式（`\ND`）
+### A. 无参数模式（`/ND`）
 
 每次启动按以下顺序寻找唯一任务：
 
@@ -35,23 +35,27 @@ Owner 在 TRAE IDE 中输入：
 
 如果同一优先级存在多个候选，必须输出 `AMBIGUOUS_DEV_TASK` 并停止，不得自行猜测。
 
-### B. 显式 Issue 模式（`\ND {ISSUE_NUMBER}`，PASAY-TASK-005 NEW）
+### B. 显式 Issue 模式（`/ND {ISSUE_NUMBER}`，PASAY-TASK-005 NEW）
 
-仅当用户输入**恰好一个裸正整数**参数时进入本模式。例如 `\ND 20`。
+仅当用户输入**恰好一个裸正整数**参数时进入本模式。例如 `/ND 20`。
 
-执行顺序：
+**执行顺序（PASAY-TASK-005-FIX1 修复：先读取 Issue + 关联 PR，再按 Repair / New Dev 分别下门禁）：**
 
 1. **跳过 1A/1B 全局候选扫描**。显式 Issue 编号是 Owner 的精准路由指令，不再和其他 Issue 一起做"全局唯一候选"判断。这绝不等于跳过审批门禁——下一步立即单独核验。
-2. 通过 GitHub MCP 直接读取 `jhackuy/pasay-pm` 的该 Issue，强制检查下列门禁，任一不满足立即 STOP：
+2. 通过 GitHub MCP 直接读取 `jhackuy/pasay-pm` 的该 Issue，先核验下列**基础门禁**，任一不满足立即 STOP：
    - Issue 必须 OPEN。
    - 必须含 `route:dev`。
-   - 必须含 `ready-for-dev`。
    - 不得含 `blocked`。
-3. 上述门禁通过后，再判断 Repair / New Dev：
-   - 若该 Issue 已关联**恰好一个 OPEN PR**，且该 PR 中存在最新的总控返修合同标记 `ND_RETURN` → **Repair Mode**（沿用 Repair Mode 完整合同）。
-   - 若该 Issue**没有关联 OPEN PR** → **New Dev Mode**（沿用 New Dev Mode 完整合同）。
-   - 若关联了**多个 OPEN PR** → `AMBIGUOUS_DEV_TASK` → STOP。
-4. Claim（移除 Issue `ready-for-dev`）、开发、tests、commit、push、PR handoff 全部沿用 `/ND` 的既有合同，没有任何权限放松。
+3. 基础门禁通过后，**立即读取该 Issue 关联的所有 OPEN PR**（按 GitHub MCP `closed_by_pull_requests` / PR list with state=OPEN），按数量 + 最新评论分支：
+   - **0 个 OPEN PR** → 继续执行 New Dev 专属门禁：必须含 `ready-for-dev`；若缺少 → `BLOCKED` reason="New Dev requires ready-for-dev" STOP。
+   - **恰好 1 个 OPEN PR** → 再检查该 PR 最新评论：
+     - 存在最新 `ND_RETURN` 合同评论（由 Owner 签发）→ **Repair Mode**（Repair Mode 专属门禁在 Repair Mode 合同内部重新核验 `ready-for-dev` + 领取）。
+     - 不存在最新 `ND_RETURN` 合同评论 → `BLOCKED` reason="DEV_TASK_ALREADY_RUNNING: 1 OPEN PR but no latest ND_RETURN on the PR; must not create 2nd PR" STOP。不得进入 New Dev；不得创建第二个 PR。
+   - **多个 OPEN PR** → `AMBIGUOUS_DEV_TASK` → STOP。
+4. Claim / 开发 / tests / commit / push / PR handoff：
+   - 若判定 Repair → Repair Mode 合同：继续在现有 PR head branch 上最小返修。
+   - 若判定 New Dev → New Dev Mode 合同：在独立分支新建 PR。
+   - 全部沿用既有 `/ND` 合同，不新增任何权限或放松。
 
 ### C. 非法参数（PASAY-TASK-005 — fail closed）
 
@@ -59,12 +63,12 @@ Owner 在 TRAE IDE 中输入：
 
 | 示例 | 拒绝原因 |
 |---|---|
-| `\ND abc` | 参数不是正整数 |
-| `\ND 20 21` | 参数个数 = 2，只允许 0 或 1 个 |
-| `\ND #20` | 含有 `#` 前缀，必须是裸数字 |
-| `\ND -1` | 负数，Issue number 非负 |
-| `\ND 0` | 0，GitHub Issue number 最小 = 1 |
-| `\ND ` 尾部有空格以外的额外字符 | 只能有 `<SP>` + `<正整数>`，无别名/无 flags |
+| `/ND abc` | 参数不是正整数 |
+| `/ND 20 21` | 参数个数 = 2，只允许 0 或 1 个 |
+| `/ND #20` | 含有 `#` 前缀，必须是裸数字 |
+| `/ND -1` | 负数，Issue number 必须 ≥ 1 |
+| `/ND 0` | 0，GitHub Issue number 最小 = 1 |
+| `/ND ` 尾部有空格以外的额外字符 | 只能有 `<SP>` + `<正整数>`，无别名/无 flags |
 
 **唯一合法形式**：
 
@@ -163,7 +167,7 @@ Owner 在 TRAE IDE 中输入：
 - Targeted Tests（如有）
 - Stop Condition
 
-合同不明确 → `BLOCKED_UNCLEAR_CONTRACT` → STOP。
+合同不明确 → `BLOCKED` reason="UNCLEAR_CONTRACT" → STOP。
 
 禁止要求 Owner 复制 Issue 内容。
 
@@ -174,7 +178,7 @@ Owner 在 TRAE IDE 中输入：
 - Git 查询使用非交互模式，禁止 pager 卡住。
 - 不覆盖其他 branch/worktree/未提交修改。
 
-无法确认 authority → `BLOCKED_UNCLEAR_AUTHORITY` → STOP。
+无法确认 authority → `BLOCKED` reason="UNCLEAR_AUTHORITY" → STOP。
 
 ### Claim
 
@@ -182,7 +186,7 @@ Owner 在 TRAE IDE 中输入：
 
 移除 `ready-for-dev` 作为领取动作，并重新读取确认。
 
-冲突 → `BLOCKED_CLAIM_CONFLICT` → STOP。
+冲突 → `BLOCKED` reason="CLAIM_CONFLICT" → STOP。
 
 ### 开发
 
@@ -192,7 +196,7 @@ Owner 在 TRAE IDE 中输入：
 - 禁止 force push / force-with-lease。
 - Issue 指定测试就按指定测试执行；未指定则只跑 changed files 直接相关的最小 targeted tests。
 
-测试失败若不能在当前 Scope 内最小修复 → 恢复 `ready-for-dev` → `BLOCKED_TEST_FAILURE` → STOP。
+测试失败若不能在当前 Scope 内最小修复 → 恢复 `ready-for-dev` → `BLOCKED` reason="TEST_FAILURE" → STOP。
 
 ### Handoff
 
@@ -225,25 +229,37 @@ PR 创建或返修 push 后：
 只允许：
 
 - `HANDOFF_COMPLETE`
-- `BLOCKED`
+- `BLOCKED`（附 reason：UNCLEAR_CONTRACT / UNCLEAR_AUTHORITY / CLAIM_CONFLICT / TEST_FAILURE / DEV_TASK_ALREADY_RUNNING / 其他定制原因）
 - `NO_APPROVED_DEV_TASK`
 - `AMBIGUOUS_DEV_TASK`
 - `DEV_TASK_ALREADY_RUNNING`
 - `INVALID_ND_ARGUMENT`
 
-当 Final Status = `INVALID_ND_ARGUMENT` 时，报告中必须额外列出：
-- 实际接收到的用户命令（原始字符串，精确到大小写和前后空格）
-- 唯一合法形式提示：`/ND` 或 `/ND <正整数>`
-- 本此无效原因（非正整数 / 多参数 / `#` 前缀 / 负数或零 / 含多余字符）
+当 Final Status = `INVALID_ND_ARGUMENT` 时：
+- 下列字段统一输出 `N/A`：PR number / branch / commit SHA / 修改文件 / targeted tests / blocker
+- 下列字段必须额外列出：
+  - 实际接收到的用户命令（原始字符串，精确到大小写和前后空格）
+  - 唯一合法形式提示：`/ND` 或 `/ND <正整数>`
+  - 本次无效原因（非正整数 / 多参数 / `#` 前缀 / 负数或零 / 含多余字符）
 
-最终报告必须中文、简短，只报告：
+最终报告必须中文、简短，并按下列两段拆分报告：
 
-- 模式：Repair / New Dev / Auto(模式A) / Explicit(模式B) / Invalid(模式C)
-- Issue number
-- PR number（如有）
-- branch
-- commit SHA
-- 修改文件
-- targeted tests
-- blocker（如有）
+**（1）调用模式（Invocation Mode）**，仅 3 选 1：
+- Auto（模式 A）
+- Explicit（模式 B）
+- Invalid（模式 C）
+
+**（2）执行模式（Execution Mode）**，仅 3 选 1：
+- Repair
+- New Dev
+- N/A
+
+最终报告其余字段：
+- Issue number（INVALID_ND_ARGUMENT 时 = N/A）
+- PR number（如有，INVALID 时 = N/A）
+- branch（INVALID 时 = N/A）
+- commit SHA（INVALID 时 = N/A）
+- 修改文件（INVALID 时 = N/A）
+- targeted tests（INVALID 时 = N/A）
+- blocker（如有，INVALID 时 = N/A）
 - Final Status
