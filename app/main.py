@@ -142,30 +142,55 @@ def _webhook_health_snapshot(db: Session) -> dict:
 def _architecture_health_snapshot() -> dict:
     """Scope G: Architecture Truth — single production runtime.
 
-    Reports the canonical frozen topology (Scope G "Health / Architecture Truth")
-    so operators can verify Worker→Queue→Container→Neon is the only active path.
+    Reports the canonical topology and whether the architecture can be
+    considered FROZEN. Per ND_RETURN PASAY-TASK-011 FIX1 blocker #4 this
+    field MUST NOT be hard-coded to True; it is derived from real checks
+    that mirror the Worker→Queue→Container→Neon production chain:
+
+      1. runtime_mode equals the production value.
+      2. Container ingestion token is configured (Worker→Container auth).
+      3. Pooled runtime DB URL is configured (Container→Neon runtime).
+      4. Direct/unpooled migration DB URL is configured (Container→Neon
+         migration startup, also Dockerfile fail-fast).
+      5. Long-polling import-chain exit gate has not been broken.
+
+    All five must hold before ``architecture_frozen`` is True.
     """
     runtime_mode = (settings.pasay_runtime_mode or "").strip()
+    runtime_mode_ok = runtime_mode == "cloudflare-container"
+    container_ingest_ok = bool((settings.container_ingest_token or "").strip())
+    db_pooled_ok = bool((settings.database_url or "").strip())
+    db_unpooled_ok = bool((settings.database_url_unpooled or "").strip())
+    polling_exit_ok = _PRODUCTION_POLLING_EXIT_GATE_OK
+    architecture_frozen = (
+        runtime_mode_ok
+        and container_ingest_ok
+        and db_pooled_ok
+        and db_unpooled_ok
+        and polling_exit_ok
+    )
     return {
         "frozen_topology": "worker→queue→container→neon",
         "runtime_mode": runtime_mode if runtime_mode else "unset",
-        # Canonical runtime_mode for production deployments.
         "production_runtime_mode_expected": "cloudflare-container",
-        "container_ingest_configured": bool((settings.container_ingest_token or "").strip()),
+        "container_ingest_configured": container_ingest_ok,
         "db_boundary": {
-            "pooled_runtime_url_configured": bool((settings.database_url or "").strip()),
-            "direct_unpooled_migration_url_configured": bool(
-                (settings.database_url_unpooled or "").strip()
-            ),
+            "pooled_runtime_url_configured": db_pooled_ok,
+            "direct_unpooled_migration_url_configured": db_unpooled_ok,
         },
         "long_polling_exit_gate": {
-            # Compile-time flag set above. If anyone breaks the import chain this
-            # field still forces downstream tests to re-verify.
-            "import_chain_no_polling_ref": _PRODUCTION_POLLING_EXIT_GATE_OK,
+            "import_chain_no_polling_ref": polling_exit_ok,
             "production_polling_expected": False,
         },
         "telegram_cron_shared_queue": True,
-        "architecture_frozen": True,
+        "architecture_frozen": architecture_frozen,
+        "architecture_frozen_prerequisites": {
+            "runtime_mode_cloudflare_container": runtime_mode_ok,
+            "container_ingest_token_configured": container_ingest_ok,
+            "database_url_configured": db_pooled_ok,
+            "database_url_unpooled_configured": db_unpooled_ok,
+            "polling_exit_gate_intact": polling_exit_ok,
+        },
     }
 
 

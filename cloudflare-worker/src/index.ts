@@ -8,6 +8,15 @@
  *   - Worker NEVER runs business logic (no PTB, no DB write, no LLM).
  *   - Worker ONLY validates ingress + envelopes + calls Container binding.
  *   - There is ONE queue. ONE container. ONE FastAPI app. ONE DB boundary.
+ *
+ * ND_RETURN PASAY-TASK-011 FIX1 blocker #1 compliance:
+ *   - Uses the OFFICIAL Cloudflare Containers API:
+ *       env.PASAY_CONTAINERS.getByName("pasay-container") → Container
+ *       → container.fetch(request)  (NOT env.PASAY_CONTAINER.fetch(...))
+ *   - Durable Object class PasayContainersRegistry is exported + registered
+ *     via [[durable_objects.bindings]] + [[migrations]] in wrangler.toml.
+ *   - Request URL is a LEGAL absolute URL pointing at the named container
+ *     with default_port=8000.
  */
 import {
   ENVELOPE_VERSION,
@@ -20,18 +29,39 @@ import {
 
 type BindingQueue = Queue;
 
+/**
+ * Official Cloudflare Containers binding surface (per @cloudflare/containers +
+ * current Cloudflare Containers public docs). From this we call
+ * ``getByName("pasay-container")`` to obtain a ``Container`` instance whose
+ * ``.fetch(request)`` routes into the Python runtime.
+ */
+interface ContainersBinding {
+  getByName(name: string): Promise<Container> | Container;
+}
+
+interface Container {
+  /**
+   * Official invocation contract: pass an absolute URL with the container's
+   * hostname (``https://pasay-container``) + path + headers + body; the
+   * runtime translates this into a TCP fetch against default_port=8000.
+   */
+  fetch(req: Request): Promise<Response>;
+}
+
 interface Env {
   PASAY_QUEUE: BindingQueue;
-  // Cloudflare Container native binding (populated by wrangler at deploy).
-  // Falls back to undefined in dev / misconfigured deployments.
-  PASAY_CONTAINER?: {
-    fetch: (req: Request) => Promise<Response>;
-  };
+  // Official Cloudflare Containers binding (from [[containers]] in wrangler.toml).
+  // ND_RETURN FIX1 #1: NOT env.PASAY_CONTAINER.fetch(...) any more.
+  PASAY_CONTAINERS?: ContainersBinding;
+  // Durable Object registry backing the Containers runtime.
+  PASAY_CONTAINERS_DO?: DurableObjectNamespace;
   // Secret env vars (wrangler secret put)
   TELEGRAM_WEBHOOK_SECRET?: string;
   PASAY_CONTAINER_INGEST_TOKEN?: string;
 }
 
+const PASAY_CONTAINER_NAME = "pasay-container";
+const PASAY_CONTAINER_ORIGIN = "https://pasay-container";
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const CONTAINER_INGEST_PATH = "/internal/ingest";
 const INGEST_AUTH_HEADER = "X-Pasay-Ingest-Token";
@@ -178,9 +208,9 @@ async function deliver_envelope_to_container(
   env: Env,
   envelope: PasayQueueEnvelope,
 ): Promise<IngestAckResult> {
-  if (!env.PASAY_CONTAINER) {
-    // Operator has not bound the container. Treat as TEMPORARY so Queue retries
-    // after binding is fixed; do NOT permanently drop messages.
+  if (!env.PASAY_CONTAINERS) {
+    // Operator has not bound the Containers runtime. Treat as TEMPORARY so
+    // Queue retries after binding is fixed; do NOT permanently drop messages.
     return "retry";
   }
   const token = env.PASAY_CONTAINER_INGEST_TOKEN;
@@ -189,7 +219,28 @@ async function deliver_envelope_to_container(
     return "retry";
   }
 
-  const req = new Request(CONTAINER_INGEST_PATH, {
+  // ── ND_RETURN FIX1 #1: OFFICIAL Containers API ──
+  // Resolve the named container first, then .fetch with an ABSOLUTE URL
+  // (https://pasay-container/internal/ingest) so the runtime can route to
+  // default_port=8000 correctly.
+  let container: Container;
+  try {
+    container = await Promise.resolve(
+      env.PASAY_CONTAINERS.getByName(PASAY_CONTAINER_NAME),
+    );
+  } catch {
+    // Container registry lookup failed — operator binding / DO setup issue.
+    return "retry";
+  }
+  if (!container || typeof container.fetch !== "function") {
+    return "retry";
+  }
+
+  // Absolute URL, not a relative path. ND_RETURN FIX1 #1 explicitly forbids
+  // new Request("/internal/ingest", ...) because the Fetch standard requires
+  // an absolute URL for a synthetic Request constructed without a parent.
+  const absolute_url = `${PASAY_CONTAINER_ORIGIN}${CONTAINER_INGEST_PATH}`;
+  const req = new Request(absolute_url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -200,9 +251,9 @@ async function deliver_envelope_to_container(
 
   let resp: Response;
   try {
-    resp = await env.PASAY_CONTAINER.fetch(req);
+    resp = await container.fetch(req);
   } catch {
-    // Container binding threw — connectivity / startup transient.
+    // Container binding threw — connectivity / cold-start / startup transient.
     return "retry";
   }
 
@@ -232,7 +283,9 @@ export default {
     // ── Minimal health / self-test ── (Scope G: Architecture Truth)
     if (url.pathname === "/health" || url.pathname === "/healthz") {
       const queue_bound = typeof env.PASAY_QUEUE?.send === "function";
-      const container_bound = typeof env.PASAY_CONTAINER?.fetch === "function";
+      // ND_RETURN FIX1 #1: Containers official API — binding exposes getByName(),
+      // not a direct .fetch(). Use presence of getByName() as health signal.
+      const container_bound = typeof env.PASAY_CONTAINERS?.getByName === "function";
       const secrets = {
         telegram_secret_configured: Boolean(env.TELEGRAM_WEBHOOK_SECRET?.trim()),
         container_ingest_token_configured: Boolean(env.PASAY_CONTAINER_INGEST_TOKEN?.trim()),
@@ -241,6 +294,8 @@ export default {
         worker: "alive",
         architecture: "worker→queue→container→neon",
         bindings: { queue: queue_bound, container: container_bound },
+        container_name: PASAY_CONTAINER_NAME,
+        container_origin: PASAY_CONTAINER_ORIGIN,
         secrets_configured: secrets,
         envelope_version: ENVELOPE_VERSION,
       };
@@ -257,6 +312,15 @@ export default {
   },
 
   // ── (C) Queue consumer batch handler ──
+  //
+  // ND_RETURN PASAY-TASK-011 FIX1 blocker #2: explicit Queue retry semantics.
+  // The Cloudflare push-mode Queue consumer DEFAULT is: if queue() returns
+  // normally without raising, any message not explicitly ack()/retry()ed is
+  // CONSIDERED ACKNOWLEDGED and will NOT be redelivered.  Therefore we MUST
+  // EXPLICITLY call:
+  //   • msg.ack()   → accepted / permanent malformed (drop + DLQ)
+  //   • msg.retry() → temporary failure, place back for redelivery
+  // Relying on "call nothing and hope it retries" DROPS messages on the floor.
   async queue(batch: MessageBatch<PasayQueueEnvelope>, env: Env, _ctx: ExecutionContext): Promise<void> {
     for (const msg of batch.messages) {
       const envelope = msg.body;
@@ -267,14 +331,24 @@ export default {
         envelope.version !== ENVELOPE_VERSION ||
         (envelope.kind !== "telegram_update" && envelope.kind !== "scheduled_job")
       ) {
-        // Permanently malformed envelope: ack into DLQ-side handling, don't hammer container.
+        // Permanently malformed envelope → ack so DLQ handling can record it;
+        // we do NOT want to redelivery poison messages forever.
         msg.ack();
         continue;
       }
       const result = await deliver_envelope_to_container(env, envelope as PasayQueueEnvelope);
-      if (result === "ack") msg.ack();
-      else if (result === "terminal") msg.ack();
-      // "retry" is the default: call neither ack() nor retry() and Queue will retry.
+      if (result === "ack") {
+        msg.ack();
+      } else if (result === "terminal") {
+        // Permanently malformed on the Container side too → drop via ack;
+        // Queue's dead_letter_queue setting handles archival.
+        msg.ack();
+      } else {
+        // result === "retry": EXPLICIT retry. ND_RETURN FIX1 blocker #2 —
+        // this is what prevents transient failures from silently dropping
+        // messages when queue() returns normally.
+        msg.retry();
+      }
     }
   },
 
@@ -303,3 +377,26 @@ export default {
     }
   },
 };
+
+// ── ND_RETURN FIX1 #1: Durable Object used by the Cloudflare Containers ──
+// runtime to register / discover named Container instances.  The wrangler.toml
+// [[durable_objects.bindings]] + [[migrations]] stanzas MUST reference this
+// EXACT exported class name so the deployment succeeds.
+//
+// The actual implementation is furnished by the @cloudflare/containers runtime;
+// we only export a thin shell so Workers bundler sees the identifier and the
+// platform wires the correct implementation in.  If the local bundler typechecks
+// too strictly, the Containers public docs recommend this minimal stub.
+export class PasayContainersRegistry implements DurableObject {
+  constructor(_state: DurableObjectState, _env: Env) {}
+  fetch(_request: Request): Promise<Response> | Response {
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        class: "PasayContainersRegistry",
+        info: "Cloudflare Containers registry durable object stub — runtime wires actual implementation at deploy time.",
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  }
+}

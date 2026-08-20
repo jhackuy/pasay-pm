@@ -9,10 +9,12 @@
     "dev": "wrangler dev",
     "types": "tsc --noEmit"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@cloudflare/containers": "^1.0.0"
+  },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240101.0",
+    "@cloudflare/workers-types": "^4.20241201.0",
     "typescript": "^5.3.0",
-    "wrangler": "^3.28.0"
+    "wrangler": "^3.99.0"
   }
 }

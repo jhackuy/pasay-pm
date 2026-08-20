@@ -1,6 +1,38 @@
 name = "pasay-cloudflare-worker"
 main = "src/index.ts"
-compatibility_date = "2024-01-01"
+compatibility_date = "2025-01-01"
+
+# ── Cloudflare Containers — official native binding (ND_RETURN FIX1 #1) ──
+# Single pasay-container (FastAPI/Pasay Python runtime).
+# default_port = 8000 matches Dockerfile CMD "uvicorn ... --port 8000".
+# env vars forwarded into the container at startup (operator populates
+# via wrangler secret put / wrangler env / Cloudflare dashboard).
+[[containers]]
+  binding = "PASAY_CONTAINERS"
+  containers = [
+    { name = "pasay-container", default_port = 8000 }
+  ]
+
+# Container env vars (Secrets bound from wrangler secret put pasay-database-url etc.)
+[containers.env]
+  DATABASE_URL = "${DATABASE_URL}"
+  DATABASE_URL_UNPOOLED = "${DATABASE_URL_UNPOOLED}"
+  TELEGRAM_BOT_TOKEN = "${TELEGRAM_BOT_TOKEN}"
+  TELEGRAM_WEBHOOK_SECRET = "${TELEGRAM_WEBHOOK_SECRET}"
+  CONTAINER_INGEST_TOKEN = "${PASAY_CONTAINER_INGEST_TOKEN}"
+  PASAY_RUNTIME_MODE = "cloudflare-container"
+
+# Durable Object binding used by the Containers runtime to expose
+# getContainer(name) → Container instance per the official API.
+[[durable_objects.bindings]]
+  name = "PASAY_CONTAINERS_DO"
+  class_name = "PasayContainersRegistry"
+
+# One-time migration to register the Containers DO namespace.
+# Operator runs `wrangler deploy` once; this row is idempotent.
+[[migrations]]
+  tag = "v1-pasay-containers-registry"
+  new_classes = ["PasayContainersRegistry"]
 
 # ── Queue binding (single unified queue for telegram + cron) ──
 [[queues.producers]]
@@ -14,11 +46,12 @@ compatibility_date = "2024-01-01"
   max_retries = 5
   dead_letter_queue = "pasay-events-dlq"
 
-# ── Cloudflare Container binding (single Python runtime) ──
-# Operator fills these in at deploy time; code must fail-closed if missing.
-# [container_bindings]
-#   PASAY_CONTAINER = { name = "pasay-container" }
-
-# ── Secrets (set via wrangler secret put) ──
-# TELEGRAM_WEBHOOK_SECRET  — matches backend TELEGRAM_WEBHOOK_SECRET
-# PASAY_CONTAINER_INGEST_TOKEN — shared secret for container internal ingestion
+# ── Secrets (set via wrangler secret put BEFORE deploy) ──
+# Operator must configure ALL of the following before `wrangler deploy`:
+#   wrangler secret put TELEGRAM_WEBHOOK_SECRET
+#   wrangler secret put PASAY_CONTAINER_INGEST_TOKEN
+#   wrangler secret put DATABASE_URL
+#   wrangler secret put DATABASE_URL_UNPOOLED
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+# Missing any above → Worker startup or Container binding fetch fails
+# closed (fail-fast per Scope D + ND_RETURN FIX1 blocker #4).

@@ -47,40 +47,12 @@ router = APIRouter(prefix="/internal", tags=["internal"])
 # ---------------------------------------------------------------------------
 # Idempotency for scheduled jobs.
 #
-# We reuse the EXISTING Postgres / SQLAlchemy boundary via a tiny dedicated
-# table-backed service rather than introducing a second idempotency store.
-# Today only ``pasay_heartbeat`` fires; future jobs slot in here without
-# adding Redis / SQLite / etc (per Scope E Strictly Forbidden).
+# Table ``pasay_scheduled_job_ledger`` is created by Alembic migration
+# ``a1b2c3d4e5f6_scheduled_job_ledger`` (PASAY-TASK-011 FIX1).  The runtime
+# path MUST NOT lazily CREATE TABLE — the migration chain is the single
+# schema authority (Scope E: Alembic single-head contract + ND_RETURN
+# blocker #4).
 # ---------------------------------------------------------------------------
-
-_SCHEDULED_IDEMPOTENCY_TABLE_EXISTS: bool = False
-
-
-def _ensure_scheduled_idempotency_table(db: Session) -> None:
-    """Best-effort CREATE TABLE IF NOT EXISTS on first use.
-
-    This is the ONLY migration-style touch in this Issue — Scope E says
-    "禁止新增业务 migration" but an internal idempotency ledger for the
-    new Queue/Container boundary IS the architecture layer, not a business
-    migration.  We create it lazily with raw DDL so Alembic single-head
-    remains strictly untouched (Scope E: "Alembic 必须继续 single-head").
-    """
-    global _SCHEDULED_IDEMPOTENCY_TABLE_EXISTS
-    if _SCHEDULED_IDEMPOTENCY_TABLE_EXISTS:
-        return
-    from sqlalchemy import text
-
-    db.execute(text(
-        "CREATE TABLE IF NOT EXISTS pasay_scheduled_job_ledger ("
-        "  event_id VARCHAR(256) PRIMARY KEY,"
-        "  job_name VARCHAR(128) NOT NULL,"
-        "  occurred_at TIMESTAMPTZ NOT NULL,"
-        "  consumed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
-        "  payload JSONB"
-        ")"
-    ))
-    db.commit()
-    _SCHEDULED_IDEMPOTENCY_TABLE_EXISTS = True
 
 
 def _try_claim_scheduled_job(
@@ -97,7 +69,6 @@ def _try_claim_scheduled_job(
     """
     from sqlalchemy import text
 
-    _ensure_scheduled_idempotency_table(db)
     try:
         result = db.execute(
             text(

@@ -39,21 +39,23 @@ COPY . .
 RUN mkdir -p /app/uploads
 
 # ── Startup ────────────────────────────────────────────────────────────────
-# Step ordering per Scope D fail-fast contract:
-#   1. alembic upgrade head using **direct/unpooled** Neon URL
-#      (operator sets DATABASE_URL_UNPOOLED; if empty we fall back to
-#      DATABASE_URL only for the migration step but log a warning).
-#   2. exec uvicorn app.main:app — HTTP-only, NO polling loops.
+# Step ordering per Scope D + ND_RETURN FIX1 blocker #4 fail-fast contract:
+#   1. REQUIRE DATABASE_URL_UNPOOLED — NO silent fallback to DATABASE_URL.
+#      Missing env → container startup fails IMMEDIATELY with a clear error.
+#      (Scope E: migrations use direct/unpooled; Scope D: fail-fast on missing
+#      required env; ND_RETURN FIX1 blocker #4 explicitly forbids fallback.)
+#   2. alembic upgrade head using the direct/unpooled Neon URL.
+#   3. exec uvicorn app.main:app — HTTP-only, NO polling loops.
 #
 # If migrations fail the whole container fails immediately (entrypoint is
 # `sh -e` by default; non-zero alembic exit propagates).
 ENTRYPOINT ["sh", "-c", "\
 set -e; \
-MIGRATION_URL=\"${DATABASE_URL_UNPOOLED:-${DATABASE_URL}}\"; \
 if [ -z \"${DATABASE_URL_UNPOOLED}\" ]; then \
-  echo '[pasay][warn] DATABASE_URL_UNPOOLED not set; using DATABASE_URL for alembic (Scope E recommends separate direct URL for migrations).'; \
+  echo '[pasay][fatal] DATABASE_URL_UNPOOLED is required for alembic migrations (Scope E direct/unpooled + ND_RETURN FIX1 blocker #4: NO fallback). Container cannot start.' >&2; \
+  exit 1; \
 fi; \
-export ALEMBIC_DATABASE_URL=\"$MIGRATION_URL\"; \
+export ALEMBIC_DATABASE_URL=\"${DATABASE_URL_UNPOOLED}\"; \
 alembic upgrade head; \
 exec \"$@\"\
 ", "entrypoint"]
