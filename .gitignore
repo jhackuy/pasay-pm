@@ -35,5 +35,6 @@ pasay-telegram-bot/.pytest_tmp/
 cloudflare-worker/node_modules/
 cloudflare-worker/.wrangler/
 cloudflare-worker/.wrangler-config/
-cloudflare-worker/.dev.vars
+cloudflare-worker/.dev.vars*
+!cloudflare-worker/.dev.vars.example
 cloudflare-worker/.env
