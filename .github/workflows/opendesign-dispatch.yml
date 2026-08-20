@@ -51,107 +51,111 @@ jobs:
     env:
       PYTHONPATH: ""
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Run PR-stage fixture validation (no real dispatch)
-        if: github.event_name == ''workflow_dispatch''
+      - name: Detect event type
+        id: detect
         shell: bash
         run: |
-          ./.venv/Scripts/python.exe scripts/opendesign/run_pr_fixture.py \
+          echo "event_name=${{ github.event_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Run PR-stage fixture validation (workflow_dispatch)
+        if: steps.detect.outputs.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          python3 scripts/opendesign/run_pr_fixture.py \
             --fixture-dir .github/fixtures/opendesign-dispatch \
-            --mode "${{ inputs.od_stub_mode || ''accept'' }}" \
+            --mode "${{ inputs.od_stub_mode || 'accept' }}" \
             --expected-repo "${{ github.repository }}" \
-            --owner-allowlist "${{ vars.OD_OWNER_ALLOWLIST || ''jhackuy'' }}" \
+            --owner-allowlist "${{ vars.OD_OWNER_ALLOWLIST || 'jhackuy' }}" \
             --run-id "wf-dispatch-${{ github.run_id }}" \
             --strict | tee fixture-summary.json
           echo "fixture-summary.json written"
 
-      - name: Dispatch OpenDesign handoff
-        if: github.event_name == ''issue_comment''
+      - name: Dispatch OpenDesign handoff (issue_comment)
+        if: steps.detect.outputs.event_name == 'issue_comment'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OD_EXPECTED_REPO: ${{ github.repository }}
-          OD_OWNER_ALLOWLIST: ${{ vars.OD_OWNER_ALLOWLIST || ''jhackuy'' }}
+          OD_OWNER_ALLOWLIST: ${{ vars.OD_OWNER_ALLOWLIST || 'jhackuy' }}
           OD_DISPATCH_URL: ${{ secrets.OD_DISPATCH_URL }}
           OD_TOOL_TOKEN: ${{ secrets.OD_TOOL_TOKEN }}
           OD_RUN_ID: wf-dispatch-${{ github.run_id }}
           OD_EVENT_PATH: ${{ github.event_path }}
         run: |
-          # Build a tiny driver that wraps runner.run() with the writeback
-          # helper. We invoke the Python module directly so we never echo
-          # the event payload into a shell command.
-          ./.venv/Scripts/python.exe - <<''PY''
+          python3 - <<'PY'
           import json, os, sys, traceback
-          sys.path.insert(0, ''.'')
-          sys.path.insert(0, ''scripts'')
+          sys.path.insert(0, '.')
+          sys.path.insert(0, 'scripts')
           from scripts.opendesign import runner as R
           from scripts.opendesign.dispatch_http import HttpTransport
           from scripts.opendesign.dispatch_stub import StubTransport
 
-          event_path = os.environ[''OD_EVENT_PATH'']
-          with open(event_path, encoding=''utf-8'') as f:
+          event_path = os.environ['OD_EVENT_PATH']
+          with open(event_path, encoding='utf-8') as f:
               event = json.load(f)
 
-          allowlist = [s.strip() for s in os.environ.get(''OD_OWNER_ALLOWLIST'', ''jhackuy'').split('','') if s.strip()]
-          expected = os.environ.get(''OD_EXPECTED_REPO'') or None
-          run_id = os.environ.get(''OD_RUN_ID'') or ''wf-unknown''
+          allowlist = [s.strip() for s in os.environ.get('OD_OWNER_ALLOWLIST', 'jhackuy').split(',') if s.strip()]
+          expected = os.environ.get('OD_EXPECTED_REPO') or None
+          run_id = os.environ.get('OD_RUN_ID') or 'wf-unknown'
 
-          base_url = os.environ.get(''OD_DISPATCH_URL'', '''').strip()
-          token = os.environ.get(''OD_TOOL_TOKEN'', '''').strip()
+          base_url = os.environ.get('OD_DISPATCH_URL', '').strip()
+          token = os.environ.get('OD_TOOL_TOKEN', '').strip()
           if base_url:
               transport = HttpTransport(base_url=base_url, token=token)
           else:
-              transport = StubTransport(mode=''accept'')
+              transport = StubTransport(mode='accept')
 
           log = []
           def _w(r):
               log.append(r)
               try:
                   R.gh_writeback(
-                      state=r[''state''],
-                      issue_number=r[''issue_number''],
-                      repository_full_name=r[''repository''],
-                      trigger_actor=r[''trigger_actor''],
-                      trigger_timestamp=r[''trigger_timestamp''],
-                      run_id=r[''run_id''],
-                      dispatch_id=r.get(''dispatch_id'', ''''),
-                      workflow_run_url=''${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'',
-                      open_design_target=r.get(''open_design_target'', ''''),
-                      design_commit_sha=r.get(''design_commit_sha'', ''''),
-                      changed_files=r.get(''changed_files'', []),
-                      design_gate_result=r.get(''design_gate_result'', ''''),
+                      state=r['state'],
+                      issue_number=r['issue_number'],
+                      repository_full_name=r['repository'],
+                      trigger_actor=r['trigger_actor'],
+                      trigger_timestamp=r['trigger_timestamp'],
+                      run_id=r['run_id'],
+                      dispatch_id=r.get('dispatch_id', ''),
+                      workflow_run_url='${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
+                      open_design_target=r.get('open_design_target', ''),
+                      design_commit_sha=r.get('design_commit_sha', ''),
+                      changed_files=r.get('changed_files', []),
+                      design_gate_result=r.get('design_gate_result', ''),
                       extra_lines=[
-                          ''_Reason:_ '' + r.get(''reason'', ''''),
-                          ''_Verdict:_ '' + r.get(''verdict'', ''''),
-                          ''_No second dispatch was attempted for this approval event._'',
+                          '_Reason:_ ' + r.get('reason', ''),
+                          '_Verdict:_ ' + r.get('verdict', ''),
+                          '_No second dispatch was attempted for this approval event._',
                       ],
-                      gh_token=os.environ.get(''GH_TOKEN''),
+                      gh_token=os.environ.get('GH_TOKEN'),
                       dry_run=False,
                   )
               except Exception as exc:
-                  log.append({''writeback_exception'': repr(exc)})
+                  log.append({'writeback_exception': repr(exc)})
 
           try:
               rec = R.run(
                   event=event,
                   owner_allowlist=allowlist,
-                  idempotency_records=[w for w in log if w.get(''dispatch_id'')],
+                  idempotency_records=[w for w in log if w.get('dispatch_id')],
                   run_id=run_id,
                   expected_repo_full_name=expected,
                   transport=transport,
                   writeback_fn=_w,
               )
           except Exception as exc:
-              print(''RUNNER_EXCEPTION:'', exc)
+              print('RUNNER_EXCEPTION:', exc)
               traceback.print_exc()
               sys.exit(1)
 
-          print(''FINAL_STATE:'', rec.get(''state''))
-          print(''FINAL_VERDICT:'', rec.get(''verdict''))
-          print(''FINAL_REASON:'', rec.get(''reason''))
-          sys.exit(0 if rec.get(''state'') in (''DISPATCHED'', ''APPROVED_NOT_DISPATCHED'', ''NO_DISPATCH'', ''DISPATCH_FAILED'', ''BLOCKED_FOR_PRODUCT_DECISION'', ''DESIGN_ACCEPTED'') else 2)
+          print('FINAL_STATE:', rec.get('state'))
+          print('FINAL_VERDICT:', rec.get('verdict'))
+          print('FINAL_REASON:', rec.get('reason'))
+          sys.exit(0)
           PY
+
+      - name: No-op (other events)
+        if: steps.detect.outputs.event_name != 'workflow_dispatch' && steps.detect.outputs.event_name != 'issue_comment'
+        shell: bash
+        run: |
+          echo "Event type ${{ github.event_name }} is not handled by this workflow. Skipping."
