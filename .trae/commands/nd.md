@@ -1,29 +1,79 @@
 ---
 Name: nd
-Description: Next Dev - 一键执行下一个开发任务或返修任务
+Description: Next Dev - 一键执行下一个开发任务或返修任务。支持显式 Issue 编号：/ND 或 /ND {ISSUE_NUMBER}
 ---
 
 # /ND — Next Dev
 
 ## 核心原则
 
-Owner 在 TRAE IDE 中只输入：`/ND`
+Owner 在 TRAE IDE 中输入：
 
-- 不要求 Owner 输入 Issue/PR 编号或复制任务正文。
-- 不使用 `status:approved` / `status:in-progress` / `status:review`。
-- 只使用现有 workflow contract：`route:dev`、`ready-for-dev`、`ready-for-owner`、`blocked`。
+- `\ND` → 自动发现唯一任务（现有行为，零变更）
+- `\ND {ISSUE_NUMBER}` → 显式选择 GitHub Issue（PASAY-TASK-005 新增）
+
+例如：
+- `\ND 20` → 精准选择 `jhackuy/pasay-pm` 的 GitHub Issue #20
+- `\ND 22` → 精准选择 Issue #22
+
+治理边界：
+
+- 不要求 Owner 复制 Issue/PR 正文；显式 Issue 编号只做任务路由，不绕过审批门禁。
+- 不使用 `status:approved` / `status:in-progress` / `status:review`；只使用现有 contract：`route:dev`、`ready-for-dev`、`ready-for-owner`、`blocked`。
 - TRAE 只负责开发实现、targeted tests、commit、push、PR handoff；不做运维、部署值守、监控平台、OpenDesign/GitHub 同步守护。
 - 不 merge，不设置 `ready-for-owner`，不等待 CI / CodeRabbit，不 Review 自己。
 - 达到任务 Stop Condition 后立即停止，禁止顺手重构。
 
 ## 任务优先级
 
-`/ND` 每次启动按以下顺序寻找唯一任务：
+### A. 无参数模式（`\ND`）
+
+每次启动按以下顺序寻找唯一任务：
 
 1. **RETURN 返修任务优先**
 2. 没有返修任务时，才领取新的 `ready-for-dev` Issue
 
 如果同一优先级存在多个候选，必须输出 `AMBIGUOUS_DEV_TASK` 并停止，不得自行猜测。
+
+### B. 显式 Issue 模式（`\ND {ISSUE_NUMBER}`，PASAY-TASK-005 NEW）
+
+仅当用户输入**恰好一个裸正整数**参数时进入本模式。例如 `\ND 20`。
+
+执行顺序：
+
+1. **跳过 1A/1B 全局候选扫描**。显式 Issue 编号是 Owner 的精准路由指令，不再和其他 Issue 一起做"全局唯一候选"判断。这绝不等于跳过审批门禁——下一步立即单独核验。
+2. 通过 GitHub MCP 直接读取 `jhackuy/pasay-pm` 的该 Issue，强制检查下列门禁，任一不满足立即 STOP：
+   - Issue 必须 OPEN。
+   - 必须含 `route:dev`。
+   - 必须含 `ready-for-dev`。
+   - 不得含 `blocked`。
+3. 上述门禁通过后，再判断 Repair / New Dev：
+   - 若该 Issue 已关联**恰好一个 OPEN PR**，且该 PR 中存在最新的总控返修合同标记 `ND_RETURN` → **Repair Mode**（沿用 Repair Mode 完整合同）。
+   - 若该 Issue**没有关联 OPEN PR** → **New Dev Mode**（沿用 New Dev Mode 完整合同）。
+   - 若关联了**多个 OPEN PR** → `AMBIGUOUS_DEV_TASK` → STOP。
+4. Claim（移除 Issue `ready-for-dev`）、开发、tests、commit、push、PR handoff 全部沿用 `/ND` 的既有合同，没有任何权限放松。
+
+### C. 非法参数（PASAY-TASK-005 — fail closed）
+
+以下输入**一律拒绝**，输出最终状态 `INVALID_ND_ARGUMENT` 并 STOP，不得猜测为"自动模式"、"截断后选前一个"或"去掉符号后重试"：
+
+| 示例 | 拒绝原因 |
+|---|---|
+| `\ND abc` | 参数不是正整数 |
+| `\ND 20 21` | 参数个数 = 2，只允许 0 或 1 个 |
+| `\ND #20` | 含有 `#` 前缀，必须是裸数字 |
+| `\ND -1` | 负数，Issue number 非负 |
+| `\ND 0` | 0，GitHub Issue number 最小 = 1 |
+| `\ND ` 尾部有空格以外的额外字符 | 只能有 `<SP>` + `<正整数>`，无别名/无 flags |
+
+**唯一合法形式**：
+
+```text
+/ND                 → 模式 A（自动）
+/ND <正整数>        → 模式 B（显式 Issue）
+```
+
+**`INVALID_ND_ARGUMENT` 报告必须提示**：唯一合法形式就是上述两种。
 
 ---
 
@@ -179,10 +229,16 @@ PR 创建或返修 push 后：
 - `NO_APPROVED_DEV_TASK`
 - `AMBIGUOUS_DEV_TASK`
 - `DEV_TASK_ALREADY_RUNNING`
+- `INVALID_ND_ARGUMENT`
+
+当 Final Status = `INVALID_ND_ARGUMENT` 时，报告中必须额外列出：
+- 实际接收到的用户命令（原始字符串，精确到大小写和前后空格）
+- 唯一合法形式提示：`/ND` 或 `/ND <正整数>`
+- 本此无效原因（非正整数 / 多参数 / `#` 前缀 / 负数或零 / 含多余字符）
 
 最终报告必须中文、简短，只报告：
 
-- 模式：Repair / New Dev
+- 模式：Repair / New Dev / Auto(模式A) / Explicit(模式B) / Invalid(模式C)
 - Issue number
 - PR number（如有）
 - branch
