@@ -34,6 +34,26 @@ depends_on: Union[str, None] = None
 
 
 def upgrade() -> None:
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if inspector.has_table("pasay_scheduled_job_ledger"):
+        existing_pk = inspector.get_pk_constraint("pasay_scheduled_job_ledger")
+        pk_cols = (existing_pk or {}).get("constrained_columns") or []
+        if "event_id" not in pk_cols:
+            raise RuntimeError(
+                "pasay_scheduled_job_ledger already exists but PRIMARY KEY is not (event_id). "
+                "Please manually reconcile the legacy table with this migration's schema."
+            )
+        existing_cols = {c["name"] for c in inspector.get_columns("pasay_scheduled_job_ledger")}
+        required = {"event_id", "job_name", "occurred_at", "consumed_at", "payload"}
+        missing = required - existing_cols
+        if missing:
+            raise RuntimeError(
+                f"pasay_scheduled_job_ledger already exists but is missing required columns: {sorted(missing)}. "
+                "Please manually reconcile the legacy table with this migration's schema."
+            )
+        return
+
     op.create_table(
         "pasay_scheduled_job_ledger",
         sa.Column("event_id", sa.String(length=256), nullable=False),

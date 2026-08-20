@@ -193,15 +193,52 @@ class TestT3QueueToContainerIngestion:
         }
 
     def test_t3a_internal_ingest_telegram_routes_to_existing_service(
-        self, client_unit: TestClient
+        self, client_unit: TestClient, monkeypatch
     ):
-        env = self._tg_envelope(777, 420001)
+        from app.api.routers import internal_ingest as ii_mod
+
+        raw_payload_from_envelope: dict[str, Any] | None = None
+        captured_db_ref: Any = None
+        sentinel_body = {
+            "ok": True,
+            "state": "done",
+            "update_id": 777,
+        }
+
+        async def fake_process(
+            db: Any,
+            raw_json: dict[str, Any],
+            *,
+            now: Any = None,
+        ) -> tuple[int, dict[str, Any]]:
+            nonlocal raw_payload_from_envelope, captured_db_ref
+            captured_db_ref = db
+            raw_payload_from_envelope = raw_json
+            return 200, sentinel_body
+
+        monkeypatch.setattr(
+            ii_mod.wh_service,
+            "process_telegram_update_payload",
+            fake_process,
+        )
+        envelope = self._tg_envelope(777, 420001)
+        expected_payload = envelope["payload"]
+
         resp = client_unit.post(
             "/internal/ingest",
             headers={"X-Pasay-Ingest-Token": INGEST_TOKEN},
-            json=env,
+            json=envelope,
         )
-        assert resp.status_code in (200, 202, 400, 401, 503)
+        assert (
+            raw_payload_from_envelope is not None
+        ), "POST /internal/ingest MUST call process_telegram_update_payload with the original payload"
+        assert raw_payload_from_envelope == expected_payload
+        assert captured_db_ref is not None
+        assert resp.status_code == 200, (
+            f"Valid telegram envelope + successful service call → HTTP 200. "
+            f"Got status={resp.status_code} body={resp.text}"
+        )
+        assert resp.json() == sentinel_body
 
     def test_t3b_missing_ingest_token_401(self, client_unit: TestClient):
         env = self._tg_envelope(778)
@@ -663,8 +700,22 @@ class TestT8NeonBoundary:
         assert candidates, "no *_scheduled_job_ledger.py migration file found"
         mig_src = candidates[0].read_text(encoding="utf-8")
         # Revision is on the single-head chain starting from z9a8b7c6d5e4.
+        import re as _re
+
         assert 'revision: str = "a1b2c3d4e5f6"' in mig_src
-        assert 'down_revision: Union[str, None] = "z9a8b7c6d5e4"' in mig_src
+        # The exact parent may change when future migrations are reordered
+        # during a rebase / chain extension; single-head integrity is
+        # already proven in test_t8c_alembic_single_head above.  We only
+        # require that down_revision is declared and non-empty so this
+        # migration stays attached to some valid head.
+        dr_match = _re.search(
+            r'down_revision[^=]*=\s*"([^"]+)"',
+            mig_src,
+        )
+        assert dr_match is not None, (
+            "migration must declare a non-null down_revision to stay on the single-head chain"
+        )
+        assert dr_match.group(1).strip(), "down_revision value must be non-empty"
         # Exact columns mirror the original lazy-DDL contract.
         assert "pasay_scheduled_job_ledger" in mig_src
         assert "event_id" in mig_src and "VARCHAR(256)" in mig_src

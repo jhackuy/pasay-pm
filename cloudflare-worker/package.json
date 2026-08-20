@@ -10,6 +10,9 @@
     "types": "tsc --noEmit",
     "test": "tsx tests/index.spec.ts"
   },
+  "dependencies": {
+    "@cloudflare/containers": "^1.20260815.1"
+  },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260815.1",
     "@types/node": "^20.11.0",

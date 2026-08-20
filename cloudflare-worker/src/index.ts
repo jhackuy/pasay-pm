@@ -71,10 +71,35 @@ const INGEST_AUTH_HEADER = "X-Pasay-Ingest-Token";
  * defaultPort = 8000 must match the Dockerfile CMD uvicorn --port 8000.
  * sleepAfter = 15m lets a cold container stay warm 15 minutes between
  * worker requests (operator-friendly heartbeat cost).
+ *
+ * envVars: official @cloudflare/containers property that maps Worker
+ * environment / secrets into the spawned Container process runtime.
+ * Cloudflare injects the return values of each function as POSIX env
+ * vars inside the container; the Python Settings model picks them up
+ * via pydantic_settings BaseSettings.  This is the ONLY supported way
+ * to propagate Worker secrets (wrangler secret put …) across the
+ * Worker↔Container boundary without hardcoding values into the image.
  */
 export class PasayContainer extends Container {
   defaultPort = 8000;
   sleepAfter = "15m";
+  envVars = {
+    CONTAINER_INGEST_TOKEN: (env: Env): string => env.PASAY_CONTAINER_INGEST_TOKEN ?? "",
+    DATABASE_URL: (env: Env): string => {
+      const v = (env as unknown as Record<string, string | undefined>)["DATABASE_URL"];
+      return v ?? "";
+    },
+    DATABASE_URL_UNPOOLED: (env: Env): string => {
+      const v = (env as unknown as Record<string, string | undefined>)["DATABASE_URL_UNPOOLED"];
+      return v ?? "";
+    },
+    TELEGRAM_BOT_TOKEN: (env: Env): string => {
+      const v = (env as unknown as Record<string, string | undefined>)["TELEGRAM_BOT_TOKEN"];
+      return v ?? "";
+    },
+    TELEGRAM_WEBHOOK_SECRET: (env: Env): string => env.TELEGRAM_WEBHOOK_SECRET ?? "",
+    PASAY_RUNTIME_MODE: (): string => "cloudflare-container",
+  };
 }
 
 type IngestAckResult = "ack" | "retry" | "terminal";

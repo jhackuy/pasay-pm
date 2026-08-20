@@ -18,6 +18,13 @@ export abstract class Container {
   defaultPort: number = 8000;
   /** Instance sleep-after-idle timeout (Cloudflare runtime only; no-op in tests). */
   sleepAfter?: string;
+  /**
+   * Optional environment-variable provisioning table (Cloudflare Containers
+   * runtime feature).  Worker code declares envVars on the Container
+   * subclass; the mock base class accepts any record so tests can assert
+   * on the declared map without needing a live Cloudflare build.
+   */
+  envVars?: Record<string, (env: any) => string>;
 }
 
 export interface MockContainerHandle {

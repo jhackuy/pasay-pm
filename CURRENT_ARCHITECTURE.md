@@ -179,7 +179,7 @@ Worker 侧 `GET /health` 还返回：
 - ❌ **未重写**：FastAPI 业务层（仅新增 `/internal/ingest` 路由 + 增强 `/health`）
 - ❌ **未部署**：不执行 production deploy，不配置 Cloudflare/Telegram/GitHub secrets
 - ❌ **未执行**：`setWebhook / deleteWebhook` Telegram API 调用（仅收口仓库代码）
-- ❌ **未新增业务 alembic migration**（`pasay_scheduled_job_ledger` 使用 CREATE TABLE IF NOT EXISTS 懒创建，保持 alembic single-head 不变）
+- ❌ **未新增业务 alembic migration**：`pasay_scheduled_job_ledger` 已通过 Alembic 迁移 [a1b2c3d4e5f6_scheduled_job_ledger.py](file:///d:/AI-Review/pasay-pm/alembic/versions/a1b2c3d4e5f6_scheduled_job_ledger.py)（挂在 Membership P0 head 上，保持 single-head），严格禁止通过懒 DDL 绕过迁移链。
 
 ---
 

@@ -29,7 +29,7 @@ RUN apt-get update \
         curl \
  && rm -rf /var/lib/apt/lists/*
 
-# ── Python deps ──
+# ── App sources ──
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -37,6 +37,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN mkdir -p /app/uploads
+
+# ── Non-root runtime user (security best practice) ──
+# Create a dedicated unprivileged `app` user + group.  Writability of
+# /app/uploads is preserved by chown so uploads still work at runtime.
+# The rest of /app stays root-owned (read-only for the app user).
+RUN groupadd --system --gid 10001 appgroup \
+ && useradd  --system --uid 10000 --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
+ && chown -R appuser:appgroup /app/uploads
+
+USER appuser:appgroup
 
 # ── Startup ────────────────────────────────────────────────────────────────
 # Step ordering per Scope D + ND_RETURN FIX1 blocker #4 fail-fast contract:
