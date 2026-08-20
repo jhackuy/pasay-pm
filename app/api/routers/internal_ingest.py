@@ -64,16 +64,17 @@ def _try_claim_scheduled_job(
 ) -> bool:
     """Return True if we own this event_id (first time), False if duplicate.
 
-    Uses dialect-neutral SQLAlchemy Core + INSERT … ON CONFLICT DO NOTHING.
-    Works on both PostgreSQL (production) and SQLite (CI/pytest).
+    PostgreSQL INSERT … ON CONFLICT DO NOTHING on the single-column PK
+    ``event_id``.  Production path only (PASAY-TASK-011 FIX8: SQLite
+    dialect branches were the wrong CI direction and have been removed
+    from the production ingestion boundary).
     """
     import json as _json
 
     import sqlalchemy as sa
-    from sqlalchemy.dialects import postgresql, sqlite
+    from sqlalchemy.dialects import postgresql
 
     try:
-        bind = db.get_bind()
         meta = sa.MetaData()
         ledger = sa.Table(
             "pasay_scheduled_job_ledger",
@@ -92,28 +93,17 @@ def _try_claim_scheduled_job(
         oa_str = occurred_at.replace("Z", "+00:00")
         payload_json = _json.dumps(payload) if payload is not None else None
 
-        ins = ledger.insert().values(
-            event_id=event_id,
-            job_name=job_name,
-            occurred_at=oa_str,
-            payload=payload_json,
-        ).prefix_with("OR IGNORE", dialect="sqlite")
-
-        if bind.dialect.name == "sqlite":
-            compiled = ins.compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": False})
-            result = db.execute(compiled, compiled.params)
-        else:
-            ins_on_conflict = (
-                postgresql.insert(ledger)
-                .values(
-                    event_id=event_id,
-                    job_name=job_name,
-                    occurred_at=oa_str,
-                    payload=payload_json,
-                )
-                .on_conflict_do_nothing(index_elements=["event_id"])
+        ins = (
+            postgresql.insert(ledger)
+            .values(
+                event_id=event_id,
+                job_name=job_name,
+                occurred_at=oa_str,
+                payload=payload_json,
             )
-            result = db.execute(ins_on_conflict)
+            .on_conflict_do_nothing(index_elements=["event_id"])
+        )
+        result = db.execute(ins)
         db.commit()
         rowcount = getattr(result, "rowcount", 0) or 0
         return rowcount > 0

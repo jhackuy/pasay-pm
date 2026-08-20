@@ -19,6 +19,20 @@ jobs:
     timeout-minutes: 15
     env:
       PYTHONPATH: ""
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -92,8 +106,9 @@ jobs:
       - name: Run backend targeted pytest (Issue #18 + Issue #31)
         if: steps.changed.outputs.backend == 'true'
         env:
-          DATABASE_URL: "sqlite://"
-          DATABASE_URL_UNPOOLED: "sqlite://"
+          DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          PASAY_TEST_DB_NAME: "pasay_pm_test"
           TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"

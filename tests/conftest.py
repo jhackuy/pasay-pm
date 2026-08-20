@@ -57,35 +57,32 @@ def _test_url():
 def test_engine():
     """Create the dedicated test database once per session.
 
-    PostgreSQL: connect as admin, `CREATE DATABASE` the isolated test DB, then
-    return an engine bound to it.
-    SQLite: has no `CREATE DATABASE`.  We build the test URL (which pins the
-    DB name / file path via `_test_url()`) and return an engine bound there
-    directly — the fixture-level schema DDL in `db_session` handles the rest.
+    PostgreSQL-only test harness (PASAY-TASK-011 FIX8: SQLite compatibility
+    route was a wrong CI direction — GitHub Actions uses PostgreSQL 16).
     """
     base_url = make_url(settings.database_url)
     base_dialect = base_url.get_dialect().name
 
-    if base_dialect == "postgresql":
-        admin_url = base_url.set(database="postgres")
-        admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
-        try:
-            with admin_engine.connect() as conn:
-                exists = conn.execute(
-                    text("SELECT 1 FROM pg_database WHERE datname = :name"),
-                    {"name": TEST_DB_NAME},
-                ).scalar()
-                if not exists:
-                    conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
-        finally:
-            admin_engine.dispose()
-        engine = create_engine(_test_url())
-    elif base_dialect == "sqlite":
-        engine = create_engine(_test_url())
-    else:
+    if base_dialect != "postgresql":
         raise RuntimeError(
-            "tests/conftest.py test_engine: unsupported dialect %r" % base_dialect
+            "tests/conftest.py test_engine: unsupported dialect %r "
+            "(PASAY-TASK-011 FIX8: test harness is PostgreSQL-only; "
+            "set DATABASE_URL to a postgresql+psycopg2:// URL)" % base_dialect
         )
+
+    admin_url = base_url.set(database="postgres")
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin_engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": TEST_DB_NAME},
+            ).scalar()
+            if not exists:
+                conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
+    finally:
+        admin_engine.dispose()
+    engine = create_engine(_test_url())
 
     try:
         yield engine

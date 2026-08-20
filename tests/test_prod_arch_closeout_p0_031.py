@@ -86,11 +86,7 @@ def client_unit():
             ledger.create(bind=engine, checkfirst=True)
 
             with SessionLocal() as s:
-                dialect_name = engine.dialect.name
-                if dialect_name == "sqlite":
-                    s.execute(text("DELETE FROM pasay_scheduled_job_ledger"))
-                else:
-                    s.execute(text("TRUNCATE TABLE pasay_scheduled_job_ledger"))
+                s.execute(text("TRUNCATE TABLE pasay_scheduled_job_ledger"))
                 s.commit()
         except Exception:
             pass
