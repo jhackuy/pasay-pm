@@ -143,13 +143,21 @@ jobs:
         if: steps.changed.outputs.cloudflare == 'true'
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: cloudflare-worker/package-lock.json
 
-      - name: Cloudflare Worker — install dependencies
+      - name: Cloudflare Worker — verify Node engine gate
         if: steps.changed.outputs.cloudflare == 'true'
         working-directory: cloudflare-worker
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          node -e "const v=process.versions.node.split('.').map(Number); if(v[0]<22){console.error('NODE_VERSION_TOO_OLD:', process.version); process.exit(1);} console.log('NODE_VERSION_OK:', process.version)"
+
+      - name: Cloudflare Worker — install dependencies (strict lockfile)
+        if: steps.changed.outputs.cloudflare == 'true'
+        working-directory: cloudflare-worker
+        run: |
+          npm ci --no-audit --no-fund
 
       - name: Cloudflare Worker — tsc --noEmit (typecheck gate)
         if: steps.changed.outputs.cloudflare == 'true'
