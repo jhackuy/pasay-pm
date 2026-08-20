@@ -25,3 +25,14 @@ Windows is the current canonical Pasay development authority. Pasay development,
   reviews, and human acceptance remain authoritative.
 - Final Owner-facing reports default to Chinese unless the Issue explicitly says
   otherwise.
+
+## OpenDesign Dispatcher (PASAY-OPENDESIGN-AUTO-DISPATCH-001)
+
+The `opendesign-dispatch` GitHub workflow is the only approved entry
+point for handing off `route:design-dev` Issues to OpenDesign. It is
+implemented in `scripts/opendesign/` (pure stdlib) and validated by
+`tests/opendesign/`. The dispatcher is event-driven, idempotent,
+owner-allowlisted, and never echoes Issue / comment content into shell.
+Manual or scheduled polling is NOT an approved alternative. See
+`docs/opendesign-dispatch.md` for the trigger contract and PR-stage
+fixture validation.

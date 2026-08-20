@@ -1,0 +1,35 @@
+{
+  "action": "created",
+  "delivery": "fx-07",
+  "_expected": {
+    "verdict": "DISPATCH",
+    "state": "DISPATCHED"
+  },
+  "repository": {
+    "name": "pasay-pm",
+    "owner": {
+      "login": "jhackuy"
+    }
+  },
+  "issue": {
+    "number": 4,
+    "state": "open",
+    "title": "Expense redesign \"phase 2\" \\ backtick `evil` $HOME",
+    "body": "Body with shell-meta: \" ; rm -rf / ; $(whoami) ; `cat /etc/passwd` ; newline\\n\\n```bash\\necho $HOMEBREW\\n```\\n\\nEnd.",
+    "labels": [
+      {
+        "name": "route:design-dev"
+      }
+    ]
+  },
+  "comment": {
+    "id": 1007,
+    "body": "Approved.\nOWNER_APPROVED_FOR_OPENDESIGN",
+    "created_at": "2026-08-20T00:00:06Z"
+  },
+  "sender": {
+    "login": "jhackuy",
+    "id": 1,
+    "type": "User"
+  }
+}

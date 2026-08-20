@@ -89,3 +89,15 @@ results are independent evidence for the same PR.
 `READY_FOR_OWNER` may be set to `YES` only when the task-specific design gate
 (if any), CodeRabbit, and `pasay-gate` evidence are all present and pass for
 the scope of the task. No PR may be auto-merged in this phase.
+
+## OpenDesign Auto-Dispatch (PASAY-OPENDESIGN-AUTO-DISPATCH-001)
+
+The `opendesign-dispatch` workflow handles the GitHub to OpenDesign
+handoff for `route:design-dev` issues. Trigger contract, status
+states, and PR-stage fixture validation are documented in
+`docs/opendesign-dispatch.md`. The dispatcher is event-driven; it
+does NOT poll, does NOT run on a schedule, and does NOT use a second
+database. Until Owner configures either a self-hosted runner or an
+`OD_DISPATCH_URL` secret, every approval event records a
+`BLOCKED_FOR_PRODUCT_DECISION` status comment so the missing step is
+auditable.
