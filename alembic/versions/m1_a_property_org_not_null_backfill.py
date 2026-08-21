@@ -26,8 +26,6 @@ Downgrade safety (Alembic downgrade MUST preserve column semantics):
 """
 from __future__ import annotations
 
-from typing import Union
-
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
@@ -51,7 +49,7 @@ def _gather_null_property_ids_without_org(conn: Connection) -> list[int]:
     rows = conn.execute(
         sa.text(
             "SELECT p.id FROM properties p "
-            "WHERE p.deleted_at IS NULL AND p.organization_id IS NULL "
+            "WHERE p.organization_id IS NULL "
             "ORDER BY p.id"
         )
     ).all()
@@ -189,10 +187,14 @@ def downgrade() -> None:
     # Must be BIGINT-compatible; NOT a different scalar type.
     type_name = type(col_type).__name__
     if "BIGINT" not in type_name.upper() and "BigInteger" not in type_name:
-        # Best-effort textual check too
         try:
             compiled = str(col_type.compile(dialect=conn.dialect))
         except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("alembic.runtime.migration").warning(
+                "cannot compile organization_id column type in downgrade audit", exc_info=True
+            )
             compiled = ""
         if "BIGINT" not in compiled.upper():
             raise RuntimeError(

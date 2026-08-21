@@ -16,11 +16,13 @@ Downgrade safety:
 """
 from __future__ import annotations
 
-from typing import Union
+import logging
 
 from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
+
+logger = logging.getLogger("alembic.runtime.migration")
 
 revision: str = "m1b000000001"
 down_revision: str | None = "m1a000000001"
@@ -34,9 +36,7 @@ class _AmbiguousTenantBackfill(RuntimeError):
 
 def _list_all_tenant_ids(conn: Connection) -> list[int]:
     rows = conn.execute(
-        sa.text(
-            "SELECT t.id FROM tenants t WHERE t.deleted_at IS NULL ORDER BY t.id"
-        )
+        sa.text("SELECT t.id FROM tenants t ORDER BY t.id")
     ).all()
     return [r[0] for r in rows]
 
@@ -44,16 +44,20 @@ def _list_all_tenant_ids(conn: Connection) -> list[int]:
 def _infer_tenant_orgs(conn: Connection, tenant_ids: list[int]) -> dict[int, list[int]]:
     """For every tenant_id, collect all DISTINCT org_ids via
     tenant -> Lease -> Unit -> Property.org. If tenant has 0 leases -> empty.
+
+    All rows (including soft-deleted Tenants / Leases / Units / Properties)
+    enter resolution because the final column is NOT NULL for the entire
+    table; ambiguous legacy soft-deleted facts still fail closed.
     """
     out: dict[int, list[int]] = {tid: [] for tid in tenant_ids}
     rows = conn.execute(
         sa.text(
             "SELECT DISTINCT t.id AS tenant_id, pr.organization_id "
             "FROM tenants t "
-            "JOIN leases l ON l.tenant_id = t.id AND l.deleted_at IS NULL "
-            "JOIN units u ON u.id = l.unit_id AND u.deleted_at IS NULL "
-            "JOIN properties pr ON pr.id = u.property_id AND pr.deleted_at IS NULL "
-            "WHERE t.deleted_at IS NULL AND pr.organization_id IS NOT NULL "
+            "JOIN leases l ON l.tenant_id = t.id "
+            "JOIN units u ON u.id = l.unit_id "
+            "JOIN properties pr ON pr.id = u.property_id "
+            "WHERE pr.organization_id IS NOT NULL "
             "ORDER BY t.id, pr.organization_id"
         )
     ).all()
@@ -67,14 +71,15 @@ def _backfill_tenant_orgs(conn: Connection, backfill_map: dict[int, int]) -> Non
     if not backfill_map:
         return
     chunk_size = 500
-    ids = sorted(backfill_map.keys())
-    for i in range(0, len(ids), chunk_size):
-        chunk = ids[i : i + chunk_size]
-        stmt = sa.text(
-            "UPDATE tenants SET organization_id = :oid WHERE id = :tid"
-        )
-        for tid in chunk:
-            conn.execute(stmt, {"tid": tid, "oid": backfill_map[tid]})
+    by_org: dict[int, list[int]] = {}
+    for tid, oid in sorted(backfill_map.items()):
+        by_org.setdefault(oid, []).append(tid)
+    stmt = sa.text(
+        "UPDATE tenants SET organization_id = :oid WHERE id IN :ids"
+    ).bindparams(sa.bindparam("ids", expanding=True))
+    for oid, ids in sorted(by_org.items()):
+        for i in range(0, len(ids), chunk_size):
+            conn.execute(stmt, {"oid": oid, "ids": ids[i : i + chunk_size]})
 
 
 def _organizations_lookup(conn: Connection) -> dict[int, str]:
@@ -109,10 +114,13 @@ def upgrade() -> None:
             sa.BigInteger(),
             sa.ForeignKey("organizations.id"),
             nullable=True,
-            index=True,
         ),
     )
-    # (2) Backfill via Lease->Unit->Property
+    # (2) Create index explicitly (op.add_column ignores Column(index=True)).
+    op.create_index(
+        "ix_tenants_organization_id", "tenants", ["organization_id"]
+    )
+    # (3) Backfill via Lease->Unit->Property
     tids = _list_all_tenant_ids(conn)
     if tids:
         inferred = _infer_tenant_orgs(conn, tids)
@@ -126,7 +134,7 @@ def upgrade() -> None:
         if ambiguous:
             _fail_closed(conn, ambiguous)
         _backfill_tenant_orgs(conn, backfill)
-    # (3) Enforce NOT NULL
+    # (4) Enforce NOT NULL
     op.alter_column(
         "tenants",
         "organization_id",
@@ -151,7 +159,7 @@ def downgrade() -> None:
     try:
         compiled = str(col["type"].compile(dialect=conn.dialect))
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning("cannot compile tenants.organization_id type", exc_info=True)
     if "BIGINT" not in tname.upper() and "BigInteger" not in tname and "BIGINT" not in compiled.upper():
         raise RuntimeError(
             f"PASAY-MILESTONE-001 downgrade FAIL CLOSED: "
@@ -178,7 +186,7 @@ def downgrade() -> None:
                 "PASAY-MILESTONE-001 downgrade FAIL CLOSED: "
                 "FK tenants.organization_id -> organizations(id) missing."
             )
-    # Drop index FIRST (before dropping column, column drop cascades index).
+    # Drop index FIRST (before dropping column; column drop cascades index drop).
     # Use IF EXISTS via raw SQL to stay fail-safe even if index was renamed.
     conn = op.get_bind()
     try:
@@ -186,7 +194,7 @@ def downgrade() -> None:
             sa.text("DROP INDEX IF EXISTS ix_tenants_organization_id")
         )
     except Exception:  # noqa: BLE001 — any index-drop issue is non-fatal in downgrade
-        pass
+        logger.warning("ix_tenants_organization_id drop failed", exc_info=True)
     # Relax NOT NULL -> NULL
     op.alter_column(
         "tenants",
