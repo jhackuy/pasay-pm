@@ -1,7 +1,7 @@
-"""PASAY-TASK-007 Issue #25 FIX1 — Property + Unit scoped + Channel Binding.
+"""PASAY-TASK-007 Issue #25 FIX3 — Property + Unit scoped + Channel Binding.
 
-Revision ID: a1b2c3d4e5f6
-Revises: z9a8b7c6d5e4
+Revision ID: b5c6d7e8f9a0
+Revises: a1b2c3d4e5f6
 Create Date: 2026-08-21
 
 Scope (Issue #25 authoritative contract, NOT PRODUCT_CONFORMANCE_AUDIT_001):
@@ -38,8 +38,8 @@ from sqlalchemy import inspect as sa_inspect
 
 from alembic import op
 
-revision: str = "a1b2c3d4e5f6"
-down_revision: str | None = "z9a8b7c6d5e4"
+revision: str = "b5c6d7e8f9a0"
+down_revision: str | None = "a1b2c3d4e5f6"
 branch_labels = None
 depends_on = None
 
@@ -50,6 +50,8 @@ depends_on = None
 # We NEVER renumber/rename the older values; only the PASAY-TASK-007 tail
 # changes (from 7 archive-article → 3 minimal-binding actions), which is
 # safe because this migration has never been merged into the base branch.
+# Note: PASAY-TASK-011 (a1b2c3d4e5f6_scheduled_job_ledger) does NOT modify
+# the audit action allowlist, so _BASE_ALLOWED is still valid here.
 
 _BASE_ALLOWED = (
     "create,update,soft_delete,confirm,approve,reject,pay,reverse,"

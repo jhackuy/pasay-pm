@@ -55,20 +55,39 @@ def _test_url():
 
 @pytest.fixture(scope="session")
 def test_engine():
-    """Create the dedicated `pasay_pm_test` database once per session."""
-    admin_url = make_url(settings.database_url).set(database="postgres")
-    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
-    with admin_engine.connect() as conn:
-        exists = conn.execute(
-            text("SELECT 1 FROM pg_database WHERE datname = :name"), {"name": TEST_DB_NAME}
-        ).scalar()
-        if not exists:
-            conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
-    admin_engine.dispose()
+    """Create the dedicated test database once per session.
 
+    PostgreSQL-only test harness (PASAY-TASK-011 FIX8: SQLite compatibility
+    route was a wrong CI direction — GitHub Actions uses PostgreSQL 16).
+    """
+    base_url = make_url(settings.database_url)
+    base_dialect = base_url.get_dialect().name
+
+    if base_dialect != "postgresql":
+        raise RuntimeError(
+            "tests/conftest.py test_engine: unsupported dialect %r "
+            "(PASAY-TASK-011 FIX8: test harness is PostgreSQL-only; "
+            "set DATABASE_URL to a postgresql+psycopg2:// URL)" % base_dialect
+        )
+
+    admin_url = base_url.set(database="postgres")
+    admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin_engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM pg_database WHERE datname = :name"),
+                {"name": TEST_DB_NAME},
+            ).scalar()
+            if not exists:
+                conn.execute(text(f'CREATE DATABASE "{TEST_DB_NAME}"'))
+    finally:
+        admin_engine.dispose()
     engine = create_engine(_test_url())
-    yield engine
-    engine.dispose()
+
+    try:
+        yield engine
+    finally:
+        engine.dispose()
 
 
 @pytest.fixture()

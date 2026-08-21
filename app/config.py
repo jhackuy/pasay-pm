@@ -35,6 +35,25 @@ class Settings(BaseSettings):
     # Past this budget the update is marked ``failed`` permanently so Telegram's
     # delivery loop stops replaying it and the operator can inspect the row.
     telegram_webhook_max_attempts: int = 3
+    # ------------------------------------------------------------------
+    # PASAY-TASK-011 / Production Architecture Closeout P0
+    # ------------------------------------------------------------------
+    # Shared secret that authorizes the Cloudflare Worker queue consumer
+    # to call ``POST /internal/ingest`` via the native Container binding.
+    # If left empty the endpoint FAILS CLOSED (401) — Container can only
+    # receive envelopes from the legitimate Worker queue consumer, never
+    # from the public internet.
+    container_ingest_token: str = ""
+    # Canonical runtime mode. Production deployments set this to
+    # "cloudflare-container". Anything else (including the empty default)
+    # keeps the development entry points alive but they are never referenced
+    # from Dockerfile / Cloudflare startup.
+    # Values: "cloudflare-container" | "development-native" | ""
+    pasay_runtime_mode: str = ""
+    # Neon direct/unpooled URL used EXCLUSIVELY by alembic migrations at
+    # container startup (fail-fast). Application runtime continues to use
+    # ``database_url`` (pooled, Neon-recommended). Scope E contract.
+    database_url_unpooled: str = ""
 
 
 settings = Settings()

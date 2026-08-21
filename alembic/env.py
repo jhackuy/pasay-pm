@@ -12,7 +12,12 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 config.set_main_option("sqlalchemy.url", settings.database_url)
-target_metadata = Base.metadata
+
+_isolated_test_metadata = config.attributes.get("pasay.test.target_metadata", None)
+if _isolated_test_metadata is not None:
+    target_metadata = _isolated_test_metadata
+else:
+    target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:

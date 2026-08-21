@@ -66,6 +66,7 @@ from app.models.repair import (
     RepairProposal,
     RepairProposalStatus,
 )
+from app.models.scheduled_job import ScheduledJobLedger
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.telegram_webhook import (
     CLAIM_STALE_SECONDS,
@@ -129,6 +130,7 @@ __all__ = [
     "RepairOperationStatus",
     "RepairProposal",
     "RepairProposalStatus",
+    "ScheduledJobLedger",
     "SecretaryInvite",
     "SecurityEvent",
     "SoftDeleteMixin",
