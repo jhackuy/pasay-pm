@@ -161,12 +161,13 @@ def get_onboarding_state(
             and invite.expires_at > now
         ):
             org = db.get(Organization, invite.organization_id)
-            return OnboardingStateResponse(
-                stage="SECRETARY_VALID_INVITE_PENDING_ACCEPT",
-                user_id=user.id,
-                secretary_hint_en=HINT_SECRETARY_ACCEPT_EN,
-                invite_organization_name=org.name if org else None,
-            )
+            if org is not None:
+                return OnboardingStateResponse(
+                    stage="SECRETARY_VALID_INVITE_PENDING_ACCEPT",
+                    user_id=user.id,
+                    secretary_hint_en=HINT_SECRETARY_ACCEPT_EN,
+                    invite_organization_name=org.name,
+                )
 
     if _is_owner_role(user):
         return OnboardingStateResponse(

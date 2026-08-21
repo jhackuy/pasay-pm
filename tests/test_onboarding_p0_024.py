@@ -156,6 +156,22 @@ class TestOnboardingStateService:
         reloaded = get_invite_by_code(db_session, invite.code)
         assert reloaded.state == InviteState.PENDING
 
+    def test_p03_pending_invite_with_missing_organization_is_invalid_no_leak(self, db_session, owner_user, sec_user, monkeypatch):
+        org, _ = bootstrap_first_owner(db_session, owner_user.id, "DanglingOrg", now=NOW)
+        invite = create_secretary_invite(db_session, owner_user.id, org.id, now=NOW)
+        assert invite.state == InviteState.PENDING
+        original_get = db_session.get
+
+        def fake_get(model, ident):
+            if getattr(model, "__name__", None) == "Organization" and ident == org.id:
+                return None
+            return original_get(model, ident)
+
+        monkeypatch.setattr(db_session, "get", fake_get)
+        resp = get_onboarding_state(db_session, sec_user, pending_invite_code=invite.code, now=NOW)
+        assert resp.stage != "SECRETARY_VALID_INVITE_PENDING_ACCEPT"
+        assert resp.invite_organization_name is None
+
 
 # ---------------------------------------------------------------------------
 # T2 / T4 — Owner bootstrap service + /state after bootstrap
@@ -300,14 +316,14 @@ class TestOnboardingRouter:
         return make_user(db_session, uname, UserRole.agent)
 
     def test_get_state_http_200(self, db_session, client):
-        user, key = self._create_admin(db_session, "http_state_usr", uid=601)
+        _user, key = self._create_admin(db_session, "http_state_usr", uid=601)
         r = client.get("/api/v1/onboarding/state", headers=_auth_headers(key))
         assert r.status_code == 200, r.text
         body = r.json()
         assert body["stage"] in ("OWNER_BOOTSTRAP_REQUIRED", "SECRETARY_NO_INVITE", "EXISTING_MEMBER")
 
     def test_post_owner_bootstrap_http_201(self, db_session, client):
-        user, key = self._create_admin(db_session, "http_owner_usr", uid=602)
+        _user, key = self._create_admin(db_session, "http_owner_usr", uid=602)
         r = client.post(
             "/api/v1/onboarding/owner/bootstrap",
             json={"org_name": "HTTP Co"},
@@ -319,7 +335,7 @@ class TestOnboardingRouter:
         assert body["membership"]["role"] == "OWNER"
 
     def test_post_owner_bootstrap_http_403_when_already_member(self, db_session, client):
-        user, key = self._create_admin(db_session, "http_owner_usr2", uid=603)
+        _user, key = self._create_admin(db_session, "http_owner_usr2", uid=603)
         client.post(
             "/api/v1/onboarding/owner/bootstrap",
             json={"org_name": "First"},
@@ -335,7 +351,7 @@ class TestOnboardingRouter:
 
     # --- P0-1 HTTP: fresh Secretary POST /owner/bootstrap MUST 403 English hint ---
     def test_p01_fresh_secretary_http_owner_bootstrap_403_english_hint(self, db_session, client):
-        sec_user, sec_key = self._create_secretary(db_session, "http_sec_fresh", uid=701)
+        _sec_user, sec_key = self._create_secretary(db_session, "http_sec_fresh", uid=701)
         r = client.post(
             "/api/v1/onboarding/owner/bootstrap",
             json={"org_name": "SecShouldFailCo"},
@@ -347,7 +363,7 @@ class TestOnboardingRouter:
         assert "Ask your Owner for an invite code" in detail
 
     def test_t10_secretary_bootstrap_endpoint_always_403(self, db_session, client):
-        user, key = self._create_admin(db_session, "http_sec_usr", uid=604)
+        _user, key = self._create_admin(db_session, "http_sec_usr", uid=604)
         # No body, with body, existing user — the endpoint always 403s.
         r = client.post("/api/v1/onboarding/secretary/bootstrap", json={}, headers=_auth_headers(key))
         assert r.status_code == 403, r.text
@@ -355,7 +371,7 @@ class TestOnboardingRouter:
 
     def test_post_secretary_accept_invite_http_201(self, db_session, client):
         owner, owner_key = self._create_admin(db_session, "http_owner_usr3", uid=605)
-        sec, sec_key = self._create_admin(db_session, "http_sec_usr3", uid=606)
+        _sec, sec_key = self._create_admin(db_session, "http_sec_usr3", uid=606)
         r_org = client.post(
             "/api/v1/onboarding/owner/bootstrap",
             json={"org_name": "Invited By API"},
@@ -363,7 +379,7 @@ class TestOnboardingRouter:
         )
         org_id = r_org.json()["organization"]["id"]
         # Create invite through the service directly (no invite-creation API in this slice).
-        inv = create_secretary_invite(db_session, owner.id, org_id, now=NOW)
+        inv = create_secretary_invite(db_session, owner.id, org_id)
         r = client.post(
             "/api/v1/onboarding/secretary/accept-invite",
             json={"invite_code": inv.code},
@@ -375,8 +391,8 @@ class TestOnboardingRouter:
         assert body["membership"]["state"] == "ACTIVE"
 
     def test_post_secretary_accept_invalid_invite_http_400(self, db_session, client):
-        owner, owner_key = self._create_admin(db_session, "http_owner_usr4", uid=607)
-        sec, sec_key = self._create_admin(db_session, "http_sec_usr4", uid=608)
+        _owner, owner_key = self._create_admin(db_session, "http_owner_usr4", uid=607)
+        _sec, sec_key = self._create_admin(db_session, "http_sec_usr4", uid=608)
         client.post(
             "/api/v1/onboarding/owner/bootstrap",
             json={"org_name": "Never Invited Co"},
