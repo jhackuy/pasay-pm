@@ -271,9 +271,9 @@ class TestOrganizationScope:
         assert prop_x.id == px.id
         assert membership.role == OrganizationRole.OWNER.value
 
-        with pytest.raises(ScopeBlocked):
+        with pytest.raises(LookupError):
             scoped_get_property(db_session, py.id, for_user_id=alice.id)
-        with pytest.raises(ScopeBlocked):
+        with pytest.raises(LookupError):
             scoped_get_property(db_session, px.id, for_user_id=bob.id)
 
     def test_scoped_get_unit_must_be_in_my_org(
@@ -288,7 +288,7 @@ class TestOrganizationScope:
         unit, _m = scoped_get_unit(db_session, ux.id, for_user_id=alice.id)
         assert unit.id == ux.id
 
-        with pytest.raises(ScopeBlocked):
+        with pytest.raises(LookupError):
             scoped_get_unit(db_session, uy.id, for_user_id=alice.id)
 
 
@@ -534,8 +534,8 @@ class TestPermissionMatrix:
         _mark_removed(db_session, secretary_carol_m)
         db_session.commit()
 
-        # After removal — ScopeBlocked immediately
-        with pytest.raises(ScopeBlocked):
+        # After removal — LookupError immediately (fail-closed 404)
+        with pytest.raises(LookupError):
             scoped_get_property(db_session, prop.id, for_user_id=carol.id)
 
     def test_secretary_cannot_bind_or_revoke_channel(
