@@ -244,7 +244,7 @@ class TestSecretaryInviteService:
     def test_t5_valid_invite_joins_as_secretary(self, db_session, owner_user, sec_user):
         org, _ = bootstrap_first_owner(db_session, owner_user.id, "T5 Org", now=NOW)
         inv = create_secretary_invite(db_session, owner_user.id, org.id, now=NOW)
-        out = secretary_join_via_invite(db_session, sec_user, inv.code)
+        out = secretary_join_via_invite(db_session, sec_user, inv.code, now=NOW)
         assert out.organization.name == "T5 Org"
         assert out.membership.role == OrganizationRole.SECRETARY.value
         assert out.membership.state == MembershipState.ACTIVE.value
