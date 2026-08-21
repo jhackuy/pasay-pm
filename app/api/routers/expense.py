@@ -13,7 +13,7 @@ from app.models.operations import (
     OperationalTaskStatus,
     OperationalTaskType,
 )
-from app.models.property import Unit
+from app.models.property import Property, Unit
 from app.models.user import User
 from app.schemas.financial import (
     ExpenseCreate,
@@ -45,7 +45,9 @@ from app.services.organization_scope import (
     OwnerRequired,
     ScopeBlocked,
     assert_co_org,
+    property_org_id,
     resolve_org_membership,
+    scope_exception_to_http,
     scoped_get_expense,
     scoped_list_expenses,
     unit_org_id,
@@ -55,19 +57,11 @@ router = APIRouter(prefix="/expenses", tags=["expenses"])
 
 _CREATABLE = {ExpenseStatus.pending, ExpenseStatus.approved}
 
-_CRITICAL_FIELDS = ("amount", "payee", "category", "description", "unit_id", "payer_user_id")
+_CRITICAL_FIELDS = ("amount", "payee", "category", "description", "unit_id", "property_id", "payer_user_id")
 
 
 class _ResubmitPayload(ExpenseUpdate):
     idempotency_key: str | None = None
-
-
-def _scope_exception_to_http(exc: Exception) -> HTTPException:
-    if isinstance(exc, LookupError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc) or "Not found")
-    if isinstance(exc, (ScopeBlocked, OwnerRequired, CrossOrgReference)):
-        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc) or "Forbidden")
-    raise exc
 
 
 def _check_unit(db: Session, unit_id: int | None) -> None:
@@ -80,6 +74,56 @@ def _check_unit(db: Session, unit_id: int | None) -> None:
     )
     if unit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
+
+
+def _check_property(db: Session, property_id: int | None) -> None:
+    if property_id is None:
+        return
+    prop = (
+        db.query(Property)
+        .filter(Property.id == property_id, Property.deleted_at.is_(None))
+        .first()
+    )
+    if prop is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+
+
+def _resolve_expense_property_id(db: Session, unit_id: int | None, property_id: int | None) -> int:
+    """Resolve the final expense.property_id with canonical ownership rules.
+
+    * At least one of unit_id or property_id MUST be present.
+    * If both present: unit.property_id MUST equal property_id, else CrossOrgReference (409).
+    * Returns the property_id to store on Expense (NOT NULL).
+    """
+    resolved_from_unit: int | None = None
+    if unit_id is not None:
+        unit_row = db.query(Unit.property_id).filter(Unit.id == unit_id, Unit.deleted_at.is_(None)).one_or_none()
+        if unit_row is None:
+            raise LookupError("Unit not found")
+        resolved_from_unit = unit_row[0]
+    if property_id is not None and resolved_from_unit is not None:
+        if property_id != resolved_from_unit:
+            raise CrossOrgReference(
+                "Expense unit_id and property_id must belong to the same property"
+            )
+    final_property_id = resolved_from_unit if resolved_from_unit is not None else property_id
+    if final_property_id is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Expense requires at least unit_id or property_id (canonical ownership anchor)",
+        )
+    return final_property_id
+
+
+def _resolve_expense_org_id(db: Session, unit_id: int | None, property_id: int | None) -> int:
+    """Resolve canonical organization_id for an Expense via both channels (fail closed)."""
+    final_property_id = _resolve_expense_property_id(db, unit_id, property_id)
+    oid = property_org_id(db, final_property_id)
+    if oid is None:
+        raise CrossOrgReference(
+            f"Expense property id={final_property_id} not found or has no organization"
+        )
+    return oid
 
 
 def _check_payer(db: Session, payer_user_id: int | None) -> None:
@@ -248,7 +292,7 @@ def list_expenses(db: Session = Depends(get_db), user: User = Depends(get_curren
     try:
         return scoped_list_expenses(db, for_user_id=user.id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.get("/{expense_id}", response_model=ExpenseRead)
@@ -259,7 +303,7 @@ def get_expense(
         obj, _membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
         return obj
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.get("/{expense_id}/detail", response_model=ExpenseDetailOut)
@@ -271,7 +315,7 @@ def expense_detail(
     try:
         obj, _membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     return _build_detail(db, obj)
 
 
@@ -293,26 +337,24 @@ def create_expense(
 
     membership = None
     try:
-        if payload.unit_id is not None:
-            u_org_id = unit_org_id(db, payload.unit_id)
-            if u_org_id is None:
-                raise LookupError("Unit not found")
-            membership = resolve_org_membership(
-                db, user.id, u_org_id, role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY]
-            )
-            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=u_org_id, object_kind="Unit", object_id=payload.unit_id)
-        else:
-            raise CrossOrgReference("Expense must be associated with a unit")
+        final_property_id = _resolve_expense_property_id(db, payload.unit_id, payload.property_id)
+        e_org_id = _resolve_expense_org_id(db, payload.unit_id, payload.property_id)
+        membership = resolve_org_membership(
+            db, user.id, e_org_id, role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY]
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     if payload.status == ExpenseStatus.approved and membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Only OWNER can create an approved expense"
         )
     _check_unit(db, payload.unit_id)
+    _check_property(db, payload.property_id)
     _check_payer(db, payload.payer_user_id)
-    obj = Expense(**payload.model_dump(), version=1)
+    data = payload.model_dump()
+    data["property_id"] = final_property_id
+    obj = Expense(**data, version=1)
     obj.created_by = user.id
     obj.updated_by = user.id
     if obj.status == ExpenseStatus.approved:
@@ -346,23 +388,30 @@ def update_expense(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
     _guard_edit(db, obj, updates, user)
 
+    effective_unit_id = updates.get("unit_id", obj.unit_id)
+    effective_property_id = updates.get("property_id", obj.property_id)
     try:
-        if updates.get("unit_id") is not None and updates["unit_id"] != obj.unit_id:
-            new_unit_org = unit_org_id(db, updates["unit_id"])
-            if new_unit_org is None:
-                raise LookupError("Unit not found")
-            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=new_unit_org, object_kind="Unit", object_id=updates["unit_id"])
+        final_property_id = _resolve_expense_property_id(db, effective_unit_id, effective_property_id)
+        new_org_id = _resolve_expense_org_id(db, effective_unit_id, effective_property_id)
+        assert_co_org(
+            db,
+            user_org_id=membership.organization_id,
+            object_org_id=new_org_id,
+            object_kind="Expense (after update)",
+            object_id=expense_id,
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     _check_unit(db, updates.get("unit_id"))
+    _check_property(db, updates.get("property_id"))
     if "payer_user_id" in updates:
         _check_payer(db, updates.get("payer_user_id"))
     old = serialize_row(obj)
@@ -370,6 +419,7 @@ def update_expense(
     for field, value in updates.items():
         if field != "status":
             setattr(obj, field, value)
+    obj.property_id = final_property_id
     obj.updated_by = user.id
     record_audit(
         db,
@@ -397,16 +447,13 @@ def approve_expense(
     user: User = Depends(get_current_user),
 ):
     try:
-        obj, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        obj, membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
-    if obj.created_by == user.id:
+    if obj.created_by == user.id and membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot approve an expense you created"
         )
@@ -453,16 +500,13 @@ def reject_expense(
     user: User = Depends(get_current_user),
 ):
     try:
-        obj, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        obj, membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
-    if obj.created_by == user.id:
+    if obj.created_by == user.id and membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot reject an expense you created"
         )
@@ -517,7 +561,7 @@ def resubmit_expense(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     if prior.status != ExpenseStatus.rejected:
         raise HTTPException(
@@ -525,19 +569,18 @@ def resubmit_expense(
             "Only a rejected expense can be resubmitted as the next version",
         )
     updates = payload.model_dump(exclude_unset=True)
-    effective_unit_id = updates.get("unit_id") or prior.unit_id
-
+    effective_unit_id = updates.get("unit_id", prior.unit_id)
+    effective_property_id = updates.get("property_id", prior.property_id)
     try:
-        if effective_unit_id is not None:
-            u_org_id = unit_org_id(db, effective_unit_id)
-            if u_org_id is None:
-                raise LookupError("Unit not found")
-            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=u_org_id, object_kind="Unit", object_id=effective_unit_id)
+        final_property_id = _resolve_expense_property_id(db, effective_unit_id, effective_property_id)
+        new_org_id = _resolve_expense_org_id(db, effective_unit_id, effective_property_id)
+        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=new_org_id, object_kind="Expense (resubmit)", object_id=expense_id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     _check_unit(db, effective_unit_id)
-    effective_payer = updates.get("payer_user_id") or prior.payer_user_id
+    _check_property(db, effective_property_id)
+    effective_payer = updates.get("payer_user_id", prior.payer_user_id)
     if effective_payer:
         _check_payer(db, effective_payer)
     data = {
@@ -548,6 +591,7 @@ def resubmit_expense(
         "payee": updates.get("payee", prior.payee),
         "description": updates.get("description", prior.description),
         "unit_id": effective_unit_id,
+        "property_id": final_property_id,
         "payer_user_id": effective_payer,
         "status": ExpenseStatus.pending,
         "version": (prior.version or 1) + 1,
@@ -590,7 +634,7 @@ def create_payment_claim(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     if payload.claimed_amount is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "claimed_amount is required")
@@ -621,7 +665,7 @@ def list_payment_claims(
     try:
         _expense, _membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     return [PaymentClaimOut(**__claim_out(c)) for c in list_claims(db, expense_id)]
 
 
@@ -653,14 +697,11 @@ def verify_payment_claim(
     user: User = Depends(get_current_user),
 ):
     try:
-        expense, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     try:
         claim = verify_claim(
@@ -689,14 +730,11 @@ def fail_payment_claim(
     user: User = Depends(get_current_user),
 ):
     try:
-        expense, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     try:
         claim = fail_claim(
@@ -720,14 +758,11 @@ def reverse_payment_claim(
     user: User = Depends(get_current_user),
 ):
     try:
-        expense, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     try:
         claim = reverse_claim(
@@ -760,14 +795,11 @@ def pay_expense(
     user: User = Depends(get_current_user),
 ):
     try:
-        _check, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        obj, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     obj = (
         db.query(Expense)
@@ -842,14 +874,11 @@ def reverse_expense(
     user: User = Depends(get_current_user),
 ):
     try:
-        _check, membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
-        if membership.role != OrganizationRole.OWNER:
-            raise OwnerRequired(
-                f"user_id={user.id!r} has ACTIVE {membership.role.value} membership in "
-                f"org={membership.organization_id!r}; action requires ACTIVE OWNER"
-            )
+        obj, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     obj = (
         db.query(Expense)
@@ -865,6 +894,11 @@ def reverse_expense(
         return obj
     claims = [c for c in list_claims(db, obj.id) if c.status == ClaimStatus.VERIFIED]
     if not claims:
+        db.refresh(obj)
+        if obj.status == ExpenseStatus.reversed:
+            db.commit()
+            db.refresh(obj)
+            return obj
         raise HTTPException(status.HTTP_409_CONFLICT, "No verified payments to reverse")
     now = datetime.now(timezone.utc)
     for c in claims:
