@@ -109,7 +109,7 @@ jobs:
         run: |
           python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
-      - name: Run backend targeted pytest (Issue #18 + Issue #31)
+      - name: Run backend targeted pytest (Issue #18 + Issue #31 + M1 + M002 Rent/Repair)
         if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.cloudflare == 'true'
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
@@ -119,11 +119,19 @@ jobs:
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
           PASAY_RUNTIME_MODE: "ci"
-        timeout-minutes: 8
+        timeout-minutes: 12
         run: |
+          # Legacy P0 gates: Issue #18 (telegram webhook) + Issue #31 (prod arch closeout)
+          # M1 org-scope P0 regression (milestone/1)
+          # M002: Rent closure + Repair closure + Expense payment truth + Repair AI employee
           python -m pytest \
-            tests/test_prod_arch_closeout_p0_031.py \
             tests/test_telegram_webhook_p018.py \
+            tests/test_prod_arch_closeout_p0_031.py \
+            tests/test_milestone_1_org_scope_p0.py \
+            tests/test_expense_003b_payment_truth.py \
+            tests/test_repair_ai_employee_008.py \
+            tests/test_rent_closure_m2.py \
+            tests/test_repair_closure_m2.py \
             -v --tb=short -q
 
       - name: Install bot dependencies
