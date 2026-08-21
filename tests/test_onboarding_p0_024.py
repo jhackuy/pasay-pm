@@ -281,7 +281,7 @@ class TestOnboardingAuditDelegates:
         logs = db_session.query(AuditLog).filter(
             AuditLog.table_name.in_(["organizations", "memberships"])
         ).all()
-        actions = [str(l.action.value) for l in logs]
+        actions = [str(log.action.value) for log in logs]
         assert "org_created" in actions
         assert "org_first_owner_activated" in actions
 
