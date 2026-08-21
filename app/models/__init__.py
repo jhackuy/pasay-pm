@@ -54,11 +54,9 @@ from app.models.operations import (
 )
 from app.models.property import Property, Unit, UnitLifecycleEvent, UnitStatus
 from app.models.property_channel import (
-    ArchiveArticleStatus,
-    ChannelPlatform,
-    ChannelScope,
-    PropertyArchiveChannel,
-    UnitArchiveArticle,
+    BindingStatus,
+    ChannelPurpose,
+    UnitChannelBinding,
 )
 from app.models.repair import (
     RepairAction,
@@ -81,14 +79,13 @@ __all__ = [
     "CLAIM_STALE_SECONDS",
     "AgentRole",
     "ApiCredential",
-    "ArchiveArticleStatus",
     "Attachment",
     "AuditAction",
     "AuditLog",
     "AuditMixin",
     "Base",
-    "ChannelPlatform",
-    "ChannelScope",
+    "BindingStatus",
+    "ChannelPurpose",
     "ClaimStatus",
     "CommissionRule",
     "CommissionRuleType",
@@ -124,7 +121,6 @@ __all__ = [
     "Principal",
     "PrincipalType",
     "Property",
-    "PropertyArchiveChannel",
     "Recurrence",
     "RecurringRule",
     "RepairAction",
@@ -145,7 +141,7 @@ __all__ = [
     "Tenant",
     "TenantContactStatus",
     "Unit",
-    "UnitArchiveArticle",
+    "UnitChannelBinding",
     "UnitLifecycleEvent",
     "UnitStatus",
     "User",

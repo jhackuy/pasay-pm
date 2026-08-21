@@ -99,18 +99,11 @@ class AuditAction(str, Enum):
     secretary_invite_accepted = "secretary_invite_accepted"
     secretary_invite_cancelled = "secretary_invite_cancelled"
     secretary_removed = "secretary_removed"
-    # PASAY-TASK-007 (appended only; never rename or reorder prior values):
-    # Property Channel lifecycle audit actions. Each distinguishes exactly
-    # WHO triggered the archive edit so the Owner can audit both human
-    # editors (Owner/Secretary taps a "Republish Archive" button) and
-    # system-triggered republishes (lifecycle event refreshed the file).
-    property_article_published = "property_article_published"
-    property_article_edited = "property_article_edited"
-    property_article_archived = "property_article_archived"
-    unit_article_published = "unit_article_published"
-    unit_article_edited = "unit_article_edited"
-    unit_article_archived = "unit_article_archived"
-    unit_archive_rendered = "unit_archive_rendered"
+    # PASAY-TASK-007 (Issue #25, appended only; never rename or reorder prior
+    # values): Unit ↔ Channel minimal binding lifecycle audit actions.
+    unit_channel_bound = "unit_channel_bound"
+    unit_channel_replaced = "unit_channel_replaced"
+    unit_channel_revoked = "unit_channel_revoked"
 
 
 class AuditLog(AuditMixin, Base):

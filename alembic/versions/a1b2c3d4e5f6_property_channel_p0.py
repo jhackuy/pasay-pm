@@ -1,29 +1,35 @@
-"""PASAY-TASK-007 Property + Channel P0 migration.
+"""PASAY-TASK-007 Issue #25 FIX1 — Property + Unit scoped + Channel Binding.
 
 Revision ID: a1b2c3d4e5f6
-Revises: e2a114b2f9d0
+Revises: z9a8b7c6d5e4
 Create Date: 2026-08-21
 
-Scope (PASAY-TASK-007 Issue #25 contract):
-1. ``property_archive_channels`` — one property-level article row per
-   (platform, property_id) with a PUBLISHED-has-message_id CHECK guard so
-   the bot always has exactly one message to edit in-place.
-2. ``unit_archive_articles`` — per-unit digital file with
-   ``render_hash`` + ``render_version`` counters so the rendering
-   service can short-circuit a no-op edit (no truth change = no spam).
-3. AuditAction allowlist append (PASAY-TASK-007 rows at the TAIL, never
-   renumber or rename the existing membership/expense/repair values).
+Scope (Issue #25 authoritative contract, NOT PRODUCT_CONFORMANCE_AUDIT_001):
+  1. properties.organization_id — nullable BIGINT FK (compatible with existing
+     data; old rows keep NULL, new writes MUST supply).
+  2. uq_units_active_property_unit_number — partial UNIQUE on
+     (property_id, unit_number) WHERE deleted_at IS NULL AND is_active = TRUE.
+     + ck_units_unit_number_nonblank — forbid blank unit_number strings.
+  3. unit_channel_bindings — Issue #25 §4 minimal binding model:
+       - organization_id NOT NULL FK, unit_id NOT NULL FK
+       - purpose enum (archive / business_group)
+       - channel_chat_id BigInteger (required if ACTIVE, allows negative Telegram IDs)
+       - thread_topic_id BigInteger (optional thread/topic locator)
+       - status ACTIVE|REVOKED with timestamp gating (CHECK)
+       - uq_unit_binding_active_unit_purpose: partial UNIQUE on (unit_id, purpose)
+         WHERE status='ACTIVE' → one active binding per (unit, purpose)
+       - revokes preserve history (REVOKED rows stay; never hard-deleted)
+  4. AuditAction allowlist tail-append: drop the 7 archive-article actions
+     (property_article_* / unit_article_* / unit_archive_rendered) and add
+     the 3 minimal binding actions (unit_channel_bound/replaced/revoked).
 
-Downgrade safety (mirrors Issue #31 FIX5 + Issue #20 FIX2 pattern):
-- Every DROP in ``downgrade()`` runs a ``sa.inspect``-backed audit
-  confirming:
-  (a) DateTime columns marked timezone-aware ARE real tz-aware columns
-      in the live connection dialect (UTC-vs-local semantic data loss);
-  (b) No JSON/JSONB "dialect-only" columns silently appear that the
-      declared schema did not intend to ship (would mean a DROP loses
-      unmodeled JSON payloads that future migrations might re-add).
-- Audit aborts with a RuntimeError before any DROP when drift is
-  detected; no partial loss possible.
+Downgrade safety (mirrors Issue #20 FIX2 pattern — FAIL CLOSED on drift):
+  - unit_channel_bindings downgrade: sa.inspect audit of 4 tz-aware DateTime
+    columns + no unmodeled JSONB/dialect types BEFORE drop_table.
+  - properties.organization_id downgrade: sa.inspect audit of the column's
+    actual DB type (must be BIGINT/INT8-ish, no JSONB drift) BEFORE drop.
+  - Audit logs CHECK constraint is rebuilt in both directions atomically.
+  - Any drift aborts with RuntimeError before destructive SQL executes.
 """
 from __future__ import annotations
 
@@ -38,15 +44,12 @@ branch_labels = None
 depends_on = None
 
 
-PROPERTY_CHANNEL_AUDIT_APPENDS = (
-    "property_article_published",
-    "property_article_edited",
-    "property_article_archived",
-    "unit_article_published",
-    "unit_article_edited",
-    "unit_article_archived",
-    "unit_archive_rendered",
-)
+# ---- AuditLog action allowlist rebuild -------------------------------------
+#
+# _BASE_ALLOWED matches the tail in z9a8b7c6d5e4 (membership P0 migration).
+# We NEVER renumber/rename the older values; only the PASAY-TASK-007 tail
+# changes (from 7 archive-article → 3 minimal-binding actions), which is
+# safe because this migration has never been merged into the base branch.
 
 _BASE_ALLOWED = (
     "create,update,soft_delete,confirm,approve,reject,pay,reverse,"
@@ -77,19 +80,19 @@ _BASE_ALLOWED = (
     "secretary_invite_cancelled,secretary_removed"
 )
 
-_DT_TZ_COLUMNS = {
-    "property_archive_channels": [
-        "created_at", "updated_at",
-        "last_published_at", "last_rendered_at",
-    ],
-    "unit_archive_articles": [
-        "created_at", "updated_at",
-        "last_published_at", "last_rendered_at",
-    ],
-}
+_PROPERTY_CHANNEL_ISSUE25_APPENDS = (
+    "unit_channel_bound",
+    "unit_channel_replaced",
+    "unit_channel_revoked",
+)
+
+# ---- Downgrade audit catalogues --------------------------------------------
+_UCB_DT_TZ_COLUMNS = [
+    "created_at", "updated_at", "revoked_at",
+]
 
 _SAFE_TYPES_PREFIX = (
-    "VARCHAR", "CHAR", "BIGINT", "INTEGER", "INT ", "SMALLINT",
+    "VARCHAR", "CHAR", "BIGINT", "INTEGER", "INT ", "INT,", "SMALLINT",
     "BOOLEAN", "NUMERIC", "DECIMAL", "TEXT", "DATE", "DATETIME",
     "TIMESTAMP", "UUID",
 )
@@ -145,92 +148,152 @@ def _audit_no_jsonb_or_dialect_columns(conn, table: str) -> None:
         )
 
 
+def _audit_column_type_is_int(conn, table: str, column: str) -> None:
+    insp = sa_inspect(conn)
+    cols = {c["name"]: c for c in insp.get_columns(table)}
+    if column not in cols:
+        return  # column not present = nothing to drop, OK
+    col_type = str(cols[column]["type"]).upper()
+    if not any(col_type.startswith(p) for p in ("BIGINT", "INTEGER", "INT ", "INT,", "SMALLINT")):
+        raise RuntimeError(
+            f"downgrade audit: {table}.{column} type={col_type!r} not integer-ish"
+            f" — refusing drop column (would silently drop unexpected payload)"
+        )
+
+
+# ---- upgrade / downgrade ---------------------------------------------------
+
 def upgrade() -> None:
-    op.create_table(
-        "property_archive_channels",
-        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
-        sa.Column("property_id", sa.BigInteger(), sa.ForeignKey("properties.id"), nullable=False, index=True),
-        sa.Column("platform", sa.String(length=30), nullable=False, server_default="telegram_channel"),
-        sa.Column("channel_chat_id", sa.BigInteger(), nullable=True),
-        sa.Column("external_message_id", sa.BigInteger(), nullable=True),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="draft"),
-        sa.Column("render_hash", sa.String(length=64), nullable=True),
-        sa.Column("last_published_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("last_rendered_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("render_error", sa.Text(), nullable=True),
-        sa.Column("editor_user_id", sa.BigInteger(), sa.ForeignKey("users.id"), nullable=True),
-        sa.Column("notes", sa.String(length=500), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("created_by", sa.BigInteger(), nullable=True),
-        sa.Column("updated_by", sa.BigInteger(), nullable=True),
-        sa.UniqueConstraint("platform", "property_id", name="uq_property_archive_active_property"),
-        sa.CheckConstraint(
-            "platform IN ('telegram_channel','telegram_group','discord')",
-            name="ck_property_archive_platform",
-        ),
-        sa.CheckConstraint(
-            "status IN ('draft','published','archived')",
-            name="ck_property_archive_status",
-        ),
-        sa.CheckConstraint(
-            "(status = 'published' AND external_message_id IS NOT NULL) OR status <> 'published'",
-            name="ck_property_archive_published_has_message",
-        ),
+    # --- 1. properties.organization_id (nullable, compat with existing data)
+    with op.batch_alter_table("properties", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column("organization_id", sa.BigInteger(), sa.ForeignKey("organizations.id"), nullable=True)
+        )
+        batch_op.create_index(
+            "ix_properties_organization_id_active",
+            ["organization_id"],
+            postgresql_where=sa.text("deleted_at IS NULL"),
+        )
+    op.create_index(
+        "ix_properties_organization_id",
+        "properties",
+        ["organization_id"],
+        unique=False,
     )
 
+    # --- 2. Unit table: partial unique index + nonblank CHECK
+    with op.batch_alter_table("units", schema=None) as batch_op:
+        batch_op.create_index(
+            "uq_units_active_property_unit_number",
+            ["property_id", "unit_number"],
+            unique=True,
+            postgresql_where=sa.text("deleted_at IS NULL AND is_active = TRUE"),
+        )
+        batch_op.create_check_constraint(
+            "ck_units_unit_number_nonblank",
+            "length(btrim(unit_number)) > 0",
+        )
+
+    # --- 3. unit_channel_bindings table (Issue #25 §4 minimal binding)
     op.create_table(
-        "unit_archive_articles",
+        "unit_channel_bindings",
         sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
-        sa.Column("unit_id", sa.BigInteger(), sa.ForeignKey("units.id"), nullable=False, index=True),
-        sa.Column("property_id", sa.BigInteger(), sa.ForeignKey("properties.id"), nullable=False, index=True),
-        sa.Column("platform", sa.String(length=30), nullable=False, server_default="telegram_channel"),
+        sa.Column(
+            "organization_id",
+            sa.BigInteger(), sa.ForeignKey("organizations.id"),
+            nullable=False, index=True,
+        ),
+        sa.Column(
+            "unit_id",
+            sa.BigInteger(), sa.ForeignKey("units.id"),
+            nullable=False, index=True,
+        ),
+        sa.Column("purpose", sa.String(length=30), nullable=False),
         sa.Column("channel_chat_id", sa.BigInteger(), nullable=True),
-        sa.Column("external_message_id", sa.BigInteger(), nullable=True),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="draft"),
-        sa.Column("render_hash", sa.String(length=64), nullable=True),
-        sa.Column("render_version", sa.Integer(), nullable=False, server_default="1"),
-        sa.Column("last_published_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("last_rendered_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("render_error", sa.Text(), nullable=True),
-        sa.Column("editor_user_id", sa.BigInteger(), sa.ForeignKey("users.id"), nullable=True),
-        sa.Column("event_count_at_publish", sa.Integer(), nullable=True),
+        sa.Column("thread_topic_id", sa.BigInteger(), nullable=True),
+        sa.Column("status", sa.String(length=20), nullable=False, server_default="ACTIVE"),
+        sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "revoked_by_membership_id",
+            sa.BigInteger(), sa.ForeignKey("memberships.id"),
+            nullable=True,
+        ),
         sa.Column("notes", sa.String(length=500), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
         sa.Column("created_by", sa.BigInteger(), nullable=True),
         sa.Column("updated_by", sa.BigInteger(), nullable=True),
-        sa.UniqueConstraint("platform", "unit_id", name="uq_unit_archive_active_unit"),
+        # Constraints (mirror the ORM model declarations):
         sa.CheckConstraint(
-            "platform IN ('telegram_channel','telegram_group','discord')",
-            name="ck_unit_archive_platform",
+            "purpose IN ('archive','business_group')",
+            name="ck_unit_binding_purpose_enum",
         ),
         sa.CheckConstraint(
-            "status IN ('draft','published','archived')",
-            name="ck_unit_archive_status",
+            "status IN ('ACTIVE','REVOKED')",
+            name="ck_unit_binding_status_enum",
         ),
         sa.CheckConstraint(
-            "(status = 'published' AND external_message_id IS NOT NULL) OR status <> 'published'",
-            name="ck_unit_archive_published_has_message",
+            "(status = 'ACTIVE' AND channel_chat_id IS NOT NULL) OR status <> 'ACTIVE'",
+            name="ck_unit_binding_active_has_chat_id",
+        ),
+        sa.CheckConstraint(
+            "(status = 'REVOKED' AND revoked_at IS NOT NULL) OR status <> 'REVOKED'",
+            name="ck_unit_binding_revoked_has_timestamp",
         ),
     )
     op.create_index(
-        "ix_unit_archive_property_status",
-        "unit_archive_articles",
-        ["unit_id", "status"],
+        "uq_unit_binding_active_unit_purpose",
+        "unit_channel_bindings",
+        ["unit_id", "purpose"],
+        unique=True,
+        postgresql_where=sa.text("status = 'ACTIVE'"),
+    )
+    op.create_index(
+        "ix_unit_bindings_org_unit_status",
+        "unit_channel_bindings",
+        ["organization_id", "unit_id", "status"],
     )
 
+    # --- 4. Audit action allowlist rebuild
     conn = op.get_bind()
-    expanded = _BASE_ALLOWED + "," + ",".join(PROPERTY_CHANNEL_AUDIT_APPENDS)
+    expanded = _BASE_ALLOWED + "," + ",".join(_PROPERTY_CHANNEL_ISSUE25_APPENDS)
     _set_audit_action_allowlist(conn, expanded)
 
 
 def downgrade() -> None:
     conn = op.get_bind()
-    for table, cols in _DT_TZ_COLUMNS.items():
-        _audit_timezone_columns(conn, table, cols)
-        _audit_no_jsonb_or_dialect_columns(conn, table)
+
+    # --- Pre-drop audits (FAIL CLOSED on any detected drift)
+    # a) unit_channel_bindings table (tz + JSONB audits)
+    _audit_timezone_columns(conn, "unit_channel_bindings", _UCB_DT_TZ_COLUMNS)
+    _audit_no_jsonb_or_dialect_columns(conn, "unit_channel_bindings")
+    # b) properties.organization_id column type audit (must be integer-ish)
+    _audit_column_type_is_int(conn, "properties", "organization_id")
+
+    # --- 4. Restore baseline audit allowlist (drop the Issue #25 tail)
     _set_audit_action_allowlist(conn, _BASE_ALLOWED)
 
-    op.drop_table("unit_archive_articles")
-    op.drop_table("property_archive_channels")
+    # --- 3. Drop unit_channel_bindings (audited above)
+    op.drop_index("uq_unit_binding_active_unit_purpose", table_name="unit_channel_bindings")
+    op.drop_index("ix_unit_bindings_org_unit_status", table_name="unit_channel_bindings")
+    op.drop_table("unit_channel_bindings")
+
+    # --- 2. Drop Unit constraints / indexes added in upgrade
+    with op.batch_alter_table("units", schema=None) as batch_op:
+        batch_op.drop_constraint("ck_units_unit_number_nonblank", type_="check")
+        batch_op.drop_index("uq_units_active_property_unit_number")
+
+    # --- 1. Drop properties.organization_id (audited above for type safety)
+    with op.batch_alter_table("properties", schema=None) as batch_op:
+        batch_op.drop_index("ix_properties_organization_id_active")
+    op.drop_index("ix_properties_organization_id", table_name="properties")
+    with op.batch_alter_table("properties", schema=None) as batch_op:
+        batch_op.drop_column("organization_id")

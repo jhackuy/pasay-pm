@@ -1,414 +1,404 @@
-"""Property Channel service layer (PASAY-TASK-007).
+"""Property / Unit scoped helpers + Unit Channel Binding service (Issue #25 P0).
 
-Implements the three operations the bot & backend share:
-  * ``render_unit_archive(db, unit_id)`` -> deterministic hash + text
-    body built on top of ``build_unit_timeline`` from the existing
-    deterministic Quick Views module (PRODUCT_CONFORMANCE_AUDIT_001 §4.2
-    explicitly calls this re-use out).
-  * ``publish_unit_article(db, unit_id, external_message_id, actor_id)``
-    -> records the PUBLISHED row with the hash guard; subsequent renders
-    with the same hash are no-ops.
-  * ``publish_property_article(db, property_id, external_message_id,
-    actor_id)`` -> same for the per-property "all units in this building"
-    overview article.
-  * ``render_property_archive(db, property_id)`` -> summary body with
-    status/vacancy counts and per-unit links.
+Replaces the PRODUCT_CONFORMANCE_AUDIT_001 archive-article/render-publish
+layer that was out-of-contract for Issue #25. This module implements exactly
+what the Issue #25 P0 contract requires for the NEW code paths:
 
-The renderers never write themselves — they are pure read + return. The
-``publish_*`` functions accept a pre-rendered hash so the bot can ship
-the actual ``editMessageText`` call and only then commit the PostgreSQL
-mapping. This mirrors the ``evidence`` table pattern (storage bytes in
-TG, PG keeps index + relationship authority).
+  1. organization-scoped Property / Unit access (cross-org isolation)
+  2. ``organization + property_id + unit_number → Unit`` stable lookup
+  3. Unit ↔ Telegram Channel minimal binding lifecycle:
+        bind (OWNER-only) / replace (OWNER-only → old REVOKED, new ACTIVE)
+        / revoke (OWNER-only → REVOKED + history preserved)
+  4. Active-binding uniqueness: one ACTIVE per (unit_id, purpose)
+
+Permission philosophy (mirrors Issue #25 §5):
+  * New Property / Unit / Binding write paths in this slice use **Membership
+    state + role** as the exclusive authority. Legacy ``users.role`` is NEVER
+    consulted here.
+  * ``ACTIVE OWNER``: create Property, bind/revoke/replace Unit channels,
+    edit ANY field on Property/Unit.
+  * ``ACTIVE SECRETARY``: daily-maintenance edits on Property/Unit only
+    (management_*, operational_notes, is_active, total_units on Property;
+    floor/size_sqm/monthly_rent/status/unit_state/is_active/unit_number
+    on Unit); NOT allowed to touch channel bindings.
+  * ``REMOVED`` membership or no ACTIVE row → immediate 403 on every path.
+
+Concurrency (CodeRabbit "concurrent publish 500" fix):
+  * ``bind_unit_channel`` locks any currently-ACTIVE binding for the same
+    (unit_id, purpose) with ``with_for_update`` before the REVOKE + INSERT
+    dance, so concurrent binders serialize instead of IntegrityError + 500.
 """
 from __future__ import annotations
 
-import hashlib
-import json
-from collections import Counter
-from collections.abc import Iterable
 from datetime import datetime, timezone
-from decimal import Decimal
+from collections.abc import Iterable
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction
+from app.models.membership import Membership, MembershipState, Organization, OrganizationRole
 from app.models.property import Property, Unit
-from app.models.property_channel import (
-    ArchiveArticleStatus,
-    PropertyArchiveChannel,
-    UnitArchiveArticle,
-)
+from app.models.property_channel import BindingStatus, ChannelPurpose, UnitChannelBinding
 from app.services.audit import record_audit, serialize_row
-from app.services.operations.quick import build_unit_timeline
+from app.services.membership import has_active_membership
 
 
-def _stable_hash(payload: dict | list | str) -> str:
-    body = payload if isinstance(payload, str) else json.dumps(
-        payload, sort_keys=True, ensure_ascii=False, default=str
-    )
-    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+# ---------------------------------------------------------------------------
+# Organization-scope resolution helpers
+# ---------------------------------------------------------------------------
+
+class ScopeBlocked(PermissionError):
+    """Caller has no ACTIVE Membership in the target organization/property."""
 
 
-def render_unit_archive(
-    db: Session, unit_id: int, *, now: datetime | None = None
-) -> dict:
-    """Pure render -> {unit, events, summary, body_text, render_hash}.
-
-    The same truth always produces the same ``render_hash`` so callers
-    can skip an editMessageText round-trip entirely when the stored
-    hash equals the fresh one. Never raises for missing units — returns
-    a structured tombstone instead so API consumers get a 404 upstream
-    via the caller, not here.
-    """
-    timeline = build_unit_timeline(db, unit_id, now=now)
-    unit_data = timeline.get("unit")
-    events: list[dict] = timeline.get("events", [])
-    if unit_data is None:
-        return {
-            "unit_id": unit_id,
-            "found": False,
-            "unit": None,
-            "events": [],
-            "summary": {},
-            "body_text": "",
-            "render_hash": "",
-            "event_count": 0,
-        }
-    unit_obj: Unit | None = db.query(Unit).filter(Unit.id == unit_id, Unit.deleted_at.is_(None)).first()
-    summary = {
-        "event_count": len(events),
-        "status": unit_obj.status.value if unit_obj else "unknown",
-        "unit_state": getattr(unit_obj, "unit_state", None),
-    }
-    summary_lines = [
-        f"Unit #{unit_data.get('id') or unit_id} — {summary['status']}",
-        f"Total timeline events: {summary['event_count']}",
-        "",
-        "Recent events (newest first):",
-    ]
-    for ev in list(reversed(events))[:12]:
-        at = ev.get("at", "?")[:10]
-        label = ev.get("label", "")
-        detail = ev.get("detail", "")
-        summary_lines.append(f"- [{at}] {label}  {detail}".rstrip())
-    body_text = "\n".join(summary_lines)
-    h = _stable_hash({"u": unit_data, "e": events})
-    return {
-        "unit_id": unit_id,
-        "found": True,
-        "unit": unit_data,
-        "events": events,
-        "summary": summary,
-        "body_text": body_text,
-        "render_hash": h,
-        "event_count": len(events),
-        "rendered_at": (now or datetime.now(timezone.utc)).isoformat(),
-    }
+class OwnerRequired(PermissionError):
+    """Caller is an ACTIVE SECRETARY but this action needs ACTIVE OWNER."""
 
 
-def render_property_archive(
-    db: Session, property_id: int, *, now: datetime | None = None
-) -> dict:
+def resolve_org_membership(
+    db: Session, user_id: int, organization_id: int,
+    *, role: OrganizationRole | Iterable[OrganizationRole] | None = None,
+) -> Membership:
+    """Return the ACTIVE Membership for (user_id, organization_id) or raise ScopeBlocked."""
+    m = has_active_membership(db, user_id, organization_id, role=role)
+    if m is None:
+        if role is None:
+            hint = "ACTIVE"
+        elif isinstance(role, OrganizationRole):
+            hint = f"ACTIVE {role.value}"
+        else:
+            hint = "ACTIVE " + "/".join(r.value for r in role)
+        raise ScopeBlocked(
+            f"user_id={user_id!r} has no {hint} membership in org={organization_id!r}"
+        )
+    return m
+
+
+def property_org_id(db: Session, property_id: int) -> int | None:
+    row = db.query(Property.organization_id).filter(
+        Property.id == property_id, Property.deleted_at.is_(None)
+    ).one_or_none()
+    return row[0] if row else None
+
+
+def unit_org_id(db: Session, unit_id: int) -> int | None:
+    row = db.query(Property.organization_id).select_from(Unit).join(
+        Property, Property.id == Unit.property_id
+    ).filter(
+        Unit.id == unit_id, Unit.deleted_at.is_(None)
+    ).one_or_none()
+    return row[0] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Organization-scoped Property / Unit access (cross-org isolation enforced)
+# ---------------------------------------------------------------------------
+
+def scoped_get_property(
+    db: Session, property_id: int, *, for_user_id: int,
+) -> tuple[Property, Membership]:
+    org_id = property_org_id(db, property_id)
+    if org_id is None:
+        raise LookupError(f"property {property_id} not found or has no organization")
+    membership = resolve_org_membership(db, for_user_id, org_id)
     prop = db.query(Property).filter(
         Property.id == property_id, Property.deleted_at.is_(None)
     ).first()
     if prop is None:
-        return {
-            "property_id": property_id,
-            "found": False,
-            "property": None,
-            "units": [],
-            "body_text": "",
-            "render_hash": "",
-        }
-    units = (
-        db.query(Unit)
-        .filter(Unit.property_id == property_id, Unit.deleted_at.is_(None))
-        .order_by(Unit.unit_number, Unit.id)
+        raise LookupError(f"property {property_id} not found")
+    return prop, membership
+
+
+def scoped_list_properties(
+    db: Session, *, for_user_id: int,
+) -> list[Property]:
+    rows = (
+        db.query(Property, Membership)
+        .join(Membership, Membership.organization_id == Property.organization_id)
+        .filter(
+            Membership.user_id == for_user_id,
+            Membership.state == MembershipState.ACTIVE,
+            Property.deleted_at.is_(None),
+        )
+        .order_by(Property.id)
         .all()
     )
-    status_counts: Counter[str] = Counter()
-    unit_rows: list[dict] = []
-    for u in units:
-        status_counts[u.status.value] += 1
-        unit_rows.append({
-            "id": u.id,
-            "unit_number": u.unit_number,
-            "floor": u.floor,
-            "monthly_rent": str(Decimal(u.monthly_rent).quantize(Decimal("0.01"))),
-            "status": u.status.value,
-            "unit_state": u.unit_state,
-        })
-    summary_dict = {
-        "property_id": prop.id,
-        "name": prop.name,
-        "address": prop.address,
-        "city": prop.city,
-        "total_units_model": prop.total_units,
-        "active_unit_rows": len(unit_rows),
-        "status_counts": dict(status_counts),
-    }
-    lines = [
-        f"{prop.name} — {prop.city}",
-        prop.address,
-        "",
-        f"Active units: {len(unit_rows)} (model says total_units={prop.total_units})",
-        f"Status mix: {', '.join(f'{k}={v}' for k, v in sorted(status_counts.items())) or '(none)'}",
-        "",
-        "Units:",
-    ]
-    for row in unit_rows:
-        lines.append(
-            f"- #{row['id']} {row['unit_number']} "
-            f"[{row['status']}]  ₱{row['monthly_rent']}/mo"
-        )
-    body_text = "\n".join(lines)
-    h = _stable_hash({"p": serialize_row(prop), "u": unit_rows})
-    return {
-        "property_id": property_id,
-        "found": True,
-        "property": {
-            "id": prop.id,
-            "name": prop.name,
-            "address": prop.address,
-            "city": prop.city,
-            "total_units": prop.total_units,
-            "is_active": prop.is_active,
-            "management_company": prop.management_company,
-            "operational_notes": prop.operational_notes,
-        },
-        "units": unit_rows,
-        "summary": summary_dict,
-        "body_text": body_text,
-        "render_hash": h,
-        "rendered_at": (now or datetime.now(timezone.utc)).isoformat(),
-    }
+    return [p for p, _m in rows]
 
 
-def _touch(actor_id: int | None, row: object) -> None:
-    now = datetime.now(timezone.utc)
-    if hasattr(row, "updated_by"):
-        row.updated_by = actor_id
-    if hasattr(row, "updated_at"):
-        row.updated_at = now
-
-
-def publish_unit_article(
-    db: Session,
-    unit_id: int,
-    *,
-    external_message_id: int,
-    actor_id: int | None,
-    render_hash: str,
-    channel_chat_id: int | None = None,
-    event_count_at_publish: int | None = None,
-    platform: str = "telegram_channel",
-) -> tuple[UnitArchiveArticle, bool]:
-    """Insert-or-update the unit archive article.
-
-    Returns ``(row, changed)`` where ``changed`` is False when the
-    stored hash already matches the new one and the row status is
-    already PUBLISHED — callers MUST skip the Telegram
-    ``editMessageText`` when ``changed`` is False to avoid spamming
-    the channel with identical payloads.
-
-    Raises ``ValueError`` for a missing unit (caller should produce
-    the HTTP 404) — never silently creates rows for nonexistent IDs.
-    """
-    if not external_message_id:
-        raise ValueError("external_message_id is required for PUBLISHED unit articles")
-    unit = db.query(Unit).filter(Unit.id == unit_id, Unit.deleted_at.is_(None)).first()
+def scoped_get_unit(
+    db: Session, unit_id: int, *, for_user_id: int,
+) -> tuple[Unit, Membership]:
+    org_id = unit_org_id(db, unit_id)
+    if org_id is None:
+        raise LookupError(f"unit {unit_id} not found or property has no organization")
+    membership = resolve_org_membership(db, for_user_id, org_id)
+    unit = db.query(Unit).filter(
+        Unit.id == unit_id, Unit.deleted_at.is_(None)
+    ).first()
     if unit is None:
-        raise ValueError(f"unit {unit_id} not found")
-    existing = db.query(UnitArchiveArticle).filter(
-        UnitArchiveArticle.unit_id == unit_id,
-        UnitArchiveArticle.platform == platform,
-    ).first()
-    changed = True
-    now = datetime.now(timezone.utc)
-    if existing is None:
-        existing = UnitArchiveArticle(
-            unit_id=unit_id,
-            property_id=unit.property_id,
-            platform=platform,
-            channel_chat_id=channel_chat_id,
-            external_message_id=external_message_id,
-            status=ArchiveArticleStatus.published.value,
-            render_hash=render_hash,
-            render_version=1,
-            last_published_at=now,
-            last_rendered_at=now,
-            editor_user_id=actor_id,
-            event_count_at_publish=event_count_at_publish,
-            created_by=actor_id,
-            updated_by=actor_id,
-        )
-        db.add(existing)
-        db.flush()
-        record_audit(
-            db,
-            table_name="unit_archive_articles",
-            record_id=existing.id,
-            action=AuditAction.unit_article_published.value,
-            actor_id=actor_id,
-            new_value=serialize_row(existing),
-        )
-    else:
-        same_hash = (existing.render_hash == render_hash)
-        same_message = (existing.external_message_id == external_message_id)
-        already_published = (existing.status == ArchiveArticleStatus.published.value)
-        if same_hash and same_message and already_published:
-            changed = False
-            existing.last_rendered_at = now
-            _touch(actor_id, existing)
-            db.flush()
-            record_audit(
-                db,
-                table_name="unit_archive_articles",
-                record_id=existing.id,
-                action=AuditAction.unit_archive_rendered.value,
-                actor_id=actor_id,
-                new_value={"render_hash_match": True, "changed": False},
-            )
-            return existing, changed
-        old = serialize_row(existing)
-        existing.property_id = unit.property_id
-        existing.channel_chat_id = channel_chat_id
-        existing.external_message_id = external_message_id
-        existing.render_hash = render_hash
-        existing.render_version = (existing.render_version or 1) + 1
-        existing.status = ArchiveArticleStatus.published.value
-        existing.last_published_at = now
-        existing.last_rendered_at = now
-        existing.editor_user_id = actor_id
-        existing.event_count_at_publish = event_count_at_publish
-        _touch(actor_id, existing)
-        db.flush()
-        record_audit(
-            db,
-            table_name="unit_archive_articles",
-            record_id=existing.id,
-            action=AuditAction.unit_article_edited.value,
-            actor_id=actor_id,
-            old_value=old,
-            new_value=serialize_row(existing),
-        )
-    return existing, changed
+        raise LookupError(f"unit {unit_id} not found")
+    return unit, membership
 
 
-def publish_property_article(
+def scoped_lookup_unit(
     db: Session,
-    property_id: int,
     *,
-    external_message_id: int,
-    actor_id: int | None,
-    render_hash: str,
-    channel_chat_id: int | None = None,
-    platform: str = "telegram_channel",
-) -> tuple[PropertyArchiveChannel, bool]:
-    """Insert-or-update the property-level archive article.
+    organization_id: int,
+    property_id: int,
+    unit_number: str,
+    for_user_id: int,
+) -> tuple[Unit, Membership]:
+    """Stable ``organization + property + unit_number → Unit`` lookup.
 
-    Same semantics as ``publish_unit_article`` but scoped to the
-    property row. Missing property raises ``ValueError``.
+    This is the Issue #25 §3 canonical unit-positioner so the rest of the
+    system never confuses Org X / Building Bayshore / 1608 with Org Y /
+    Building Whatever / 1608 — an ACTIVE Membership in organization_id is
+    mandatory before we even look at the unit row.
     """
-    if not external_message_id:
-        raise ValueError("external_message_id is required for PUBLISHED property articles")
-    prop = db.query(Property).filter(
-        Property.id == property_id, Property.deleted_at.is_(None)
-    ).first()
-    if prop is None:
-        raise ValueError(f"property {property_id} not found")
-    existing = db.query(PropertyArchiveChannel).filter(
-        PropertyArchiveChannel.property_id == property_id,
-        PropertyArchiveChannel.platform == platform,
-    ).first()
-    changed = True
-    now = datetime.now(timezone.utc)
-    if existing is None:
-        existing = PropertyArchiveChannel(
-            property_id=property_id,
-            platform=platform,
-            channel_chat_id=channel_chat_id,
-            external_message_id=external_message_id,
-            status=ArchiveArticleStatus.published.value,
-            render_hash=render_hash,
-            last_published_at=now,
-            last_rendered_at=now,
-            editor_user_id=actor_id,
-            created_by=actor_id,
-            updated_by=actor_id,
+    membership = resolve_org_membership(db, for_user_id, organization_id)
+    unit = (
+        db.query(Unit)
+        .join(Property, Property.id == Unit.property_id)
+        .filter(
+            Property.organization_id == organization_id,
+            Property.id == property_id,
+            Property.deleted_at.is_(None),
+            Unit.unit_number == unit_number,
+            Unit.deleted_at.is_(None),
+            Unit.is_active.is_(True),
         )
-        db.add(existing)
+        .first()
+    )
+    if unit is None:
+        raise LookupError(
+            f"unit org={organization_id} property={property_id} "
+            f"unit_number={unit_number!r} not found"
+        )
+    return unit, membership
+
+
+# ---------------------------------------------------------------------------
+# SECRETARY allowlist for Property / Unit "daily maintenance" updates
+# (all other fields require OWNER)
+# ---------------------------------------------------------------------------
+
+SECRETARY_EDITABLE_PROPERTY_FIELDS: frozenset[str] = frozenset({
+    "management_company", "management_office_phone",
+    "management_contact_person", "management_email",
+    "management_office_location", "operational_notes",
+    "is_active", "total_units",
+})
+
+SECRETARY_EDITABLE_UNIT_FIELDS: frozenset[str] = frozenset({
+    "floor", "size_sqm", "monthly_rent",
+    "status", "unit_state", "is_active", "unit_number",
+})
+
+
+def filter_secretary_property_updates(fields: set[str]) -> set[str]:
+    """If any non-allowlisted field is present, raise OwnerRequired."""
+    extra = fields - SECRETARY_EDITABLE_PROPERTY_FIELDS
+    if extra:
+        raise OwnerRequired(
+            f"SECRETARY cannot update property fields {sorted(extra)}; "
+            f"only ACTIVE OWNER may"
+        )
+    return fields & SECRETARY_EDITABLE_PROPERTY_FIELDS
+
+
+def filter_secretary_unit_updates(fields: set[str]) -> set[str]:
+    extra = fields - SECRETARY_EDITABLE_UNIT_FIELDS
+    if extra:
+        raise OwnerRequired(
+            f"SECRETARY cannot update unit fields {sorted(extra)}; "
+            f"only ACTIVE OWNER may"
+        )
+    return fields & SECRETARY_EDITABLE_UNIT_FIELDS
+
+
+# ---------------------------------------------------------------------------
+# Unit ↔ Channel binding lifecycle (OWNER only)
+# ---------------------------------------------------------------------------
+
+_PURPOSES_ALLOWED = {ChannelPurpose.archive.value, ChannelPurpose.business_group.value}
+
+
+def _validate_purpose(purpose: str) -> str:
+    if purpose not in _PURPOSES_ALLOWED:
+        raise ValueError(
+            f"purpose={purpose!r} not in {sorted(_PURPOSES_ALLOWED)}"
+        )
+    return purpose
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def list_bindings_for_unit(
+    db: Session, unit_id: int, *, status: BindingStatus | None = None,
+) -> list[UnitChannelBinding]:
+    q = db.query(UnitChannelBinding).filter(UnitChannelBinding.unit_id == unit_id)
+    if status is not None:
+        q = q.filter(UnitChannelBinding.status == status.value)
+    return q.order_by(UnitChannelBinding.id.desc()).all()
+
+
+def get_active_binding(db: Session, unit_id: int, purpose: str) -> UnitChannelBinding | None:
+    return db.query(UnitChannelBinding).filter(
+        UnitChannelBinding.unit_id == unit_id,
+        UnitChannelBinding.purpose == purpose,
+        UnitChannelBinding.status == BindingStatus.ACTIVE.value,
+    ).one_or_none()
+
+
+def bind_unit_channel(
+    db: Session,
+    *,
+    unit_id: int,
+    purpose: str,
+    channel_chat_id: int,
+    thread_topic_id: int | None,
+    actor_user_id: int,
+    notes: str | None = None,
+) -> UnitChannelBinding:
+    """Bind or replace the ACTIVE binding for (unit_id, purpose). OWNER-only.
+
+    Replace semantics (Issue #25 §4 "更换 binding → 旧 binding 失效但历史保留"):
+      1. Verify actor has ACTIVE OWNER in the unit's org.
+      2. SELECT … FOR UPDATE any currently-ACTIVE binding for (unit_id, purpose)
+         so concurrent binders serialize instead of raising IntegrityError.
+      3. If an ACTIVE exists and matches (chat_id/thread_id), return it unchanged.
+      4. Otherwise mark the old one REVOKED (timestamp + revoked_by_membership_id
+         + audit unit_channel_revoked) and INSERT the new ACTIVE one
+         (+ audit unit_channel_replaced for a replace / unit_channel_bound for
+           a first-time bind).
+    """
+    purpose = _validate_purpose(purpose)
+    # (a) Scope & OWNER check
+    org_id = unit_org_id(db, unit_id)
+    if org_id is None:
+        raise LookupError(f"unit {unit_id} not found or orphaned")
+    owner_membership = resolve_org_membership(
+        db, actor_user_id, org_id, role=OrganizationRole.OWNER,
+    )
+    unit = db.query(Unit).filter(
+        Unit.id == unit_id, Unit.deleted_at.is_(None)
+    ).first()
+    if unit is None:
+        raise LookupError(f"unit {unit_id} not found")
+
+    now = _now()
+
+    # (b) Row-level lock on currently-active binding → serialize concurrent binders
+    lock_q = (
+        select(UnitChannelBinding)
+        .where(
+            UnitChannelBinding.unit_id == unit_id,
+            UnitChannelBinding.purpose == purpose,
+            UnitChannelBinding.status == BindingStatus.ACTIVE.value,
+        )
+        .with_for_update()
+    )
+    existing = db.execute(lock_q).scalar_one_or_none()
+
+    if (
+        existing is not None
+        and existing.channel_chat_id == channel_chat_id
+        and existing.thread_topic_id == thread_topic_id
+    ):
+        # Same destination — pure no-op (mirrors the short-circuit semantic from
+        # the archive hash guard; kept for deterministic callers).
+        return existing
+
+    action = AuditAction.unit_channel_replaced.value
+    if existing is not None:
+        # (c) Replace: revoke existing (REVOKED → history)
+        old_serialized = serialize_row(existing)
+        existing.status = BindingStatus.REVOKED.value
+        existing.revoked_at = now
+        existing.revoked_by_membership_id = owner_membership.id
+        existing.updated_by = actor_user_id
+        existing.updated_at = now
         db.flush()
         record_audit(
             db,
-            table_name="property_archive_channels",
+            table_name="unit_channel_bindings",
             record_id=existing.id,
-            action=AuditAction.property_article_published.value,
-            actor_id=actor_id,
+            action=AuditAction.unit_channel_revoked.value,
+            actor_id=actor_user_id,
+            old_value=old_serialized,
             new_value=serialize_row(existing),
         )
     else:
-        same_hash = (existing.render_hash == render_hash)
-        same_message = (existing.external_message_id == external_message_id)
-        already_published = (existing.status == ArchiveArticleStatus.published.value)
-        if same_hash and same_message and already_published:
-            changed = False
-            existing.last_rendered_at = now
-            _touch(actor_id, existing)
-            db.flush()
-            record_audit(
-                db,
-                table_name="property_archive_channels",
-                record_id=existing.id,
-                action=AuditAction.unit_archive_rendered.value,
-                actor_id=actor_id,
-                new_value={"render_hash_match": True, "changed": False},
-            )
-            return existing, changed
-        old = serialize_row(existing)
-        existing.channel_chat_id = channel_chat_id
-        existing.external_message_id = external_message_id
-        existing.render_hash = render_hash
-        existing.status = ArchiveArticleStatus.published.value
-        existing.last_published_at = now
-        existing.last_rendered_at = now
-        existing.editor_user_id = actor_id
-        _touch(actor_id, existing)
-        db.flush()
-        record_audit(
-            db,
-            table_name="property_archive_channels",
-            record_id=existing.id,
-            action=AuditAction.property_article_edited.value,
-            actor_id=actor_id,
-            old_value=old,
-            new_value=serialize_row(existing),
-        )
-    return existing, changed
+        action = AuditAction.unit_channel_bound.value
 
-
-def list_unit_articles_for_property(
-    db: Session, property_id: int
-) -> Iterable[UnitArchiveArticle]:
-    stmt = (
-        select(UnitArchiveArticle)
-        .where(UnitArchiveArticle.property_id == property_id)
-        .order_by(UnitArchiveArticle.unit_id, UnitArchiveArticle.id)
+    # (d) Insert new ACTIVE row
+    new_binding = UnitChannelBinding(
+        organization_id=org_id,
+        unit_id=unit_id,
+        purpose=purpose,
+        channel_chat_id=channel_chat_id,
+        thread_topic_id=thread_topic_id,
+        status=BindingStatus.ACTIVE.value,
+        revoked_at=None,
+        revoked_by_membership_id=None,
+        notes=notes,
+        created_by=actor_user_id,
+        updated_by=actor_user_id,
+        created_at=now,
+        updated_at=now,
     )
-    return db.execute(stmt).scalars().all()
+    db.add(new_binding)
+    db.flush()
+    record_audit(
+        db,
+        table_name="unit_channel_bindings",
+        record_id=new_binding.id,
+        action=action,
+        actor_id=actor_user_id,
+        new_value=serialize_row(new_binding),
+    )
+    return new_binding
 
 
-def get_unit_article(db: Session, unit_id: int, platform: str = "telegram_channel") -> UnitArchiveArticle | None:
-    return db.query(UnitArchiveArticle).filter(
-        UnitArchiveArticle.unit_id == unit_id,
-        UnitArchiveArticle.platform == platform,
+def revoke_unit_channel(
+    db: Session,
+    *,
+    binding_id: int,
+    actor_user_id: int,
+) -> UnitChannelBinding:
+    """OWNER-only: revoke the current ACTIVE binding. Row is NOT deleted."""
+    # Scope via binding.organization_id (not unit_org_id) so revoked-history
+    # rows still enforce cross-org isolation on the revocation action itself.
+    binding = db.query(UnitChannelBinding).filter(
+        UnitChannelBinding.id == binding_id
     ).first()
+    if binding is None:
+        raise LookupError(f"binding {binding_id} not found")
+    owner_membership = resolve_org_membership(
+        db, actor_user_id, binding.organization_id, role=OrganizationRole.OWNER,
+    )
+    if binding.status == BindingStatus.REVOKED.value:
+        return binding  # idempotent
 
-
-def get_property_article(db: Session, property_id: int, platform: str = "telegram_channel") -> PropertyArchiveChannel | None:
-    return db.query(PropertyArchiveChannel).filter(
-        PropertyArchiveChannel.property_id == property_id,
-        PropertyArchiveChannel.platform == platform,
-    ).first()
+    now = _now()
+    old_serialized = serialize_row(binding)
+    binding.status = BindingStatus.REVOKED.value
+    binding.revoked_at = now
+    binding.revoked_by_membership_id = owner_membership.id
+    binding.updated_by = actor_user_id
+    binding.updated_at = now
+    db.flush()
+    record_audit(
+        db,
+        table_name="unit_channel_bindings",
+        record_id=binding.id,
+        action=AuditAction.unit_channel_revoked.value,
+        actor_id=actor_user_id,
+        old_value=old_serialized,
+        new_value=serialize_row(binding),
+    )
+    return binding
