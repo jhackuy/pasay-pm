@@ -29,7 +29,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from sqlalchemy import and_
+from fastapi import HTTPException, status
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session
 
 from app.models.financial import Expense, Income
@@ -63,6 +64,28 @@ class CrossOrgReference(ValueError):
 
 
 # ---------------------------------------------------------------------------
+# Shared HTTP translator (Owner contract §7 / FIX1 contract #7):
+#   * LookupError (cross-org object lookup or missing object) -> HTTP 404
+#     (fail-closed, does not leak existence).
+#   * ScopeBlocked / OwnerRequired (same org, Membership.role insufficient
+#     or no ACTIVE membership) -> HTTP 403.
+#   * CrossOrgReference (create/update FK referencing other org) -> HTTP 409.
+#   * Any other exception -> propagate unchanged (do not swallow unknowns
+#     or leak type(exc).__name__ in a 500 body).
+# ---------------------------------------------------------------------------
+
+
+def scope_exception_to_http(exc: Exception) -> HTTPException:
+    if isinstance(exc, LookupError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc) or "Not found")
+    if isinstance(exc, (ScopeBlocked, OwnerRequired)):
+        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc) or "Forbidden")
+    if isinstance(exc, CrossOrgReference):
+        return HTTPException(status.HTTP_409_CONFLICT, str(exc) or "Conflict")
+    raise exc
+
+
+# ---------------------------------------------------------------------------
 # Membership resolution
 # ---------------------------------------------------------------------------
 
@@ -74,18 +97,26 @@ def resolve_org_membership(
     *,
     role: OrganizationRole | Iterable[OrganizationRole] | None = None,
 ) -> Membership:
-    """Return the ACTIVE Membership for (user_id, organization_id) or raise ScopeBlocked."""
-    m = has_active_membership(db, user_id, organization_id, role=role)
+    """Return the ACTIVE Membership for (user_id, organization_id) or raise.
+
+    * No ACTIVE membership at all -> :class:`ScopeBlocked` (maps to HTTP 403).
+    * ACTIVE membership exists but role does not match the requested role ->
+      :class:`OwnerRequired` (maps to HTTP 403).
+    """
+    m = has_active_membership(db, user_id, organization_id, role=None)
     if m is None:
-        if role is None:
-            hint = "ACTIVE"
-        elif isinstance(role, OrganizationRole):
-            hint = f"ACTIVE {role.value}"
-        else:
-            hint = "ACTIVE " + "/".join(r.value for r in role)
+        hint = "ACTIVE"
         raise ScopeBlocked(
             f"user_id={user_id!r} has no {hint} membership in org={organization_id!r}"
         )
+    if role is not None:
+        roles = list(role) if not isinstance(role, OrganizationRole) else [role]
+        if m.role not in roles:
+            hint = "ACTIVE " + "/".join(r.value for r in roles)
+            raise OwnerRequired(
+                f"user_id={user_id!r} has ACTIVE {m.role.value} membership in "
+                f"org={organization_id!r}; action requires {hint}"
+            )
     return m
 
 
@@ -158,17 +189,35 @@ def income_org_id(db: Session, income_id: int) -> int | None:
 
 
 def expense_org_id(db: Session, expense_id: int) -> int | None:
-    """Expense ownership: unit_id -> property -> org. If unit_id is NULL
-    the expense has no canonical org boundary -> fail closed (None)."""
+    """Expense ownership chain (Owner FIX1 #4: canonical via unit→property OR
+    directly through expense.property_id).
+
+    Returns Property.organization_id for whichever chain resolves first.
+    Both chains MUST ultimately resolve to the SAME organization; if the
+    unit chain and the direct property_id chain diverge, fail closed (None).
+    """
     row = (
-        db.query(Property.organization_id)
-        .select_from(Expense)
-        .join(Unit, Unit.id == Expense.unit_id)
-        .join(Property, Property.id == Unit.property_id)
+        db.query(Expense.unit_id, Expense.property_id)
         .filter(Expense.id == expense_id)
         .one_or_none()
     )
-    return row[0] if row else None
+    if row is None:
+        return None
+    unit_id, property_id = row
+    oid_from_unit: int | None = None
+    if unit_id is not None:
+        oid_from_unit = unit_org_id(db, unit_id)
+    oid_from_property: int | None = None
+    if property_id is not None:
+        oid_from_property = property_org_id(db, property_id)
+    # If only one chain resolves, use it. If both resolve, they must match.
+    if oid_from_unit is None:
+        return oid_from_property
+    if oid_from_property is None:
+        return oid_from_unit
+    if oid_from_unit != oid_from_property:
+        return None
+    return oid_from_unit
 
 
 def repair_org_id(db: Session, repair_id: int) -> int | None:
@@ -217,10 +266,12 @@ def _resolve_scoped_membership(
 ) -> Membership:
     """Resolve membership for a scoped object lookup.
 
-    Callers outside the object's organization receive :class:`LookupError`
-    (HTTP 404 fail-closed — no existence leakage). Same-org callers then pass
-    through :func:`resolve_org_membership` for any additional role gate
-    (OWNER vs SECRETARY — raises :class:`OwnerRequired` on 403 path).
+    * Caller outside the object's organization -> :class:`LookupError`
+      (HTTP 404 fail-closed — no existence leakage).
+    * Caller inside object's org but no ACTIVE membership ->
+      :class:`ScopeBlocked` (HTTP 403).
+    * Caller inside object's org but role insufficient ->
+      :class:`OwnerRequired` (HTTP 403).
     """
     if object_org_id not in list_active_org_ids_for_user(db, for_user_id):
         raise LookupError(f"{object_kind} not found")
@@ -335,10 +386,14 @@ def scoped_list_expenses(db: Session, *, for_user_id: int) -> list[Expense]:
     orgs = list_active_org_ids_for_user(db, for_user_id)
     if not orgs:
         return []
+    # Expense canonical ownership (Owner FIX1 #4):
+    # Expense.property_id -> Property.organization_id (direct building-level path).
+    # Expense.unit_id remains nullable (unit-level path) automatically resolves
+    # to the same organization because Expense.property_id via migration m1c backfill;
+    # hence filtering on Expense.property_id covers both cases.
     return (
         db.query(Expense)
-        .join(Unit, Unit.id == Expense.unit_id)
-        .join(Property, Property.id == Unit.property_id)
+        .join(Property, Property.id == Expense.property_id)
         .filter(Property.organization_id.in_(orgs))
         .order_by(Expense.id)
         .all()
@@ -349,20 +404,22 @@ def scoped_list_repairs(db: Session, *, for_user_id: int) -> list[RepairOperatio
     orgs = list_active_org_ids_for_user(db, for_user_id)
     if not orgs:
         return []
-    org_property_ids = [
-        r[0]
-        for r in db.query(Property.id).filter(
+    org_property_ids = (
+        select(Property.id)
+        .where(
             Property.organization_id.in_(orgs),
             Property.deleted_at.is_(None),
-        ).all()
-    ]
-    org_unit_ids = [
-        r[0]
-        for r in db.query(Unit.id).filter(
+        )
+        .scalar_subquery()
+    )
+    org_unit_ids = (
+        select(Unit.id)
+        .where(
             Unit.property_id.in_(org_property_ids),
             Unit.deleted_at.is_(None),
-        ).all()
-    ]
+        )
+        .scalar_subquery()
+    )
     return (
         db.query(RepairOperation)
         .filter(

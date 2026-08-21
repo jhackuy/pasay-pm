@@ -37,7 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction
-from app.models.membership import OrganizationRole
+from app.models.membership import Membership, OrganizationRole
 from app.models.property import Property, Unit
 from app.models.property_channel import (
     BindingStatus,
@@ -45,6 +45,9 @@ from app.models.property_channel import (
     UnitChannelBinding,
 )
 from app.services.audit import record_audit, serialize_row
+# TODO(M2): Deprecate this re-export block. Canonical home for all org-scope
+# helpers is app/services/organization_scope.py. This block is kept for
+# back-compat only; new code MUST import directly from organization_scope.
 from app.services.organization_scope import (  # noqa: F401  (re-exported for back-compat)
     CrossOrgReference,
     OwnerRequired,
@@ -92,7 +95,7 @@ def scoped_lookup_unit(
     property_id: int,
     unit_number: str,
     for_user_id: int,
-):
+) -> tuple[Unit, Membership]:
     """Stable ``organization + property + unit_number → Unit`` lookup.
 
     Mirrors the canonical unit-positioner: an ACTIVE Membership in
