@@ -30,7 +30,6 @@ Concurrency (CodeRabbit "concurrent publish 500" fix):
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -38,11 +37,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction
-from app.models.membership import (
-    Membership,
-    MembershipState,
-    OrganizationRole,
-)
+from app.models.membership import OrganizationRole
 from app.models.property import Property, Unit
 from app.models.property_channel import (
     BindingStatus,
@@ -50,18 +45,34 @@ from app.models.property_channel import (
     UnitChannelBinding,
 )
 from app.services.audit import record_audit, serialize_row
-from app.services.membership import has_active_membership
-
-# ---------------------------------------------------------------------------
-# Organization-scope resolution helpers
-# ---------------------------------------------------------------------------
-
-class ScopeBlocked(PermissionError):
-    """Caller has no ACTIVE Membership in the target organization/property."""
-
-
-class OwnerRequired(PermissionError):
-    """Caller is an ACTIVE SECRETARY but this action needs ACTIVE OWNER."""
+from app.services.organization_scope import (  # noqa: F401  (re-exported for back-compat)
+    CrossOrgReference,
+    OwnerRequired,
+    ScopeBlocked,
+    expense_org_id,
+    income_org_id,
+    lease_org_id,
+    list_active_org_ids_for_user,
+    property_org_id,
+    repair_org_id,
+    resolve_org_membership,
+    scoped_get_expense,
+    scoped_get_income,
+    scoped_get_lease,
+    scoped_get_property,
+    scoped_get_repair,
+    scoped_get_tenant,
+    scoped_get_unit,
+    scoped_list_expenses,
+    scoped_list_incomes,
+    scoped_list_leases,
+    scoped_list_properties,
+    scoped_list_repairs,
+    scoped_list_tenants,
+    scoped_list_units,
+    tenant_org_id,
+    unit_org_id,
+)
 
 
 class BindingConflict(Exception):
@@ -69,110 +80,9 @@ class BindingConflict(Exception):
     partial unique index. Mapped to HTTP 409 at the API layer."""
 
 
-def resolve_org_membership(
-    db: Session, user_id: int, organization_id: int,
-    *, role: OrganizationRole | Iterable[OrganizationRole] | None = None,
-) -> Membership:
-    """Return the ACTIVE Membership for (user_id, organization_id) or raise ScopeBlocked."""
-    m = has_active_membership(db, user_id, organization_id, role=role)
-    if m is None:
-        if role is None:
-            hint = "ACTIVE"
-        elif isinstance(role, OrganizationRole):
-            hint = f"ACTIVE {role.value}"
-        else:
-            hint = "ACTIVE " + "/".join(r.value for r in role)
-        raise ScopeBlocked(
-            f"user_id={user_id!r} has no {hint} membership in org={organization_id!r}"
-        )
-    return m
-
-
-def property_org_id(db: Session, property_id: int) -> int | None:
-    """Return the Property.organization_id, or None.
-
-    Legacy compatibility (Issue #25 "不得粗暴删除旧数据"):
-      - Pre-migration rows keep ``organization_id = NULL`` and survive the
-        ALTER ADD COLUMN because the column is nullable.
-      - A NULL org_id is treated as "unscoped / not yet on-boarded" and the
-        scoped_* helpers below raise LookupError (→ HTTP 404) instead of
-        leaking the row to the nearest org. The Property row itself is NEVER
-        deleted or modified by this service layer.
-      - New writes via the Property API enforce ``organization_id NOT NULL``
-        on the request schema, so the NULL set is monotonically non-growing.
-    """
-    row = db.query(Property.organization_id).filter(
-        Property.id == property_id, Property.deleted_at.is_(None)
-    ).one_or_none()
-    return row[0] if row else None
-
-
-def unit_org_id(db: Session, unit_id: int) -> int | None:
-    row = db.query(Property.organization_id).select_from(Unit).join(
-        Property, Property.id == Unit.property_id
-    ).filter(
-        Unit.id == unit_id, Unit.deleted_at.is_(None)
-    ).one_or_none()
-    return row[0] if row else None
-
-
 # ---------------------------------------------------------------------------
-# Organization-scoped Property / Unit access (cross-org isolation enforced)
+# Organization-scoped stable lookup (Property + Unit Number → Unit)
 # ---------------------------------------------------------------------------
-
-def scoped_get_property(
-    db: Session, property_id: int, *, for_user_id: int,
-) -> tuple[Property, Membership]:
-    org_id = property_org_id(db, property_id)
-    if org_id is None:
-        # Legacy (organization_id = NULL) rows: fail closed with LookupError
-        # (→ 404) instead of 500 or accidental cross-org exposure.
-        raise LookupError(
-            f"property {property_id} not found or has no organization"
-            " (legacy pre-migration row, not yet org-scoped)"
-        )
-    membership = resolve_org_membership(db, for_user_id, org_id)
-    prop = db.query(Property).filter(
-        Property.id == property_id, Property.deleted_at.is_(None)
-    ).first()
-    if prop is None:
-        raise LookupError(f"property {property_id} not found")
-    return prop, membership
-
-
-def scoped_list_properties(
-    db: Session, *, for_user_id: int,
-) -> list[Property]:
-    rows = (
-        db.query(Property, Membership)
-        .join(Membership, Membership.organization_id == Property.organization_id)
-        .filter(
-            Membership.user_id == for_user_id,
-            Membership.state == MembershipState.ACTIVE,
-            Property.deleted_at.is_(None),
-            # Legacy rows: organization_id IS NULL would fail the JOIN
-            # condition above, so they are naturally excluded here without
-            # any extra filter. No legacy data is deleted.
-        )
-        .order_by(Property.id)
-        .all()
-    )
-    return [p for p, _m in rows]
-
-
-def scoped_get_unit(
-    db: Session, unit_id: int, *, for_user_id: int,
-) -> tuple[Unit, Membership]:
-    org_id = unit_org_id(db, unit_id)
-    if org_id is None:
-        raise LookupError(f"unit {unit_id} not found or property has no organization")
-    membership = resolve_org_membership(db, for_user_id, org_id)
-    unit = db.query(Unit).filter(
-        Unit.id == unit_id, Unit.deleted_at.is_(None)
-    ).first()
-    if unit is None:
-        raise LookupError(f"unit {unit_id} not found")
-    return unit, membership
 
 
 def scoped_lookup_unit(
@@ -182,13 +92,11 @@ def scoped_lookup_unit(
     property_id: int,
     unit_number: str,
     for_user_id: int,
-) -> tuple[Unit, Membership]:
+):
     """Stable ``organization + property + unit_number → Unit`` lookup.
 
-    This is the Issue #25 §3 canonical unit-positioner so the rest of the
-    system never confuses Org X / Building Bayshore / 1608 with Org Y /
-    Building Whatever / 1608 — an ACTIVE Membership in organization_id is
-    mandatory before we even look at the unit row.
+    Mirrors the canonical unit-positioner: an ACTIVE Membership in
+    organization_id is mandatory before we even look at the unit row.
     """
     membership = resolve_org_membership(db, for_user_id, organization_id)
     unit = (
