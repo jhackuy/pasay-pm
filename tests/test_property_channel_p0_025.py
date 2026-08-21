@@ -545,8 +545,8 @@ class TestPermissionMatrix:
         u = _create_unit(db_session, prop, "101")
         db_session.commit()
 
-        # bind — must be OWNER
-        with pytest.raises(ScopeBlocked):
+        # bind — must be OWNER (FIX1: SECRETARY has ACTIVE membership so raises OwnerRequired, not ScopeBlocked)
+        with pytest.raises(OwnerRequired):
             bind_unit_channel(
                 db_session,
                 unit_id=u.id,
@@ -767,7 +767,7 @@ class TestBindingAudit:
             .order_by(AuditLog.id.asc())
             .all()
         )
-        actions = {l.action: l.record_id for l in logs}
+        actions = {log.action: log.record_id for log in logs}
         assert AuditAction.unit_channel_bound in actions
         assert AuditAction.unit_channel_revoked in actions
         assert actions[AuditAction.unit_channel_revoked] == old.id
@@ -852,67 +852,58 @@ class TestDirectRegression:
 
 
 # ===================================================================
-# 10. Legacy Property.organization_id = NULL compatibility (Issue #25)
-# ===================================================================
+# 10. Property.organization_id NOT NULL schema truth (FIX1 Blocker #2)
+# =====================================================================
 
 
-class TestLegacyPropertyCompatibility:
-    def _create_legacy_null_org_property(self, db_session, *, name="Legacy-Hotel"):
-        """Insert a Property with organization_id=NULL (pre-migration legacy)."""
+class TestPropertyOrgIdNotNull:
+    """M1 + FIX1 contract: Property.org_id is NOT NULL both in DB and ORM.
+    No legacy NULL row can be inserted via ORM anymore (schema truth parity)."""
+
+    def test_orm_insert_without_organization_id_raises_integrity_error(
+        self, db_session
+    ):
+        """FIX1 Blocker #2: ORM Mapped[int] + nullable=False. A direct NULL
+        insert MUST raise IntegrityError on flush — no ORM/DB lag."""
+        from sqlalchemy.exc import IntegrityError
+
         prop = Property(
-            organization_id=None,
-            name=name,
-            address=f"Old {name} St",
-            city="OldPasay",
+            name="No-Org-Hotel",
+            address="Ghost St",
+            city="Nowhere",
             total_units=1,
             is_active=True,
             created_by=0,
             updated_by=0,
         )
+        prop.organization_id = None  # force bypass pydantic / constructor typing
         db_session.add(prop)
-        db_session.flush()
-        return prop
+        with pytest.raises(IntegrityError):
+            db_session.flush()
+        db_session.rollback()
 
-    def test_legacy_null_org_property_survives_orm_insert(self, db_session, org_x):
-        """Constraint-free nullable column lets legacy rows exist untouched."""
-        legacy = self._create_legacy_null_org_property(db_session)
-        db_session.commit()
-        db_session.refresh(legacy)
-        assert legacy.id > 0
-        assert legacy.organization_id is None
-        # Confirm the row is still there (no silent delete)
-        still_there = (
-            db_session.query(Property)
-            .filter(Property.id == legacy.id)
-            .one()
-        )
-        assert still_there.organization_id is None
-        assert still_there.name == legacy.name
-
-    def test_scoped_list_properties_excludes_legacy_null_org(
-        self, db_session, alice, org_x
+    def test_scoped_list_properties_excludes_cross_org_property(
+        self, db_session, alice, org_x, org_y
     ):
-        """Legacy NULL-org properties are naturally excluded from JOINs."""
-        modern = _create_property(db_session, org_x, name="Modern-Tower")
-        legacy = self._create_legacy_null_org_property(db_session, name="Old-Inn")
+        """A Property bound to org_y MUST NOT appear in alice (org_x) scoped list."""
+        org_x_prop = _create_property(db_session, org_x, name="X-Tower")
+        org_y_prop = _create_property(db_session, org_y, name="Y-Hotel")
         db_session.commit()
 
         alice_visible = scoped_list_properties(db_session, for_user_id=alice.id)
         visible_ids = {p.id for p in alice_visible}
-        assert modern.id in visible_ids
-        # Legacy row is NOT visible (fail-closed via the inner JOIN), but it
-        # is still physically present (confirmed in the parallel test above).
-        assert legacy.id not in visible_ids
+        assert org_x_prop.id in visible_ids
+        assert org_y_prop.id not in visible_ids
 
-    def test_scoped_get_property_fails_closed_on_legacy_null_org(
-        self, db_session, alice, org_x
+    def test_scoped_get_property_fails_closed_on_cross_org(
+        self, db_session, alice, org_y
     ):
-        """Direct scoped get on legacy NULL org raises LookupError (→ 404)."""
-        legacy = self._create_legacy_null_org_property(db_session)
+        """Direct scoped get on an org_y property as alice (org_x) → LookupError."""
+        org_y_prop = _create_property(db_session, org_y, name="Y-Exclusive")
         db_session.commit()
 
         with pytest.raises(LookupError):
-            scoped_get_property(db_session, legacy.id, for_user_id=alice.id)
+            scoped_get_property(db_session, org_y_prop.id, for_user_id=alice.id)
 
 
 # ===================================================================

@@ -47,8 +47,9 @@ def _income_payload(lease_id, key, amount="12000.00", status="pending"):
     }
 
 
-def _expense_payload(status="pending"):
-    return {
+def _expense_payload(*, status="pending", unit_id=None, property_id=None):
+    """FIX1: Expense requires canonical ownership anchor (unit_id or property_id)."""
+    d = {
         "expense_date": "2026-02-05",
         "category": "repair",
         "amount": "5000.00",
@@ -56,6 +57,11 @@ def _expense_payload(status="pending"):
         "description": "AC repair",
         "status": status,
     }
+    if unit_id is not None:
+        d["unit_id"] = unit_id
+    if property_id is not None:
+        d["property_id"] = property_id
+    return d
 
 
 def _audit_count(db, table_name, action, record_id=None):
@@ -101,11 +107,26 @@ def http_server(db_session, test_engine):
 
 
 @pytest.fixture()
-def lease_id(db_session):
+def lease_id(db_session, org_a, admin):
     """Lease data created directly in the test DB (never through the API), so
     the conftest ``client`` fixture never clobbers the per-request dependency
-    override that ``http_server`` installs."""
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
+    override that ``http_server`` installs.
+
+    FIX1 (NOT NULL constraint for org_id): reuses conftest ``org_a`` (where
+    ``admin`` user is already OWNER via conftest ``org_a`` fixture membership
+    setup) + ``admin`` user for canonical ownership chain consistency with
+    ``admin_headers`` calls in tests. Property/Tenant/Lease are scoped to
+    ``org_a`` so any admin user HTTP call resolves to the same org.
+    """
+    del admin  # Consumed transitively by org_a fixture to bind OWNER membership;
+               # admin_headers already carries the same user's API key.
+    prop = Property(
+        organization_id=org_a.id,
+        name="Sunset Tower",
+        address="1 Roxas Blvd",
+        city="Pasay",
+        total_units=4,
+    )
     db_session.add(prop)
     db_session.flush()
     unit = Unit(
@@ -116,7 +137,11 @@ def lease_id(db_session):
         monthly_rent="12000.00",
         status=UnitStatus.vacant,
     )
-    tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
+    tenant = Tenant(
+        organization_id=org_a.id,
+        full_name="Juan Dela Cruz",
+        phone="+639170000000",
+    )
     db_session.add_all([unit, tenant])
     db_session.flush()
     lease = Lease(
@@ -311,12 +336,21 @@ def test_income_reverse_sequential_and_concurrent_x10(
 
 
 def test_expense_approve_reject_pay_reverse_sequential_and_concurrent_x10(
-    http_server, admin_headers, manager_headers, test_engine
+    http_server, admin_headers, manager_headers, test_engine, lease_id
 ):
+    """FIX1 (ownership anchor): lease_id fixture guarantees ORG+PROPERTY+UNIT rows
+    exist in the test-engine DB; we then look up a valid unit_id for expense payloads."""
+    _S = sessionmaker(bind=test_engine, expire_on_commit=False)
+    with _S() as _s:
+        _unit_id = _s.execute(text("SELECT id FROM units ORDER BY id LIMIT 1")).scalar()
     admin_key = admin_headers["Authorization"].split()[-1]
     with _new_client(http_server, admin_key) as c:
         def _mk_expense():
-            resp = c.post(f"{API}/expenses", json=_expense_payload(), headers=manager_headers)
+            resp = c.post(
+                f"{API}/expenses",
+                json=_expense_payload(unit_id=_unit_id),
+                headers=manager_headers,
+            )
             assert resp.status_code == 201, resp.text
             return resp.json()["id"]
 

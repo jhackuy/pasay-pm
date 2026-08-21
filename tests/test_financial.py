@@ -14,8 +14,9 @@ def _income(lease_id, amount="12000.00", status="pending"):
     }
 
 
-def _expense(status="pending"):
-    return {
+def _expense(*, status="pending", unit_id=None, property_id=None):
+    """FIX1: Expense requires canonical ownership anchor (unit_id or property_id)."""
+    d = {
         "expense_date": "2026-02-05",
         "category": "repair",
         "amount": "5000.00",
@@ -23,6 +24,11 @@ def _expense(status="pending"):
         "description": "AC repair",
         "status": status,
     }
+    if unit_id is not None:
+        d["unit_id"] = unit_id
+    if property_id is not None:
+        d["property_id"] = property_id
+    return d
 
 
 def test_income_requires_status(client, admin_headers, lease_id):
@@ -90,8 +96,8 @@ def test_expense_requires_status(client, admin_headers):
     assert resp.status_code == 422
 
 
-def test_expense_approve_pay_reverse_flow(client, admin_headers, manager_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+def test_expense_approve_pay_reverse_flow(client, admin_headers, manager_headers, unit_id):
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=manager_headers)
     assert resp.status_code == 201
     expense_id = resp.json()["id"]
 
@@ -109,9 +115,9 @@ def test_expense_approve_pay_reverse_flow(client, admin_headers, manager_headers
     assert resp.json()["status"] == "reversed"
 
 
-def test_expense_admin_can_approve_own_created(client, admin_headers, manager_headers):
+def test_expense_admin_can_approve_own_created(client, admin_headers, manager_headers, unit_id):
     # admin creates an expense, then approves their own -> allowed
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=admin_headers)
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=admin_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/approve", headers=admin_headers)
     assert resp.status_code == 200
@@ -119,17 +125,17 @@ def test_expense_admin_can_approve_own_created(client, admin_headers, manager_he
     assert resp.json()["approved_by"] is not None
 
 
-def test_expense_manager_cannot_approve_own_created(client, admin_headers, manager_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+def test_expense_manager_cannot_approve_own_created(client, admin_headers, manager_headers, unit_id):
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=manager_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/approve", headers=manager_headers)
     assert resp.status_code == 403
 
 
-def test_expense_admin_can_reject_own_created(client, admin_headers):
+def test_expense_admin_can_reject_own_created(client, admin_headers, unit_id):
     # Owner records an expense themselves, then rejects it -> allowed (the
     # Owner is the final authority; this is the V1 Owner-records flow).
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=admin_headers)
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=admin_headers)
     assert resp.status_code == 201
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/reject", headers=admin_headers)
@@ -137,26 +143,26 @@ def test_expense_admin_can_reject_own_created(client, admin_headers):
     assert resp.json()["status"] == "rejected"
 
 
-def test_expense_manager_cannot_reject_own_created(client, admin_headers, manager_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+def test_expense_manager_cannot_reject_own_created(client, admin_headers, manager_headers, unit_id):
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=manager_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/reject", headers=manager_headers)
     assert resp.status_code == 403
 
 
-def test_expense_reject_flow(client, admin_headers, manager_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+def test_expense_reject_flow(client, admin_headers, manager_headers, unit_id):
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=manager_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/reject", headers=admin_headers)
     assert resp.status_code == 200
     assert resp.json()["status"] == "rejected"
 
 
-def test_expense_amount_locked_after_approve(client, admin_headers, manager_headers):
+def test_expense_amount_locked_after_approve(client, admin_headers, manager_headers, unit_id):
     """003B §9: a critical financial field (amount) changed after approval must
     INVALIDATE the old approval and return the expense to PENDING for Owner
     re-review — it must NOT keep showing a stale APPROVED with the new amount."""
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=manager_headers)
     expense_id = resp.json()["id"]
     client.post(f"{API}/expenses/{expense_id}/approve", headers=admin_headers)
 
@@ -171,15 +177,15 @@ def test_expense_amount_locked_after_approve(client, admin_headers, manager_head
     assert body["reapproval_reason"] is not None
 
 
-def test_expense_pay_requires_approved(client, admin_headers, manager_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=manager_headers)
+def test_expense_pay_requires_approved(client, admin_headers, manager_headers, unit_id):
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=manager_headers)
     expense_id = resp.json()["id"]
     resp = client.post(f"{API}/expenses/{expense_id}/pay", headers=admin_headers)
     assert resp.status_code == 409
 
 
-def test_expense_no_delete_endpoint(client, admin_headers):
-    resp = client.post(f"{API}/expenses", json=_expense(), headers=admin_headers)
+def test_expense_no_delete_endpoint(client, admin_headers, unit_id):
+    resp = client.post(f"{API}/expenses", json=_expense(unit_id=unit_id), headers=admin_headers)
     expense_id = resp.json()["id"]
     resp = client.delete(f"{API}/expenses/{expense_id}", headers=admin_headers)
     assert resp.status_code == 405
