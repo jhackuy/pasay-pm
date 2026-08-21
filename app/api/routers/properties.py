@@ -47,7 +47,10 @@ def create_property(
 ):
     try:
         resolve_org_membership(
-            db, user.id, payload.organization_id, role=OrganizationRole.OWNER,
+            db,
+            user.id,
+            payload.organization_id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except ScopeBlocked as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
