@@ -1,27 +1,27 @@
-# Pasay AI Development Control
+# Pasay SOLO — AI Development Control
 
-Canonical workflow rules: `AI_WORKFLOW_RULES.md`
+TRAE SOLO 是 Pasay 的主工程执行者。本文件是 Pasay 仓库级开发控制入口。
 
-Before any execution, the worker must pass rules preflight (implemented in `scripts/wf/wf_ctl.py preflight`).
+## Canonical Rules Location
 
-If rules are missing or hash validation fails: **FAIL CLOSED** (`BLOCKED_RULES_MISMATCH` / `BLOCKED_RULES_MISSING`), and no Max/Lily is started.
+- Pasay 项目级工程规则：`project_rules.md`
+- Pasay 项目完整上下文与接手合同：`SOLO_HANDOFF.md`
+- 历史工作流（已退役，仅作记录）：`AI_WORKFLOW_RULES.md`（HISTORICAL）、`GITHUB_DEV_WORKFLOW.md`
 
-All task handoffs use the structured task envelope (`task_id`, `rules_path`, `rules_sha256`, `role`, `objective`, `allowed_paths`, `forbidden_paths`, `acceptance_criteria`). No LLM-based rule ACK loops; ACK is a machine-parsed field only.
-
-Windows is the current canonical Pasay development authority. Pasay development, testing, commits, and GitHub pushes run from Windows by default unless the Owner explicitly changes authority again.
-
-## Long-Term Engineering Rules
+## Long-Term Engineering Rules（继续有效）
 
 - Git authority and history safety are non-negotiable: no default-branch rewrite,
   no force push, no shared-history rewrite, no overwriting remote-only commits.
-- Keep slices small: one Issue should map to one small branch/worktree, one PR,
-  and one Owner acceptance step. If scope expands materially, stop and split.
-- Do not expand scope beyond the current Issue. Nearby cleanup is out of scope
-  unless the Issue explicitly includes it.
-- Prefer targeted validation over broad expensive test runs. Use the smallest
-  reliable checks that match the files and contract touched by the task.
 - Never delete, skip, or xfail real failing tests just to manufacture a PASS.
 - Agent self-report is never enough to claim success; independent GitHub checks,
   reviews, and human acceptance remain authoritative.
-- Final Owner-facing reports default to Chinese unless the Issue explicitly says
+- Final Owner-facing reports default to Chinese unless the task explicitly says
   otherwise.
+
+## Hard Bans（永远有效）
+
+- No force push / force-with-lease
+- No merge PR (TRAE SOLO 不 merge)
+- No production deploy (TRAE SOLO 不负责部署)
+- No secret write or credential commit
+- No weakening confirmed business facts or core product rules
