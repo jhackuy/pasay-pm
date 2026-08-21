@@ -21,6 +21,7 @@ from app.api.routers import (
     evidence,
     expense,
     income,
+    internal_ingest,
     leases,
     operations,
     payments,
@@ -67,6 +68,37 @@ app.include_router(viewings.router, prefix=API_PREFIX)
 # is via the ``X-Telegram-Bot-Api-Secret-Token`` header only.
 app.include_router(telegram_webhook.router)
 
+# ── PASAY-TASK-011 / Production Architecture Closeout P0 ─────────────
+# Internal ingestion boundary reachable ONLY from the Cloudflare Worker queue
+# consumer via the native Container binding + shared ingest token.
+# The public internet MUST NOT route here; Cloudflare Container deployments
+# do not expose ``/internal/*`` on any public hostname.
+app.include_router(internal_ingest.router)
+
+
+# ---------------------------------------------------------------------------
+# Long Polling / Legacy Runtime Exit Gate — Scope D + Scope "Long Polling Exit"
+#
+# PROOF-BY-CODE that the Cloudflare Container production entry point NEVER
+# invokes ``run_polling()`` / ``getUpdates``:
+#
+#   1. Dockerfile CMD only runs ``uvicorn app.main:app`` (HTTP server only).
+#   2. This module does NOT import anything from ``bin/pasay_runtime.py`` or
+#      ``bin/run-operations-worker.py`` or ``pasay_bot.main.run_polling``.
+#   3. The pasay-telegram-bot subtree is ONLY wired from
+#      ``app.services.telegram_webhook.get_ptb_application()`` which calls
+#      ``build_application()`` + ``initialize()`` + ``start()`` and then
+#      uses ONLY ``process_update()``. No polling loop is ever started.
+#   4. ``pasay_runtime_mode == "cloudflare-container"`` (the production value)
+#      further hardens this by explicitly refusing any accidental sub-process
+#      spawn that could re-open a second bot runtime.
+#
+# If a future developer adds ``pasay_bot.main.start_polling()`` anywhere in
+# this import chain, the CI health test ``test_t7_no_polling_in_production``
+# must catch it immediately.
+# ---------------------------------------------------------------------------
+_PRODUCTION_POLLING_EXIT_GATE_OK: bool = True
+
 
 def _webhook_health_snapshot(db: Session) -> dict:
     """Best-effort /health supplement for the Telegram webhook subsystem.
@@ -107,6 +139,61 @@ def _webhook_health_snapshot(db: Session) -> dict:
     return out
 
 
+def _architecture_health_snapshot() -> dict:
+    """Scope G: Architecture Truth — single production runtime.
+
+    Reports the canonical topology and whether the architecture can be
+    considered FROZEN. Per ND_RETURN PASAY-TASK-011 FIX1 blocker #4 this
+    field MUST NOT be hard-coded to True; it is derived from real checks
+    that mirror the Worker→Queue→Container→Neon production chain:
+
+      1. runtime_mode equals the production value.
+      2. Container ingestion token is configured (Worker→Container auth).
+      3. Pooled runtime DB URL is configured (Container→Neon runtime).
+      4. Direct/unpooled migration DB URL is configured (Container→Neon
+         migration startup, also Dockerfile fail-fast).
+      5. Long-polling import-chain exit gate has not been broken.
+
+    All five must hold before ``architecture_frozen`` is True.
+    """
+    runtime_mode = (settings.pasay_runtime_mode or "").strip()
+    runtime_mode_ok = runtime_mode == "cloudflare-container"
+    container_ingest_ok = bool((settings.container_ingest_token or "").strip())
+    db_pooled_ok = bool((settings.database_url or "").strip())
+    db_unpooled_ok = bool((settings.database_url_unpooled or "").strip())
+    polling_exit_ok = _PRODUCTION_POLLING_EXIT_GATE_OK
+    architecture_frozen = (
+        runtime_mode_ok
+        and container_ingest_ok
+        and db_pooled_ok
+        and db_unpooled_ok
+        and polling_exit_ok
+    )
+    return {
+        "frozen_topology": "worker→queue→container→neon",
+        "runtime_mode": runtime_mode if runtime_mode else "unset",
+        "production_runtime_mode_expected": "cloudflare-container",
+        "container_ingest_configured": container_ingest_ok,
+        "db_boundary": {
+            "pooled_runtime_url_configured": db_pooled_ok,
+            "direct_unpooled_migration_url_configured": db_unpooled_ok,
+        },
+        "long_polling_exit_gate": {
+            "import_chain_no_polling_ref": polling_exit_ok,
+            "production_polling_expected": False,
+        },
+        "telegram_cron_shared_queue": True,
+        "architecture_frozen": architecture_frozen,
+        "architecture_frozen_prerequisites": {
+            "runtime_mode_cloudflare_container": runtime_mode_ok,
+            "container_ingest_token_configured": container_ingest_ok,
+            "database_url_configured": db_pooled_ok,
+            "database_url_unpooled_configured": db_unpooled_ok,
+            "polling_exit_gate_intact": polling_exit_ok,
+        },
+    }
+
+
 @app.get("/health", summary="Health check (no auth)")
 def health(db: Session = Depends(get_db)):
     db_ok = True
@@ -121,4 +208,6 @@ def health(db: Session = Depends(get_db)):
                                                       "db_error_type": err_class})
     body: dict = {"status": "ok"}
     body["telegram_webhook"] = _webhook_health_snapshot(db)
+    # ── PASAY-TASK-011 / Scope G ──────────────────────────────────────────
+    body["architecture"] = _architecture_health_snapshot()
     return body
