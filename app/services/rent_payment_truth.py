@@ -151,15 +151,6 @@ def snapshot(
             failed_n += 1
         elif s == RentClaimStatus.REVERSED.value:
             reversed_n += 1
-            # REVERSED claims *remove* previously counted verified amounts.
-            # The service-level ``verify`` path already sets verified_amount
-            # on reversal to -|original|; if the caller left it as a positive
-            # number we subtract explicitly rather than rely on convention.
-            amt = _zero(c.verified_amount)
-            if amt < 0:
-                verified_sum += amt
-            else:
-                verified_sum -= amt
 
     lease = db.get(Lease, lease_id)
     if lease is None or lease.monthly_rent is None:

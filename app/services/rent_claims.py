@@ -86,12 +86,26 @@ def create_claim(
             "period must be YYYY-MM (e.g. 2026-01)"
         )
     now = now or datetime.now(timezone.utc)
-    key = idempotency_key
+    # FIX3: client-supplied idempotency keys are namespaced by
+    # (lease_id, period) before they touch the DB.  This guarantees:
+    #   * same client key on same lease+period → dedupe hit
+    #   * same client key on different lease/org → independent names,
+    #     no cross-lease collisions (and no "does this key exist"
+    #     leak between leases / orgs)
+    # If the caller does not pass a key we continue without one so
+    # legitimate retries still get through the uniqueness constraints
+    # on (status transitions + claim_id).
+    raw_client_key = idempotency_key
+    if raw_client_key:
+        key = claim_idempotency_key(lease.id, period, claimed_by, raw_client_key)
+    else:
+        key = None
     if key:
         existing = (
             db.query(RentPaymentClaim)
             .filter(
                 RentPaymentClaim.lease_id == lease.id,
+                RentPaymentClaim.period == period,
                 RentPaymentClaim.idempotency_key == key,
             )
             .first()
@@ -133,6 +147,7 @@ def create_claim(
                 db.query(RentPaymentClaim)
                 .filter(
                     RentPaymentClaim.lease_id == lease.id,
+                    RentPaymentClaim.period == period,
                     RentPaymentClaim.idempotency_key == key,
                 )
                 .first()
@@ -294,6 +309,15 @@ def verify_claim(
 
     if required > 0 and new_total > required + _MONEY:
         # Strict over-claim beyond a 1c rounding tolerance → FAILED + mismatch.
+        # FIX5: capture pre-mutation snapshot BEFORE setting status/mismatch/verified_amount.
+        old_snap = serialize_row(claim)
+        pre_status = str(claim.status.value if hasattr(claim.status, "value") else claim.status)
+        pre_mismatch = bool(claim.mismatch)
+        pre_verified_amount = (
+            str(claim.verified_amount)
+            if claim.verified_amount is not None
+            else None
+        )
         claim.status = RentClaimStatus.FAILED
         claim.mismatch = True
         claim.mismatch_reason = (
@@ -319,15 +343,22 @@ def verify_claim(
             action="rent_amount_mismatch",
             actor_id=verified_by,
             changed_fields={
-                "status": ["PENDING", "FAILED"],
-                "mismatch": [False, True],
-                "verified_amount": [None, None],
+                "status": [pre_status, "FAILED"],
+                "mismatch": [pre_mismatch, True],
+                "verified_amount": [pre_verified_amount, None],
             },
-            old_value=serialize_row(claim),
+            old_value=old_snap,
             new_value=serialize_row(claim),
         )
         return claim
 
+    old_snap = serialize_row(claim)
+    pre_status = str(claim.status.value if hasattr(claim.status, "value") else claim.status)
+    pre_verified_amount = (
+        str(claim.verified_amount)
+        if claim.verified_amount is not None
+        else None
+    )
     claim.status = RentClaimStatus.VERIFIED
     claim.verified_amount = admitted
     claim.verified_by = verified_by
@@ -348,10 +379,10 @@ def verify_claim(
         action="rent_claim_verified",
         actor_id=verified_by,
         changed_fields={
-            "status": ["PENDING", "VERIFIED"],
-            "verified_amount": [None, str(admitted)],
+            "status": [pre_status, "VERIFIED"],
+            "verified_amount": [pre_verified_amount, str(admitted)],
         },
-        old_value=serialize_row(claim),
+        old_value=old_snap,
         new_value=serialize_row(claim),
     )
     truth_after = snapshot(db, lease.id, claim.period)
@@ -381,6 +412,12 @@ def fail_claim(
             f"Only PENDING claims can be failed (claim is {claim.status})"
         )
     now = now or datetime.now(timezone.utc)
+    old_snap = serialize_row(claim)
+    pre_status = (
+        str(claim.status.value)
+        if hasattr(claim.status, "value")
+        else str(claim.status)
+    )
     claim.status = RentClaimStatus.FAILED
     claim.failure_reason = reason
     claim.updated_by = failed_by
@@ -392,8 +429,8 @@ def fail_claim(
         record_id=claim.id,
         action="rent_claim_failed",
         actor_id=failed_by,
-        changed_fields={"status": ["PENDING", "FAILED"]},
-        old_value=serialize_row(claim),
+        changed_fields={"status": [pre_status, "FAILED"]},
+        old_value=old_snap,
         new_value=serialize_row(claim),
     )
     return claim
@@ -410,10 +447,10 @@ def reverse_claim(
 ) -> RentPaymentClaim:
     """Reverse a VERIFIED claim (bounced check / clawback).
 
-    The aggregate is reduced via the snapshot helper (REVERSED rows with
-    a positive verified_amount are subtracted); OperationalTasks for the
-    period are reopened (if they were COMPLETED and the period is no
-    longer fully paid).
+    The aggregate is reduced via the snapshot helper: REVERSED rows simply
+    increment reversed_n (verified_sum is derived exclusively from VERIFIED
+    rows); OperationalTasks for the period are reopened (if they were
+    COMPLETED and the period is no longer fully paid).
     """
     claim = _get_claim_or_error(db, claim_id)
     if claim.lease_id != lease.id:
@@ -423,9 +460,20 @@ def reverse_claim(
             f"Only VERIFIED claims can be reversed (claim is {claim.status})"
         )
     now = now or datetime.now(timezone.utc)
+    old_snap = serialize_row(claim)
+    pre_status = (
+        str(claim.status.value)
+        if hasattr(claim.status, "value")
+        else str(claim.status)
+    )
+    pre_verified_amount_str = (
+        str(claim.verified_amount)
+        if claim.verified_amount is not None
+        else None
+    )
     claim.status = RentClaimStatus.REVERSED
     claim.failure_reason = reason
-    claim.verified_amount = None  # snapshot subtracts the old value
+    claim.verified_amount = None
     claim.updated_by = reversed_by
     claim.updated_at = now
     db.flush()
@@ -436,10 +484,10 @@ def reverse_claim(
         action="rent_claim_reversed",
         actor_id=reversed_by,
         changed_fields={
-            "status": ["VERIFIED", "REVERSED"],
-            "verified_amount": [str(claim.claimed_amount), None],
+            "status": [pre_status, "REVERSED"],
+            "verified_amount": [pre_verified_amount_str, None],
         },
-        old_value=serialize_row(claim),
+        old_value=old_snap,
         new_value=serialize_row(claim),
     )
     truth_after = snapshot(db, lease.id, claim.period)

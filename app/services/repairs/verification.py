@@ -227,7 +227,12 @@ def _complete_linked_operational_tasks(
     for task in candidates:
         if task.status == OperationalTaskStatus.COMPLETED:
             continue
-        old_status = task.status.value if hasattr(task.status, "value") else str(task.status)
+        old_snap = serialize_row(task)
+        old_status = (
+            task.status.value
+            if hasattr(task.status, "value")
+            else str(task.status)
+        )
         task.status = OperationalTaskStatus.COMPLETED
         task.completed_at = now
         task.completed_by = resolved_by
@@ -243,7 +248,7 @@ def _complete_linked_operational_tasks(
                 "status": [old_status, OperationalTaskStatus.COMPLETED.value],
                 "repair_id": [None, repair.id],
             },
-            old_value=serialize_row(task),
+            old_value=old_snap,
             new_value=serialize_row(task),
         )
 

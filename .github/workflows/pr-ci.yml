@@ -132,6 +132,7 @@ jobs:
             tests/test_repair_ai_employee_008.py \
             tests/test_rent_closure_m2.py \
             tests/test_repair_closure_m2.py \
+            tests/test_fix3_blockers_m2.py \
             -v --tb=short -q
 
       - name: Install bot dependencies
