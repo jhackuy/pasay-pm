@@ -80,8 +80,8 @@ def create_income(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Income can only be created as pending or confirmed",
         )
-    _check_lease(db, payload.lease_id)
     try:
+        _check_lease(db, payload.lease_id)
         _assert_lease_co_org(db, user, payload.lease_id)
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
@@ -168,8 +168,8 @@ def update_income(
             status.HTTP_409_CONFLICT, "Cannot change the amount of a confirmed income"
         )
     if "lease_id" in updates:
-        _check_lease(db, updates["lease_id"])
         try:
+            _check_lease(db, updates["lease_id"])
             _assert_lease_co_org(db, user, updates["lease_id"])
         except Exception as exc:
             raise scope_exception_to_http(exc) from exc
