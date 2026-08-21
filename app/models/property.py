@@ -18,6 +18,12 @@ class Property(AuditMixin, SoftDeleteMixin, Base):
         ),
     )
 
+    # NOTE: ORM layer remains nullable=True until the migration that sets
+    # NOT NULL (alembic/versions/m1_a_property_org_not_null_backfill.py)
+    # is confirmed executed in all environments. Post-deploy the ORM mapping
+    # will be tightened to ``Mapped[int]`` with ``nullable=False``.
+    # This intentional ORM/DB lag prevents a race where a new container
+    # starts and rejects inserts BEFORE `alembic upgrade head` runs.
     organization_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("organizations.id"), nullable=True, index=True
     )

@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import Boolean, DateTime, String
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import AuditMixin, Base, SoftDeleteMixin, pg_enum
@@ -21,6 +21,9 @@ class TenantContactStatus(str, Enum):
 class Tenant(AuditMixin, SoftDeleteMixin, Base):
     __tablename__ = "tenants"
 
+    organization_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("organizations.id"), nullable=False, index=True
+    )
     full_name: Mapped[str] = mapped_column(String(200), nullable=False)
     phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # PASAY-AI-EMPLOYEE-FOUNDATION-007 §3: structured contact fields. The
