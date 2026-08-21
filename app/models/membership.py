@@ -124,9 +124,9 @@ class SecretaryInvite(AuditMixin, Base):
         ),
         CheckConstraint(
             "(state = 'PENDING' AND accepted_at IS NULL AND cancelled_at IS NULL) OR "
-            "(state = 'ACCEPTED' AND accepted_at IS NOT NULL) OR "
-            "(state = 'CANCELLED' AND cancelled_at IS NOT NULL) OR "
-            "(state = 'EXPIRED')",
+            "(state = 'ACCEPTED' AND accepted_at IS NOT NULL AND cancelled_at IS NULL) OR "
+            "(state = 'CANCELLED' AND accepted_at IS NULL AND cancelled_at IS NOT NULL) OR "
+            "(state = 'EXPIRED' AND accepted_at IS NULL AND cancelled_at IS NULL)",
             name="ck_secretary_invites_state_timestamps",
         ),
         CheckConstraint("expires_at > created_at", name="ck_secretary_invites_expires_after_created"),

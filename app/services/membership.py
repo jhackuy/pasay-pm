@@ -1,4 +1,4 @@
-"""PASAY-TASK-002 FIX1 — Membership service: bootstrap, invite, accept, remove, auth helpers.
+"""PASAY-TASK-002 FIX2 — Membership service: bootstrap, invite, accept, remove, auth helpers.
 
 Authoritative identity chain (CONFIRMED BY CODE):
     Telegram external_user_id
@@ -15,16 +15,15 @@ against the Membership truth table.
 from __future__ import annotations
 
 import secrets
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction
-from app.models.identity import Principal, PrincipalType
-from app.services.identity import resolve_telegram_human
+from app.models.identity import Principal
 from app.models.membership import (
     InviteState,
     Membership,
@@ -35,7 +34,7 @@ from app.models.membership import (
 )
 from app.models.user import User
 from app.services.audit import record_audit
-
+from app.services.identity import resolve_telegram_human
 
 DEFAULT_INVITE_TTL = timedelta(days=7)
 

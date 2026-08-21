@@ -53,7 +53,6 @@ from app.services.membership import (
     resolve_telegram_org_membership,
 )
 
-
 NOW = datetime(2026, 8, 20, 0, 0, tzinfo=timezone.utc)
 TEL_A = 1000000001
 TEL_B = 1000000002
@@ -210,7 +209,7 @@ class TestBootstrap:
     def test_bootstrap_refuses_if_user_is_already_a_secretary(self, db_session, user_a, user_b):
         alice, _ = user_a
         bob, _ = user_b
-        org, owner_m = bootstrap_first_owner(db_session, alice.id, "Host Corp")
+        org, _owner_m = bootstrap_first_owner(db_session, alice.id, "Host Corp")
         invite = create_secretary_invite(db_session, alice.id, org.id)
         accept_secretary_invite(db_session, bob.id, invite.code)
         # Bob now has an ACTIVE SECRETARY membership. A second bootstrap must fail.
@@ -470,7 +469,7 @@ class TestSecretaryRemoval:
             remove_secretary(db_session, alice.id, org.id, alice.id)
 
     def test_stranger_cannot_remove_secretary(self, db_session, user_a, user_b, user_c):
-        org, alice, bob, _ = self._scenario(db_session, user_a, user_b)
+        org, _alice, bob, _ = self._scenario(db_session, user_a, user_b)
         carol, _ = user_c
         with pytest.raises(RemovalBlocked):
             remove_secretary(db_session, carol.id, org.id, bob.id)
@@ -561,7 +560,7 @@ class TestTelegramMembershipChain:
         org, _ = bootstrap_first_owner(db_session, alice.id, "TeleSecretary")
         invite = create_secretary_invite(db_session, alice.id, org.id)
         accept_secretary_invite(db_session, bob.id, invite.code)
-        u, p, m = resolve_telegram_org_membership(
+        u, _p, m = resolve_telegram_org_membership(
             db_session, TEL_B, org.id, role=OrganizationRole.SECRETARY,
         )
         assert u.id == bob.id
@@ -578,7 +577,7 @@ class TestTelegramMembershipChain:
 
     def test_telegram_bound_but_no_membership_raises_lookup(self, db_session, user_a, user_c):
         alice, _ = user_a
-        carol, _ = user_c
+        _carol, _ = user_c
         org, _ = bootstrap_first_owner(db_session, alice.id, "Exclusion Co")
         # Carol has a valid TelegramIdentityBinding → User but ZERO memberships.
         with pytest.raises(LookupError) as exc:
@@ -615,7 +614,7 @@ class TestHappyPathEndToEnd:
         # 1) User A (无组织) → 创建 Organization X → A 成为 OWNER
         alice, _ = user_a
         bob, _ = user_b
-        org, owner_m = bootstrap_first_owner(db_session, alice.id, "FullCycle Co")
+        org, _owner_m = bootstrap_first_owner(db_session, alice.id, "FullCycle Co")
 
         # 2) A → 创建 Secretary invite
         invite = create_secretary_invite(db_session, alice.id, org.id)
@@ -670,9 +669,10 @@ class TestAlembicSingleHead:
         )
 
 
-import os  # noqa: E402  (placed after TestAlembicSingleHead to keep sections tidy)
-import threading  # noqa: E402
-from sqlalchemy.orm import sessionmaker  # noqa: E402
+import os
+import threading
+
+from sqlalchemy.orm import sessionmaker
 
 
 class TestInviteConcurrentAccept:
@@ -793,7 +793,7 @@ class TestExpiredInvitePersists:
     ):
         """FIX1: cancel 路径的 stale EXPIRED 转换也必须持久化到 DB。"""
         alice, _ = user_a
-        bob, _ = user_b
+        _bob, _ = user_b
         org, _ = bootstrap_first_owner(db_session, alice.id, "CancelStaleLand")
         invite = create_secretary_invite(
             db_session, alice.id, org.id,
@@ -882,7 +882,7 @@ class TestRemovedSecretaryCanRejoin:
         invite_v2 = create_secretary_invite(db_session, alice.id, org.id)
         accept_secretary_invite(db_session, bob.id, invite_v2.code)
         # Rejoined: chain succeeds, SECRETARY
-        u, p, m = resolve_telegram_org_membership(
+        u, _p, m = resolve_telegram_org_membership(
             db_session, TEL_B, org.id, role=OrganizationRole.SECRETARY,
         )
         assert u.id == bob.id

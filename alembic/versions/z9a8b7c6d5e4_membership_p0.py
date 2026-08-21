@@ -1,10 +1,10 @@
-"""PASAY-TASK-002 FIX1 — Membership P0: Organization / Membership / Secretary Invite.
+"""PASAY-TASK-002 FIX2 — Membership P0: Organization / Membership / Secretary Invite.
 
 Revision ID: z9a8b7c6d5e4
 Revises: f1a2b3c4d5e6
 Create Date: 2026-08-20
 
-Scope (from PASAY-TASK-002 contract + FIX1 amendments):
+Scope (from PASAY-TASK-002 contract + FIX1/FIX2 amendments):
 1. ``organizations`` — minimal org entity (name + display_name + audit cols).
 2. ``memberships`` — User<->Org links with role (OWNER/SECRETARY), state
    (ACTIVE/REMOVED), audit timestamps, and a partial unique index enforcing
@@ -20,14 +20,15 @@ Scope (from PASAY-TASK-002 contract + FIX1 amendments):
 Rollback:
     alembic downgrade f1a2b3c4d5e6
 """
-from typing import Union
+from __future__ import annotations
+
+import sqlalchemy as sa
+from sqlalchemy import inspect
 
 from alembic import op
-import sqlalchemy as sa
-
 
 revision: str = "z9a8b7c6d5e4"
-down_revision: Union[str, None] = "f1a2b3c4d5e6"
+down_revision: str | None = "f1a2b3c4d5e6"
 branch_labels = None
 depends_on = None
 
@@ -67,16 +68,61 @@ _BASE_ALLOWED = (
     "expense_resubmitted,expense_rejected"
 )
 
+_DT_TZ_COLUMNS = {
+    "organizations": {"created_at", "updated_at"},
+    "memberships": {"joined_at", "removed_at", "created_at", "updated_at"},
+    "secretary_invites": {
+        "expires_at", "accepted_at", "cancelled_at",
+        "created_at", "updated_at",
+    },
+}
+
 
 def _set_audit_action_allowlist(conn, allowed_csv: str) -> None:
     conn.execute(
         sa.text("ALTER TABLE audit_logs DROP CONSTRAINT IF EXISTS ck_audit_logs_action")
     )
-    values_sql = ",".join("'%s'" % v for v in allowed_csv.split(","))
+    values_sql = ",".join(f"'{v}'" for v in allowed_csv.split(","))
     conn.execute(sa.text(
-        "ALTER TABLE audit_logs ADD CONSTRAINT ck_audit_logs_action CHECK "
-        "(action IN (%s))" % values_sql
+        f"ALTER TABLE audit_logs ADD CONSTRAINT ck_audit_logs_action CHECK "
+        f"(action IN ({values_sql}))"
     ))
+
+
+def _audit_timezone_columns(conn, table: str, expected_tz_cols: set[str]) -> None:
+    insp = inspect(conn)
+    cols = insp.get_columns(table)
+    actual = {
+        c["name"]
+        for c in cols
+        if isinstance(c.get("type"), sa.DateTime) and bool(c["type"].timezone)
+    }
+    missing = expected_tz_cols - actual
+    extra = actual - expected_tz_cols
+    if missing:
+        raise RuntimeError(
+            f"downgrade audit: table={table!r} missing timezone-aware columns: "
+            f"{sorted(missing)}; data semantic loss risk (UTC wallclock vs local)"
+        )
+    if extra:
+        raise RuntimeError(
+            f"downgrade audit: table={table!r} unexpected tz cols: {sorted(extra)}; "
+            f"schema drift detected, refusing blind DROP"
+        )
+
+
+def _audit_no_jsonb_or_dialect_columns(conn, table: str) -> None:
+    insp = inspect(conn)
+    cols = insp.get_columns(table)
+    risky = [
+        c["name"] for c in cols
+        if isinstance(c.get("type"), (sa.JSON, sa.dialects.postgresql.JSONB))
+    ]
+    if risky:
+        raise RuntimeError(
+            f"downgrade audit: table={table!r} has JSON(B) columns not audited for "
+            f"semantic equivalence post-downgrade: {risky}"
+        )
 
 
 def upgrade() -> None:
@@ -154,9 +200,9 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "(state = 'PENDING' AND accepted_at IS NULL AND cancelled_at IS NULL) OR "
-            "(state = 'ACCEPTED' AND accepted_at IS NOT NULL) OR "
-            "(state = 'CANCELLED' AND cancelled_at IS NOT NULL) OR "
-            "(state = 'EXPIRED')",
+            "(state = 'ACCEPTED' AND accepted_at IS NOT NULL AND cancelled_at IS NULL) OR "
+            "(state = 'CANCELLED' AND accepted_at IS NULL AND cancelled_at IS NOT NULL) OR "
+            "(state = 'EXPIRED' AND accepted_at IS NULL AND cancelled_at IS NULL)",
             name="ck_secretary_invites_state_timestamps",
         ),
         sa.CheckConstraint("expires_at > created_at", name="ck_secretary_invites_expires_after_created"),
@@ -174,6 +220,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     conn = op.get_bind()
+    for table, cols in _DT_TZ_COLUMNS.items():
+        _audit_timezone_columns(conn, table, cols)
+        _audit_no_jsonb_or_dialect_columns(conn, table)
+
     _set_audit_action_allowlist(conn, _BASE_ALLOWED)
 
     op.drop_table("secretary_invites")
