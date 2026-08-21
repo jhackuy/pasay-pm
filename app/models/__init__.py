@@ -66,6 +66,7 @@ from app.models.repair import (
     RepairProposal,
     RepairProposalStatus,
 )
+from app.models.rent_payment_claim import RentClaimStatus, RentPaymentClaim
 from app.models.scheduled_job import ScheduledJobLedger
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.telegram_webhook import (
@@ -130,6 +131,8 @@ __all__ = [
     "RepairOperationStatus",
     "RepairProposal",
     "RepairProposalStatus",
+    "RentClaimStatus",
+    "RentPaymentClaim",
     "ScheduledJobLedger",
     "SecretaryInvite",
     "SecurityEvent",

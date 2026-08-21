@@ -104,6 +104,32 @@ class AuditAction(str, Enum):
     unit_channel_bound = "unit_channel_bound"
     unit_channel_replaced = "unit_channel_replaced"
     unit_channel_revoked = "unit_channel_revoked"
+    # PASAY-MILESTONE-002 Rent payment-claim truth lifecycle. Mirrors the
+    # expense_claim_* shape exactly for traceability.
+    rent_claim_created = "rent_claim_created"
+    rent_claim_verified = "rent_claim_verified"
+    rent_claim_failed = "rent_claim_failed"
+    rent_claim_reversed = "rent_claim_reversed"
+    rent_amount_mismatch = "rent_amount_mismatch"
+    rent_partially_paid = "rent_partially_paid"
+    rent_fully_paid = "rent_fully_paid"
+    # PASAY-MILESTONE-002 Rent legacy income projection: the authoritative claim truth aggregate
+    # (RentPeriodTruth is mirrored into Income rows as non-authoritative reports
+    # (legacy bucket projection only; single source of truth remains RentPaymentClaim).
+    income_truth_projected = "income_truth_projected"
+    # PASAY-MILESTONE-002 Truth→Task projection on reversal path: when a
+    # fully-paid period is reopened (e.g. bounced check reversed the claim)
+    # the COMPLETED task is reopened too.
+    task_reopened = "task_reopened"
+    # PASAY-MILESTONE-002 Repair CLOSED → linked operational-task projection
+    # marked COMPLETED (truth → task, never the reverse).
+    repair_closure_task_completed = "repair_closure_task_completed"
+    # PASAY-MILESTONE-002 Repair proposal auto-creates Expense: keep Quote
+    # (RepairProposal) and Expense separated while writing an audit trail so
+    # the financial link is never lost.
+    expense_created_from_approved_repair_proposal = (
+        "expense_created_from_approved_repair_proposal"
+    )
 
 
 class AuditLog(AuditMixin, Base):
