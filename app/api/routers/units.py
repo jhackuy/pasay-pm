@@ -11,6 +11,7 @@ from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.property import UnitCreate, UnitRead, UnitUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.organization_scope import scope_exception_to_http
 from app.services.property_channel import (
     OwnerRequired,
     ScopeBlocked,
@@ -21,14 +22,6 @@ from app.services.property_channel import (
 )
 
 router = APIRouter(prefix="/units", tags=["units"])
-
-
-def _scope_exception_to_http(exc: Exception) -> HTTPException:
-    if isinstance(exc, LookupError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (ScopeBlocked, OwnerRequired)):
-        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
-    return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, type(exc).__name__)
 
 
 @router.get("", response_model=list[UnitRead])
@@ -94,7 +87,7 @@ def get_unit(
     try:
         unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     return unit
 
 
@@ -108,14 +101,14 @@ def update_unit(
     try:
         obj, membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
 
     try:
-        if membership.role != OrganizationRole.OWNER.value:
+        if membership.role != OrganizationRole.OWNER:
             filter_secretary_unit_updates(set(updates.keys()))
     except OwnerRequired as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
@@ -171,8 +164,8 @@ def delete_unit(
     try:
         obj, membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
-    if membership.role != OrganizationRole.OWNER.value:
+        raise scope_exception_to_http(exc) from exc
+    if membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only ACTIVE OWNER may soft-delete a Unit",

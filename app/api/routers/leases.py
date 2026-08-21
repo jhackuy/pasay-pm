@@ -17,6 +17,7 @@ from app.services.organization_scope import (
     ScopeBlocked,
     assert_co_org,
     resolve_org_membership,
+    scope_exception_to_http,
     scoped_get_lease,
     scoped_list_leases,
     tenant_org_id,
@@ -24,14 +25,6 @@ from app.services.organization_scope import (
 )
 
 router = APIRouter(prefix="/leases", tags=["leases"])
-
-
-def _scope_exception_to_http(exc: Exception) -> HTTPException:
-    if isinstance(exc, LookupError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc) or "Not found")
-    if isinstance(exc, (ScopeBlocked, OwnerRequired, CrossOrgReference)):
-        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc) or "Forbidden")
-    raise exc
 
 
 def _sync_unit_status(db: Session, unit: Unit) -> None:
@@ -53,7 +46,7 @@ def list_leases(
     try:
         return scoped_list_leases(db, for_user_id=user.id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.post("", response_model=LeaseRead, status_code=status.HTTP_201_CREATED)
@@ -69,13 +62,12 @@ def create_lease(
         membership = resolve_org_membership(
             db, user.id, u_org_id, role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY]
         )
-        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=u_org_id, object_kind="Unit", object_id=payload.unit_id)
         t_org_id = tenant_org_id(db, payload.tenant_id)
         if t_org_id is None:
             raise LookupError("Tenant not found")
         assert_co_org(db, user_org_id=membership.organization_id, object_org_id=t_org_id, object_kind="Tenant", object_id=payload.tenant_id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     unit = db.query(Unit).filter(Unit.id == payload.unit_id, Unit.deleted_at.is_(None)).first()
     if unit is None:
@@ -117,7 +109,7 @@ def get_lease(
         obj, _membership = scoped_get_lease(db, lease_id, for_user_id=user.id)
         return obj
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.patch("/{lease_id}", response_model=LeaseRead)
@@ -133,7 +125,7 @@ def update_lease(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
@@ -166,7 +158,7 @@ def update_lease(
                 raise LookupError("Tenant not found")
             assert_co_org(db, user_org_id=membership.organization_id, object_org_id=new_tenant_org, object_kind="Tenant", object_id=updates["tenant_id"])
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     if updates.get("unit_id") is not None and updates["unit_id"] != obj.unit_id:
         unit = db.query(Unit).filter(Unit.id == updates["unit_id"], Unit.deleted_at.is_(None)).first()
@@ -232,7 +224,7 @@ def delete_lease(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     if obj.status == LeaseStatus.active:
         raise HTTPException(

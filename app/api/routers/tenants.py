@@ -14,19 +14,12 @@ from app.services.organization_scope import (
     OwnerRequired,
     ScopeBlocked,
     resolve_org_membership,
+    scope_exception_to_http,
     scoped_get_tenant,
     scoped_list_tenants,
 )
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
-
-
-def _scope_exception_to_http(exc: Exception) -> HTTPException:
-    if isinstance(exc, LookupError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (ScopeBlocked, OwnerRequired, CrossOrgReference)):
-        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
-    raise exc
 
 
 def _to_public(obj: Tenant) -> TenantPublic:
@@ -78,7 +71,7 @@ def create_tenant(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except (ScopeBlocked, LookupError) as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     obj = Tenant(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -111,7 +104,7 @@ def get_tenant(
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except (LookupError, ScopeBlocked) as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     return _to_public(obj)
 
 
@@ -129,16 +122,13 @@ def update_tenant(
             for_user_id=user.id,
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
-        if payload.organization_id is not None:
-            resolve_org_membership(
-                db,
-                user.id,
-                payload.organization_id,
-                role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        updates = payload.model_dump(exclude_unset=True)
+        if "organization_id" in updates:
+            raise CrossOrgReference(
+                "Tenant organization_id is immutable in this milestone; use a dedicated transfer workflow"
             )
     except (LookupError, ScopeBlocked, CrossOrgReference) as exc:
-        raise _scope_exception_to_http(exc) from exc
-    updates = payload.model_dump(exclude_unset=True)
+        raise scope_exception_to_http(exc) from exc
     if not updates:
         return _to_public(obj)
     old = serialize_row(obj)
@@ -175,7 +165,7 @@ def delete_tenant(
             role=OrganizationRole.OWNER,
         )
     except (LookupError, ScopeBlocked, OwnerRequired) as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     from datetime import datetime, timezone
 
     obj.deleted_at = datetime.now(timezone.utc)
