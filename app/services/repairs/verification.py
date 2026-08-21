@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.operations import (
@@ -150,31 +151,72 @@ def _complete_linked_operational_tasks(
             candidates.append(t)
     # (b) Tasks whose details JSONB contain repair_id, or dedupe_key
     #     references the repair_id (existing legacy projections).
+    #
+    # FIX2 (CodeRabbit 🔴 Critical) — SQL-side narrowing:
+    #   * If repair.property_id resolves, restrict to OperationalTasks on the
+    #     same property. This cuts cross-org / cross-property false positives.
+    #   * Use JSONB `metadata->>'repair_id' == str(repair.id)` to avoid the
+    #     earlier Python-only fallback scanning every open task on the DB.
+    #   * dedupe_key match only accepts exact `repair:{id}` or the prefix
+    #     `repair:{id}:` (which precedes an additional qualifier); the old
+    #     substring `in` would match repair:1 inside repair:120 / repair:11 —
+    #     closing other repairs' linked tasks (potentially cross-org).
+    #
+    # Python `t.details.get("repair_id")` secondary guard is kept as a
+    # belt-and-braces check for projections written through an older schema.
 
     str_rid = str(repair.id)
-    for t in (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.status.in_(
-                (
-                    OperationalTaskStatus.PENDING,
-                    OperationalTaskStatus.IN_PROGRESS,
-                )
-            ),
-            OperationalTask.task_type.in_(
-                (
-                    OperationalTaskType.APPROVAL_PENDING,
-                    OperationalTaskType.PAYMENT_PENDING,
-                    OperationalTaskType.FOLLOWUP,
-                    OperationalTaskType.AC_MAINTENANCE,
-                    OperationalTaskType.RENT_OVERDUE,
-                )
-            ),
+    repair_ref_exact = f"repair:{repair.id}"
+    repair_ref_prefix = f"repair:{repair.id}:"
+    # JSONB metadata->>'repair_id' == str(repair.id).  We write the SQL
+    # expression without a Python-side cast() wrapper because the operator
+    # already returns text; cast() can break under SQLite/ORM bindings when
+    # the JSONB-op dialect is not fully loaded.
+    jsonb_rid_text = OperationalTask.details.op("->>")("repair_id")
+    q = db.query(OperationalTask).filter(
+        OperationalTask.status.in_(
+            (
+                OperationalTaskStatus.PENDING,
+                OperationalTaskStatus.IN_PROGRESS,
+            )
+        ),
+        OperationalTask.task_type.in_(
+            (
+                OperationalTaskType.APPROVAL_PENDING,
+                OperationalTaskType.PAYMENT_PENDING,
+                OperationalTaskType.FOLLOWUP,
+                OperationalTaskType.AC_MAINTENANCE,
+                OperationalTaskType.RENT_OVERDUE,
+            )
+        ),
+        or_(
+            OperationalTask.dedupe_key == repair_ref_exact,
+            OperationalTask.dedupe_key.like(f"{repair_ref_prefix}%"),
+            jsonb_rid_text == str_rid,
+        ),
+    )
+    if repair.property_id is not None:
+        # If the repair resolves to a property, tasks must either share that
+        # property OR have a NULL property_id (legacy tasks pre-dating the
+        # property_id column).  Combined with the exact/prefix dedupe_key
+        # guard above this blocks cross-property false positives when an
+        # unrelated repair happens to have a numeric ID that is a prefix of
+        # another repair's ID (e.g. repair:1 vs repair:120).
+        q = q.filter(
+            or_(
+                OperationalTask.property_id == None,  # noqa: E711
+                OperationalTask.property_id == repair.property_id,
+            )
         )
-        .all()
-    ):
+    for t in q.all():
         matched = False
-        if t.dedupe_key and f"repair:{repair.id}" in t.dedupe_key:
+        # Secondary (belt-and-braces) Python dedupe_key guard; the SQL query
+        # already narrowed to exact/prefix matches, but we re-assert to be
+        # defensive against any unexpected future callers widening the query.
+        if t.dedupe_key and (
+            t.dedupe_key == repair_ref_exact
+            or t.dedupe_key.startswith(repair_ref_prefix)
+        ):
             matched = True
         elif t.details:
             details_rid = t.details.get("repair_id")
