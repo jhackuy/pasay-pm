@@ -24,8 +24,14 @@ from app.models.evidence import (
 from app.models.expense_claim import ClaimStatus, ExpensePaymentClaim
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.identity import (
-    ApiCredential, CommunicationEndpoint, CredentialLifecycle, CredentialState,
-    Principal, PrincipalType, SecurityEvent, TelegramIdentityBinding,
+    ApiCredential,
+    CommunicationEndpoint,
+    CredentialLifecycle,
+    CredentialState,
+    Principal,
+    PrincipalType,
+    SecurityEvent,
+    TelegramIdentityBinding,
 )
 from app.models.lease import Lease, LeaseStatus
 from app.models.membership import (
@@ -47,6 +53,13 @@ from app.models.operations import (
     RecurringRule,
 )
 from app.models.property import Property, Unit, UnitLifecycleEvent, UnitStatus
+from app.models.property_channel import (
+    ArchiveArticleStatus,
+    ChannelPlatform,
+    ChannelScope,
+    PropertyArchiveChannel,
+    UnitArchiveArticle,
+)
 from app.models.repair import (
     RepairAction,
     RepairActionStatus,
@@ -56,55 +69,62 @@ from app.models.repair import (
     RepairProposalStatus,
 )
 from app.models.task import Task, TaskPriority, TaskStatus
-from app.models.tenant import Tenant, TenantContactStatus
 from app.models.telegram_webhook import (
     CLAIM_STALE_SECONDS,
     TelegramWebhookState,
     TelegramWebhookUpdate,
 )
+from app.models.tenant import Tenant, TenantContactStatus
 from app.models.user import User, UserRole
 
 __all__ = [
+    "CLAIM_STALE_SECONDS",
     "AgentRole",
+    "ApiCredential",
+    "ArchiveArticleStatus",
     "Attachment",
     "AuditAction",
     "AuditLog",
     "AuditMixin",
     "Base",
-    "CLAIM_STALE_SECONDS",
+    "ChannelPlatform",
+    "ChannelScope",
+    "ClaimStatus",
     "CommissionRule",
     "CommissionRuleType",
     "CommissionSettlement",
     "CommissionSettlementStatus",
+    "CommunicationEndpoint",
     "CopilotActionProposal",
     "CopilotActionStatus",
     "CopilotRun",
     "CopilotRunStatus",
+    "CredentialLifecycle",
+    "CredentialState",
     "Evidence",
     "EvidenceCategory",
-    "ClaimStatus",
     "Expense",
     "ExpensePaymentClaim",
     "ExpenseStatus",
     "Income",
     "IncomeStatus",
-    "ApiCredential", "CommunicationEndpoint", "CredentialLifecycle", "CredentialState",
-    "Principal", "PrincipalType", "SecurityEvent", "TelegramIdentityBinding",
     "InviteState",
     "Lease",
     "LeaseStatus",
     "Membership",
     "MembershipState",
     "NotificationOutbox",
-    "Organization",
-    "OrganizationRole",
-    "SecretaryInvite",
     "NotificationStatus",
     "OperationalTask",
     "OperationalTaskPriority",
     "OperationalTaskStatus",
     "OperationalTaskType",
+    "Organization",
+    "OrganizationRole",
+    "Principal",
+    "PrincipalType",
     "Property",
+    "PropertyArchiveChannel",
     "Recurrence",
     "RecurringRule",
     "RepairAction",
@@ -113,15 +133,19 @@ __all__ = [
     "RepairOperationStatus",
     "RepairProposal",
     "RepairProposalStatus",
+    "SecretaryInvite",
+    "SecurityEvent",
     "SoftDeleteMixin",
     "Task",
     "TaskPriority",
     "TaskStatus",
-    "Tenant",
-    "TenantContactStatus",
+    "TelegramIdentityBinding",
     "TelegramWebhookState",
     "TelegramWebhookUpdate",
+    "Tenant",
+    "TenantContactStatus",
     "Unit",
+    "UnitArchiveArticle",
     "UnitLifecycleEvent",
     "UnitStatus",
     "User",

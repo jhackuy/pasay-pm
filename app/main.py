@@ -25,11 +25,12 @@ from app.api.routers import (
     operations,
     payments,
     properties,
-    reports,
+    property_channel,
     repairs,
+    reports,
     tasks,
-    tenants,
     telegram_webhook,
+    tenants,
     units,
     viewings,
 )
@@ -46,6 +47,7 @@ API_PREFIX = "/api/v1"
 
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(properties.router, prefix=API_PREFIX)
+app.include_router(property_channel.router, prefix=API_PREFIX)
 app.include_router(units.router, prefix=API_PREFIX)
 app.include_router(tenants.router, prefix=API_PREFIX)
 app.include_router(leases.router, prefix=API_PREFIX)
