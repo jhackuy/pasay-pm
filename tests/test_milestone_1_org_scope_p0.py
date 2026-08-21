@@ -351,3 +351,171 @@ def test_repair_t2_get_cross_org_404(client, owner_a, owner_b, org_a, org_b):
 
     resp_get_b = client.get(f"{API}/repairs/{repair_id_a}", headers=owner_b_headers)
     assert resp_get_b.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# FIX2 Blocker regressions (Owner 3 Blocker explicit HTTP/migration contracts)
+# ---------------------------------------------------------------------------
+
+
+def test_fix2_blocker2_income_patch_lease_id_none_http_409(
+    client, owner_a, org_a
+):
+    """FIX2 Blocker 2: IncomeUpdate.lease_id = None (PATCH /incomes/{id})
+    MUST return HTTP 409 Conflict (CrossOrgReference through the shared
+    scope_exception_to_http translator), NOT an unhandled 500.
+
+    (IncomeCreate.lease_id is already required int per Pydantic; the real
+    place a caller can sneak in a None is via IncomeUpdate.lease_id:
+    int | None = None on the PATCH endpoint.)
+    """
+    owner_a_headers = _bearer(owner_a[1])
+    # Create a perfectly valid pending Income (with a real lease) first.
+    lease_id_a = _create_org_a_tenant_and_lease(client, owner_a, org_a)
+    resp_create = client.post(
+        f"{API}/incomes",
+        json={
+            "lease_id": lease_id_a,
+            "amount": "12000.00",
+            "received_date": "2026-03-01",
+            "payment_method": "cash",
+            "status": "pending",
+            "description": "valid income",
+        },
+        headers=owner_a_headers,
+    )
+    assert resp_create.status_code == 201, resp_create.text
+    income_id = resp_create.json()["id"]
+
+    # Then PATCH with lease_id=None explicitly (keep amount unchanged so
+    # other fields don't trigger their own 422). The router should convert
+    # the CrossOrgReference raised by _check_lease() to HTTP 409, never
+    # let it bubble up as 500.
+    resp_patch = client.patch(
+        f"{API}/incomes/{income_id}",
+        json={
+            "lease_id": None,
+            "amount": "12000.00",
+            "received_date": "2026-03-01",
+            "payment_method": "cash",
+        },
+        headers=owner_a_headers,
+    )
+    assert resp_patch.status_code == 409, (
+        f"Expected HTTP 409 Conflict for PATCH lease_id=None, "
+        f"got {resp_patch.status_code}. Body: {resp_patch.text[:500]!r}"
+    )
+    body = resp_patch.json()
+    detail = str(body.get("detail", ""))
+    assert (
+        "canonical lease ownership" in detail or "lease_id is required" in detail
+    ), body
+
+
+def test_fix2_blocker2_income_cross_org_idempotency_replay_http_404(
+    client, owner_a, owner_b, org_a, org_b
+):
+    """FIX2 Blocker 2: Org A creates an Income with idempotency key=K (using
+    OrgA lease). OrgB then replays the SAME key=K using OrgB's OWN lease —
+    must return HTTP 404 (fail-closed: idempotency hit must verify that the
+    FOUND Income belongs to the CALLER's org; otherwise it looks like a miss,
+    i.e. 404, not returning OrgA's record nor re-creating under same key).
+
+    The previous M1-FIX1 code already guarded this; we keep the hard contract
+    explicit here so any future regression that reopens the cross-org replay
+    door (e.g. removing _assert_income_co_org before idempotency return) is
+    caught in CI.
+    """
+    owner_a_headers = _bearer(owner_a[1])
+    owner_b_headers = _bearer(owner_b[1])
+
+    shared_key = "idem-key-fix2-001"
+
+    # --- OrgA setup: create 1 Income with shared_key using OrgA lease ---
+    lease_id_a = _create_org_a_tenant_and_lease(client, owner_a, org_a)
+    resp_a_create = client.post(
+        f"{API}/incomes",
+        json={
+            "lease_id": lease_id_a,
+            "amount": "12000.00",
+            "received_date": "2026-03-01",
+            "payment_method": "cash",
+            "status": "confirmed",
+            "idempotency_key": shared_key,
+            "description": "OrgA creates with shared key",
+        },
+        headers=owner_a_headers,
+    )
+    assert resp_a_create.status_code == 201, resp_a_create.text
+    income_a_id = resp_a_create.json()["id"]
+    # Sanity: OrgA replaying the same key returns the SAME record (HTTP 200)
+    resp_a_replay = client.post(
+        f"{API}/incomes",
+        json={
+            "lease_id": lease_id_a,
+            "amount": "12000.00",
+            "received_date": "2026-03-01",
+            "payment_method": "cash",
+            "status": "confirmed",
+            "idempotency_key": shared_key,
+        },
+        headers=owner_a_headers,
+    )
+    assert resp_a_replay.status_code == 200, resp_a_replay.text
+    assert resp_a_replay.json()["id"] == income_a_id
+
+    # --- OrgB setup: create its OWN, perfectly valid lease in OrgB ---
+    _property_id_b, unit_id_b = _setup_org_b_property_and_unit(
+        client, owner_b, org_b
+    )
+    tenant_id_b_resp = client.post(
+        f"{API}/tenants",
+        json={
+            "organization_id": org_b.id,
+            "full_name": "Tenant B",
+            "phone": "+639170000002",
+        },
+        headers=owner_b_headers,
+    )
+    assert tenant_id_b_resp.status_code == 201, tenant_id_b_resp.text
+    tenant_id_b = tenant_id_b_resp.json()["id"]
+    lease_b_resp = client.post(
+        f"{API}/leases",
+        json={
+            "unit_id": unit_id_b,
+            "tenant_id": tenant_id_b,
+            "start_date": "2026-02-01",
+            "end_date": "2027-01-31",
+            "monthly_rent": "15000.00",
+            "deposit": "30000.00",
+            "status": "active",
+        },
+        headers=owner_b_headers,
+    )
+    assert lease_b_resp.status_code == 201, lease_b_resp.text
+    lease_id_b = lease_b_resp.json()["id"]
+
+    # --- ACTUAL TEST: OrgB replays shared_key with OrgB's lease_id. ---
+    # OrgB's request is perfectly formed (valid OrgB lease), but the key K
+    # already hit for OrgA's Income → fail-closed: MUST NOT return OrgA's
+    # record as if it was OrgB's → HTTP 404.
+    resp_b_replay = client.post(
+        f"{API}/incomes",
+        json={
+            "lease_id": lease_id_b,
+            "amount": "15000.00",
+            "received_date": "2026-03-02",
+            "payment_method": "bank_transfer",
+            "status": "pending",
+            "idempotency_key": shared_key,
+            "description": "OrgB replay of shared key",
+        },
+        headers=owner_b_headers,
+    )
+    assert resp_b_replay.status_code == 404, (
+        f"Expected HTTP 404 fail-closed on cross-org idempotency replay, "
+        f"got {resp_b_replay.status_code}. Body: {resp_b_replay.text[:600]!r}"
+    )
+    # Belt-and-suspenders: OrgB still cannot read OrgA's record (paranoia).
+    resp_peek = client.get(f"{API}/incomes/{income_a_id}", headers=owner_b_headers)
+    assert resp_peek.status_code == 404

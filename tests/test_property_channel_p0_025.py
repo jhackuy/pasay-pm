@@ -1086,3 +1086,208 @@ class TestNegativeChatAndSerialization:
         db_session.refresh(revoked)
         read_rev = UnitChannelBindingRead.model_validate(revoked)
         assert isinstance(read_rev.revoked_at, datetime)
+
+
+# ===================================================================
+# 14. FIX2 Migration regressions (CRITICAL Blocker #1 namespace guard)
+# ===================================================================
+
+
+class TestFix2MigrationExpensePropertyIdNamespace:
+    """FIX2 Blocker #1: Expense.property_id backfill MUST NEVER accept an
+    organization_id as a property_id. The two IDs are in DIFFERENT SQL
+    namespaces; numeric coincidence MUST NOT silently collapse them.
+
+    We test the two pure helper functions (no alembic op) that together
+    decide the backfill value:
+      A. ``_resolve_org_unique_property`` — when an org has 0 or >1 active
+         properties, the candidate-property-id list stays empty, so the
+         main upgrade loop will fail CLOSED with explicit IDs, never
+         fall through to ``backfill[eid] = orgs[0]`` (which was the bug).
+      B. When an org has EXACTLY 1 active property, the candidate list is
+         [property_id], and property_id is a bona fide row from the
+         properties table (NOT the org id). We force org.id != prop.id
+         by inserting orgs and properties out of numeric order, proving
+         the namespace is not collapsed.
+    """
+
+    @staticmethod
+    def _load_m1c_module():
+        """Import the m1c migration module from disk (alembic.versions is
+        not a Python package, so ``from alembic.versions.X import Y`` fails
+        with ``ModuleNotFoundError``; use ``importlib`` + absolute file path)."""
+        import importlib.util as _ilu
+        import os as _os
+
+        path = _os.path.join(
+            _os.path.dirname(__file__),
+            "..",
+            "alembic",
+            "versions",
+            "m1_c_expense_add_property_id.py",
+        )
+        spec = _ilu.spec_from_file_location(
+            "m1_c_expense_add_property_id", _os.path.abspath(path)
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"cannot locate m1c migration at {path!r}")
+        mod = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_helper_org_unique_property_zero_or_multiple_properties_is_ambiguous(
+        self, db_session, alice, org_x
+    ):
+        """When the resolved org has 0 or >=2 active properties, backfill
+        returns an EMPTY candidate list for that expense — the main
+        upgrade loop will FAIL CLOSED instead of guessing (BUG FIX 2-1)."""
+        m1c = self._load_m1c_module()
+        _resolve_org_unique_property = m1c._resolve_org_unique_property
+
+        # Org-x has 0 active properties (we never insert one) → empty.
+        by_expense_empty: dict[int, list[int]] = {1: [org_x.id]}
+        resolved_empty = _resolve_org_unique_property(db_session, by_expense_empty)
+        assert resolved_empty[1] == [], (
+            "0 active properties → empty property candidates (fail closed), "
+            f"got {resolved_empty[1]!r}"
+        )
+
+        # Now give org-x 2 active properties → also empty (ambiguous).
+        p_a = _create_property(db_session, org_x, name="Tower-A")
+        p_b = _create_property(db_session, org_x, name="Tower-B")
+        db_session.commit()
+
+        by_expense_two: dict[int, list[int]] = {2: [org_x.id]}
+        resolved_two = _resolve_org_unique_property(db_session, by_expense_two)
+        # The helper lists ALL eligible property IDs under the org; the
+        # main upgrade loop then checks len(props) == 1 (exactly 1) — if not,
+        # FAIL CLOSED. So for >=2 properties we expect len(resolved) != 1,
+        # AND the returned values are bona-fide property IDs (not empty).
+        assert len(resolved_two[2]) >= 2, (
+            f">=2 active properties → helper should list those property IDs "
+            f"(upgrade loop will fail closed on len != 1), got {resolved_two[2]!r}"
+        )
+        assert sorted(resolved_two[2]) == sorted([p_a.id, p_b.id]), (
+            "Property IDs must match the two we inserted (no extras)."
+        )
+
+    def test_helper_org_unique_property_exactly_one_picks_real_pid_not_org_id(
+        self, db_session, alice
+    ):
+        """CRITICAL namespace separation. Create an Organization with id=101
+        and a single Property with id=202 (we insert with explicit PKs via
+        raw SQL when possible, otherwise we force the ordering by inserting
+        OTHER orgs/props first so auto-inc values diverge). Prove that
+        _resolve_org_unique_property returns [202] NOT [101]."""
+        m1c = self._load_m1c_module()
+        _resolve_org_unique_property = m1c._resolve_org_unique_property
+        from app.models.membership import (
+            Membership,
+            MembershipState,
+            Organization,
+            OrganizationRole,
+        )
+        from app.models.property import Property
+        from app.models.user import User, UserRole
+
+        # --- Insert a USER we'll use to create explicit memberships ---
+        u = User(
+            username="fix2-namespace-u",
+            role=UserRole.admin,
+            api_key_hash="sha256$placeholder$" + "z" * 40,
+        )
+        db_session.add(u)
+        db_session.flush()
+
+        # --- Explicitly pick diverging org/property IDs ---
+        #
+        # PostgreSQL serials can't be cheaply overridden via ORM flush;
+        # instead, we INSERT A BUNCH of OTHER orgs (org_1..org_N) and then
+        # INSERT A BUNCH of OTHER unrelated properties (prop_1..prop_M)
+        # so the auto-assigned IDs drift apart. We then create the final
+        # "TARGET org" and immediately its ONE property, reading back
+        # their assigned IDs. The drift guarantees the IDs won't be the
+        # same numeric value, which would mask a regression silently.
+        drift_orgs = 17
+        drift_props = 5
+        for i in range(drift_orgs):
+            o = Organization(name=f"fix2-drift-org-{i}")
+            db_session.add(o)
+        db_session.flush()
+        # Give the first drift org a bunch of properties to create the
+        # property-id drift we need (the target org will then be created
+        # AFTER these; its id will be further along than the last
+        # drift-org id, but we'll create properties under drift-org[0] to
+        # get higher property ids than that target org id).
+        first_drift_org = (
+            db_session.query(Organization)
+            .filter(Organization.name == "fix2-drift-org-0")
+            .one()
+        )
+        for i in range(drift_props):
+            p = Property(
+                organization_id=first_drift_org.id,
+                name=f"fix2-drift-prop-{i}",
+                address=f"{i} Drift St",
+                city="Pasay",
+                total_units=1,
+            )
+            db_session.add(p)
+        db_session.flush()
+
+        # --- TARGET: single target org + single target property ---
+        target_org = Organization(name="fix2-namespace-target-org")
+        db_session.add(target_org)
+        db_session.flush()
+        # Bind `alice` (or our explicit user) as OWNER so if any downstream
+        # code re-checks memberships it won't blow up (not strictly needed
+        # by the helper but keeps the fixture holistic).
+        db_session.add(
+            Membership(
+                organization_id=target_org.id,
+                user_id=u.id,
+                role=OrganizationRole.OWNER,
+                state=MembershipState.ACTIVE,
+            )
+        )
+        target_prop = Property(
+            organization_id=target_org.id,
+            name="fix2-namespace-target-prop",
+            address="99 Unique Ave",
+            city="Pasay",
+            total_units=2,
+        )
+        db_session.add(target_prop)
+        db_session.commit()
+        db_session.refresh(target_org)
+        db_session.refresh(target_prop)
+
+        # --- THE ASSERTION THAT MATTERS: IDs diverge, no numeric accident ---
+        # If numeric IDs are accidentally equal, this test's whole premise is
+        # vacuous; force fail so author notices and increases drift counts.
+        assert target_org.id != target_prop.id, (
+            "Test infrastructure error: target org.id accidentally equals "
+            f"target property.id ({target_org.id}). Increment drift_* and "
+            "re-run to guarantee namespace separation in this fixture."
+        )
+
+        # Now call the helper for expense_id=911, candidate org=[target_org.id].
+        by_expense: dict[int, list[int]] = {911: [target_org.id]}
+        resolved = _resolve_org_unique_property(db_session, by_expense)
+
+        # Critical contract:
+        #   NOT the org-id   → resolved[911] != [target_org.id]
+        #   YES exactly 1   → len(resolved[911]) == 1
+        #   YES the real PID → resolved[911][0] == target_prop.id
+        assert resolved[911] != [target_org.id], (
+            "NAMESPACE COLLAPSE DETECTED: helper returned org-id "
+            f"{target_org.id} as property-id. Blocker #1 still broken."
+        )
+        assert len(resolved[911]) == 1, (
+            f"Expected exactly 1 property candidate (unique-prop fallback), "
+            f"got {resolved[911]!r}"
+        )
+        assert resolved[911][0] == target_prop.id, (
+            f"Helper should return the only property.id={target_prop.id}, "
+            f"got {resolved[911][0]!r}"
+        )
