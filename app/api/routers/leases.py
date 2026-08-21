@@ -1,9 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, manager_or_admin
+from app.api.deps import get_current_user
 from app.database import get_db
-from app.models.commission import CommissionSettlement
 from app.models.lease import Lease, LeaseStatus
 from app.models.property import Unit, UnitStatus
 from app.models.tenant import Tenant
@@ -11,31 +10,31 @@ from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.lease import LeaseCreate, LeaseRead, LeaseUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.organization_scope import (
+    CrossOrgReference,
+    OrganizationRole,
+    OwnerRequired,
+    ScopeBlocked,
+    assert_co_org,
+    resolve_org_membership,
+    scoped_get_lease,
+    scoped_list_leases,
+    tenant_org_id,
+    unit_org_id,
+)
 
 router = APIRouter(prefix="/leases", tags=["leases"])
 
 
-def _get_or_404(db: Session, lease_id: int) -> Lease:
-    obj = db.query(Lease).filter(Lease.id == lease_id, Lease.deleted_at.is_(None)).first()
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
-    return obj
-
-
-def _visible_lease_ids(db: Session, user: User) -> set[int] | None:
-    """For agents: leases related to their commission settlements. None = no filter."""
-    if user.role != "agent":
-        return None
-    rows = (
-        db.query(CommissionSettlement.lease_id)
-        .filter(CommissionSettlement.agent_id == user.id)
-        .all()
-    )
-    return {r[0] for r in rows}
+def _scope_exception_to_http(exc: Exception) -> HTTPException:
+    if isinstance(exc, LookupError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc) or "Not found")
+    if isinstance(exc, (ScopeBlocked, OwnerRequired, CrossOrgReference)):
+        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc) or "Forbidden")
+    raise exc
 
 
 def _sync_unit_status(db: Session, unit: Unit) -> None:
-    """Recompute unit occupancy from its active leases."""
     active = (
         db.query(Lease)
         .filter(Lease.unit_id == unit.id, Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
@@ -51,19 +50,33 @@ def _sync_unit_status(db: Session, unit: Unit) -> None:
 def list_leases(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    query = db.query(Lease).filter(Lease.deleted_at.is_(None))
-    visible = _visible_lease_ids(db, user)
-    if visible is not None:
-        query = query.filter(Lease.id.in_(visible))
-    return query.order_by(Lease.id).all()
+    try:
+        return scoped_list_leases(db, for_user_id=user.id)
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
 
 
 @router.post("", response_model=LeaseRead, status_code=status.HTTP_201_CREATED)
 def create_lease(
     payload: LeaseCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
+    try:
+        u_org_id = unit_org_id(db, payload.unit_id)
+        if u_org_id is None:
+            raise LookupError("Unit not found")
+        membership = resolve_org_membership(
+            db, user.id, u_org_id, role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY]
+        )
+        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=u_org_id, object_kind="Unit", object_id=payload.unit_id)
+        t_org_id = tenant_org_id(db, payload.tenant_id)
+        if t_org_id is None:
+            raise LookupError("Tenant not found")
+        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=t_org_id, object_kind="Tenant", object_id=payload.tenant_id)
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
+
     unit = db.query(Unit).filter(Unit.id == payload.unit_id, Unit.deleted_at.is_(None)).first()
     if unit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
@@ -100,11 +113,11 @@ def get_lease(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, lease_id)
-    visible = _visible_lease_ids(db, user)
-    if visible is not None and obj.id not in visible:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient permissions")
-    return obj
+    try:
+        obj, _membership = scoped_get_lease(db, lease_id, for_user_id=user.id)
+        return obj
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
 
 
 @router.patch("/{lease_id}", response_model=LeaseRead)
@@ -112,9 +125,16 @@ def update_lease(
     lease_id: int,
     payload: LeaseUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, lease_id)
+    try:
+        obj, membership = scoped_get_lease(
+            db, lease_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
+
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
@@ -133,6 +153,20 @@ def update_lease(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "accounting_start_date must be within [start_date, end_date]",
             )
+
+    try:
+        if updates.get("unit_id") is not None and updates["unit_id"] != obj.unit_id:
+            new_unit_org = unit_org_id(db, updates["unit_id"])
+            if new_unit_org is None:
+                raise LookupError("Unit not found")
+            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=new_unit_org, object_kind="Unit", object_id=updates["unit_id"])
+        if updates.get("tenant_id") is not None and updates["tenant_id"] != obj.tenant_id:
+            new_tenant_org = tenant_org_id(db, updates["tenant_id"])
+            if new_tenant_org is None:
+                raise LookupError("Tenant not found")
+            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=new_tenant_org, object_kind="Tenant", object_id=updates["tenant_id"])
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
 
     if updates.get("unit_id") is not None and updates["unit_id"] != obj.unit_id:
         unit = db.query(Unit).filter(Unit.id == updates["unit_id"], Unit.deleted_at.is_(None)).first()
@@ -164,7 +198,7 @@ def update_lease(
     for field, value in updates.items():
         setattr(obj, field, value)
     obj.updated_by = user.id
-    db.flush()  # make the status change visible to the occupancy re-check
+    db.flush()
     if unit is not None:
         if new_status == LeaseStatus.active:
             unit.status = UnitStatus.occupied
@@ -190,9 +224,16 @@ def update_lease(
 def delete_lease(
     lease_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, lease_id)
+    try:
+        obj, _membership = scoped_get_lease(
+            db, lease_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
+
     if obj.status == LeaseStatus.active:
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Terminate the lease before deleting it"
