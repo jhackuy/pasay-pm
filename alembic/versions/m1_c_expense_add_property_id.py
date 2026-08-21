@@ -75,7 +75,7 @@ def _resolve_unit_property(conn: Connection, expense_ids: list[int]) -> dict[int
 
 
 def _resolve_created_by_orgs(conn: Connection, expense_ids: list[int]) -> dict[int, list[int]]:
-    """Fallback for expenses with no resolvable unit → created_by user's ACTIVE memberships.
+    """Fallback step 1 for expenses with no resolvable unit → created_by user's ACTIVE memberships.
     Returns {expense_id: [sorted candidate org_ids]}.
     """
     result: dict[int, list[int]] = {eid: [] for eid in expense_ids}
@@ -91,6 +91,44 @@ def _resolve_created_by_orgs(conn: Connection, expense_ids: list[int]) -> dict[i
             {"eid": eid},
         ).all()
         result[eid] = sorted(r[0] for r in rows)
+    return result
+
+
+def _resolve_org_unique_property(
+    conn: Connection, org_ids_by_expense: dict[int, list[int]]
+) -> dict[int, list[int]]:
+    """Fallback step 2: given candidate org_ids per expense, resolve each org's active
+    (non-deleted) Properties. For an expense to be unitless-backfillable, it must:
+      (a) have exactly 1 candidate org (already filtered upstream), AND
+      (b) that org has exactly 1 active (deleted_at IS NULL) Property.
+    The Property IDs are in a DIFFERENT namespace from org IDs; mixing is forbidden.
+    Returns {expense_id: [sorted candidate property_ids]}. If the expense has 0 or >1
+    active properties → ambiguous → stay empty in FAIL CLOSED.
+    """
+    result: dict[int, list[int]] = {}
+    all_orgs: set[int] = set()
+    for ids in org_ids_by_expense.values():
+        all_orgs.update(ids)
+    org_to_props: dict[int, list[int]] = {}
+    if all_orgs:
+        rows = conn.execute(
+            sa.text(
+                "SELECT p.organization_id, p.id "
+                "FROM properties p "
+                "WHERE p.organization_id = ANY(:orgs) AND p.deleted_at IS NULL "
+                "ORDER BY p.organization_id, p.id"
+            ),
+            {"orgs": sorted(all_orgs)},
+        ).all()
+        for oid, pid in rows:
+            org_to_props.setdefault(oid, []).append(pid)
+    for eid, org_ids in org_ids_by_expense.items():
+        if len(org_ids) != 1:
+            result[eid] = []
+            continue
+        only_org = org_ids[0]
+        props = sorted(org_to_props.get(only_org, []))
+        result[eid] = props
     return result
 
 
@@ -114,20 +152,62 @@ def _organizations_lookup(conn: Connection) -> dict[int, str]:
     return {r[0]: r[1] for r in rows}
 
 
-def _fail_closed(conn: Connection, bad: dict[int, list[int]]) -> None:
-    names = _organizations_lookup(conn)
-    lines = [
-        "PASAY-MILESTONE-001 FIX1 FAIL CLOSED: Expense.property_id backfill is AMBIGUOUS "
-        "for the following unitless/orphan-unit legacy expenses. Owner must decide manually."
-    ]
-    for eid, orgs in sorted(bad.items()):
-        cand = ", ".join(f"org_id={o} ({names.get(o, 'UNKNOWN')})" for o in orgs) or (
-            "NO candidates (expense has unit_id NULL and created_by has 0 ACTIVE memberships)."
+def _properties_lookup(conn: Connection) -> dict[int, tuple[int, str]]:
+    rows = conn.execute(
+        sa.text(
+            "SELECT p.id, p.organization_id, p.name FROM properties p ORDER BY p.id"
         )
-        lines.append(f"  - expense_id={eid} candidates=[{cand}]")
+    ).all()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def _fail_closed(
+    conn: Connection,
+    bad: dict[int, tuple[list[int], list[int]]],
+) -> None:
+    """bad map: {expense_id: (candidate_org_ids, candidate_property_ids)}.
+    candidate_org_ids is from step-1 membership resolution; candidate_property_ids
+    is from step-2 org→active-properties resolution. Both are always printed so
+    Owner has full forensic context of WHY backfill is ambiguous.
+    """
+    org_names = _organizations_lookup(conn)
+    prop_info = _properties_lookup(conn)
+    lines = [
+        "PASAY-MILESTONE-001 FIX2 FAIL CLOSED: Expense.property_id backfill is AMBIGUOUS "
+        "for the following unitless/orphan-unit legacy expenses. Owner must decide manually. "
+        "CRITICAL: org_id and property_id are SEPARATE namespaces; we NEVER write org_id "
+        "into the property_id column, even if numeric values accidentally overlap."
+    ]
+    for eid, (orgs, props) in sorted(bad.items()):
+        org_cand = ", ".join(
+            f"org_id={o} ({org_names.get(o, 'UNKNOWN')})" for o in orgs
+        ) or (
+            "NO org candidates (expense has unit_id NULL and created_by has 0 ACTIVE memberships)."
+        )
+        prop_cand_fragments = []
+        for pid in props:
+            p_tuple = prop_info.get(pid)
+            if p_tuple is None:
+                prop_cand_fragments.append(f"property_id={pid} (NOT IN properties table)")
+            else:
+                p_org, p_name = p_tuple
+                prop_cand_fragments.append(
+                    f"property_id={pid} (org_id={p_org} name={p_name!r})"
+                )
+        prop_cand = ", ".join(prop_cand_fragments) or (
+            "NO property candidates (resolved org has 0 active properties, OR 0 orgs resolved)."
+        )
+        lines.append(f"  - expense_id={eid}")
+        lines.append(f"      step-1 org candidates: [{org_cand}]")
+        lines.append(f"      step-2 prop candidates: [{prop_cand}]")
     lines.append("All candidate Organizations:")
-    for oid, oname in sorted(names.items()):
+    for oid, oname in sorted(org_names.items()):
         lines.append(f"  - org_id={oid} name={oname!r}")
+    lines.append("All candidate Properties (for forensic cross-reference):")
+    for pid, (p_org, p_name) in sorted(prop_info.items()):
+        lines.append(
+            f"  - property_id={pid} org_id={p_org} (org={org_names.get(p_org, 'UNKNOWN')!r}) name={p_name!r}"
+        )
     raise _AmbiguousExpenseBackfill("\n".join(lines))
 
 
@@ -148,29 +228,48 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
-    # (2) Backfill
+    # (2) Backfill — STRICT namespace separation.
+    #     Stage A: expenses WITH a live unit → use unit.property_id (DIFFERENT namespace!)
+    #     Stage B: unitless/orphan-unit expenses → step-1 membership→org candidates;
+    #              step-2 org→active properties. Only accept EXACTLY 1 property.
+    #              Org ID is NEVER written into property_id column.
     eids = _list_all_expense_ids(conn)
     if eids:
         unit_pids = _resolve_unit_property(conn, eids)
         needs_created_by_fallback: list[int] = [
             eid for eid, pid in unit_pids.items() if pid is None
         ]
-        created_by_orgs = (
+        created_by_orgs: dict[int, list[int]] = (
             _resolve_created_by_orgs(conn, needs_created_by_fallback)
-            if needs_created_by_fallback else {}
+            if needs_created_by_fallback
+            else {}
+        )
+        # Step-2: for each expense's candidate-orgs list, resolve to active property IDs.
+        candidate_props_by_expense: dict[int, list[int]] = (
+            _resolve_org_unique_property(conn, created_by_orgs)
+            if created_by_orgs
+            else {}
         )
         backfill: dict[int, int] = {}
-        ambiguous: dict[int, list[int]] = {}
+        # Ambiguous map now carries BOTH org candidates AND property candidates for
+        # forensic context (owner can see WHY it failed).
+        ambiguous: dict[int, tuple[list[int], list[int]]] = {}
         for eid in eids:
             pid = unit_pids.get(eid)
             if pid is not None:
+                # Confirmed valid property ID from unit→property chain.
+                # This PID is already the CORRECT namespace, NEVER an org ID.
                 backfill[eid] = pid
                 continue
             orgs = created_by_orgs.get(eid, [])
-            if len(orgs) == 1:
-                backfill[eid] = orgs[0]
+            props = candidate_props_by_expense.get(eid, [])
+            if len(props) == 1:
+                # EXACTLY one active property under the (exactly-1) resolved org.
+                # props[0] is a bona fide property ID from the properties table,
+                # NEVER an org ID. Fail closed on 0 or >=2.
+                backfill[eid] = props[0]
             else:
-                ambiguous[eid] = orgs
+                ambiguous[eid] = (orgs, props)
         if ambiguous:
             _fail_closed(conn, ambiguous)
         _backfill_expenses(conn, backfill)
@@ -231,10 +330,9 @@ def downgrade() -> None:
             "FK expenses.property_id -> properties(id) missing."
         )
     # Drop index FIRST (IF EXISTS via raw SQL, avoid cascade surprises).
-    try:
-        conn.execute(sa.text("DROP INDEX IF EXISTS ix_expenses_property_id"))
-    except Exception:  # noqa: BLE001
-        logger.warning("ix_expenses_property_id drop failed", exc_info=True)
+    # IF EXISTS already covers the missing-index case. Real DDL failures must
+    # propagate and halt downgrade (FAIL CLOSED — never catch-and-continue).
+    conn.execute(sa.text("DROP INDEX IF EXISTS ix_expenses_property_id"))
     # Relax NOT NULL -> NULL
     op.alter_column(
         "expenses",

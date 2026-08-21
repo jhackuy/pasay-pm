@@ -187,14 +187,13 @@ def downgrade() -> None:
                 "FK tenants.organization_id -> organizations(id) missing."
             )
     # Drop index FIRST (before dropping column; column drop cascades index drop).
-    # Use IF EXISTS via raw SQL to stay fail-safe even if index was renamed.
+    # IF EXISTS already covers missing-index case. Any REAL DDL failure (e.g. lock
+    # timeout, permission denied, broken storage, unknown catalog error) MUST
+    # propagate and stop downgrade (FAIL CLOSED — never catch-and-continue).
     conn = op.get_bind()
-    try:
-        conn.execute(
-            sa.text("DROP INDEX IF EXISTS ix_tenants_organization_id")
-        )
-    except Exception:  # noqa: BLE001 — any index-drop issue is non-fatal in downgrade
-        logger.warning("ix_tenants_organization_id drop failed", exc_info=True)
+    conn.execute(
+        sa.text("DROP INDEX IF EXISTS ix_tenants_organization_id")
+    )
     # Relax NOT NULL -> NULL
     op.alter_column(
         "tenants",
