@@ -25,7 +25,9 @@
 
 四层系统职责（产品设计，00 页）：
 1. **Telegram**（完成 ✅）= 精简办公 + 高频动作 + 决策入口
-2. **Property Channel**（基础刚合入 PR #33，后续功能待做 🔶）= 每套房源一个动态档案文章，供群内引用
+2. **Unit Channel Binding（PR #33 已合入 P0 最小绑定 ✅）/ Property Channel（未来设计目标，未实现 🔶）**
+   - **当前实现（CONFIRMED BY `app/models/property_channel.py`）**：`unit_channel_bindings` 最小绑定模型（Unit ↔ Telegram Channel/Group/Topic 绑定 + org scoped + bind/replace/revoke/history/audit）。Docstring 明确："no archive article or render-publish scaffolding"。
+   - **未来设计目标（未实现）**：每套房源一个动态档案文章（Property Channel Articles）、业务变化自动增量更新、双语详情、群内「精简结论 + 完整档案跳转」引用模式。
 3. **PostgreSQL**（完成 ✅）= 唯一业务事实源，所有写路径幂等 + 审计
 4. **Control Panel / Mini App**（完全未开始 ❌）= 完整后台 / 上帝视角 / 报表 / 设置 / 历史
 
@@ -143,8 +145,8 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 | `organizations` | `id`, `name` | 组织（房东实体），1..N Owner + 0..N Secretary |
 | `users` | `id`, `email?`, `display_name?` | 自然人抽象 |
 | `telegram_identity_bindings` | `user_id`, `telegram_id`, `is_primary`, `verified_at` | Telegram ↔ User 绑定；不是权限本身 |
-| `memberships` | `org_id`, `user_id`, `role[OWNER/SECRETARY]`, `state[ACTIVE/REMOVED]`, `removed_at` | **权限真实边界**。CHECK 约束：ACTIVE↔removed_at 互斥 |
-| `secretary_invites` | `code`, `email`, `org_id`, `invited_by`, `state[PENDING/ACCEPTED/CANCELLED/EXPIRED]`, **`accepted_at/cancelled_at/expires_at/expired_at`（三选一互斥 CHECK）**, `accepted_by_user_id` | 一次性、可过期、一人一票邀请 |
+| `memberships` | `org_id`, `user_id`, `role[OWNER/SECRETARY]`, `state[ACTIVE/REMOVED]`, `joined_at`, `removed_at`, `removed_by?`, `removal_reason?`, `invited_by?` | **权限真实边界**。CHECK 约束：ACTIVE↔removed_at 互斥；一个 User 一个 Org 最多 1 ACTIVE Membership（`uq_memberships_active_user_org` 部分唯一） |
+| `secretary_invites` | `code UNIQUE`, `org_id NOT NULL`, `created_by_membership_id NOT NULL`, `invited_name_hint?`, `state[PENDING/ACCEPTED/CANCELLED/EXPIRED]`, `expires_at NOT NULL（有效期至，> created_at）`, `accepted_at?`, `accepted_by_user_id?`, `cancelled_at?`, `cancelled_by_membership_id?`, `created_membership_id? UNIQUE（最多生成一条 Membership）`, `note?` | 一次性、单消费、可过期邀请。CHECK：PENDING→accepted/cancelled NULL；ACCEPTED→accepted_at NOT NULL；CANCELLED→cancelled_at NOT NULL；EXPIRED 状态存在。**无 expired_at 字段**（EXPIRED 是 state 枚举值） |
 | `api_keys` | `key_hash`, `user_id`, `role[admin/manager/agent]`, `revoked_at` | 旧 Bearer API Key 体系（向后兼容；逐渐迁移到 Membership） |
 
 ### 财产/租约链
@@ -177,11 +179,11 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 | `repair_records` | `unit_id`, `task_id`, `repair_stage[ISSUE_REPORTED→QUOTE→APPROVED→IN_PROGRESS→EVIDENCE→COMPLETED→CLOSED]`, `contractor_info`, `invoice_amount`, `associated_expense_id` | REPORTED→…→COMPLETED→EXPENSE→PAID。完成后缺凭证 → 自动 FOLLOWUP Secretary |
 | `unit_lifecycle_events` | `unit_id`, `event_type[NEW/VACANT/OCCUPIED]`, `event_at`, `notes` | 单元生命周期事件（PARTIAL；没有 SOLD/ARCHIVED 强制迁移） |
 
-### Property Channel（PR #33 刚合入 P0 foundation）
-| 表 | 关键字段 | 说明 |
+### Property Channel（当前实现 = Unit Channel Binding Foundation；未来动态档案 = 设计目标未实现）
+| 分类 | 内容 | 状态 / 说明 |
 |---|---|---|
-| `property_channel_articles` | `property_id UNIQUE`, `telegram_chat_id`, `telegram_message_id`, `last_edited_at`, `version INT`, `publish_status[DRAFT/PUBLISHED/ARCHIVED]` | 每套房一个 channel message 动态档案（P0 foundation；双语/完整内容仍待后续） |
-| `property_channel_pins` | `chat_id`, `property_id`, `message_id`, `pinned_at` | 频道内引用索引 |
+| **当前实现（CONFIRMED BY CODE：`app/models/property_channel.py`）** | **`unit_channel_bindings` 表（`UnitChannelBinding` 类）** — 字段：`organization_id NOT NULL`, `unit_id NOT NULL`, `purpose enum archive\|business_group NOT NULL`, `channel_chat_id`, `thread_topic_id?`, `status ACTIVE\|REVOKED`, `revoked_at?`, `revoked_by_membership_id?`, `notes?`。DB guarantees：partial UNIQUE (unit_id, purpose) WHERE status='ACTIVE'（每 unit 每 purpose 最多 1 个 ACTIVE 绑定）；ACTIVE→channel_chat_id NOT NULL；REVOKED↔revoked_at 互斥；`ix_unit_bindings_org_unit_status` 索引。 | **PR #33 已合入的 P0 最小绑定**。Docstring 原文："exactly the Issue #25 P0 minimal binding, **no archive article or render-publish scaffolding**"。 |
+| **未来设计目标（NOT implemented — 设计输入，不是 backend 已实现结构）** | `property_channel_articles`（每套房一个动态档案 message：publish_status DRAFT/PUBLISHED/ARCHIVED、last_edited_at、version、publish/unpublish/edit 幂等流程、业务变化自动增量更新、双语详情）；`property_channel_pins`（频道内引用索引 / pin 管理）；群内引用「精简结论 → 跳频道完整档案」交互；动态档案和 Evidences/Attachments 解耦（私有存档频道 ≠ 房产档案出版物）。 | **完全未实现，仅 OpenDesign / 旧 Issue body 设计残留**；不得当作现有表或已完成能力。 |
 
 ### AI / Copilot
 | 表 | 关键字段 | 说明 |
@@ -216,9 +218,9 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 ✅ **Audit logs 全路径**
 ✅ **Telegram Webhook → CF Worker → CF Queue → CF Container → Neon** 生产链路（PR #31 收口，CONFIRMED BY `test_prod_arch_closeout_p0_031.py`）
 ✅ **Identity V13**（IdentityBinding → HUMAN → User → Membership）
-✅ **Onboarding P0**（Owner Bootstrap + Secretary Invite + PENDING/ACCEPTED/CANCELLED/EXPIRED + fail-closed Secretary 防越权）
-✅ **Membership P0**（CHECK 约束 + 并发行级锁 + accepted_at/cancelled_at/expires_at 三选一互斥）
-✅ **Property Channel P0**（PR #33，`property_channel_articles` + publish/unpublish/edit 基础 + 幂等）
+✅ **Onboarding P0**（Owner Bootstrap + Secretary Invite + PENDING/ACCEPTED/CANCELLED/EXPIRED state-timestamps + fail-closed Secretary 防越权，CONFIRMED BY `test_onboarding_p0_024.py`）
+✅ **Membership & Secretary Invite P0**（Membership: ACTIVE↔removed_at CHECK + `uq_memberships_active_user_org` partial unique；SecretaryInvite: `ck_secretary_invites_state_timestamps` state-timestamps + `expires_at NOT NULL > created_at` + one-time single-consumption；并发场景 `with_for_update` 行级锁）
+✅ **Unit Channel Binding P0**（PR #33，`unit_channel_bindings` 最小绑定模型 + org/unit/status 索引 + partial unique (unit,purpose) for ACTIVE + ACTIVE/REVOKED 双时间戳 CHECK；**没有 publish/unpublish/edit 流程，没有 property_channel_articles 表**）
 ✅ **Cloudflare Worker 真实编译门（PR #32 FIX11）**：`tsconfig.json` + `tsconfig.tests.json` 双配置；engine-strict；Node 22 锁死
 
 ---
@@ -239,11 +241,10 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 - 「低价值默认静默/中价值摘要/行动即时通知/高风险 @」只有局部实现
 - **无统一 Notification Budget Engine**；各模块各自决定通知节奏
 
-🔶 **Property Channel P0 后续功能**：
-- PR #33 仅基础 P0（channel_articles 表 + publish/unpublish/edit 基础）
-- 频道双语（中文详情 + English Details）未完成
-- 业务变化自动增量更新 channel article（不是整文重编）未完成
-- 群内引用「精简结论 + 完整房产资料 → 跳频道」模式未完成
+🔶 **Property Channel 动态档案功能（完全未实现）**：
+- PR #33 只合入了 **Unit Channel Binding 最小绑定 foundation**（`unit_channel_bindings` 表，见 §5）
+- **Property Channel 动态档案（property_channel_articles / property_channel_pins 结构、publish/unpublish/edit 幂等流程、频道双语详情、业务变化自动增量更新、群内精简结论 + 跳转档案引用模式）全部未实现**
+- 私有 Telegram 存档频道（Evidences 证据链）≠ Property Channel 房产档案出版物（设计态），两者边界已在 §5 附件部分界定
 
 🔶 **Legacy ↔ New API Key ↔ Membership 兼容**：
 - 旧 `role=admin/manager/agent`（Bearer API Key）存在
@@ -263,7 +264,7 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 ❌ **Telegram → TRAE Auto Wake → `/ND` 链路（Issue #29 / PR #30）**：本 Transition 已明确**退役**，不应再继续投入
 ❌ **`/ND` 显式 Issue 参数（Issue #22 / PR #23）** 已退役
 ❌ **OpenDesign 自动派发（Issue #5 / PR #16）**：Auto dispatch 存在但 `/ND` 退役后应切换为 SOLO 输入
-❌ **Property Channel 业务动态增量更新**（不是整篇重写）：仅 foundation
+❌ **Property Channel 动态档案全部能力**：property_channel_articles / property_channel_pins 结构、publish/unpublish/edit 幂等、自动双语详情、业务变化自动增量更新、群内引用跳转；**当前仅有 `unit_channel_bindings` 最小绑定 foundation（PR #33）**，动态档案 0%
 ❌ **Tenant 端自助服务 Portal / Bot**：当前 Tenant 仅被动收通知；无主动查询
 ❌ **指标 & 看板 & KPI Dashboard**：完全无
 
@@ -284,7 +285,7 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 4. **Alchemic downgrade 语义丢失**（Membership P0 FIX2 中首次实现门控）：任何 Alembic `downgrade` 前必须 `sa.inspect` 审计列属性，不能盲目 DROP：
    - `timezone=True` → 若变成 timestamp without tz = 语义损失（所有历史时刻错了 8 小时或任意）
    - `JSONB` → TEXT = 键值索引失效 + schema 可破坏
-5. **Membership 状态时间戳互斥**：FIX2 新增 CHECK 约束 `(accepted_at IS NOT NULL)::int + (cancelled_at IS NOT NULL)::int + (expired_at IS NOT NULL)::int <= 1`，避免一个 invite 同时 ACCEPTED 和 EXPIRED
+5. **`SecretaryInvite` 状态-时间戳合规性 CHECK**（Membership P0 FIX2 首次引入门控模式，Alembic downgrade 同原则）：`ck_secretary_invites_state_timestamps` 约束状态↔时间戳互斥一致（PENDING→accepted/cancelled NULL；ACCEPTED→accepted_at NOT NULL；CANCELLED→cancelled_at NOT NULL；EXPIRED 状态存在）+ `ck_secretary_invites_expires_after_created`（expires_at NOT NULL 且 > created_at）。**字段名：expires_at（有效期至，NOT NULL）/ accepted_at / cancelled_at；当前无 expired_at 列（EXPIRED 是 `InviteState` 枚举值，不是字段名）**。一个 invite 只允许生成最多一条 Membership（created_membership_id UNIQUE，one-time single-consumption）
 6. **`ready-for-dev` / Auto Wake 残留 race**：本 Transition 全链路退役后此条自然失效
 
 ---
@@ -372,7 +373,8 @@ Pasay 早期单房东 assumption：所有 Property 同属于 Owner 直接的上�
    - 动作：所有 Rent 相关接口（Income, Income Matching, Lease status, Quick Rent）强制 `WHERE organization_id = current_user.org_id`；加 failing tests 保证不过就红
 2. **Repair：Org/Unit scoped 全硬化（解决 Issue #27 blocked）**
    - 同上先决；Payment Claim → Verified Payment 对账硬化（claim 不等于到账凭证）
-3. **Property Channel 业务联动增量更新**
+3. **Property Channel 动态档案（设计目标，未来能力）业务联动增量更新**
+   - 依赖先实现 `property_channel_articles` 动态档案（当前未实现；仅有 `unit_channel_bindings` 最小绑定）
    - 房租状态/维修状态/租约变化时，只更新 channel article 的相关段落，不整篇重发
 4. **Operation CLOSED 语义硬化**
    - 任何 `operations_tasks.status = CLOSED` 都必须对应：PAID 财务到账 / Repair 完成凭证 + Expense PAID / Rent 全结清 / 任务完成确认。禁止手工直接 CLOSED 没有证据链
@@ -456,7 +458,7 @@ Owner 产品语义决定
 - **Telegram ID ≠ 业务身份**：必须通过绑定 → User → Membership 验证
 - Secretary 永远不能：调 Owner bootstrap、审批自己创建的支出、执行 payment（Owner-only）、commission settlement confirm
 - Organization / Membership 切分是唯一权限边界；Property.org_id NULL 会弱化这个边界（§11 debt，谨慎处理）
-- Membership ACCEPTED_AT / CANCELLED_AT / EXPIRED_AT 互斥。一个 invite 只吃一次
+- SecretaryInvite 状态-时间戳合规 + 一次性单消费（一个 invite 最多产生一条 Membership，`created_membership_id` UNIQUE）。PENDING invite 必须绑定有效 Organization，过期或未绑定则 fail-closed 不泄露信息（CONFIRMED BY `app/models/membership.py §SecretaryInvite CHECK 约束` + `test_onboarding_p0_024.py`）
 - PENDING invite 必须绑定有效 Organization；过期 PENDING 不能泄露 org 名称给未授权人
 
 ### 16.4 UX Truth（Telegram 侧）

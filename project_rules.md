@@ -111,10 +111,10 @@ SOLO 的边界：不是产品 Owner，不是部署运维，不是 Code Review �
 
 ### 5.5 状态机与并发安全
 
-- `Membership` 的 `ACCEPTED_AT` / `CANCELLED_AT` / `EXPIRED_AT` 必须互斥（CHECK 约束），三选一或全 NULL
-- `Membership ACCEPTED` 需要绑定有效 Organization；fail-closed：PENDING invite 必须绑定有效组织才能暴露信息
-- 高风险写路径：PostgreSQL 行级锁 `with_for_update`（membership / membership 并发 claim / 财务状态流转）
-- Expense：禁止审批自己创建的支出（manager 级）
+- **Membership（人员角色）**：role ∈ {OWNER, SECRETARY}，state ∈ {ACTIVE, REMOVED}，CHECK：ACTIVE↔removed_at 互斥；一个 User 一个 Org 最多 1 ACTIVE Membership（`uq_memberships_active_user_org` 部分唯一）。
+- **SecretaryInvite（一次性邀请）**：state ∈ {PENDING / ACCEPTED / CANCELLED / EXPIRED}。CHECK 约束 `ck_secretary_invites_state_timestamps`（PENDING→accepted_at & cancelled_at NULL；ACCEPTED→accepted_at NOT NULL；CANCELLED→cancelled_at NOT NULL；EXPIRED 状态）+ `ck_secretary_invites_expires_after_created`（**expires_at NOT NULL 且 > created_at**；字段名：`expires_at`=有效期至、`accepted_at`、`cancelled_at`；**当前无 expired_at 字段**（EXPIRED 是 `InviteState` 枚举值，不是字段名）。fail-closed：PENDING invite 必须绑定有效 Organization 才暴露 org 名称，过期或未绑定则信息不泄露。一个 invite 最多生成一条 Membership（`created_membership_id` UNIQUE，one-time single-consumption）。
+- 高风险写路径：PostgreSQL 行级锁 `with_for_update`（secretary_invite accept 并发 claim、财务状态流转、Membership 并发变更）
+- Expense：Manager/Secretary 永远不能审批自己创建的支出（403 fail-closed）
 
 ### 5.6 简单、确定性优先
 
