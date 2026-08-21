@@ -30,19 +30,27 @@ Concurrency (CodeRabbit "concurrent publish 500" fix):
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from collections.abc import Iterable
+from datetime import datetime, timezone
 
-from sqlalchemy import and_, select
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.audit_log import AuditAction
-from app.models.membership import Membership, MembershipState, Organization, OrganizationRole
+from app.models.membership import (
+    Membership,
+    MembershipState,
+    OrganizationRole,
+)
 from app.models.property import Property, Unit
-from app.models.property_channel import BindingStatus, ChannelPurpose, UnitChannelBinding
+from app.models.property_channel import (
+    BindingStatus,
+    ChannelPurpose,
+    UnitChannelBinding,
+)
 from app.services.audit import record_audit, serialize_row
 from app.services.membership import has_active_membership
-
 
 # ---------------------------------------------------------------------------
 # Organization-scope resolution helpers
@@ -54,6 +62,11 @@ class ScopeBlocked(PermissionError):
 
 class OwnerRequired(PermissionError):
     """Caller is an ACTIVE SECRETARY but this action needs ACTIVE OWNER."""
+
+
+class BindingConflict(Exception):
+    """Raised when a concurrent bind wins the race on the (unit_id, purpose)
+    partial unique index. Mapped to HTTP 409 at the API layer."""
 
 
 def resolve_org_membership(
@@ -76,6 +89,18 @@ def resolve_org_membership(
 
 
 def property_org_id(db: Session, property_id: int) -> int | None:
+    """Return the Property.organization_id, or None.
+
+    Legacy compatibility (Issue #25 "不得粗暴删除旧数据"):
+      - Pre-migration rows keep ``organization_id = NULL`` and survive the
+        ALTER ADD COLUMN because the column is nullable.
+      - A NULL org_id is treated as "unscoped / not yet on-boarded" and the
+        scoped_* helpers below raise LookupError (→ HTTP 404) instead of
+        leaking the row to the nearest org. The Property row itself is NEVER
+        deleted or modified by this service layer.
+      - New writes via the Property API enforce ``organization_id NOT NULL``
+        on the request schema, so the NULL set is monotonically non-growing.
+    """
     row = db.query(Property.organization_id).filter(
         Property.id == property_id, Property.deleted_at.is_(None)
     ).one_or_none()
@@ -100,7 +125,12 @@ def scoped_get_property(
 ) -> tuple[Property, Membership]:
     org_id = property_org_id(db, property_id)
     if org_id is None:
-        raise LookupError(f"property {property_id} not found or has no organization")
+        # Legacy (organization_id = NULL) rows: fail closed with LookupError
+        # (→ 404) instead of 500 or accidental cross-org exposure.
+        raise LookupError(
+            f"property {property_id} not found or has no organization"
+            " (legacy pre-migration row, not yet org-scoped)"
+        )
     membership = resolve_org_membership(db, for_user_id, org_id)
     prop = db.query(Property).filter(
         Property.id == property_id, Property.deleted_at.is_(None)
@@ -120,6 +150,9 @@ def scoped_list_properties(
             Membership.user_id == for_user_id,
             Membership.state == MembershipState.ACTIVE,
             Property.deleted_at.is_(None),
+            # Legacy rows: organization_id IS NULL would fail the JOIN
+            # condition above, so they are naturally excluded here without
+            # any extra filter. No legacy data is deleted.
         )
         .order_by(Property.id)
         .all()
@@ -292,6 +325,16 @@ def bind_unit_channel(
 
     now = _now()
 
+    # (b-prime) Lock the PARENT Unit first — this is the authoritative
+    # serialisation gate for *first* binds too, because when there is no
+    # ACTIVE binding yet the SELECT … FOR UPDATE on bindings returns nothing
+    # and two concurrent binders would race on the partial unique index.
+    unit_lock = db.execute(
+        select(Unit).where(Unit.id == unit_id).with_for_update()
+    ).scalar_one_or_none()
+    if unit_lock is None:
+        raise LookupError(f"unit {unit_id} not found (concurrent delete?)")
+
     # (b) Row-level lock on currently-active binding → serialize concurrent binders
     lock_q = (
         select(UnitChannelBinding)
@@ -335,7 +378,10 @@ def bind_unit_channel(
     else:
         action = AuditAction.unit_channel_bound.value
 
-    # (d) Insert new ACTIVE row
+    # (d) Insert new ACTIVE row — a racy INSERT still raises IntegrityError on
+    #     the partial unique index if another TX committed an ACTIVE between
+    #     our SELECT FOR UPDATE (which returned None) and this flush.
+    #     Translate that deterministically to BindingConflict → HTTP 409.
     new_binding = UnitChannelBinding(
         organization_id=org_id,
         unit_id=unit_id,
@@ -352,7 +398,14 @@ def bind_unit_channel(
         updated_at=now,
     )
     db.add(new_binding)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        raise BindingConflict(
+            f"concurrent bind on unit_id={unit_id} purpose={purpose!r} "
+            f"— another transaction committed an ACTIVE row first"
+        ) from exc
     record_audit(
         db,
         table_name="unit_channel_bindings",

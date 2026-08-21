@@ -161,6 +161,29 @@ def _audit_column_type_is_int(conn, table: str, column: str) -> None:
         )
 
 
+def _audit_no_orphan_audit_actions(conn, actions: tuple[str, ...]) -> None:
+    """Fail closed if audit_logs still carries the Issue #25 tail actions.
+
+    Per Issue #25 "不得粗暴删除旧数据" rule — we must NOT let downgrade
+    DROP the CHECK constraint then re-add a narrower one that would fail on
+    existing rows, NOR silently delete audit rows. When orphan rows exist,
+    abort the downgrade explicitly with a RuntimeError that names the count.
+    """
+    values_sql = ",".join(f"'{v}'" for v in actions)
+    row = conn.execute(sa.text(
+        f"SELECT COUNT(*) FROM audit_logs WHERE action IN ({values_sql})"
+    )).fetchone()
+    count = row[0] if row is not None else 0
+    if count:
+        raise RuntimeError(
+            f"downgrade audit: audit_logs has {count} rows with Issue #25 tail "
+            f"actions {sorted(actions)} — refusing to rebuild the narrower "
+            f"ck_audit_logs_action constraint (would violate existing rows). "
+            f"Either migrate those rows forward to a newer schema, or "
+            f"explicitly delete them BEFORE running downgrade."
+        )
+
+
 # ---- upgrade / downgrade ---------------------------------------------------
 
 def upgrade() -> None:
@@ -277,6 +300,9 @@ def downgrade() -> None:
     _audit_no_jsonb_or_dialect_columns(conn, "unit_channel_bindings")
     # b) properties.organization_id column type audit (must be integer-ish)
     _audit_column_type_is_int(conn, "properties", "organization_id")
+    # c) AuditLog orphan-row guard: existing unit_channel_* rows would make
+    #    the narrower _BASE_ALLOWED CHECK fail on ADD CONSTRAINT. Abort early.
+    _audit_no_orphan_audit_actions(conn, _PROPERTY_CHANNEL_ISSUE25_APPENDS)
 
     # --- 4. Restore baseline audit allowlist (drop the Issue #25 tail)
     _set_audit_action_allowlist(conn, _BASE_ALLOWED)

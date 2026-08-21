@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -86,7 +87,7 @@ class UnitChannelBindingCreate(UnitChannelBindingBase):
     pass
 
 
-class UnitChannelBindingRead(BaseModel):
+class UnitChannelBindingRead(AuditFields):
     id: int
     organization_id: int
     unit_id: int
@@ -94,10 +95,6 @@ class UnitChannelBindingRead(BaseModel):
     channel_chat_id: int | None
     thread_topic_id: int | None
     status: str
-    revoked_at: str | None = None
+    revoked_at: datetime | None = None
     revoked_by_membership_id: int | None = None
     notes: str | None
-    created_at: str
-    updated_at: str
-    created_by: int | None = None
-    updated_by: int | None = None

@@ -1,22 +1,23 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.database import get_db
 from app.models.property_channel import BindingStatus
 from app.models.user import User
-from app.schemas.common import MessageResponse
 from app.schemas.property import UnitChannelBindingCreate, UnitChannelBindingRead
 from app.services.property_channel import (
+    BindingConflict,
     OwnerRequired,
     ScopeBlocked,
+    _validate_purpose,
     bind_unit_channel,
     get_active_binding,
     list_bindings_for_unit,
     revoke_unit_channel,
     scoped_get_unit,
     scoped_lookup_unit,
-    unit_org_id,
 )
 
 router = APIRouter(prefix="/property-channel", tags=["property_channel"])
@@ -29,6 +30,8 @@ def _scope_exception_to_http(exc: Exception) -> HTTPException:
         return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
     if isinstance(exc, ValueError):
         return HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+    if isinstance(exc, BindingConflict):
+        return HTTPException(status.HTTP_409_CONFLICT, str(exc))
     return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, type(exc).__name__)
 
 
@@ -42,6 +45,10 @@ def lookup_unit(
     user: User = Depends(get_current_user),
 ):
     try:
+        _validate_purpose(purpose)
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
+    try:
         _unit, _membership = scoped_lookup_unit(
             db,
             organization_id=organization_id,
@@ -49,7 +56,7 @@ def lookup_unit(
             unit_number=unit_number,
             for_user_id=user.id,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise _scope_exception_to_http(exc) from exc
     active = get_active_binding(db, _unit.id, purpose)
     return active
@@ -64,7 +71,7 @@ def list_unit_bindings(
 ):
     try:
         _unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise _scope_exception_to_http(exc) from exc
     return list_bindings_for_unit(db, unit_id, status=status_filter)
 
@@ -77,8 +84,12 @@ def get_unit_active_binding(
     user: User = Depends(get_current_user),
 ):
     try:
+        _validate_purpose(purpose)
+    except Exception as exc:
+        raise _scope_exception_to_http(exc) from exc
+    try:
         _unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise _scope_exception_to_http(exc) from exc
     return get_active_binding(db, unit_id, purpose)
 
@@ -99,9 +110,17 @@ def create_binding(
             actor_user_id=user.id,
             notes=payload.notes,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise _scope_exception_to_http(exc) from exc
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"concurrent bind conflict on unit_id={payload.unit_id} "
+            f"purpose={payload.purpose!r}",
+        ) from exc
     db.refresh(binding)
     return binding
 
@@ -118,7 +137,7 @@ def revoke_binding(
             binding_id=binding_id,
             actor_user_id=user.id,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise _scope_exception_to_http(exc) from exc
     db.commit()
     db.refresh(binding)
