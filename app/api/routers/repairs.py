@@ -1,21 +1,3 @@
-"""REPAIR-AI-EMPLOYEE-WORKFLOW-008A — Repair API router (/api/v1/repairs).
-
-Owns the Repair Operation lifecycle and its decoupled Proposals / Actions.
-
-RBAC (consistent with the rest of the app):
-- admin: everything.
-- manager: view + submit proposals + record results.
-- agent: only view/act repairs assigned to them.
-
-The Router enforces the 008A invariants by delegating to the service layer:
-- reject_proposal keeps the repair OPEN/WAITING_HUMAN (never closes/cancels);
-- approve_proposal -> WAITING_PAYMENT (never closes);
-- pay links Expense-paid -> VERIFYING at most (never closes);
-- ONLY verify closes the repair (verification gate).
-
-Timeline is surfaced via the existing audit_log (every mutation records an
-audit event with action + old/new row).
-"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -26,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import admin_only, get_current_user, manager_or_admin
 from app.database import get_db
 from app.models.financial import Expense, ExpenseStatus
+from app.models.property import Unit
 from app.models.repair import (
     RepairOperation,
     RepairProposal,
@@ -42,7 +25,22 @@ from app.schemas.repair import (
     RepairVerifyIn,
 )
 from app.services.audit import record_audit, serialize_row
-from app.services.repairs import continuation, operations as op_svc
+from app.services.organization_scope import (
+    CrossOrgReference,
+    OrganizationRole,
+    OwnerRequired,
+    ScopeBlocked,
+    expense_org_id,
+    property_org_id,
+    resolve_org_membership,
+    scope_exception_to_http,
+    scoped_get_expense,
+    scoped_get_repair,
+    scoped_list_repairs,
+    unit_org_id,
+)
+from app.services.repairs import continuation
+from app.services.repairs import operations as op_svc
 from app.services.repairs import payment as payment_svc
 from app.services.repairs import proposals as prop_svc
 from app.services.repairs import verification as verify_svc
@@ -51,11 +49,45 @@ from app.services.repairs.state import TransitionError
 router = APIRouter(prefix="/repairs", tags=["repairs"])
 
 
-def _get_repair_or_404(db: Session, repair_id: int) -> RepairOperation:
-    repair = db.get(RepairOperation, repair_id)
-    if repair is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Repair not found")
-    return repair
+def _scope_guard(repair: RepairOperation, user: User) -> None:
+    if user.role == UserRole.agent and repair.assignee_user_id not in (None, user.id):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a repair assigned to another user"
+        )
+
+
+def _resolve_repair_property_id(db: Session, repair: RepairOperation) -> int | None:
+    """Return canonical property_id for repair (unit.property_id preferred, else direct)."""
+    if repair.unit_id is not None:
+        row = db.query(Unit.property_id).filter(Unit.id == repair.unit_id, Unit.deleted_at.is_(None)).one_or_none()
+        if row is not None:
+            return row[0]
+    return repair.property_id
+
+
+def _resolve_target_org_id_for_create(
+    db: Session, payload: RepairCreateIn
+) -> tuple[int | None, int | None]:
+    """Return (target_org_id, final_property_id). If both unit_id and property_id are present,
+    assert they resolve to the SAME property_id (fail closed otherwise)."""
+    resolved_from_unit_prop: int | None = None
+    if payload.unit_id is not None:
+        unit_row = db.query(Unit.property_id).filter(Unit.id == payload.unit_id, Unit.deleted_at.is_(None)).one_or_none()
+        if unit_row is None:
+            raise LookupError("Unit not found")
+        resolved_from_unit_prop = unit_row[0]
+        if payload.property_id is not None and resolved_from_unit_prop != payload.property_id:
+            raise CrossOrgReference(
+                "Repair unit_id and property_id must belong to the same property"
+            )
+    final_property_id = resolved_from_unit_prop if resolved_from_unit_prop is not None else payload.property_id
+    if payload.unit_id is not None:
+        oid = unit_org_id(db, payload.unit_id)
+        if oid is not None:
+            return oid, final_property_id
+    if payload.property_id is not None:
+        return property_org_id(db, payload.property_id), final_property_id
+    return None, None
 
 
 def _get_proposal_or_404(db: Session, proposal_id: int) -> RepairProposal:
@@ -63,13 +95,6 @@ def _get_proposal_or_404(db: Session, proposal_id: int) -> RepairProposal:
     if p is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Proposal not found")
     return p
-
-
-def _scope_guard(repair: RepairOperation, user: User) -> None:
-    if user.role == UserRole.agent and repair.assignee_user_id not in (None, user.id):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Cannot access a repair assigned to another user"
-        )
 
 
 def _resolve_proposal(db, repair, payload: RepairDecisionIn) -> RepairProposal:
@@ -95,7 +120,6 @@ def _resolve_proposal(db, repair, payload: RepairDecisionIn) -> RepairProposal:
                 status.HTTP_404_NOT_FOUND, f"Proposal V{payload.version} not found"
             )
         return proposal
-    # default: the latest proposal
     proposal = prop_svc.latest_proposal(db, repair.id)
     if proposal is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Repair has no proposals")
@@ -111,10 +135,12 @@ def list_repairs(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    query = db.query(RepairOperation)
+    try:
+        items = scoped_list_repairs(db, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     if user.role == UserRole.agent:
-        query = query.filter(RepairOperation.assignee_user_id == user.id)
-    items = query.order_by(RepairOperation.id.desc()).all()
+        items = [r for r in items if r.assignee_user_id == user.id]
     return RepairListOut(items=items, total=len(items))
 
 
@@ -124,7 +150,10 @@ def get_repair_detail(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    repair = _get_repair_or_404(db, repair_id)
+    try:
+        repair, _membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     _scope_guard(repair, user)
     proposals = prop_svc.list_proposals(db, repair.id)
     actions = continuation.resolve_actions(db, repair.id)
@@ -149,7 +178,11 @@ def list_repair_actions(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _scope_guard(_get_repair_or_404(db, repair_id), user)
+    try:
+        repair, _membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    _scope_guard(repair, user)
     return continuation.resolve_actions(db, repair_id)
 
 
@@ -161,8 +194,25 @@ def list_repair_actions(
 def create_repair(
     payload: RepairCreateIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
+    try:
+        target_org_id, _final_property_id = _resolve_target_org_id_for_create(db, payload)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    if target_org_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cannot determine organization for repair (unit_id/property_id missing or invalid)",
+        )
+    try:
+        resolve_org_membership(
+            db, user.id, target_org_id,
+            role=[OrganizationRole.SECRETARY, OrganizationRole.OWNER],
+        )
+    except ScopeBlocked as exc:
+        raise scope_exception_to_http(exc) from exc
+
     repair = op_svc.create_repair(
         db,
         issue=payload.issue,
@@ -195,7 +245,10 @@ def submit_proposal(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    repair = _get_repair_or_404(db, repair_id)
+    try:
+        repair, _membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     _scope_guard(repair, user)
     try:
         proposal, version = prop_svc.submit_proposal(
@@ -236,10 +289,13 @@ def decide_proposal(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    repair = _get_repair_or_404(db, repair_id)
+    try:
+        repair, membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     proposal = _resolve_proposal(db, repair, payload)
 
-    if user.role == UserRole.manager and proposal.submitted_by == user.id:
+    if membership.role == OrganizationRole.SECRETARY and proposal.submitted_by == user.id:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot decide on a proposal you submitted"
         )
@@ -268,13 +324,28 @@ def decide_proposal(
                 changed_fields={"status": [proposal.status.value, "APPROVED"]},
                 new_value=serialize_row(proposal),
             )
-            # If the decision carries a pre-created expense, link it so payment
-            # is tracked separately from the repair.
             if payload.expense_id is not None:
-                expense = db.get(Expense, payload.expense_id)
-                if expense is None:
+                try:
+                    expense, _exp_membership = scoped_get_expense(
+                        db, payload.expense_id, for_user_id=user.id,
+                        role=[OrganizationRole.SECRETARY, OrganizationRole.OWNER],
+                    )
+                except Exception as exc:
                     db.rollback()
-                    raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+                    raise scope_exception_to_http(exc) from exc
+                repair_canonical_property_id = _resolve_repair_property_id(db, repair)
+                expense_canonical_property_id = expense.property_id
+                if (
+                    repair_canonical_property_id is not None
+                    and expense_canonical_property_id is not None
+                    and repair_canonical_property_id != expense_canonical_property_id
+                ):
+                    db.rollback()
+                    raise scope_exception_to_http(
+                        CrossOrgReference(
+                            "Linked expense must belong to the same property as the repair"
+                        )
+                    )
                 payment_svc.link_expense_to_proposal(db, proposal, expense)
         else:
             prop_svc.reject_proposal(
@@ -293,8 +364,6 @@ def decide_proposal(
                 changed_fields={"status": ["PENDING", "REJECTED"]},
                 new_value=serialize_row(proposal),
             )
-            # 008A AI-continuation: reject -> create ONE dedup'd requote action
-            # (Case C proves repeated calls create only one active action).
             continuation.ensure_requote_action(db, repair, proposal, actor_id=user.id)
     except prop_svc.ProposalError as exc:
         db.rollback()
@@ -309,17 +378,35 @@ def pay_linked_expense(
     repair_id: int,
     expense_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
     """Mark the linked expense paid via a VERIFIED payment claim (003B) — the
     repair goes at most to VERIFYING, NEVER CLOSED."""
-    repair = _get_repair_or_404(db, repair_id)
-    expense = db.get(Expense, expense_id)
-    if expense is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
+    try:
+        repair, _membership = scoped_get_repair(
+            db, repair_id, for_user_id=user.id, role=OrganizationRole.OWNER,
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    try:
+        expense, _exp_membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER,
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    repair_canonical_property_id = _resolve_repair_property_id(db, repair)
+    if (
+        repair_canonical_property_id is not None
+        and expense.property_id is not None
+        and repair_canonical_property_id != expense.property_id
+    ):
+        raise scope_exception_to_http(
+            CrossOrgReference(
+                "Paid expense must belong to the same property as the repair"
+            )
+        )
     if expense.status != ExpenseStatus.approved:
         raise HTTPException(status.HTTP_409_CONFLICT, "Only approved expenses can be paid")
-    # 003B: paid status is reached ONLY through verified-claims aggregation.
     try:
         from app.services.expense_claims import create_claim, verify_claim
 
@@ -328,7 +415,7 @@ def pay_linked_expense(
             idempotency_key=f"repair:{repair_id}:expense:{expense.id}:owner-pay",
         )
         verify_claim(db, expense, claim.id, verified_by=user.id)
-    except Exception as exc:  # noqa: BLE001 - preserve the 409 financial guard
+    except Exception as exc:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, f"Payment verification failed: {exc}") from exc
     record_audit(
@@ -352,7 +439,10 @@ def record_result(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    repair = _get_repair_or_404(db, repair_id)
+    try:
+        repair, _membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     _scope_guard(repair, user)
     try:
         verify_svc.mark_repair_completed(
@@ -388,7 +478,10 @@ def verify_repair(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    repair = _get_repair_or_404(db, repair_id)
+    try:
+        repair, _membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     _scope_guard(repair, user)
     try:
         verify_svc.verify_and_close(
@@ -399,7 +492,7 @@ def verify_repair(
             closure_signal=payload.closure_signal,
             source=payload.source,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, f"Verification failed: {exc}") from exc
     record_audit(
@@ -431,7 +524,10 @@ def cancel_repair(
     the guard. Terminal states are rejected here so the message is
     consistent for the bot / tests.
     """
-    repair = _get_repair_or_404(db, repair_id)
+    try:
+        repair, _membership = scoped_get_repair(db, repair_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     if repair.status in ("CLOSED", "CANCELLED"):
         raise HTTPException(status.HTTP_409_CONFLICT, f"Repair is already {repair.status}")
     try:
@@ -460,6 +556,7 @@ def _create_linked_expense(db, repair, proposal, version, user: User) -> Expense
     """Create an Expense for an approved-style quote. expense_date = today."""
     import datetime as _dt
 
+    repair_property_id = _resolve_repair_property_id(db, repair)
     expense = Expense(
         expense_date=_dt.date.today(),
         category="维修",
@@ -467,6 +564,7 @@ def _create_linked_expense(db, repair, proposal, version, user: User) -> Expense
         payee=proposal.vendor or "Vendor",
         description=(proposal.description or repair.issue)[:500],
         unit_id=repair.unit_id,
+        property_id=repair_property_id,
         status=ExpenseStatus.pending,
         created_by=user.id,
         updated_by=user.id,

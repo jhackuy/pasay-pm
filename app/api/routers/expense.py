@@ -1,20 +1,19 @@
 from datetime import datetime, timezone
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
-from app.api.deps import admin_only, get_current_user, manager_or_admin
+from app.api.deps import get_current_user
 from app.database import get_db
-from app.models.expense_claim import ClaimStatus, ExpensePaymentClaim
+from app.models.expense_claim import ClaimStatus
 from app.models.financial import Expense, ExpenseStatus
 from app.models.operations import (
     OperationalTask,
     OperationalTaskStatus,
     OperationalTaskType,
 )
-from app.models.property import Unit
+from app.models.property import Property, Unit
 from app.models.user import User
 from app.schemas.financial import (
     ExpenseCreate,
@@ -37,29 +36,32 @@ from app.services.expense_payment_truth import (
     expense_finance_payload,
     payment_truth,
     clear_approval,
-    sync_expense_status,
 )
 from app.services.expense_timeline import build_expense_timeline
 from app.services.operations import projection as task_projection
+from app.services.organization_scope import (
+    CrossOrgReference,
+    OrganizationRole,
+    OwnerRequired,
+    ScopeBlocked,
+    assert_co_org,
+    property_org_id,
+    resolve_org_membership,
+    scope_exception_to_http,
+    scoped_get_expense,
+    scoped_list_expenses,
+    unit_org_id,
+)
 
 router = APIRouter(prefix="/expenses", tags=["expenses"])
 
 _CREATABLE = {ExpenseStatus.pending, ExpenseStatus.approved}
 
-# Critical financial fields (PASAY-EXPENSE-OPERATION-003B §9): changing any of
-# these after approval invalidates the old approval and requires re-approval.
-_CRITICAL_FIELDS = ("amount", "payee", "category", "description", "unit_id", "payer_user_id")
+_CRITICAL_FIELDS = ("amount", "payee", "category", "description", "unit_id", "property_id", "payer_user_id")
 
 
 class _ResubmitPayload(ExpenseUpdate):
     idempotency_key: str | None = None
-
-
-def _get_or_404(db: Session, expense_id: int) -> Expense:
-    obj = db.query(Expense).filter(Expense.id == expense_id).first()
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
-    return obj
 
 
 def _check_unit(db: Session, unit_id: int | None) -> None:
@@ -74,9 +76,57 @@ def _check_unit(db: Session, unit_id: int | None) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
 
 
+def _check_property(db: Session, property_id: int | None) -> None:
+    if property_id is None:
+        return
+    prop = (
+        db.query(Property)
+        .filter(Property.id == property_id, Property.deleted_at.is_(None))
+        .first()
+    )
+    if prop is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+
+
+def _resolve_expense_property_id(db: Session, unit_id: int | None, property_id: int | None) -> int:
+    """Resolve the final expense.property_id with canonical ownership rules.
+
+    * At least one of unit_id or property_id MUST be present.
+    * If both present: unit.property_id MUST equal property_id, else CrossOrgReference (409).
+    * Returns the property_id to store on Expense (NOT NULL).
+    """
+    resolved_from_unit: int | None = None
+    if unit_id is not None:
+        unit_row = db.query(Unit.property_id).filter(Unit.id == unit_id, Unit.deleted_at.is_(None)).one_or_none()
+        if unit_row is None:
+            raise LookupError("Unit not found")
+        resolved_from_unit = unit_row[0]
+    if property_id is not None and resolved_from_unit is not None:
+        if property_id != resolved_from_unit:
+            raise CrossOrgReference(
+                "Expense unit_id and property_id must belong to the same property"
+            )
+    final_property_id = resolved_from_unit if resolved_from_unit is not None else property_id
+    if final_property_id is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Expense requires at least unit_id or property_id (canonical ownership anchor)",
+        )
+    return final_property_id
+
+
+def _resolve_expense_org_id(db: Session, unit_id: int | None, property_id: int | None) -> int:
+    """Resolve canonical organization_id for an Expense via both channels (fail closed)."""
+    final_property_id = _resolve_expense_property_id(db, unit_id, property_id)
+    oid = property_org_id(db, final_property_id)
+    if oid is None:
+        raise CrossOrgReference(
+            f"Expense property id={final_property_id} not found or has no organization"
+        )
+    return oid
+
+
 def _check_payer(db: Session, payer_user_id: int | None) -> None:
-    """AI-OPS-FOUNDATION-001 §4/§8: a recorded payer must be a real active
-    user so the PAYMENT_PENDING task can actually reach them."""
     if payer_user_id is None:
         return
     from app.models.user import User
@@ -87,11 +137,6 @@ def _check_payer(db: Session, payer_user_id: int | None) -> None:
 
 
 def _guard_edit(db: Session, obj: Expense, updates: dict, user: User) -> None:
-    """003B §9: a critical financial-field change on an APPROVED/PAID/PARTIAL
-    expense must demote it back to PENDING (re-approval required) instead of
-    silently keeping the stale approval. Already-reversed/pending edits are
-    allowed; rejected records can be edited to resubmit through the resubmit
-    endpoint."""
     if obj.status == ExpenseStatus.reversed:
         raise HTTPException(status.HTTP_409_CONFLICT, "Cannot edit a reversed expense")
     if obj.status == ExpenseStatus.rejected:
@@ -102,8 +147,6 @@ def _guard_edit(db: Session, obj: Expense, updates: dict, user: User) -> None:
     critical_changed = {f for f in _CRITICAL_FIELDS if f in updates and updates[f] != getattr(obj, f)}
     if obj.status in (ExpenseStatus.approved, ExpenseStatus.paid, ExpenseStatus.partially_paid, ExpenseStatus.payment_claimed):
         if critical_changed:
-            # Invalidate the old approval; the expense returns to PENDING and
-            # must go through Owner review again before payment can continue.
             clear_approval(db, obj, actor_id=user.id,
                            reason="Critical financial field changed after approval "
                                   f"({', '.join(sorted(critical_changed))})")
@@ -116,18 +159,6 @@ def _complete_linked_approval_task(
     actor_id: int,
     reason: str,
 ) -> None:
-    """Closing an expense approval also closes the linked APPROVAL_PENDING
-    operational task atomically in the same transaction (single source of
-    truth; the bot never does this itself).
-
-    Convergence boundary (PASAY-VNEXT-FOUNDATION-LEGACY-001): the
-    ``OperationalTask`` close + redelivery-suppression routes through
-    ``app/services.operations.projection``. The audit ACTION NAME remains
-    the existing ``task_completed_via_approval`` (or ``..._rejection``) so
-    production contracts and tests that match the exact string stay
-    green; ``source_domain`` / ``reason`` ride in ``changed_fields`` for
-    provenance (no new enum slot, no migration).
-    """
     task = (
         db.query(OperationalTask)
         .filter(
@@ -163,12 +194,6 @@ def _complete_linked_payment_tasks(
     *,
     actor_id: int,
 ) -> None:
-    """When an expense is FULLY paid (remaining == 0), close every still-active
-    expense-linked payment task so the to-do list never keeps showing 'waiting
-    for payment' for a fully-paid expense. NEVER closes related Repair tasks.
-
-    Audit ACTION NAME preserved as the existing ``task_completed_via_payment``.
-    """
     tasks = (
         db.query(OperationalTask)
         .filter(
@@ -234,7 +259,6 @@ def _build_detail(db: Session, expense: Expense) -> ExpenseDetailOut:
 
 
 def _evidence_for_expense(db: Session, expense: Expense, claims) -> dict:
-    """Group evidence by claim for the Mini App detail (003B §10)."""
     from app.models.evidence import Evidence
 
     out = {}
@@ -254,7 +278,6 @@ def _evidence_for_expense(db: Session, expense: Expense, claims) -> dict:
             }
             for e in rows
         ]
-    # root-level (legacy) receipt
     if expense.receipt_attachment_id:
         out["receipt_attachment_id"] = expense.receipt_attachment_id
     return out
@@ -265,26 +288,34 @@ def _evidence_for_expense(db: Session, expense: Expense, claims) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("", response_model=list[ExpenseRead])
-def list_expenses(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return db.query(Expense).order_by(Expense.id).all()
+def list_expenses(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        return scoped_list_expenses(db, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.get("/{expense_id}", response_model=ExpenseRead)
 def get_expense(
-    expense_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    expense_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    return _get_or_404(db, expense_id)
+    try:
+        obj, _membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
+        return obj
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.get("/{expense_id}/detail", response_model=ExpenseDetailOut)
 def expense_detail(
     expense_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    """Mini App full detail: Expense / Approval / Payment / Claims / Evidence /
-    Verification / Actions / Timeline (003B §15)."""
-    obj = _get_or_404(db, expense_id)
+    try:
+        obj, _membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     return _build_detail(db, obj)
 
 
@@ -296,20 +327,34 @@ def expense_detail(
 def create_expense(
     payload: ExpenseCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
     if payload.status not in _CREATABLE:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Expense can only be created as pending or approved",
         )
-    if payload.status == ExpenseStatus.approved and user.role != "admin":
+
+    membership = None
+    try:
+        final_property_id = _resolve_expense_property_id(db, payload.unit_id, payload.property_id)
+        e_org_id = _resolve_expense_org_id(db, payload.unit_id, payload.property_id)
+        membership = resolve_org_membership(
+            db, user.id, e_org_id, role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY]
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
+    if payload.status == ExpenseStatus.approved and membership.role != OrganizationRole.OWNER:
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Only admin can create an approved expense"
+            status.HTTP_403_FORBIDDEN, "Only OWNER can create an approved expense"
         )
     _check_unit(db, payload.unit_id)
+    _check_property(db, payload.property_id)
     _check_payer(db, payload.payer_user_id)
-    obj = Expense(**payload.model_dump(), version=1)
+    data = payload.model_dump()
+    data["property_id"] = final_property_id
+    obj = Expense(**data, version=1)
     obj.created_by = user.id
     obj.updated_by = user.id
     if obj.status == ExpenseStatus.approved:
@@ -335,14 +380,38 @@ def update_expense(
     expense_id: int,
     payload: ExpenseUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, expense_id)
+    try:
+        obj, membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
     _guard_edit(db, obj, updates, user)
+
+    effective_unit_id = updates.get("unit_id", obj.unit_id)
+    effective_property_id = updates.get("property_id", obj.property_id)
+    try:
+        final_property_id = _resolve_expense_property_id(db, effective_unit_id, effective_property_id)
+        new_org_id = _resolve_expense_org_id(db, effective_unit_id, effective_property_id)
+        assert_co_org(
+            db,
+            user_org_id=membership.organization_id,
+            object_org_id=new_org_id,
+            object_kind="Expense (after update)",
+            object_id=expense_id,
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     _check_unit(db, updates.get("unit_id"))
+    _check_property(db, updates.get("property_id"))
     if "payer_user_id" in updates:
         _check_payer(db, updates.get("payer_user_id"))
     old = serialize_row(obj)
@@ -350,6 +419,7 @@ def update_expense(
     for field, value in updates.items():
         if field != "status":
             setattr(obj, field, value)
+    obj.property_id = final_property_id
     obj.updated_by = user.id
     record_audit(
         db,
@@ -374,10 +444,16 @@ def update_expense(
 def approve_expense(
     expense_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, expense_id)
-    if user.role == "manager" and obj.created_by == user.id:
+    try:
+        obj, membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
+    if obj.created_by == user.id and membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot approve an expense you created"
         )
@@ -410,7 +486,7 @@ def approve_expense(
         db.refresh(obj)
         return obj
     db.rollback()
-    current = _get_or_404(db, expense_id)
+    current, _m = scoped_get_expense(db, expense_id, for_user_id=user.id)
     if current.status == ExpenseStatus.approved:
         return current
     raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be approved")
@@ -421,14 +497,16 @@ def reject_expense(
     expense_id: int,
     payload: PaymentClaimIn | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
-    """Reject the CURRENT proposal/version. The rejected V1 is preserved (row
-    kept with status=rejected + rejection_reason); the Secretary resubmits a
-    corrected version through ``POST /resubmit`` which creates a NEW V2 row
-    (003B §8 / E8)."""
-    obj = _get_or_404(db, expense_id)
-    if user.role == "manager" and obj.created_by == user.id:
+    try:
+        obj, membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
+    if obj.created_by == user.id and membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN, "Cannot reject an expense you created"
         )
@@ -451,7 +529,7 @@ def reject_expense(
             db,
             table_name="expenses",
             record_id=obj.id,
-            action="reject",  # legacy audit action (parity + existing contract)
+            action="reject",
             actor_id=user.id,
             changed_fields={
                 "status": ["pending", "rejected"],
@@ -464,7 +542,7 @@ def reject_expense(
         db.refresh(obj)
         return obj
     db.rollback()
-    current = _get_or_404(db, expense_id)
+    current, _m = scoped_get_expense(db, expense_id, for_user_id=user.id)
     if current.status == ExpenseStatus.rejected:
         return current
     raise HTTPException(status.HTTP_409_CONFLICT, "Only pending expenses can be rejected")
@@ -475,21 +553,36 @@ def resubmit_expense(
     expense_id: int,
     payload: _ResubmitPayload,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    """Create the NEXT version of a rejected (or reapproval-demoted) expense.
-    The old V1 REJECTED row is preserved; a new V2 PENDING row is created that
-    links back via ``parent_expense_id`` (003B §8 / E8)."""
-    prior = _get_or_404(db, expense_id)
+    try:
+        prior, membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     if prior.status != ExpenseStatus.rejected:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             "Only a rejected expense can be resubmitted as the next version",
         )
     updates = payload.model_dump(exclude_unset=True)
-    _check_unit(db, updates.get("unit_id") or prior.unit_id)
-    if updates.get("payer_user_id") or prior.payer_user_id:
-        _check_payer(db, updates.get("payer_user_id") or prior.payer_user_id)
+    effective_unit_id = updates.get("unit_id", prior.unit_id)
+    effective_property_id = updates.get("property_id", prior.property_id)
+    try:
+        final_property_id = _resolve_expense_property_id(db, effective_unit_id, effective_property_id)
+        new_org_id = _resolve_expense_org_id(db, effective_unit_id, effective_property_id)
+        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=new_org_id, object_kind="Expense (resubmit)", object_id=expense_id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
+    _check_unit(db, effective_unit_id)
+    _check_property(db, effective_property_id)
+    effective_payer = updates.get("payer_user_id", prior.payer_user_id)
+    if effective_payer:
+        _check_payer(db, effective_payer)
     data = {
         "expense_date": updates.get("expense_date", prior.expense_date),
         "due_date": updates.get("due_date", prior.due_date),
@@ -497,8 +590,9 @@ def resubmit_expense(
         "amount": updates.get("amount", prior.amount),
         "payee": updates.get("payee", prior.payee),
         "description": updates.get("description", prior.description),
-        "unit_id": updates.get("unit_id", prior.unit_id),
-        "payer_user_id": updates.get("payer_user_id", prior.payer_user_id),
+        "unit_id": effective_unit_id,
+        "property_id": final_property_id,
+        "payer_user_id": effective_payer,
         "status": ExpenseStatus.pending,
         "version": (prior.version or 1) + 1,
         "parent_expense_id": prior.id,
@@ -532,12 +626,16 @@ def create_payment_claim(
     expense_id: int,
     payload: PaymentClaimIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    """Secretary reports a payment -> create a PENDING claim (payment reported,
-    awaiting verification). Idempotent on ``idempotency_key``/deterministic key
-    (003B §3/§6 / E2 / E5)."""
-    expense = _get_or_404(db, expense_id)
+    try:
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     if payload.claimed_amount is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "claimed_amount is required")
     try:
@@ -562,9 +660,12 @@ def create_payment_claim(
 def list_payment_claims(
     expense_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    _get_or_404(db, expense_id)
+    try:
+        _expense, _membership = scoped_get_expense(db, expense_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     return [PaymentClaimOut(**__claim_out(c)) for c in list_claims(db, expense_id)]
 
 
@@ -593,13 +694,15 @@ def verify_payment_claim(
     claim_id: int,
     payload: PaymentClaimIn,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
-    """Owner/verifier confirms the payment is real. On success the claimed
-    amount enters the verified aggregate and the expense reconciles to
-    partial/full paid (003B §3/§4 / E3 / E4). An over-claim is surfaced as a
-    mismatch and never auto-PAIDs (E6)."""
-    expense = _get_or_404(db, expense_id)
+    try:
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     try:
         claim = verify_claim(
             db,
@@ -624,9 +727,15 @@ def fail_payment_claim(
     claim_id: int,
     payload: PaymentClaimIn,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
-    expense = _get_or_404(db, expense_id)
+    try:
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     try:
         claim = fail_claim(
             db, expense, claim_id,
@@ -646,11 +755,15 @@ def reverse_payment_claim(
     claim_id: int,
     payload: PaymentClaimIn,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
-    """Reverse a VERIFIED claim — verified aggregate recomputes, remaining
-    returns, a fully-paid expense re-enters a payable state (003B §18 / E13)."""
-    expense = _get_or_404(db, expense_id)
+    try:
+        expense, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     try:
         claim = reverse_claim(
             db, expense, claim_id,
@@ -669,9 +782,6 @@ def reverse_payment_claim(
 # ---------------------------------------------------------------------------
 
 def _finalize_paid(expense: Expense, db: Session, actor_id: int | None = None) -> None:
-    """After a payment mutation, if the expense is now FULLY paid (derived from
-    the verified aggregate) close its payment tasks. Expense status/audit was
-    already updated by sync_expense_status — this only removes stale to-dos."""
     truth = payment_truth(db, expense)
     if truth.fully_paid:
         _complete_linked_payment_tasks(db, expense, actor_id=actor_id or expense.updated_by)
@@ -682,19 +792,15 @@ def pay_expense(
     expense_id: int,
     payload: PaymentClaimIn | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
-    """Owner is the final verifier. Tapping 'confirm paid' now records a REAL
-    VERIFIED payment claim for the remaining amount and derives paid status
-    from the verified aggregate — never a bare status flip (003B §3/§7). Replays
-    are idempotent: an already-paid expense returns the current record.
+    try:
+        obj, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
 
-    Concurrent replays are serialized on the expense row (SELECT ... FOR
-    UPDATE) so only ONE caller performs the payment mutation; the others re-read
-    the fully-paid state and return the current record (legacy concurrent-pay
-    contract, E5)."""
-    # Lock the expense row to serialize concurrent Owner-pay replays.
-    _get_or_404(db, expense_id)  # ensure existence/404
     obj = (
         db.query(Expense)
         .filter(Expense.id == expense_id)
@@ -715,9 +821,6 @@ def pay_expense(
         db.refresh(obj)
         return obj
     now = datetime.now(timezone.utc)
-    # Owner-complete-remaining: a STABLE deterministic idempotency tag so
-    # concurrent/duplicate taps of the same "confirm paid" converge to ONE
-    # verified claim (section 6 / E5 — the old concurrent-pay replay contract).
     from app.services.expense_claims import claim_idempotency_key
 
     key = payload.idempotency_key if payload and payload.idempotency_key else claim_idempotency_key(
@@ -734,16 +837,11 @@ def pay_expense(
             idempotency_key=key,
             now=now,
         )
-        # Owner-verified: the claim is admitted immediately into truth.
         verify_claim(
             db, obj, claim.id, verified_by=user.id,
             verified_amount=None, result=(payload.result if payload else None), now=now,
         )
     except ClaimError as exc:
-        # A concurrent caller may have completed the payment while this retry
-        # was in flight. Roll back the failed statement, then re-read the true
-        # expense state: if it is now fully paid it is an idempotent success
-        # (return current), not a failure.
         db.rollback()
         db.expire_all()
         db.refresh(obj)
@@ -754,9 +852,6 @@ def pay_expense(
             db.refresh(obj)
             return obj
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    # Owner's explicit payment confirmation — record the `pay` audit action. On
-    # an idempotent replay (claim not newly created) skip it so concurrent pay
-    # replays converge to exactly one `pay` (legacy concurrent contract).
     if was_created:
         record_audit(
             db,
@@ -776,15 +871,15 @@ def pay_expense(
 def reverse_expense(
     expense_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(admin_only),
+    user: User = Depends(get_current_user),
 ):
-    """Reverse a fully/partially paid expense by reversing every VERIFIED
-    claim (history preserved, aggregate recomputed, remaining returns) — the
-    old row flips to ``reversed`` (003B §18 / E13). Concurrent reversals are
-    serialized on the expense row; an already-reversed expense returns the
-    current record (idempotent, legacy contract)."""
-    # Lock the row to serialize concurrent reversals.
-    _get_or_404(db, expense_id)
+    try:
+        obj, _membership = scoped_get_expense(
+            db, expense_id, for_user_id=user.id, role=OrganizationRole.OWNER
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+
     obj = (
         db.query(Expense)
         .filter(Expense.id == expense_id)
@@ -799,6 +894,11 @@ def reverse_expense(
         return obj
     claims = [c for c in list_claims(db, obj.id) if c.status == ClaimStatus.VERIFIED]
     if not claims:
+        db.refresh(obj)
+        if obj.status == ExpenseStatus.reversed:
+            db.commit()
+            db.refresh(obj)
+            return obj
         raise HTTPException(status.HTTP_409_CONFLICT, "No verified payments to reverse")
     now = datetime.now(timezone.utc)
     for c in claims:

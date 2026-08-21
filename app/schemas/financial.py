@@ -34,7 +34,7 @@ def _meaningful_label(value: str, *, field_name: str, allow_dash: bool = False) 
 
 
 class IncomeBase(BaseModel):
-    lease_id: int | None = None
+    lease_id: int
     amount: Decimal = money_field(gt=0)
     received_date: date
     payment_method: str | None = Field(default=None, max_length=50)
@@ -69,10 +69,9 @@ class ExpenseBase(BaseModel):
     payee: str = Field(min_length=1, max_length=200)
     description: str | None = None
     unit_id: int | None = None
+    property_id: int | None = None
     status: ExpenseStatus
     receipt_attachment_id: int | None = None
-    # AI-OPS-FOUNDATION-001 §4/§8: the actual payer; payment responsibility
-    # routes to this user after approval instead of always the Owner.
     payer_user_id: int | None = None
 
 
@@ -98,6 +97,7 @@ class ExpenseUpdate(BaseModel):
     payee: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = None
     unit_id: int | None = None
+    property_id: int | None = None
     receipt_attachment_id: int | None = None
     payer_user_id: int | None = None
 

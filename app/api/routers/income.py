@@ -12,28 +12,60 @@ from app.models.lease import Lease
 from app.models.user import User
 from app.schemas.financial import IncomeCreate, IncomeRead, IncomeUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.organization_scope import (
+    CrossOrgReference,
+    OwnerRequired,
+    ScopeBlocked,
+    income_org_id,
+    lease_org_id,
+    resolve_org_membership,
+    scope_exception_to_http,
+    scoped_get_income,
+    scoped_list_incomes,
+    list_active_org_ids_for_user,
+)
 
 router = APIRouter(prefix="/incomes", tags=["incomes"])
 
 
-def _get_or_404(db: Session, income_id: int) -> Income:
-    obj = db.query(Income).filter(Income.id == income_id).first()
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Income not found")
-    return obj
-
-
 def _check_lease(db: Session, lease_id: int | None) -> None:
     if lease_id is None:
-        return
+        raise CrossOrgReference("Income requires canonical lease ownership (lease_id is required)")
     lease = db.query(Lease).filter(Lease.id == lease_id, Lease.deleted_at.is_(None)).first()
     if lease is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
 
 
+def _assert_lease_co_org(db: Session, user: User, lease_id: int | None) -> None:
+    if lease_id is None:
+        raise CrossOrgReference("Income requires canonical lease ownership (lease_id is required)")
+    object_org_id = lease_org_id(db, lease_id)
+    if object_org_id is None:
+        raise CrossOrgReference(
+            f"Lease id={lease_id} not found or has no organization"
+        )
+    try:
+        resolve_org_membership(db, user.id, object_org_id)
+    except ScopeBlocked:
+        raise CrossOrgReference(
+            f"Lease id={lease_id} does not belong to the caller's organization"
+        ) from None
+
+
+def _assert_income_co_org(db: Session, user: User, income_id: int) -> None:
+    object_org_id = income_org_id(db, income_id)
+    if object_org_id is None:
+        raise LookupError(f"income {income_id} not found or has no organization")
+    if object_org_id not in list_active_org_ids_for_user(db, user.id):
+        raise LookupError(f"income {income_id} not found")
+
+
 @router.get("", response_model=list[IncomeRead])
-def list_incomes(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return db.query(Income).order_by(Income.id).all()
+def list_incomes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        return scoped_list_incomes(db, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.post("", response_model=IncomeRead, status_code=status.HTTP_201_CREATED)
@@ -48,7 +80,11 @@ def create_income(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "Income can only be created as pending or confirmed",
         )
-    _check_lease(db, payload.lease_id)
+    try:
+        _check_lease(db, payload.lease_id)
+        _assert_lease_co_org(db, user, payload.lease_id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     if payload.idempotency_key:
         existing = (
             db.query(Income)
@@ -56,7 +92,10 @@ def create_income(
             .first()
         )
         if existing is not None:
-            # Idempotent replay: the create already landed -> return it.
+            try:
+                _assert_income_co_org(db, user, existing.id)
+            except Exception as exc:
+                raise scope_exception_to_http(exc) from exc
             response.status_code = status.HTTP_200_OK
             return existing
     obj = Income(**payload.model_dump())
@@ -78,8 +117,6 @@ def create_income(
         )
         db.commit()
     except IntegrityError:
-        # UNIQUE(idempotency_key) is the atomic backstop: a concurrent
-        # create with the same key won the race. Re-read and return it.
         db.rollback()
         if payload.idempotency_key:
             existing = (
@@ -88,6 +125,10 @@ def create_income(
                 .first()
             )
             if existing is not None:
+                try:
+                    _assert_income_co_org(db, user, existing.id)
+                except Exception as exc:
+                    raise scope_exception_to_http(exc) from exc
                 response.status_code = status.HTTP_200_OK
                 return existing
         raise
@@ -97,9 +138,13 @@ def create_income(
 
 @router.get("/{income_id}", response_model=IncomeRead)
 def get_income(
-    income_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    income_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    return _get_or_404(db, income_id)
+    try:
+        obj, _membership = scoped_get_income(db, income_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    return obj
 
 
 @router.patch("/{income_id}", response_model=IncomeRead)
@@ -109,7 +154,10 @@ def update_income(
     db: Session = Depends(get_db),
     user: User = Depends(manager_or_admin),
 ):
-    obj = _get_or_404(db, income_id)
+    try:
+        obj, _membership = scoped_get_income(db, income_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
@@ -120,7 +168,11 @@ def update_income(
             status.HTTP_409_CONFLICT, "Cannot change the amount of a confirmed income"
         )
     if "lease_id" in updates:
-        _check_lease(db, updates["lease_id"])
+        try:
+            _check_lease(db, updates["lease_id"])
+            _assert_lease_co_org(db, user, updates["lease_id"])
+        except Exception as exc:
+            raise scope_exception_to_http(exc) from exc
     old = serialize_row(obj)
     changed = field_changes(obj, updates)
     for field, value in updates.items():
@@ -147,7 +199,10 @@ def confirm_income(
     db: Session = Depends(get_db),
     user: User = Depends(owner_subject_only),
 ):
-    obj = _get_or_404(db, income_id)
+    try:
+        obj, _membership = scoped_get_income(db, income_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     old = serialize_row(obj)
     result = db.execute(
         update(Income)
@@ -175,10 +230,11 @@ def confirm_income(
         db.commit()
         db.refresh(obj)
         return obj
-    # rowcount == 0 -> no transition happened. Replay (already confirmed)
-    # returns the current state; any other state is a genuine conflict.
     db.rollback()
-    current = _get_or_404(db, income_id)
+    try:
+        current, _m = scoped_get_income(db, income_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     if current.status == IncomeStatus.confirmed:
         return current
     raise HTTPException(status.HTTP_409_CONFLICT, "Only pending income can be confirmed")
@@ -190,7 +246,10 @@ def reverse_income(
     db: Session = Depends(get_db),
     user: User = Depends(owner_subject_only),
 ):
-    obj = _get_or_404(db, income_id)
+    try:
+        obj, _membership = scoped_get_income(db, income_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     old = serialize_row(obj)
     result = db.execute(
         update(Income)
@@ -217,7 +276,10 @@ def reverse_income(
         db.refresh(obj)
         return obj
     db.rollback()
-    current = _get_or_404(db, income_id)
+    try:
+        current, _m = scoped_get_income(db, income_id, for_user_id=user.id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     if current.status == IncomeStatus.reversed:
         return current
     raise HTTPException(status.HTTP_409_CONFLICT, "Only confirmed income can be reversed")

@@ -1,10 +1,10 @@
 API = "/api/v1"
 
 
-def test_create_tenant(client, admin_headers):
+def test_create_tenant(client, admin_headers, org_a):
     resp = client.post(
         f"{API}/tenants",
-        json={"full_name": "Maria Santos", "phone": "+639171111111", "email": "maria@example.com"},
+        json={"full_name": "Maria Santos", "phone": "+639171111111", "email": "maria@example.com", "organization_id": org_a.id},
         headers=admin_headers,
     )
     assert resp.status_code == 201

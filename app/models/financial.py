@@ -65,6 +65,9 @@ class Expense(AuditMixin, Base):
     unit_id: Mapped[int | None] = mapped_column(
         ForeignKey("units.id"), nullable=True, index=True
     )
+    property_id: Mapped[int] = mapped_column(
+        ForeignKey("properties.id"), nullable=False, index=True
+    )
     status: Mapped[ExpenseStatus] = mapped_column(
         pg_enum(ExpenseStatus, "expense_status"), nullable=False, default=ExpenseStatus.pending
     )

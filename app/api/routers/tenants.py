@@ -1,31 +1,28 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, manager_or_admin
+from app.api.deps import get_current_user
 from app.database import get_db
+from app.models.membership import OrganizationRole
 from app.models.tenant import Tenant
+from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.tenant import TenantCreate, TenantPublic, TenantUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.organization_scope import (
+    CrossOrgReference,
+    OwnerRequired,
+    ScopeBlocked,
+    resolve_org_membership,
+    scope_exception_to_http,
+    scoped_get_tenant,
+    scoped_list_tenants,
+)
 
 router = APIRouter(prefix="/tenants", tags=["tenants"])
 
 
-def _get_or_404(db: Session, tenant_id: int) -> Tenant:
-    obj = (
-        db.query(Tenant)
-        .filter(Tenant.id == tenant_id, Tenant.deleted_at.is_(None))
-        .first()
-    )
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
-    return obj
-
-
 def _to_public(obj: Tenant) -> TenantPublic:
-    """Safe tenant read shape: the raw id_number / id file ids are NEVER
-    returned (group / Daily Digest / archive bodies can only show the
-    ``id_registered`` boolean = ``ID：已登记``)."""
     return TenantPublic(
         id=obj.id,
         full_name=obj.full_name,
@@ -50,10 +47,13 @@ def _to_public(obj: Tenant) -> TenantPublic:
 
 
 @router.get("", response_model=list[TenantPublic])
-def list_tenants(db: Session = Depends(get_db), _: Tenant = Depends(get_current_user)):
+def list_tenants(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     return [
         _to_public(obj)
-        for obj in db.query(Tenant).filter(Tenant.deleted_at.is_(None)).order_by(Tenant.id).all()
+        for obj in scoped_list_tenants(db, for_user_id=user.id)
     ]
 
 
@@ -61,8 +61,17 @@ def list_tenants(db: Session = Depends(get_db), _: Tenant = Depends(get_current_
 def create_tenant(
     payload: TenantCreate,
     db: Session = Depends(get_db),
-    user: Tenant = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
+    try:
+        resolve_org_membership(
+            db,
+            user.id,
+            payload.organization_id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except (ScopeBlocked, LookupError) as exc:
+        raise scope_exception_to_http(exc) from exc
     obj = Tenant(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -83,9 +92,20 @@ def create_tenant(
 
 @router.get("/{tenant_id}", response_model=TenantPublic)
 def get_tenant(
-    tenant_id: int, db: Session = Depends(get_db), _: Tenant = Depends(get_current_user)
+    tenant_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    return _to_public(_get_or_404(db, tenant_id))
+    try:
+        obj, _ = scoped_get_tenant(
+            db,
+            tenant_id,
+            for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except (LookupError, ScopeBlocked) as exc:
+        raise scope_exception_to_http(exc) from exc
+    return _to_public(obj)
 
 
 @router.patch("/{tenant_id}", response_model=TenantPublic)
@@ -93,10 +113,22 @@ def update_tenant(
     tenant_id: int,
     payload: TenantUpdate,
     db: Session = Depends(get_db),
-    user: Tenant = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, tenant_id)
-    updates = payload.model_dump(exclude_unset=True)
+    try:
+        obj, _ = scoped_get_tenant(
+            db,
+            tenant_id,
+            for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+        updates = payload.model_dump(exclude_unset=True)
+        if "organization_id" in updates:
+            raise CrossOrgReference(
+                "Tenant organization_id is immutable in this milestone; use a dedicated transfer workflow"
+            )
+    except (LookupError, ScopeBlocked, CrossOrgReference) as exc:
+        raise scope_exception_to_http(exc) from exc
     if not updates:
         return _to_public(obj)
     old = serialize_row(obj)
@@ -123,9 +155,17 @@ def update_tenant(
 def delete_tenant(
     tenant_id: int,
     db: Session = Depends(get_db),
-    user: Tenant = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, tenant_id)
+    try:
+        obj, _ = scoped_get_tenant(
+            db,
+            tenant_id,
+            for_user_id=user.id,
+            role=OrganizationRole.OWNER,
+        )
+    except (LookupError, ScopeBlocked, OwnerRequired) as exc:
+        raise scope_exception_to_http(exc) from exc
     from datetime import datetime, timezone
 
     obj.deleted_at = datetime.now(timezone.utc)

@@ -1,10 +1,10 @@
 API = "/api/v1"
 
 
-def test_create_property(client, admin_headers):
+def test_create_property(client, admin_headers, org_a):
     resp = client.post(
         f"{API}/properties",
-        json={"name": "Seaside", "address": "12 Beach Rd", "city": "Pasay", "total_units": 3},
+        json={"name": "Seaside", "address": "12 Beach Rd", "city": "Pasay", "total_units": 3, "organization_id": org_a.id},
         headers=admin_headers,
     )
     assert resp.status_code == 201
@@ -14,10 +14,10 @@ def test_create_property(client, admin_headers):
     assert body["is_active"] is True
 
 
-def test_manager_can_create_property(client, manager_headers):
+def test_manager_can_create_property(client, manager_headers, org_a):
     resp = client.post(
         f"{API}/properties",
-        json={"name": "Manager Co.", "address": "x", "city": "Pasay"},
+        json={"name": "Manager Co.", "address": "x", "city": "Pasay", "total_units": 1, "organization_id": org_a.id},
         headers=manager_headers,
     )
     assert resp.status_code == 201

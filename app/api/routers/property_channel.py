@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.property_channel import BindingStatus
 from app.models.user import User
 from app.schemas.property import UnitChannelBindingCreate, UnitChannelBindingRead
+from app.services.organization_scope import scope_exception_to_http
 from app.services.property_channel import (
     BindingConflict,
     OwnerRequired,
@@ -23,16 +24,14 @@ from app.services.property_channel import (
 router = APIRouter(prefix="/property-channel", tags=["property_channel"])
 
 
-def _scope_exception_to_http(exc: Exception) -> HTTPException:
-    if isinstance(exc, LookupError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (ScopeBlocked, OwnerRequired)):
-        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
+def _route_exception_to_http(exc: Exception) -> HTTPException:
+    """Router-specific mapping (ValueError→400, BindingConflict→409);
+    all org-scope and unknown exceptions fall through to canonical shared helper."""
     if isinstance(exc, ValueError):
         return HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
     if isinstance(exc, BindingConflict):
         return HTTPException(status.HTTP_409_CONFLICT, str(exc))
-    return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, type(exc).__name__)
+    return scope_exception_to_http(exc)
 
 
 @router.get("/units/lookup", response_model=UnitChannelBindingRead | None)
@@ -47,7 +46,7 @@ def lookup_unit(
     try:
         _validate_purpose(purpose)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     try:
         _unit, _membership = scoped_lookup_unit(
             db,
@@ -57,7 +56,7 @@ def lookup_unit(
             for_user_id=user.id,
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     active = get_active_binding(db, _unit.id, purpose)
     return active
 
@@ -72,7 +71,7 @@ def list_unit_bindings(
     try:
         _unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     return list_bindings_for_unit(db, unit_id, status=status_filter)
 
 
@@ -86,11 +85,11 @@ def get_unit_active_binding(
     try:
         _validate_purpose(purpose)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     try:
         _unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     return get_active_binding(db, unit_id, purpose)
 
 
@@ -111,7 +110,7 @@ def create_binding(
             notes=payload.notes,
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     try:
         db.commit()
     except IntegrityError as exc:
@@ -138,7 +137,7 @@ def revoke_binding(
             actor_user_id=user.id,
         )
     except Exception as exc:
-        raise _scope_exception_to_http(exc) from exc
+        raise _route_exception_to_http(exc) from exc
     db.commit()
     db.refresh(binding)
     return binding

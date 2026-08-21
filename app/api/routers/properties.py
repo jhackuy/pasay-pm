@@ -9,6 +9,7 @@ from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.property import PropertyCreate, PropertyRead, PropertyUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.organization_scope import scope_exception_to_http
 from app.services.property_channel import (
     OwnerRequired,
     ScopeBlocked,
@@ -21,14 +22,6 @@ from app.services.property_channel import (
 router = APIRouter(prefix="/properties", tags=["properties"])
 
 
-def _scope_exception_to_http(exc: Exception) -> HTTPException:
-    if isinstance(exc, LookupError):
-        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
-    if isinstance(exc, (ScopeBlocked, OwnerRequired)):
-        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
-    return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, type(exc).__name__)
-
-
 @router.get("", response_model=list[PropertyRead])
 def list_properties(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
@@ -36,7 +29,7 @@ def list_properties(
     try:
         return scoped_list_properties(db, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
 
 @router.post("", response_model=PropertyRead, status_code=status.HTTP_201_CREATED)
@@ -47,7 +40,10 @@ def create_property(
 ):
     try:
         resolve_org_membership(
-            db, user.id, payload.organization_id, role=OrganizationRole.OWNER,
+            db,
+            user.id,
+            payload.organization_id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
     except ScopeBlocked as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
@@ -79,7 +75,7 @@ def get_property(
     try:
         prop, _membership = scoped_get_property(db, property_id, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
     return prop
 
 
@@ -93,14 +89,14 @@ def update_property(
     try:
         obj, membership = scoped_get_property(db, property_id, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
+        raise scope_exception_to_http(exc) from exc
 
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
 
     try:
-        if membership.role != OrganizationRole.OWNER.value:
+        if membership.role != OrganizationRole.OWNER:
             filter_secretary_property_updates(set(updates.keys()))
     except OwnerRequired as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
@@ -134,8 +130,8 @@ def delete_property(
     try:
         obj, membership = scoped_get_property(db, property_id, for_user_id=user.id)
     except Exception as exc:  # noqa: BLE001
-        raise _scope_exception_to_http(exc) from exc
-    if membership.role != OrganizationRole.OWNER.value:
+        raise scope_exception_to_http(exc) from exc
+    if membership.role != OrganizationRole.OWNER:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "Only ACTIVE OWNER may soft-delete a Property",

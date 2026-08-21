@@ -15,6 +15,7 @@ from app.models.base import Base
 from app.main import app
 from app.models.user import User, UserRole
 from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
+from app.models.membership import Organization, Membership, OrganizationRole, MembershipState
 from app.services.audit import audit_context
 
 TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
@@ -185,21 +186,117 @@ def agent_headers(agent):
     return _headers(agent[1])
 
 
-# --- shared data fixtures (created through the API as admin) ---
+# --- organization fixtures ---
 
 @pytest.fixture()
-def property_id(client, admin_headers):
+def org_a(db_session):
+    org = Organization(name="Org-A", display_name="Pasay Org A")
+    db_session.add(org)
+    db_session.flush()
+    admin_user = db_session.query(User).filter(User.username == "admin").first()
+    if admin_user is not None:
+        db_session.add(Membership(
+            organization_id=org.id,
+            user_id=admin_user.id,
+            role=OrganizationRole.OWNER,
+            state=MembershipState.ACTIVE,
+        ))
+    manager_user = db_session.query(User).filter(User.username == "manager").first()
+    if manager_user is not None:
+        db_session.add(Membership(
+            organization_id=org.id,
+            user_id=manager_user.id,
+            role=OrganizationRole.SECRETARY,
+            state=MembershipState.ACTIVE,
+        ))
+    agent_user = db_session.query(User).filter(User.username == "agent").first()
+    if agent_user is not None:
+        db_session.add(Membership(
+            organization_id=org.id,
+            user_id=agent_user.id,
+            role=OrganizationRole.SECRETARY,
+            state=MembershipState.ACTIVE,
+        ))
+    db_session.commit()
+    db_session.refresh(org)
+    return org
+
+
+@pytest.fixture()
+def org_b(db_session):
+    org = Organization(name="Org-B", display_name="Pasay Org B")
+    db_session.add(org)
+    db_session.commit()
+    db_session.refresh(org)
+    return org
+
+
+@pytest.fixture()
+def owner_a(db_session, org_a):
+    user, api_key = make_user(db_session, "owner_a", UserRole.admin)
+    membership = Membership(
+        organization_id=org_a.id,
+        user_id=user.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    )
+    db_session.add(membership)
+    db_session.commit()
+    db_session.refresh(membership)
+    return user, api_key, membership
+
+
+@pytest.fixture()
+def secretary_a(db_session, org_a):
+    user, api_key = make_user(db_session, "secretary_a", UserRole.manager)
+    membership = Membership(
+        organization_id=org_a.id,
+        user_id=user.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+    )
+    db_session.add(membership)
+    db_session.commit()
+    db_session.refresh(membership)
+    return user, api_key, membership
+
+
+@pytest.fixture()
+def owner_b(db_session, org_b):
+    user, api_key = make_user(db_session, "owner_b", UserRole.admin)
+    membership = Membership(
+        organization_id=org_b.id,
+        user_id=user.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    )
+    db_session.add(membership)
+    db_session.commit()
+    db_session.refresh(membership)
+    return user, api_key, membership
+
+
+# --- shared data fixtures (created through the API as Org Owner) ---
+
+@pytest.fixture()
+def property_id(client, owner_a, org_a):
     resp = client.post(
         "/api/v1/properties",
-        json={"name": "Sunset Tower", "address": "1 Roxas Blvd", "city": "Pasay", "total_units": 4},
-        headers=admin_headers,
+        json={
+            "name": "Sunset Tower",
+            "address": "1 Roxas Blvd",
+            "city": "Pasay",
+            "total_units": 4,
+            "organization_id": org_a.id,
+        },
+        headers=_headers(owner_a[1]),
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
 
 
 @pytest.fixture()
-def unit_id(client, admin_headers, property_id):
+def unit_id(client, owner_a, property_id):
     resp = client.post(
         "/api/v1/units",
         json={
@@ -210,25 +307,30 @@ def unit_id(client, admin_headers, property_id):
             "monthly_rent": "12000.00",
             "status": "vacant",
         },
-        headers=admin_headers,
+        headers=_headers(owner_a[1]),
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
 
 
 @pytest.fixture()
-def tenant_id(client, admin_headers):
+def tenant_id(client, owner_a, org_a):
     resp = client.post(
         "/api/v1/tenants",
-        json={"full_name": "Juan Dela Cruz", "phone": "+639170000000", "email": "juan@example.com"},
-        headers=admin_headers,
+        json={
+            "full_name": "Juan Dela Cruz",
+            "phone": "+639170000000",
+            "email": "juan@example.com",
+            "organization_id": org_a.id,
+        },
+        headers=_headers(owner_a[1]),
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
 
 
 @pytest.fixture()
-def lease_id(client, admin_headers, unit_id, tenant_id):
+def lease_id(client, owner_a, unit_id, tenant_id):
     resp = client.post(
         "/api/v1/leases",
         json={
@@ -240,7 +342,7 @@ def lease_id(client, admin_headers, unit_id, tenant_id):
             "deposit": "24000.00",
             "status": "active",
         },
-        headers=admin_headers,
+        headers=_headers(owner_a[1]),
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]

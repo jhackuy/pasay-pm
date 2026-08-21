@@ -18,8 +18,8 @@ class Property(AuditMixin, SoftDeleteMixin, Base):
         ),
     )
 
-    organization_id: Mapped[int | None] = mapped_column(
-        BigInteger, ForeignKey("organizations.id"), nullable=True, index=True
+    organization_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("organizations.id"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     address: Mapped[str] = mapped_column(String(500), nullable=False)
