@@ -8,12 +8,20 @@ Mirror pattern of test_expense_003b_payment_truth.py (E1..E6):
   R4 — idempotency key dedupe: 30 replays → single claim, single verified amount
   R5 — over-claim mismatch FAILED, never auto-paid (aggregate unchanged)
   R6 — failed claim never touches aggregate
-  R7 — reversed verified claim reopens aggregate + reopens COMPLETED task
+  R7 — reversed verified claim reopens aggregate + reopens COMPLETED task +
+       legacy Income projection NO LONGER confirmed (amount/status/confirmed_*
+       reflect zero verified truth).
   R8 — cross-org: owner_b cannot claim/verify against org_a's lease (404/409)
   R9 — period detail endpoint mirrors snapshot truth
+  R10 — natural-month bucket lookup: 28/29/30/31 end-of-month dates correctly
+        stay inside the same period bucket (anti-truncation 28-day bug)
 """
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
+from decimal import Decimal
+
+from app.models.financial import Income, IncomeStatus
 from app.models.operations import (
     OperationalTask,
     OperationalTaskPriority,
@@ -245,7 +253,9 @@ def test_r6_failed_claim_no_effect(
     assert truth["failed_claim_count"] == 1
 
 
-# R7: reversed verified claim reopens aggregate + reopens COMPLETED task
+# R7: reversed verified claim reopens aggregate + reopens COMPLETED task +
+# legacy Income projection NO LONGER confirmed (amount=0 / status=pending /
+# confirmed_by=None / confirmed_at=None)
 def test_r7_reversed_claim_reopens(
     client, owner_a, org_a, property_id, unit_id, lease_id, db_session
 ):
@@ -259,14 +269,39 @@ def test_r7_reversed_claim_reopens(
     assert _get_task_status_db(db_session, t.id) == OperationalTaskStatus.COMPLETED
     truth1 = _period_detail(client, headers, lease_id)["truth"]
     assert truth1["fully_paid"] is True
+    # After verify → Income projection must be fully confirmed (truth mirror).
+    # We use exact same period bucket as `_ensure_income_matches_truth`:
+    # received_date in [2026-03-01, 2026-04-01) on same lease_id.
+    bucket_before = (
+        db_session.query(Income)
+        .filter(
+            Income.lease_id == lease_id,
+            Income.received_date >= date(2026, 3, 1),
+            Income.received_date < date(2026, 4, 1),
+        )
+        .order_by(Income.id.asc())
+        .first()
+    )
+    assert bucket_before is not None
+    assert bucket_before.status == IncomeStatus.confirmed
+    assert bucket_before.amount == Decimal("12000.00")
+    assert bucket_before.confirmed_by is not None
+    assert bucket_before.confirmed_at is not None
     # Now reverse (bounced check / clawback)
     _reverse(client, headers, c["id"])
     truth2 = _period_detail(client, headers, lease_id)["truth"]
     assert truth2["verified_paid"] == "0.00"
     assert truth2["fully_paid"] is False
     assert truth2["reversed_claim_count"] == 1
-    # COMPLETED task should be reopened to PENDING
+    # FIX1 — Income projection MUST reflect zero verified truth:
+    # amount=0, status=pending, confirmed_by/confirmed_at cleared.
     db_session.commit()
+    db_session.refresh(bucket_before)
+    assert bucket_before.status == IncomeStatus.pending
+    assert bucket_before.amount == Decimal("0.00")
+    assert bucket_before.confirmed_by is None
+    assert bucket_before.confirmed_at is None
+    # COMPLETED task should be reopened to PENDING
     status_after = _get_task_status_db(db_session, t.id)
     assert status_after in (
         OperationalTaskStatus.PENDING,
@@ -317,3 +352,116 @@ def test_r9_period_detail_snapshot(
     assert truth["pending_claim_count"] == 1
     assert truth["verified_claim_count"] == 1
     assert len(d["claims"]) == 2
+
+
+# ---- R10: natural-month Income period bucket anti-truncation --------------
+# The FIX1 bug was: old code used received_date < replace(day=28) for every
+# non-December month, so any legacy Income row on 28/29/30/31 was missed and
+# the truth projection built a NEW bucket while the old row remained stale
+# (and appeared as "unaccounted income" in ledgers).
+# We write a helper that seeds a legacy Income bucket with received_date at
+# the LAST calendar day of four representative months, then run a verify so
+# projection walks.  If the 28-day bug is present, the query will not locate
+# these rows and will create a second bucket.  We assert that exactly 1
+# bucket exists per period and that its (confirmed/amount) fields reflect the
+# new truth (so the lookup genuinely covered the end-of-month date).
+
+def _seed_bucket_and_verify(db_session, client, headers, lease_id, period,
+                           last_day_date: date):
+    """Create a legacy Income bucket at the tail of the month and then
+    run a rent verify so projection must walk it.
+    Returns the bucket count before + after, plus the bucket object.
+    """
+    # 1. Seed legacy Income (mimics a manual old entry created on the LAST
+    # day of the month that previously would have been excluded by
+    # replace(day=28) for 30-day months, leap-day FEB, 31-day months, etc.).
+    pre = Income(
+        lease_id=lease_id,
+        amount=Decimal("999.99"),  # placeholder that SHOULD be overwritten
+        received_date=last_day_date,
+        status=IncomeStatus.pending,
+        created_by=1,
+        updated_by=1,
+    )
+    db_session.add(pre)
+    db_session.flush()
+    pre_id = pre.id
+    db_session.commit()
+    # 2. Claim + verify full rent
+    c = _claim(client, headers, lease_id, period, "12000.00")
+    _verify(client, headers, c["id"])
+    db_session.commit()
+    # 3. Count all Income rows for this lease + natural month.
+    year_month = (last_day_date.year, last_day_date.month)
+    if year_month[1] == 12:
+        end_excl = date(year_month[0] + 1, 1, 1)
+    else:
+        end_excl = date(year_month[0], year_month[1] + 1, 1)
+    start_inc = date(year_month[0], year_month[1], 1)
+    rows = (
+        db_session.query(Income)
+        .filter(
+            Income.lease_id == lease_id,
+            Income.received_date >= start_inc,
+            Income.received_date < end_excl,
+        )
+        .order_by(Income.id.asc())
+        .all()
+    )
+    return pre_id, rows
+
+
+def test_r10_period_bucket_feb28_non_leap(
+    client, owner_a, org_a, property_id, unit_id, lease_id, db_session
+):
+    """FEB non-leap: last natural day = 28 (was included even by old bug,
+    but check anyway for symmetry)."""
+    headers = {"Authorization": f"Bearer {owner_a[1]}"}
+    period = "2025-02"
+    pre_id, rows = _seed_bucket_and_verify(db_session, client, headers, lease_id, period, date(2025, 2, 28))
+    # Old bug (<28) would EXCLUDE Feb 28.  FIX1 uses <Mar 1, so included.
+    assert len(rows) == 1, f"expected 1 bucket (old bug would have 2), got ids={[r.id for r in rows]}"
+    assert rows[0].id == pre_id
+    assert rows[0].status == IncomeStatus.confirmed
+    assert rows[0].amount == Decimal("12000.00")
+    assert rows[0].confirmed_by is not None
+    assert rows[0].confirmed_at is not None
+
+
+def test_r10_period_bucket_feb29_leap(
+    client, owner_a, org_a, property_id, unit_id, lease_id, db_session
+):
+    """FEB leap: last natural day = 29.  Old bug (<28) would EXCLUDE it."""
+    headers = {"Authorization": f"Bearer {owner_a[1]}"}
+    period = "2024-02"
+    pre_id, rows = _seed_bucket_and_verify(db_session, client, headers, lease_id, period, date(2024, 2, 29))
+    assert len(rows) == 1, f"expected 1 bucket (old bug would have 2), got ids={[r.id for r in rows]}"
+    assert rows[0].id == pre_id
+    assert rows[0].status == IncomeStatus.confirmed
+    assert rows[0].amount == Decimal("12000.00")
+
+
+def test_r10_period_bucket_apr30(
+    client, owner_a, org_a, property_id, unit_id, lease_id, db_session
+):
+    """APR: last natural day = 30.  Old bug (<28) would EXCLUDE it."""
+    headers = {"Authorization": f"Bearer {owner_a[1]}"}
+    period = "2026-04"
+    pre_id, rows = _seed_bucket_and_verify(db_session, client, headers, lease_id, period, date(2026, 4, 30))
+    assert len(rows) == 1, f"expected 1 bucket (old bug would have 2), got ids={[r.id for r in rows]}"
+    assert rows[0].id == pre_id
+    assert rows[0].status == IncomeStatus.confirmed
+    assert rows[0].amount == Decimal("12000.00")
+
+
+def test_r10_period_bucket_mar31(
+    client, owner_a, org_a, property_id, unit_id, lease_id, db_session
+):
+    """MAR: last natural day = 31.  Old bug (<28) would EXCLUDE it."""
+    headers = {"Authorization": f"Bearer {owner_a[1]}"}
+    period = "2026-03"
+    pre_id, rows = _seed_bucket_and_verify(db_session, client, headers, lease_id, period, date(2026, 3, 31))
+    assert len(rows) == 1, f"expected 1 bucket (old bug would have 2), got ids={[r.id for r in rows]}"
+    assert rows[0].id == pre_id
+    assert rows[0].status == IncomeStatus.confirmed
+    assert rows[0].amount == Decimal("12000.00")

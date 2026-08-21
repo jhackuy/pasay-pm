@@ -502,14 +502,22 @@ def _ensure_income_matches_truth(
         int(period[:4]), int(period[5:7]), 1, tzinfo=timezone.utc
     ).date()
     # Locate the existing Income row(s) for this lease and period.
+    # FIX1 — Correct natural-month boundary (prev: day=28 truncation which
+    # missed the 29/30/31 tail). Always compute end_of_month date:
+    #   period_next = (start + 32 days).replace(day=1)
+    #   end_inclusive_lower_bound_exclusive = period_next
+    _year = period_date_start.year
+    _month = period_date_start.month
+    if _month == 12:
+        period_date_end_excl = date(_year + 1, 1, 1)
+    else:
+        period_date_end_excl = date(_year, _month + 1, 1)
     existing = (
         db.query(Income)
         .filter(
             Income.lease_id == lease.id,
             Income.received_date >= period_date_start,
-            Income.received_date < (
-                period_date_start.replace(day=28) if period_date_start.month != 12 else period_date_start.replace(day=31)
-            ),
+            Income.received_date < period_date_end_excl,
         )
         .order_by(Income.id.asc())
         .all()
@@ -523,41 +531,77 @@ def _ensure_income_matches_truth(
             bucket = inc
         else:
             continue
-    target_status = IncomeStatus.confirmed if truth.verified_paid_total > 0 else (
-        bucket.status if bucket else IncomeStatus.pending
-    )
-    target_amount = truth.required_amount if truth.is_fully_paid else truth.verified_paid_total
-    if target_amount <= 0:
-        target_amount = truth.verified_paid_total or None
-    if bucket is None and target_amount is None:
+    # FIX1 — Strict truth reflection:
+    #   verified_paid_total == 0 → Income status = pending (NOT confirmed)
+    #                            → amount = 0
+    #                            → confirmed_by = confirmed_at = None
+    #   verified_paid_total in (0, required) → status = confirmed,
+    #                            amount = verified_paid_total
+    #   verified_paid_total >= required → status = confirmed,
+    #                            amount = required (cap)
+    target_status: IncomeStatus
+    target_amount: Decimal
+    if truth.verified_paid_total <= 0:
+        target_status = IncomeStatus.pending
+        target_amount = Decimal(0)
+    elif truth.is_fully_paid:
+        target_status = IncomeStatus.confirmed
+        target_amount = truth.required_amount
+    else:
+        target_status = IncomeStatus.confirmed
+        target_amount = truth.verified_paid_total
+    if bucket is None and truth.verified_paid_total <= 0:
+        # No projection needed when there is nothing paid and no legacy bucket.
         return
     if bucket is None:
         bucket = Income(
             lease_id=lease.id,
-            amount=target_amount or Decimal(0),
+            amount=target_amount,
             received_date=period_date_start,
             status=target_status,
             created_by=actor_id,
             updated_by=actor_id,
         )
+        if target_status == IncomeStatus.confirmed:
+            bucket.confirmed_by = actor_id
+            bucket.confirmed_at = now
         db.add(bucket)
         db.flush()
     else:
         changed = {}
         if bucket.amount != target_amount:
             changed["amount"] = [str(bucket.amount), str(target_amount)]
-            bucket.amount = target_amount or Decimal(0)
+            bucket.amount = target_amount
         if bucket.status != target_status:
             changed["status"] = [bucket.status.value, target_status.value]
             bucket.status = target_status
-        if target_status == IncomeStatus.confirmed and bucket.confirmed_at is None:
-            bucket.confirmed_by = actor_id
-            bucket.confirmed_at = now
-            changed["confirmed_at"] = [None, now.isoformat()]
-        elif target_status != IncomeStatus.confirmed and bucket.confirmed_at is not None:
-            bucket.confirmed_by = None
-            bucket.confirmed_at = None
-            changed["confirmed_at"] = [bucket.confirmed_at.isoformat() if bucket.confirmed_at else None, None]
+        # FIX1 — confirmed_by/confirmed_at always align with target_status:
+        # never keep confirmed_* populated when target_status is not confirmed.
+        if target_status == IncomeStatus.confirmed:
+            if bucket.confirmed_at is None:
+                bucket.confirmed_by = actor_id
+                bucket.confirmed_at = now
+                changed["confirmed_at"] = [None, now.isoformat()]
+                changed["confirmed_by"] = [None, str(actor_id)]
+            else:
+                # Still update actor_id/date if the entry was stale, but only
+                # audit if they actually changed.
+                if bucket.confirmed_by != actor_id:
+                    old = None if bucket.confirmed_by is None else str(bucket.confirmed_by)
+                    bucket.confirmed_by = actor_id
+                    changed["confirmed_by"] = [old, str(actor_id)]
+        else:  # target is PENDING (verified_paid == 0) → must NOT be confirmed
+            if bucket.confirmed_at is not None or bucket.confirmed_by is not None:
+                changed["confirmed_at"] = [
+                    bucket.confirmed_at.isoformat() if bucket.confirmed_at else None,
+                    None,
+                ]
+                changed["confirmed_by"] = [
+                    None if bucket.confirmed_by is None else str(bucket.confirmed_by),
+                    None,
+                ]
+                bucket.confirmed_by = None
+                bucket.confirmed_at = None
         bucket.updated_by = actor_id
         bucket.updated_at = now
         if changed:
