@@ -1,45 +1,57 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, manager_or_admin
+from app.api.deps import get_current_user
 from app.database import get_db
+from app.models.membership import OrganizationRole
 from app.models.property import Property
+from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.property import PropertyCreate, PropertyRead, PropertyUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.property_channel import (
+    OwnerRequired,
+    ScopeBlocked,
+    filter_secretary_property_updates,
+    resolve_org_membership,
+    scoped_get_property,
+    scoped_list_properties,
+)
 
 router = APIRouter(prefix="/properties", tags=["properties"])
 
 
-def _get_or_404(db: Session, property_id: int) -> Property:
-    obj = (
-        db.query(Property)
-        .filter(Property.id == property_id, Property.deleted_at.is_(None))
-        .first()
-    )
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
-    return obj
+def _scope_exception_to_http(exc: Exception) -> HTTPException:
+    if isinstance(exc, LookupError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(exc, (ScopeBlocked, OwnerRequired)):
+        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
+    return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, type(exc).__name__)
 
 
 @router.get("", response_model=list[PropertyRead])
 def list_properties(
-    db: Session = Depends(get_db), _: Property = Depends(get_current_user)
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    return (
-        db.query(Property)
-        .filter(Property.deleted_at.is_(None))
-        .order_by(Property.id)
-        .all()
-    )
+    try:
+        return scoped_list_properties(db, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
 
 
 @router.post("", response_model=PropertyRead, status_code=status.HTTP_201_CREATED)
 def create_property(
     payload: PropertyCreate,
     db: Session = Depends(get_db),
-    user: Property = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
+    try:
+        resolve_org_membership(
+            db, user.id, payload.organization_id, role=OrganizationRole.OWNER,
+        )
+    except ScopeBlocked as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+
     obj = Property(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -62,9 +74,13 @@ def create_property(
 def get_property(
     property_id: int,
     db: Session = Depends(get_db),
-    _: Property = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    return _get_or_404(db, property_id)
+    try:
+        prop, _membership = scoped_get_property(db, property_id, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
+    return prop
 
 
 @router.patch("/{property_id}", response_model=PropertyRead)
@@ -72,12 +88,23 @@ def update_property(
     property_id: int,
     payload: PropertyUpdate,
     db: Session = Depends(get_db),
-    user: Property = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, property_id)
+    try:
+        obj, membership = scoped_get_property(db, property_id, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
+
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
+
+    try:
+        if membership.role != OrganizationRole.OWNER.value:
+            filter_secretary_property_updates(set(updates.keys()))
+    except OwnerRequired as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+
     old = serialize_row(obj)
     changed = field_changes(obj, updates)
     for field, value in updates.items():
@@ -102,9 +129,17 @@ def update_property(
 def delete_property(
     property_id: int,
     db: Session = Depends(get_db),
-    user: Property = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, property_id)
+    try:
+        obj, membership = scoped_get_property(db, property_id, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
+    if membership.role != OrganizationRole.OWNER.value:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only ACTIVE OWNER may soft-delete a Property",
+        )
     from datetime import datetime, timezone
 
     obj.deleted_at = datetime.now(timezone.utc)

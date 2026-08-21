@@ -1,3 +1,4 @@
+from datetime import datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, Field
@@ -12,7 +13,6 @@ class PropertyBase(BaseModel):
     city: str = Field(min_length=1, max_length=100)
     total_units: int = Field(default=0, ge=0)
     is_active: bool = True
-    # PASAY-AI-EMPLOYEE-FOUNDATION-007 §5: management contact + output.
     management_company: str | None = Field(default=None, max_length=200)
     management_office_phone: str | None = Field(default=None, max_length=50)
     management_contact_person: str | None = Field(default=None, max_length=200)
@@ -22,7 +22,7 @@ class PropertyBase(BaseModel):
 
 
 class PropertyCreate(PropertyBase):
-    pass
+    organization_id: int = Field(gt=0)
 
 
 class PropertyUpdate(BaseModel):
@@ -41,6 +41,7 @@ class PropertyUpdate(BaseModel):
 
 class PropertyRead(PropertyBase, AuditFields):
     id: int
+    organization_id: int | None
 
 
 class UnitBase(BaseModel):
@@ -51,9 +52,6 @@ class UnitBase(BaseModel):
     monthly_rent: Decimal = money_field(gt=0)
     status: UnitStatus = UnitStatus.vacant
     is_active: bool = True
-    # AI-OPS-FOUNDATION-001 §16: richer lifecycle state
-    # (VACANT/PREPARING/LISTED/VIEWING/RESERVED/OCCUPIED/NOTICE_GIVEN/
-    # MOVE_OUT/INSPECTION) — stored as VARCHAR, legacy enum untouched.
     unit_state: str | None = Field(default=None, max_length=30)
 
 
@@ -73,3 +71,30 @@ class UnitUpdate(BaseModel):
 
 class UnitRead(UnitBase, AuditFields):
     id: int
+
+
+# --- Issue #25 §4: Unit ↔ Channel minimal binding schemas ------------------
+
+class UnitChannelBindingBase(BaseModel):
+    unit_id: int = Field(gt=0)
+    purpose: str = Field(min_length=1, max_length=30)
+    channel_chat_id: int
+    thread_topic_id: int | None = None
+    notes: str | None = Field(default=None, max_length=500)
+
+
+class UnitChannelBindingCreate(UnitChannelBindingBase):
+    pass
+
+
+class UnitChannelBindingRead(AuditFields):
+    id: int
+    organization_id: int
+    unit_id: int
+    purpose: str
+    channel_chat_id: int | None
+    thread_topic_id: int | None
+    status: str
+    revoked_at: datetime | None = None
+    revoked_by_membership_id: int | None = None
+    notes: str | None

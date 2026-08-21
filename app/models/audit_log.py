@@ -99,6 +99,11 @@ class AuditAction(str, Enum):
     secretary_invite_accepted = "secretary_invite_accepted"
     secretary_invite_cancelled = "secretary_invite_cancelled"
     secretary_removed = "secretary_removed"
+    # PASAY-TASK-007 (Issue #25, appended only; never rename or reorder prior
+    # values): Unit ↔ Channel minimal binding lifecycle audit actions.
+    unit_channel_bound = "unit_channel_bound"
+    unit_channel_replaced = "unit_channel_replaced"
+    unit_channel_revoked = "unit_channel_revoked"
 
 
 class AuditLog(AuditMixin, Base):

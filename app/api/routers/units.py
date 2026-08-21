@@ -1,37 +1,74 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, manager_or_admin
+from app.api.deps import get_current_user
 from app.database import get_db
+from app.models.membership import OrganizationRole
 from app.models.property import Property, Unit
+from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.property import UnitCreate, UnitRead, UnitUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.property_channel import (
+    OwnerRequired,
+    ScopeBlocked,
+    filter_secretary_unit_updates,
+    property_org_id,
+    resolve_org_membership,
+    scoped_get_unit,
+)
 
 router = APIRouter(prefix="/units", tags=["units"])
 
 
-def _get_or_404(db: Session, unit_id: int) -> Unit:
-    obj = db.query(Unit).filter(Unit.id == unit_id, Unit.deleted_at.is_(None)).first()
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
-    return obj
+def _scope_exception_to_http(exc: Exception) -> HTTPException:
+    if isinstance(exc, LookupError):
+        return HTTPException(status.HTTP_404_NOT_FOUND, str(exc))
+    if isinstance(exc, (ScopeBlocked, OwnerRequired)):
+        return HTTPException(status.HTTP_403_FORBIDDEN, str(exc))
+    return HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, type(exc).__name__)
 
 
 @router.get("", response_model=list[UnitRead])
-def list_units(db: Session = Depends(get_db), _: Unit = Depends(get_current_user)):
-    return db.query(Unit).filter(Unit.deleted_at.is_(None)).order_by(Unit.id).all()
+def list_units(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    from app.services.property_channel import scoped_list_properties
+
+    props = scoped_list_properties(db, for_user_id=user.id)
+    if not props:
+        return []
+    prop_ids = [p.id for p in props]
+    return (
+        db.query(Unit)
+        .filter(Unit.property_id.in_(prop_ids), Unit.deleted_at.is_(None))
+        .order_by(Unit.id)
+        .all()
+    )
 
 
 @router.post("", response_model=UnitRead, status_code=status.HTTP_201_CREATED)
 def create_unit(
     payload: UnitCreate,
     db: Session = Depends(get_db),
-    user: Unit = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    prop = db.query(Property).filter(Property.id == payload.property_id).first()
+    org_id = property_org_id(db, payload.property_id)
+    if org_id is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found or has no organization")
+    try:
+        resolve_org_membership(db, user.id, org_id, role=OrganizationRole.OWNER)
+    except ScopeBlocked as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+
+    prop = db.query(Property).filter(
+        Property.id == payload.property_id, Property.deleted_at.is_(None)
+    ).first()
     if prop is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+
     obj = Unit(**payload.model_dump())
     obj.created_by = user.id
     obj.updated_by = user.id
@@ -52,9 +89,13 @@ def create_unit(
 
 @router.get("/{unit_id}", response_model=UnitRead)
 def get_unit(
-    unit_id: int, db: Session = Depends(get_db), _: Unit = Depends(get_current_user)
+    unit_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    return _get_or_404(db, unit_id)
+    try:
+        unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
+    return unit
 
 
 @router.patch("/{unit_id}", response_model=UnitRead)
@@ -62,23 +103,28 @@ def update_unit(
     unit_id: int,
     payload: UnitUpdate,
     db: Session = Depends(get_db),
-    user: Unit = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, unit_id)
+    try:
+        obj, membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
+
     updates = payload.model_dump(exclude_unset=True)
-    if updates.get("property_id") is not None:
-        prop = db.query(Property).filter(Property.id == updates["property_id"]).first()
-        if prop is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
     if not updates:
         return obj
+
+    try:
+        if membership.role != OrganizationRole.OWNER.value:
+            filter_secretary_unit_updates(set(updates.keys()))
+    except OwnerRequired as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+
     old = serialize_row(obj)
     changed = field_changes(obj, updates)
     for field, value in updates.items():
         setattr(obj, field, value)
     obj.updated_by = user.id
-    # AI-OPS-FOUNDATION-001 §16: every lifecycle transition (status or
-    # unit_state change) is recorded as a durable unit event.
     _record_lifecycle(db, obj, old, updates, user.id)
     record_audit(
         db,
@@ -96,13 +142,11 @@ def update_unit(
 
 
 def _record_lifecycle(db: Session, obj: Unit, old: dict, updates: dict, actor_id: int) -> None:
-    """Append a unit_lifecycle_event when status/unit_state actually changed."""
-    from datetime import datetime, timezone
-
     from app.models.property import UnitLifecycleEvent
 
     state_old = old.get("unit_state") or old.get("status")
-    state_new = updates.get("unit_state") or (updates.get("status").value if updates.get("status") else None)
+    _status_upd = updates.get("status")
+    state_new = updates.get("unit_state") or (_status_upd.value if _status_upd else None)
     if state_old == state_new or state_new is None:
         return
     event = UnitLifecycleEvent(
@@ -122,11 +166,17 @@ def _record_lifecycle(db: Session, obj: Unit, old: dict, updates: dict, actor_id
 def delete_unit(
     unit_id: int,
     db: Session = Depends(get_db),
-    user: Unit = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, unit_id)
-    from datetime import datetime, timezone
-
+    try:
+        obj, membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
+    except Exception as exc:  # noqa: BLE001
+        raise _scope_exception_to_http(exc) from exc
+    if membership.role != OrganizationRole.OWNER.value:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only ACTIVE OWNER may soft-delete a Unit",
+        )
     obj.deleted_at = datetime.now(timezone.utc)
     obj.updated_by = user.id
     record_audit(
