@@ -7,14 +7,13 @@ reject->resubmit preserves V1, critical change invalidates approval, evidence
 binds to a claim, reversed payment recomputes remaining, and a Repair-linked
 Expense being PAID does NOT close the Repair.
 """
-from datetime import date, timedelta
 from decimal import Decimal
 
 API = "/api/v1"
 
 
-def _exp(amount="28000.00", status="pending", category="维修", payee="Fix-It Co"):
-    return {
+def _exp(amount="28000.00", status="pending", category="维修", payee="Fix-It Co", *, property_id=None):
+    payload = {
         "expense_date": "2026-08-01",
         "category": category,
         "amount": amount,
@@ -22,10 +21,13 @@ def _exp(amount="28000.00", status="pending", category="维修", payee="Fix-It C
         "description": "aircon repair",
         "status": status,
     }
+    if property_id is not None:
+        payload["property_id"] = property_id
+    return payload
 
 
-def mk_approved(client, headers, amount="28000.00"):
-    e = client.post(f"{API}/expenses", json=_exp(amount), headers=headers)
+def mk_approved(client, headers, amount="28000.00", *, property_id=None):
+    e = client.post(f"{API}/expenses", json=_exp(amount, property_id=property_id), headers=headers)
     assert e.status_code == 201, e.text
     eid = e.json()["id"]
     r = client.post(f"{API}/expenses/{eid}/approve", headers=headers)
@@ -47,8 +49,8 @@ def detail(client, headers, eid):
 
 
 # E1 — approve != paid
-def test_e1_approve_not_paid(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e1_approve_not_paid(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     d = detail(client, admin_headers, eid)
     assert d["status"] == "approved"
     assert d["payment"]["verified_paid"] == "0.00"
@@ -57,8 +59,8 @@ def test_e1_approve_not_paid(client, admin_headers):
 
 
 # E2 — pending claim != paid
-def test_e2_pending_claim_not_paid(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e2_pending_claim_not_paid(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     claim(client, admin_headers, eid, "10000.00")
     d = detail(client, admin_headers, eid)
     assert d["status"] == "payment_claimed"  # awaiting verification, NEVER paid
@@ -69,8 +71,8 @@ def test_e2_pending_claim_not_paid(client, admin_headers):
 
 
 # E3 — verified 10k -> partial, remaining 18k
-def test_e3_verified_10k_partial(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e3_verified_10k_partial(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c = claim(client, admin_headers, eid, "10000.00")
     r = client.post(f"{API}/expenses/{eid}/claims/{c['id']}/verify",
                     json={"result": "ok"}, headers=admin_headers)
@@ -83,8 +85,8 @@ def test_e3_verified_10k_partial(client, admin_headers):
 
 
 # E4 — verified second 18k -> fully paid
-def test_e4_verified_second_full_paid(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e4_verified_second_full_paid(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c1 = claim(client, admin_headers, eid, "10000.00")
     client.post(f"{API}/expenses/{eid}/claims/{c1['id']}/verify", json={}, headers=admin_headers)
     c2 = claim(client, admin_headers, eid, "18000.00")
@@ -99,8 +101,8 @@ def test_e4_verified_second_full_paid(client, admin_headers):
 
 
 # E5 — duplicate 10k claim replay does not double count (30 replays)
-def test_e5_duplicate_claim_does_not_double_count(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e5_duplicate_claim_does_not_double_count(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     # Replay the SAME deterministic claim 30 times -> only one row, one verified.
     key = "ik-test-10k-replay"
     first = None
@@ -125,8 +127,8 @@ def test_e5_duplicate_claim_does_not_double_count(client, admin_headers):
 
 
 # E6 — over-claim mismatch preserved, never auto-paid/truncated
-def test_e6_overclaim_mismatch_preserved(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e6_overclaim_mismatch_preserved(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c = claim(client, admin_headers, eid, "20000.00")  # > 18k remaining? no: approved full, remaining 28k
     # Claim amount 20k is within 28k total -> fine. To force a mismatch, first
     # verify 10k (remaining 18k) then claim 20k -> admitted would exceed total.
@@ -148,8 +150,8 @@ def test_e6_overclaim_mismatch_preserved(client, admin_headers):
 
 
 # E7 — failed verification does not affect paid amount
-def test_e7_failed_verification_no_paid_effect(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e7_failed_verification_no_paid_effect(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c = claim(client, admin_headers, eid, "10000.00")
     r = client.post(f"{API}/expenses/{eid}/claims/{c['id']}/fail",
                     json={"reason": "no bank proof"}, headers=admin_headers)
@@ -161,8 +163,8 @@ def test_e7_failed_verification_no_paid_effect(client, admin_headers):
 
 
 # E8 — reject -> resubmit preserves V1 (V1 REJECTED + V2 PENDING)
-def test_e8_reject_resubmit_preserves_v1(client, admin_headers, manager_headers):
-    e = client.post(f"{API}/expenses", json=_exp(), headers=manager_headers)
+def test_e8_reject_resubmit_preserves_v1(client, admin_headers, manager_headers, property_id):
+    e = client.post(f"{API}/expenses", json=_exp(property_id=property_id), headers=manager_headers)
     eid = e.json()["id"]
     r = client.post(f"{API}/expenses/{eid}/reject",
                     json={"reason": "need cheaper option"}, headers=admin_headers)
@@ -187,8 +189,8 @@ def test_e8_reject_resubmit_preserves_v1(client, admin_headers, manager_headers)
 
 
 # E9 — critical financial change invalidates old approval (reapproval)
-def test_e9_critical_change_requires_reapproval(client, admin_headers, manager_headers):
-    e = client.post(f"{API}/expenses", json=_exp(), headers=manager_headers)
+def test_e9_critical_change_requires_reapproval(client, admin_headers, manager_headers, property_id):
+    e = client.post(f"{API}/expenses", json=_exp(property_id=property_id), headers=manager_headers)
     eid = e.json()["id"]
     r = client.post(f"{API}/expenses/{eid}/approve", headers=admin_headers)
     assert r.status_code == 200 and r.json()["status"] == "approved", r.text
@@ -206,8 +208,8 @@ def test_e9_critical_change_requires_reapproval(client, admin_headers, manager_h
 
 
 # E10 — evidence belongs to a specific claim
-def test_e10_evidence_belongs_to_claim(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e10_evidence_belongs_to_claim(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c1 = claim(client, admin_headers, eid, "10000.00")
     c2 = claim(client, admin_headers, eid, "18000.00")
     # Attach evidence ids to c1 only (via proof id fields absent -> not tested here fully;
@@ -226,8 +228,8 @@ def test_e10_evidence_belongs_to_claim(client, admin_headers):
 
 
 # E13 — payment reversal recomputes remaining
-def test_e13_reversal_recomputes_remaining(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e13_reversal_recomputes_remaining(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c1 = claim(client, admin_headers, eid, "10000.00")
     client.post(f"{API}/expenses/{eid}/claims/{c1['id']}/verify", json={}, headers=admin_headers)
     c2 = claim(client, admin_headers, eid, "18000.00")
@@ -245,8 +247,8 @@ def test_e13_reversal_recomputes_remaining(client, admin_headers):
 
 
 # E15 — timeline contains full truth history
-def test_e15_timeline_full_history(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e15_timeline_full_history(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c1 = claim(client, admin_headers, eid, "10000.00")
     client.post(f"{API}/expenses/{eid}/claims/{c1['id']}/verify", json={}, headers=admin_headers)
     d = detail(client, admin_headers, eid)
@@ -259,8 +261,8 @@ def test_e15_timeline_full_history(client, admin_headers):
 
 
 # E17 — Mini App totals match backend truth
-def test_e17_mini_app_totals_match(client, admin_headers):
-    eid = mk_approved(client, admin_headers)
+def test_e17_mini_app_totals_match(client, admin_headers, property_id):
+    eid = mk_approved(client, admin_headers, property_id=property_id)
     c1 = claim(client, admin_headers, eid, "10000.00")
     client.post(f"{API}/expenses/{eid}/claims/{c1['id']}/verify", json={}, headers=admin_headers)
     d = detail(client, admin_headers, eid)
