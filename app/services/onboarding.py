@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -42,7 +42,7 @@ from app.models.membership import (
     OrganizationRole,
     SecretaryInvite,
 )
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.onboarding import (
     MembershipRef,
     OnboardingStateResponse,
@@ -64,6 +64,11 @@ from app.services.membership import (
 HINT_OWNER_CHOOSE_ORG_NAME_ZH = "请输入要创建的公司/组织名称"
 HINT_SECRETARY_NO_INVITE_EN = "Ask your Owner to invite you to the workspace."
 HINT_SECRETARY_ACCEPT_EN = "You have a pending invite. Review the workspace and accept to join."
+
+
+def _is_owner_role(user: User) -> bool:
+    role = user.role.value if isinstance(user.role, UserRole) else str(user.role)
+    return role == UserRole.admin.value
 
 
 class BootstrapForbidden(PermissionError):
@@ -114,6 +119,7 @@ def get_onboarding_state(
     user: User,
     *,
     pending_invite_code: str | None = None,
+    now: datetime | None = None,
 ) -> OnboardingStateResponse:
     """Return the authoritative onboarding routing outcome for ``user``.
 
@@ -123,17 +129,18 @@ def get_onboarding_state(
     Order of precedence (first match wins):
       1. User has >= 1 ACTIVE membership -> EXISTING_MEMBER.
       2. A pending invite code is supplied and resolves to a PENDING invite
-         for a real Organization -> SECRETARY_VALID_INVITE_PENDING_ACCEPT.
-      3. Fallback decision (UI-level role-choice is still required but the
-         backend declares the allowed outcomes):
-         - For OWNER role (users.role == UserRole.admin) we mark the
-           Owner-branch semantics.
-         - For SECRETARY role (any non-admin human) we declare Secretary.
-
-    IMPORTANT: The frozen fact "Secretary = only invite join" is ENFORCED
-    in the action endpoints, not in this state read. The state read only
-    exposes hints.
+         that is NOT expired (expires_at > now) for a real Organization
+         -> SECRETARY_VALID_INVITE_PENDING_ACCEPT.
+         Expired PENDING invites are intentionally treated as invalid
+         (P0-2: must not leak organization name or valid-invite stage).
+      3. Fallback decision is bound to server-side ``users.role``:
+         - OWNER role (``UserRole.admin``): ``OWNER_BOOTSTRAP_REQUIRED``
+           with Owner Chinese hint only.
+         - SECRETARY role (any non-admin human): ``SECRETARY_NO_INVITE``
+           with Secretary English hint only.  **No Owner guidance is
+           leaked to an uninvited Secretary** (P0-1).
     """
+    now = now or datetime.now(timezone.utc)
     memberships = list_active_orgs_for_user(db, user.id)
 
     if memberships:
@@ -147,7 +154,12 @@ def get_onboarding_state(
 
     if pending_invite_code:
         invite = get_invite_by_code(db, pending_invite_code)
-        if invite is not None and invite.state == InviteState.PENDING:
+        if (
+            invite is not None
+            and invite.state == InviteState.PENDING
+            and invite.expires_at is not None
+            and invite.expires_at > now
+        ):
             org = db.get(Organization, invite.organization_id)
             return OnboardingStateResponse(
                 stage="SECRETARY_VALID_INVITE_PENDING_ACCEPT",
@@ -156,10 +168,16 @@ def get_onboarding_state(
                 invite_organization_name=org.name if org else None,
             )
 
+    if _is_owner_role(user):
+        return OnboardingStateResponse(
+            stage="OWNER_BOOTSTRAP_REQUIRED",
+            user_id=user.id,
+            owner_hint_zh=HINT_OWNER_CHOOSE_ORG_NAME_ZH,
+        )
+
     return OnboardingStateResponse(
-        stage="ROLE_CHOICE_REQUIRED",
+        stage="SECRETARY_NO_INVITE",
         user_id=user.id,
-        owner_hint_zh=HINT_OWNER_CHOOSE_ORG_NAME_ZH,
         secretary_hint_en=HINT_SECRETARY_NO_INVITE_EN,
     )
 
@@ -176,19 +194,31 @@ def owner_create_organization(
     now: datetime | None = None,
 ) -> OwnerBootstrapResponse:
     """Create an Organization for the calling user ONLY IF the caller has
-    ZERO active memberships anywhere.
+    ZERO active memberships anywhere AND carries the OWNER server-side role.
 
-    Guard (the whole point of this wrapper — Issue #24 Scope §2 and §4):
+    Guard (P0-1 + Issue #24 Scope §2 and §4):
+      - **Role gate first**: If the caller does NOT carry
+        ``UserRole.admin``, the call is rejected with ``BootstrapForbidden``
+        BEFORE any membership lookups or writes.  A "fresh Secretary"
+        (``UserRole.agent`` / ``UserRole.manager``) with zero memberships
+        and no invite MUST be denied — they can never become an OWNER
+        via this endpoint.
       - If the user already holds ANY active membership, the call is
-        rejected with BootstrapForbidden **before** we touch the
+        rejected with ``BootstrapForbidden`` **before** we touch the
         membership service. This guarantees that a Secretary (or a past
         Owner of a different org) can never use the Owner bootstrap
         endpoint as a back-door to fabricate a second Organization.
-      - If the underlying bootstrap_first_owner rejects with
-        BootstrapBlocked (different org name vs existing one-member org,
-        etc.) we translate the semantic exception into a BootstrapForbidden
+      - If the underlying ``bootstrap_first_owner`` rejects with
+        ``BootstrapBlocked`` (different org name vs existing one-member org,
+        etc.) we translate the semantic exception into a ``BootstrapForbidden``
         so the HTTP layer returns a stable 403.
     """
+    if not _is_owner_role(user):
+        raise BootstrapForbidden(
+            f"user_id={user.id!r} role={getattr(user.role, 'value', user.role)!r} "
+            "is not an OWNER-role user; Owner bootstrap endpoint only serves "
+            "UserRole.admin callers."
+        )
     existing = list_active_orgs_for_user(db, user.id)
     if existing:
         raise BootstrapForbidden(

@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.database import get_db
-from app.models.user import User
+from app.models.user import User, UserRole
 from app.schemas.onboarding import (
     OnboardingStateResponse,
     OwnerBootstrapRequest,
@@ -69,9 +69,16 @@ def owner_bootstrap(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> OwnerBootstrapResponse:
+    user_role = user.role.value if isinstance(user.role, UserRole) else str(user.role)
+    is_owner_role = user_role == UserRole.admin.value
     try:
         return owner_create_organization(db, user, payload.org_name)
     except BootstrapForbidden as exc:
+        if not is_owner_role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=MSG_SEC_403_NO_BOOTSTRAP_EN,
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=MSG_OWNER_403_ZH,

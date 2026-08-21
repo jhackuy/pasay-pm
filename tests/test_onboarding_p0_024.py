@@ -65,6 +65,8 @@ TEL_X = 1000000012
 @pytest.fixture()
 def owner_user(db_session):
     u, p = _make_user(db_session, "onboard_owner", uid=501)
+    u.role = UserRole.admin
+    db_session.flush()
     _bind(db_session, p, TEL_O)
     db_session.commit()
     db_session.refresh(u)
@@ -104,26 +106,55 @@ def _auth_headers(key):
 # ---------------------------------------------------------------------------
 
 class TestOnboardingStateService:
-    def test_t1_fresh_user_role_choice_contains_both_hints(self, db_session, fresh_user):
-        resp = get_onboarding_state(db_session, fresh_user)
-        assert resp.stage == "ROLE_CHOICE_REQUIRED"
+    def test_t1_fresh_secretary_no_invite_returns_secretary_no_invite_stage(self, db_session, fresh_user):
+        resp = get_onboarding_state(db_session, fresh_user, now=NOW)
+        assert resp.stage == "SECRETARY_NO_INVITE"
         assert resp.user_id == fresh_user.id
         assert resp.existing_organization is None
         assert resp.existing_membership is None
-        assert resp.owner_hint_zh == HINT_OWNER_CHOOSE_ORG_NAME_ZH
+        assert resp.owner_hint_zh is None
         assert resp.secretary_hint_en == HINT_SECRETARY_NO_INVITE_EN
+        assert resp.invite_organization_name is None
+
+    def test_t1_owner_admin_no_invite_returns_owner_bootstrap_required(self, db_session, owner_user):
+        resp = get_onboarding_state(db_session, owner_user, now=NOW)
+        assert resp.stage == "OWNER_BOOTSTRAP_REQUIRED"
+        assert resp.user_id == owner_user.id
+        assert resp.existing_organization is None
+        assert resp.existing_membership is None
+        assert resp.owner_hint_zh == HINT_OWNER_CHOOSE_ORG_NAME_ZH
+        assert resp.secretary_hint_en is None
+        assert resp.invite_organization_name is None
 
     def test_t12_secretary_hint_exact_literal_en(self, db_session, fresh_user):
-        resp = get_onboarding_state(db_session, fresh_user)
+        resp = get_onboarding_state(db_session, fresh_user, now=NOW)
+        assert resp.stage == "SECRETARY_NO_INVITE"
         assert resp.secretary_hint_en == "Ask your Owner to invite you to the workspace."
 
     def test_t11_pending_invite_in_state(self, db_session, owner_user, sec_user):
-        org, _ = bootstrap_first_owner(db_session, owner_user.id, "InviteOrg")
+        org, _ = bootstrap_first_owner(db_session, owner_user.id, "InviteOrg", now=NOW)
         invite = create_secretary_invite(db_session, owner_user.id, org.id, now=NOW)
-        resp = get_onboarding_state(db_session, sec_user, pending_invite_code=invite.code)
+        resp = get_onboarding_state(db_session, sec_user, pending_invite_code=invite.code, now=NOW)
         assert resp.stage == "SECRETARY_VALID_INVITE_PENDING_ACCEPT"
         assert resp.invite_organization_name == "InviteOrg"
         assert HINT_OWNER_CHOOSE_ORG_NAME_ZH not in (resp.owner_hint_zh or "")
+
+    # --- P0-2: expired PENDING invite must be invalid in /state, no org name leak ---
+    def test_p02_expired_pending_invite_in_state_is_invalid_no_org_leak(self, db_session, owner_user, sec_user):
+        org, _ = bootstrap_first_owner(db_session, owner_user.id, "LeakTestOrg", now=NOW)
+        invite = create_secretary_invite(
+            db_session, owner_user.id, org.id,
+            ttl=timedelta(days=7), now=NOW,
+        )
+        assert invite.state == InviteState.PENDING
+        stale_now = NOW + timedelta(days=30)
+        resp = get_onboarding_state(db_session, sec_user, pending_invite_code=invite.code, now=stale_now)
+        assert resp.stage != "SECRETARY_VALID_INVITE_PENDING_ACCEPT"
+        assert resp.stage == "SECRETARY_NO_INVITE"
+        assert resp.invite_organization_name is None
+        db_session.expire_all()
+        reloaded = get_invite_by_code(db_session, invite.code)
+        assert reloaded.state == InviteState.PENDING
 
 
 # ---------------------------------------------------------------------------
@@ -160,16 +191,33 @@ class TestOwnerBootstrapService:
 
 class TestBootstrapGuard:
     def test_t3_existing_owner_cannot_bootstrap_again(self, db_session, owner_user):
-        owner_create_organization(db_session, owner_user, "FirstOrg")
+        owner_create_organization(db_session, owner_user, "FirstOrg", now=NOW)
         with pytest.raises(BootstrapForbidden):
-            owner_create_organization(db_session, owner_user, "SecondOrg")
+            owner_create_organization(db_session, owner_user, "SecondOrg", now=NOW)
 
     def test_t9_secretary_who_joined_cannot_bootstrap_owner(self, db_session, owner_user, sec_user):
-        org, _ = bootstrap_first_owner(db_session, owner_user.id, "TargetOrg")
+        org, _ = bootstrap_first_owner(db_session, owner_user.id, "TargetOrg", now=NOW)
         inv = create_secretary_invite(db_session, owner_user.id, org.id, now=NOW)
         accept_secretary_invite(db_session, sec_user.id, inv.code, now=NOW)
         with pytest.raises(BootstrapForbidden):
-            owner_create_organization(db_session, sec_user, "SecCannotCreateThis")
+            owner_create_organization(db_session, sec_user, "SecCannotCreateThis", now=NOW)
+
+    # --- P0-1: fresh Secretary + 0 membership + no invite MUST be blocked ---
+    def test_p01_fresh_secretary_zero_membership_cannot_call_owner_bootstrap(self, db_session, fresh_user):
+        assert list_active_orgs_for_user(db_session, fresh_user.id) == []
+        with pytest.raises(BootstrapForbidden):
+            owner_create_organization(db_session, fresh_user, "SecTryCreateOrg")
+
+    def test_p01_fresh_manager_role_also_cannot_call_owner_bootstrap(self, db_session):
+        u, p = _make_user(db_session, "onboard_manager_x", uid=599)
+        u.role = UserRole.manager
+        db_session.flush()
+        _bind(db_session, p, 1000000599)
+        db_session.commit()
+        db_session.refresh(u)
+        assert list_active_orgs_for_user(db_session, u.id) == []
+        with pytest.raises(BootstrapForbidden):
+            owner_create_organization(db_session, u, "ManagerTryCreate")
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +295,16 @@ class TestOnboardingRouter:
         from tests.conftest import make_user
         return make_user(db_session, uname, UserRole.admin)
 
+    def _create_secretary(self, db_session, uname, uid=700):
+        from tests.conftest import make_user
+        return make_user(db_session, uname, UserRole.agent)
+
     def test_get_state_http_200(self, db_session, client):
         user, key = self._create_admin(db_session, "http_state_usr", uid=601)
         r = client.get("/api/v1/onboarding/state", headers=_auth_headers(key))
         assert r.status_code == 200, r.text
         body = r.json()
-        assert body["stage"] in ("ROLE_CHOICE_REQUIRED", "EXISTING_MEMBER")
+        assert body["stage"] in ("OWNER_BOOTSTRAP_REQUIRED", "SECRETARY_NO_INVITE", "EXISTING_MEMBER")
 
     def test_post_owner_bootstrap_http_201(self, db_session, client):
         user, key = self._create_admin(db_session, "http_owner_usr", uid=602)
@@ -280,6 +332,19 @@ class TestOnboardingRouter:
         )
         assert r.status_code == 403, r.text
         assert "不能再创建" in r.json()["detail"]
+
+    # --- P0-1 HTTP: fresh Secretary POST /owner/bootstrap MUST 403 English hint ---
+    def test_p01_fresh_secretary_http_owner_bootstrap_403_english_hint(self, db_session, client):
+        sec_user, sec_key = self._create_secretary(db_session, "http_sec_fresh", uid=701)
+        r = client.post(
+            "/api/v1/onboarding/owner/bootstrap",
+            json={"org_name": "SecShouldFailCo"},
+            headers=_auth_headers(sec_key),
+        )
+        assert r.status_code == 403, r.text
+        detail = r.json()["detail"]
+        assert "cannot create organizations" in detail
+        assert "Ask your Owner for an invite code" in detail
 
     def test_t10_secretary_bootstrap_endpoint_always_403(self, db_session, client):
         user, key = self._create_admin(db_session, "http_sec_usr", uid=604)
