@@ -21,10 +21,11 @@ from app.models.operations import (
     OperationalTaskStatus,
     OperationalTaskType,
 )
+from app.models.repair import RepairOperation, RepairOperationStatus
 from app.services.audit import record_audit, serialize_row
+from app.services.identity import bind_internal_audit
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.rent_math import covered_periods, lease_periods
-from app.services.identity import bind_internal_audit
 
 
 def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskStatus,
@@ -150,6 +151,29 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
             covered = covered_periods(lease, periods, incomes)
             if _rent_covered(task, covered):
                 return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "rent_paid")
+        return None
+
+    repair_id = task.source_id
+    if repair_id is None:
+        dedupe = task.dedupe_key or ""
+        if dedupe.startswith("repair:"):
+            try:
+                repair_id = int(dedupe.split(":", 2)[1])
+            except (ValueError, IndexError):
+                repair_id = None
+    repair_like = (
+        task.source_type == "repair"
+        or task.task_type in (OperationalTaskType.AC_MAINTENANCE, OperationalTaskType.FOLLOWUP)
+        or repair_id is not None
+    )
+    if repair_like and repair_id is not None:
+        repair = db.get(RepairOperation, repair_id)
+        if repair is None:
+            return None
+        if repair.status == RepairOperationStatus.CLOSED:
+            return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "repair_closed")
+        if repair.status == RepairOperationStatus.CANCELLED:
+            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "repair_cancelled")
         return None
 
     return None
