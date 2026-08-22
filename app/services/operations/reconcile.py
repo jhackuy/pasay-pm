@@ -21,10 +21,11 @@ from app.models.operations import (
     OperationalTaskStatus,
     OperationalTaskType,
 )
+from app.models.repair import RepairOperation, RepairOperationStatus
 from app.services.audit import record_audit, serialize_row
+from app.services.identity import bind_internal_audit
 from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.rent_math import covered_periods, lease_periods
-from app.services.identity import bind_internal_audit
 
 
 def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskStatus,
@@ -152,6 +153,35 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
                 return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "rent_paid")
         return None
 
+    repair_id: int | None = None
+    if task.source_type == "repair":
+        repair_id = task.source_id
+    if repair_id is None:
+        dedupe = task.dedupe_key or ""
+        if dedupe.startswith("repair:"):
+            try:
+                repair_id = int(dedupe.split(":", 2)[1])
+            except (ValueError, IndexError):
+                repair_id = None
+    if repair_id is None:
+        details = task.details or {}
+        meta_rid = (details.get("repair") or {}).get("id") if isinstance(details.get("repair"), dict) else None
+        if meta_rid is not None:
+            try:
+                repair_id = int(meta_rid)
+            except (ValueError, TypeError):
+                repair_id = None
+    repair_like = repair_id is not None
+    if repair_like and repair_id is not None:
+        repair = db.get(RepairOperation, repair_id)
+        if repair is None:
+            return None
+        if repair.status == RepairOperationStatus.CLOSED:
+            return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "repair_closed")
+        if repair.status == RepairOperationStatus.CANCELLED:
+            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "repair_cancelled")
+        return None
+
     return None
 
 
@@ -167,7 +197,7 @@ def _rent_covered(task: OperationalTask, covered: set[str]) -> bool:
 def _lease_renewed(db: Session, lease: Lease) -> bool:
     """True when another active lease exists for the same unit that started
     at/after this lease ended (a renewal), or an active lease now occupies
-    the unit."""
+    the unit with a later end_date (overlapping early-renewal contract)."""
     renewed = (
         db.query(Lease)
         .filter(
@@ -175,10 +205,23 @@ def _lease_renewed(db: Session, lease: Lease) -> bool:
             Lease.id != lease.id,
             Lease.status == LeaseStatus.active,
             Lease.deleted_at.is_(None),
-            Lease.start_date >= lease.end_date,
+            Lease.end_date > lease.end_date,
+            Lease.start_date <= lease.end_date,
         )
         .first()
     )
+    if renewed is None:
+        renewed = (
+            db.query(Lease)
+            .filter(
+                Lease.unit_id == lease.unit_id,
+                Lease.id != lease.id,
+                Lease.status == LeaseStatus.active,
+                Lease.deleted_at.is_(None),
+                Lease.start_date >= lease.end_date,
+            )
+            .first()
+        )
     return renewed is not None
 
 

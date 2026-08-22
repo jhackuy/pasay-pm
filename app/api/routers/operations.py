@@ -94,6 +94,7 @@ from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
 from app.services.operations.generation import create_operational_task
 from app.services.operations.owner_scope import is_owner_actionable
+from app.services.operations.truth_validator import assert_completion_allowed
 
 router = APIRouter(prefix="/operations", tags=["operations"])
 
@@ -399,6 +400,8 @@ def complete_task(
     task = _get_task_or_404(db, task_id)
     _require_access(task, user)
     now = datetime.now(timezone.utc)
+    if task.status == OperationalTaskStatus.PENDING:
+        assert_completion_allowed(db, task)
     old = serialize_row(task)
     result = db.execute(
         update(OperationalTask)
@@ -693,7 +696,8 @@ def update_task(
         updates["details"] = merged_details
     if payload.status is not None:
         updates["status"] = payload.status
-        if payload.status == OperationalTaskStatus.COMPLETED:
+        if payload.status == OperationalTaskStatus.COMPLETED and task.status != OperationalTaskStatus.COMPLETED:
+            assert_completion_allowed(db, task)
             updates["completed_at"] = now
             updates["completed_by"] = user.id
     if not updates:
@@ -932,9 +936,9 @@ def quick_rent(
 @router.get("/quick/expense")
 def quick_expense(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    return quick_svc.build_quick_expense(db)
+    return quick_svc.build_quick_expense(db, user_id=user.id)
 
 
 @router.get("/quick/expense-duplicates")

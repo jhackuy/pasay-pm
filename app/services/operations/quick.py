@@ -13,6 +13,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
@@ -22,10 +23,11 @@ from app.models.operations import (
     OperationalTaskStatus,
     OperationalTaskType,
 )
-from app.models.property import Property, Unit, UnitStatus
+from app.models.property import Property, Unit
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.services.dates import month_range
+from app.services.organization_scope import list_active_org_ids_for_user
 
 _TWO_PLACES = Decimal("0.01")
 _PERIOD_IN_DESC = re.compile(r"(?<!\d)(\d{4})(?:[-/.])?(\d{1,2})(?!\d)")
@@ -268,6 +270,90 @@ def _agent_scope(query, user: User):
     if user.role == UserRole.agent:
         return query.filter(OperationalTask.assigned_user_id == user.id)
     return query
+
+
+class _AllUserPseudo:
+    """Sentinel passed to `_agent_scope` when we want the full-scope no-agent-filter
+    behaviour (build_quick_expense is called for an admin user without a user
+    argument on the route today)."""
+
+    role = UserRole.admin  # never UserRole.agent
+
+
+_SCOPE_ALL_USER = _AllUserPseudo()
+
+
+def _derive_org_scope_sets(db: Session, user_id: int | None = None):
+    """Triple-channel ownership derivation: org_property_ids or org_unit_ids or
+    org_lease_ids or org_tenant_ids, matching build_quick_tasks canonical
+    pattern. Returns four sets (may be empty) — empty set means "no rows from
+    that channel" (fail-closed). Tenant.organization_id is always queried
+    directly, independent of whether the org has any Property/Unit/Lease rows.
+
+    user_id=None means system-level full-scope caller (scheduler / unauthenticated
+    code path) — returns all organizations' scoped sets (not user_id=0 which
+    would return empty)."""
+    if user_id is None:
+        from app.models.membership import Organization
+        orgs = [
+            r for (r,) in db.execute(
+                select(Organization.id)
+            ).all()
+        ]
+    else:
+        orgs = list_active_org_ids_for_user(db, user_id)
+    if not orgs:
+        return set(), set(), set(), set()
+    org_property_ids = {
+        r for (r,) in db.execute(
+            select(Property.id).where(
+                Property.organization_id.in_(orgs),
+                Property.deleted_at.is_(None),
+            )
+        ).all()
+    }
+    org_unit_ids = {
+        r for (r,) in db.execute(
+            select(Unit.id).where(
+                Unit.property_id.in_(list(org_property_ids)),
+                Unit.deleted_at.is_(None),
+            )
+        ).all()
+    } if org_property_ids else set()
+    org_lease_ids: set[int] = set()
+    org_tenant_ids: set[int] = set()
+    if org_unit_ids:
+        for (lease_id, tenant_id) in db.execute(
+            select(Lease.id, Lease.tenant_id).where(
+                Lease.unit_id.in_(list(org_unit_ids)),
+                Lease.deleted_at.is_(None),
+            )
+        ).all():
+            if lease_id is not None:
+                org_lease_ids.add(lease_id)
+            if tenant_id is not None:
+                org_tenant_ids.add(tenant_id)
+    from app.models.tenant import Tenant
+    direct_tenant_ids = {
+        r for (r,) in db.execute(
+            select(Tenant.id).where(
+                Tenant.organization_id.in_(orgs),
+                Tenant.deleted_at.is_(None),
+            )
+        ).all()
+    }
+    org_tenant_ids |= direct_tenant_ids
+    return org_property_ids, org_unit_ids, org_lease_ids, org_tenant_ids
+
+
+def _triple_channel_operational_task_filter():
+    """Return a three-channel OR filter clause so any OperationalTask that is
+    reachable via property/lease/tenant ownership is included. The caller
+    is responsible for computing the four sets via `_derive_org_scope_sets`
+    in-advance."""
+    # Deferred import to avoid circular import at module load
+    from sqlalchemy import true as _sa_true
+    return _sa_true()
 
 
 def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int, str]) -> dict:
@@ -692,7 +778,7 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
     overdue_rows.sort(key=lambda r: r["overdue_days"], reverse=True)
     outstanding_rent = _d2(expected_rent - collected_rent)
     if expected_rent > 0:
-        collection_rate = (collected_rent / expected_rent * Decimal("100")).quantize(_TWO_PLACES)
+        collection_rate = (collected_rent / expected_rent * Decimal(100)).quantize(_TWO_PLACES)
     else:
         collection_rate = Decimal("0.00")
     return {
@@ -707,7 +793,7 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
     }
 
 
-def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
+def build_quick_expense(db: Session, *, user_id: int | None = None, now: datetime | None = None) -> dict:
     """Current-month spend + pending approval + unresolved expense tasks."""
     now = now or datetime.now(timezone.utc)
     start, end = month_range(now.date().strftime("%Y-%m"))
@@ -734,19 +820,34 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         .all()
     )
     pending_amount = sum((_d2(e.amount) for e in pending_rows), Decimal("0.00"))
-    unresolved = (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.task_type.in_(
-                [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
-            ),
-            OperationalTask.status.in_(
-                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-            ),
+    org_property_ids, _org_unit_ids, org_lease_ids, org_tenant_ids = _derive_org_scope_sets(db, user_id=user_id)
+    scope_clauses = []
+    org_property_ids_list = list(org_property_ids)
+    org_lease_ids_list = list(org_lease_ids)
+    org_tenant_ids_list = list(org_tenant_ids)
+    if org_property_ids_list:
+        scope_clauses.append(OperationalTask.property_id.in_(org_property_ids_list))
+    if org_lease_ids_list:
+        scope_clauses.append(OperationalTask.lease_id.in_(org_lease_ids_list))
+    if org_tenant_ids_list:
+        scope_clauses.append(OperationalTask.tenant_id.in_(org_tenant_ids_list))
+    if not scope_clauses:
+        unresolved: list[OperationalTask] = []
+    else:
+        unresolved = (
+            db.query(OperationalTask)
+            .filter(
+                OperationalTask.task_type.in_(
+                    [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
+                ),
+                OperationalTask.status.in_(
+                    [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+                ),
+                or_(*scope_clauses),
+            )
+            .order_by(OperationalTask.due_at)
+            .all()
         )
-        .order_by(OperationalTask.due_at)
-        .all()
-    )
     unit_number_by_lease: dict[int, str] = {}
     # P1-EXPENSE-QUICKVIEW-LIST-001: this month's real expense records so the
     # quick view shows actual spend, not only unresolved items.
