@@ -29,7 +29,6 @@ from app.models.operations import (
     OperationalTaskType,
 )
 from app.models.repair import RepairOperation, RepairOperationStatus
-from app.models.tenant import Tenant
 from app.services.operations.reconcile import reconcile_tasks
 from app.services.operations.truth_validator import validate_completion
 
@@ -943,7 +942,7 @@ def test_t13_post_complete_already_completed_is_idempotent_not_409(
     task = _insert_task(
         db_session,
         task_type=OperationalTaskType.RENT_OVERDUE,
-        title=f"T13 RENT_OVERDUE already completed",
+        title="T13 RENT_OVERDUE already completed",
         source_type="lease",
         source_id=lease_id,
         lease_id=lease_id,
@@ -957,39 +956,67 @@ def test_t13_post_complete_already_completed_is_idempotent_not_409(
 
 
 def test_t14_quick_scope_tenant_organization_id_direct_coverage(
-    db_session, owner_a, org_a, property_id, unit_id, lease_id, tenant_id, client
+    db_session, owner_a, owner_b, org_a, org_b, property_id, unit_id, lease_id, tenant_id, client
 ):
-    """FIX3 #3: Tenant.organization_id 直接匹配，不依赖 Lease/Unit 链。"""
-    headers = _headers(owner_a[1])
-    # 新建第二个 tenant 只绑定 organization_id，不绑定任何 lease
+    """FIX4 #3: Tenant.org_id 直通 scope；build_quick_expense 传真实 user_id；
+    org_b tenant-only task 对 org_a 用户不可见（fail-closed 权限门）。
+    FIX4 #2: 不依赖有 Property/Unit/Lease 也能入 scope（Tenant 独立查询）。"""
+    headers_a = _headers(owner_a[1])
+    user_a_id = owner_a[0].id
+    # 新建 tenant_A2: 只绑 org_a，不绑任何 Lease（Tenant.org_id 直通）
     resp = client.post(f"{API}/tenants", json={
-        "full_name": "T14 Direct Org Tenant",
+        "full_name": "T14 Direct OrgA Tenant",
         "phone": "+639179999914",
-        "email": "t14@example.com",
+        "email": "t14a@example.com",
         "organization_id": org_a.id,
-    }, headers=headers)
+    }, headers=headers_a)
     assert resp.status_code == 201, resp.text
-    orphan_tenant_id = resp.json()["id"]
-    # task 只挂 tenant_id，不挂 lease/property，期望通过 Tenant.org_id 入 scope
-    task = _insert_task(
+    orphan_tenant_a_id = resp.json()["id"]
+    # task_A 只挂 tenant_id=orphan_tenant_a_id，不挂 lease/property
+    task_a = _insert_task(
         db_session,
         task_type=OperationalTaskType.APPROVAL_PENDING,
-        title="T14: tenant only coverage via direct org_id",
+        title="T14A: org_a tenant-only task via direct org_id",
         source_type="expense",
         source_id=1414,
-        tenant_id=orphan_tenant_id,
-        dedupe_key="T14:DIRECT_TENANT_ORG_SCOPE",
+        tenant_id=orphan_tenant_a_id,
+        dedupe_key="T14:DIRECT_TENANT_ORG_SCOPE_A",
         details={},
     )
-    q = build_quick_expense(db_session, now=datetime.now(timezone.utc))
+    # 新建 org_b 的 tenant_B，同样不绑 Lease（跨 org）
+    headers_b = _headers(owner_b[1])
+    resp_b = client.post(f"{API}/tenants", json={
+        "full_name": "T14 Direct OrgB Tenant",
+        "phone": "+639179999940",
+        "email": "t14b@example.com",
+        "organization_id": org_b.id,
+    }, headers=headers_b)
+    assert resp_b.status_code == 201, resp_b.text
+    orphan_tenant_b_id = resp_b.json()["id"]
+    task_b = _insert_task(
+        db_session,
+        task_type=OperationalTaskType.APPROVAL_PENDING,
+        title="T14B: org_b tenant-only — MUST NOT be visible to org_a user",
+        source_type="expense",
+        source_id=1440,
+        tenant_id=orphan_tenant_b_id,
+        dedupe_key="T14:DIRECT_TENANT_ORG_SCOPE_B",
+        details={},
+    )
+    # FIX4 #3: 传 owner_a 的真实 user_id，禁止 user_id=None 全系统 scope
+    q = build_quick_expense(db_session, user_id=user_a_id, now=datetime.now(timezone.utc))
     ids = {r["id"] for r in q.get("unresolved_expense_tasks", [])}
-    # 如果 _derive_org_scope_sets(user_id=None) → all orgs 工作则能看到 task
-    assert task.id in ids, (
-        f"orphan tenant {orphan_tenant_id} task not captured via Tenant.organization_id; "
+    # 正面断言：org_a 自己的 tenant task 必可见
+    assert task_a.id in ids, (
+        f"org_a orphan tenant {orphan_tenant_a_id} task not captured via Tenant.organization_id; "
         f"scope sets may still depend only on Lease chain"
     )
-    # 同时确保 org_a 外的 tenant (org_b) 创建则看不到 —— fail-closed
-    # 这里只证明正面 OK，其余 Q 组已验证 empty scope 走 []
+    # 权限门：org_b tenant task 对 org_a 用户绝不可见（fail-closed）
+    assert task_b.id not in ids, (
+        f"CRITICAL: org_b orphan tenant task {task_b.id} LEAKED into org_a scope! "
+        f"user_id={user_a_id} membership in org_a (id={org_a.id}) only; "
+        f"Tenant.organization_id filter may not be joined with user membership scope."
+    )
 
 
 def test_t15_renewal_overlap_earlier_start_later_end_ok_for_lease_expiring(
@@ -1033,11 +1060,8 @@ def test_t16_repair_reconcile_requires_explicit_repair_source_not_arbitrary_sour
 ):
     """FIX3 #4: Repair reconcile 必须 source_type=repair / repair:dedupe / details.repair.id，
     不得把任意 task.source_id 当成 repair_id。"""
-    headers = _headers(owner_a[1])
     # 先造一个真实 RepairOperation CLOSED rid=R
-    rep = _create_repair_api(None, headers, property_id, unit_id) if False else None
     # 不通过 client 依赖 network，直接 DB 造 RepairOperation CLOSED
-    from sqlalchemy.orm import Session as _S
     repair = RepairOperation(
         property_id=property_id,
         unit_id=unit_id,
@@ -1109,7 +1133,7 @@ def test_t17_validate_completion_short_circuits_completed_task_true(
     task = _insert_task(
         db_session,
         task_type=OperationalTaskType.RENT_OVERDUE,
-        title=f"T17 validate_completion COMPLETED always True (truth missing)",
+        title="T17 validate_completion COMPLETED always True (truth missing)",
         source_type="lease",
         source_id=lease_id,
         lease_id=lease_id,
@@ -1122,4 +1146,75 @@ def test_t17_validate_completion_short_circuits_completed_task_true(
     assert result.ok is True, (
         f"validate_completion on already COMPLETED task should always be True "
         f"(idempotent short-circuit), got ok={result.ok!r} detail={result}"
+    )
+
+
+def test_t18_post_complete_cancelled_task_keeps_conflict_not_truth_missing(
+    client, db_session, owner_a, org_a, property_id, unit_id, lease_id, tenant_id
+):
+    """FIX4 #1: CANCELLED 状态任务 POST complete 必须返回 409 Conflict，
+    但不是 task_completion_truth_missing（因为 PENDING gate 没被调用）。
+    语义："任务当前不是 PENDING 所以无法完成" 而非 "缺少业务真值"。"""
+    headers = _headers(owner_a[1])
+    task = _insert_task(
+        db_session,
+        task_type=OperationalTaskType.RENT_OVERDUE,
+        title="T18: CANCELLED POST /complete should NOT call truth gate",
+        source_type="lease",
+        source_id=lease_id,
+        lease_id=lease_id,
+        property_id=property_id,
+        dedupe_key=f"T18:CANCELLED_POST_COMPLETE_IDEMPOTENT:{lease_id}",
+        details={"periods": [_RENT_PERIOD]},
+        status=OperationalTaskStatus.CANCELLED,
+    )
+    r = client.post(f"{API}/operations/tasks/{task.id}/complete", headers=headers)
+    # 断言：HTTP 409（冲突），且 reason != task_completion_truth_missing
+    assert r.status_code == 409, (
+        f"Expected 409 for CANCELLED status task POST complete (not 200 idempotent); "
+        f"got {r.status_code}: {r.text}"
+    )
+    detail = r.json().get("detail", {}) if isinstance(r.json(), dict) else {}
+    reason = detail.get("reason") if isinstance(detail, dict) else None
+    assert reason != "task_completion_truth_missing", (
+        f"CANCELLED task must NOT run assert_completion_allowed gate! "
+        f"Reason leak={reason!r} full detail={detail}"
+    )
+
+
+def test_t19_derive_scope_empty_property_but_tenants_via_org_id_still_works(
+    db_session, owner_a, owner_b, org_a, org_b, client
+):
+    """FIX4 #2: org_c 有 Membership + Tenant，但 0 Property/Unit/Lease 时，
+    _derive_org_scope_sets 不得因 org_property_ids 空提前 return。
+    Tenant.organization_id 必须独立出现在 org_tenant_ids。"""
+    from app.services.operations.quick import _derive_org_scope_sets
+    headers_b = _headers(owner_b[1])
+    # owner_a 在 org_a，但 org_a 有 fixture 默认 property（非空），所以用 org_b：
+    # org_b 当前 0 Property / 0 Unit / 0 Lease，给它加 1 个 Tenant
+    resp = client.post(f"{API}/tenants", json={
+        "full_name": "T19 OrgB Tenant Zero Property",
+        "phone": "+639179999919",
+        "email": "t19b@example.com",
+        "organization_id": org_b.id,
+    }, headers=headers_b)
+    assert resp.status_code == 201, resp.text
+    t19_tenant_b_id = resp.json()["id"]
+    # 以 owner_b 真实 user_id 调 scope 推导（org_b 有 Membership、有 Tenant，无 Property）
+    ps, us, ls, ts = _derive_org_scope_sets(db_session, user_id=owner_b[0].id)
+    assert isinstance(ps, set) and isinstance(ts, set), (
+        f"_derive_org_scope_sets must return 4 sets; got ({type(ps)},{type(us)},{type(ls)},{type(ts)})"
+    )
+    assert ps == set(), (
+        f"org_b fixture has 0 Property; org_property_ids must be empty, got {ps}"
+    )
+    # 关键断言：Tenant.organization_id 独立于 Property，必须存在于 ts
+    assert t19_tenant_b_id in ts, (
+        f"org_b has 0 Property/Unit/Lease, but tenant {t19_tenant_b_id} (org_id={org_b.id}) "
+        f"still must be reachable via direct Tenant.organization_id scope. Got ts={ts}"
+    )
+    # 对比：owner_a 调用不应看到 org_b tenant（fail-closed membership 门）
+    _, _, _, ts_a = _derive_org_scope_sets(db_session, user_id=owner_a[0].id)
+    assert t19_tenant_b_id not in ts_a, (
+        f"owner_a (org_a id={org_a.id}) membership MUST NOT leak org_b tenant {t19_tenant_b_id}"
     )
