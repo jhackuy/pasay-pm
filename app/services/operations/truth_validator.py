@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
-from app.models.operations import OperationalTask, OperationalTaskType
+from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
 from app.models.repair import RepairOperation, RepairOperationStatus
 from app.services.expense_payment_truth import payment_truth as expense_payment_truth
 from app.services.operations.rent_math import covered_periods, lease_periods
@@ -137,10 +137,23 @@ def _lease_expiring_ok(db: Session, task: OperationalTask) -> TruthValidationRes
             Lease.id != lease.id,
             Lease.status == LeaseStatus.active,
             Lease.deleted_at.is_(None),
-            Lease.start_date >= lease.end_date,
+            Lease.end_date > lease.end_date,
+            Lease.start_date <= lease.end_date,
         )
         .first()
     )
+    if renewed is None:
+        renewed = (
+            db.query(Lease)
+            .filter(
+                Lease.unit_id == lease.unit_id,
+                Lease.id != lease.id,
+                Lease.status == LeaseStatus.active,
+                Lease.deleted_at.is_(None),
+                Lease.start_date >= lease.end_date,
+            )
+            .first()
+        )
     if renewed is not None or lease.status != LeaseStatus.active or (lease.deleted_at is not None):
         return TruthValidationResult(True)
     return TruthValidationResult(
@@ -305,6 +318,8 @@ def validate_completion(db: Session, task: OperationalTask) -> TruthValidationRe
     expense_claims._finalize_paid, rent_claims._sync_period_tasks,
     repairs.verification._complete_linked, projection.close_active_projections.
     Those paths write the DB directly and bypass the HTTP API."""
+    if task.status == OperationalTaskStatus.COMPLETED:
+        return TruthValidationResult(True)
     key = (task.task_type, (task.source_type or None))
     checker = _PROJECTION_TABLE.get(key)
     if checker is not None:
