@@ -23,6 +23,7 @@ from app.models.evidence import (
 )
 from app.models.expense_claim import ClaimStatus, ExpensePaymentClaim
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
+from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.identity import (
     ApiCredential,
     CommunicationEndpoint,
@@ -34,6 +35,7 @@ from app.models.identity import (
     TelegramIdentityBinding,
 )
 from app.models.lease import Lease, LeaseStatus
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.membership import (
     InviteState,
     Membership,
@@ -100,6 +102,8 @@ __all__ = [
     "CopilotRunStatus",
     "CredentialLifecycle",
     "CredentialState",
+    "DepositSettlement",
+    "DepositSettlementStatus",
     "Evidence",
     "EvidenceCategory",
     "Expense",
@@ -112,6 +116,8 @@ __all__ = [
     "LeaseStatus",
     "Membership",
     "MembershipState",
+    "MoveOutInspection",
+    "MoveOutInspectionStatus",
     "NotificationOutbox",
     "NotificationStatus",
     "OperationalTask",

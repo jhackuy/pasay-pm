@@ -39,6 +39,8 @@ class OperationalTaskType(str, Enum):
     # V1.2.2 Phase C2: human-confirmed copilot follow-up tasks (text/tracking
     # only — never a financial mutation).
     FOLLOWUP = "FOLLOWUP"
+    MOVE_OUT_INSPECTION = "MOVE_OUT_INSPECTION"
+    DEPOSIT_SETTLEMENT = "DEPOSIT_SETTLEMENT"
 
 
 class OperationalTaskStatus(str, Enum):
@@ -76,7 +78,8 @@ class OperationalTask(AuditMixin, Base):
         CheckConstraint(
             "task_type IN ('RENT_DUE','RENT_OVERDUE','LEASE_EXPIRING',"
             "'PROPERTY_FEE_DUE','AC_MAINTENANCE','APPROVAL_PENDING',"
-            "'PAYMENT_PENDING','SETTLEMENT_PENDING','FOLLOWUP')",
+            "'PAYMENT_PENDING','SETTLEMENT_PENDING','FOLLOWUP',"
+            "'MOVE_OUT_INSPECTION','DEPOSIT_SETTLEMENT')",
             name="ck_operational_tasks_task_type",
         ),
         CheckConstraint(
@@ -161,7 +164,8 @@ class RecurringRule(AuditMixin, SoftDeleteMixin, Base):
         CheckConstraint(
             "rule_type IN ('RENT_DUE','RENT_OVERDUE','LEASE_EXPIRING',"
             "'PROPERTY_FEE_DUE','AC_MAINTENANCE','APPROVAL_PENDING',"
-            "'PAYMENT_PENDING','SETTLEMENT_PENDING','FOLLOWUP')",
+            "'PAYMENT_PENDING','SETTLEMENT_PENDING','FOLLOWUP',"
+            "'MOVE_OUT_INSPECTION','DEPOSIT_SETTLEMENT')",
             name="ck_recurring_rules_rule_type",
         ),
         CheckConstraint(

@@ -51,6 +51,7 @@ class Tenant(AuditMixin, SoftDeleteMixin, Base):
     emergency_relationship: Mapped[str | None] = mapped_column(String(100), nullable=True)
     emergency_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    moved_out_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     @property
     def primary_phone(self) -> str | None:

@@ -1,8 +1,8 @@
-from datetime import date
+from datetime import date, datetime
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -42,3 +42,11 @@ class Lease(AuditMixin, SoftDeleteMixin, Base):
     deposit_received: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
     deposit_refund: Mapped[Decimal | None] = mapped_column(Numeric(14, 2), nullable=True)
     deposit_deductions: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    move_out_inspection_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    deposit_settlement_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    moved_out_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    renewal_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

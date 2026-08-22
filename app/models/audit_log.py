@@ -130,6 +130,15 @@ class AuditAction(str, Enum):
     expense_created_from_approved_repair_proposal = (
         "expense_created_from_approved_repair_proposal"
     )
+    # PASAY-MILESTONE-004 Lease & Move-out Truth Closure (appended only;
+    # never rename or reorder prior values).
+    cancel = "cancel"
+    reconcile = "reconcile"
+    create_draft = "create_draft"
+    renewal_linked = "renewal_linked"
+    create_renewal_successor = "create_renewal_successor"
+    decline_renewal = "decline_renewal"
+    auto_expire = "auto_expire"
 
 
 class AuditLog(AuditMixin, Base):
