@@ -2,44 +2,31 @@
 alwaysApply: true
 ---
 
-# Pasay SOLO Governance
+# Pasay SOLO — Hard Safety Bans ONLY
 
-> 生效：PASAY-SOLO-TRANSITION-001 (Issue #34)
-> 取代：历史 ND 微任务治理（已退役）
+本文件是 alwaysApply 硬安全禁令层。**只包含不可逾越的硬禁令**，不包含流程、规范、建议或任何非禁令内容。
 
-## Git Governance
+违反以下任何一条 = 立即 FAIL CLOSED：
 
-- Use one dedicated task branch per Milestone or Issue slice (worktree 可选，不强制).
-- Never force push, force-with-lease, rewrite shared history, overwrite remote-only commits, delete shared remote branches, bypass PR, or auto-merge.
-- Never modify authority or base-branch business code directly; all delivery goes through PR.
-- Treat Git CLI and GitHub results as authority, not IDE UI guesses.
+## 1. Git Safety
+- 禁止 force push / force-with-lease / 改写共享历史
+- 禁止 overwrite remote-only commits / 删除共享 remote 分支
+- 禁止绕过 PR 直接修改 authority 或 base-branch 业务代码
+- 禁止 auto-merge
 
-## Task Discipline — SOLO Milestone Mode
+## 2. Authority & Deployment
+- 禁止 Merge PR（SOLO 不 merge；Owner 最终 merge）
+- 禁止 Production deploy（SOLO 不部署）
+- 禁止写入 Production secrets / credentials / 私钥到仓库
 
-- SOLO 先形成 Milestone 理解，合理组织交付节奏；不再机械 `1 Issue = 1 small branch = 1 PR = STOP`.
-- 合理跨文件完成完整业务 Milestone（migrations / tests / reasonable refactor / bugfix）。
-- 合理 Targeted tests 优先；不跑不必要的全量；真实失败不 skip/xfail 换绿。
-- 如果 blocked、scope 存在真实歧义、或安全无法判定：停下并报告，不无休止探索或猜测 Owner 意图。
-- 旧 Issue 的 `blocked` / `ready-for-dev` 等历史标签不驱动执行。
+## 3. Business & Product Integrity
+- 禁止自行改变产品方向 / 核心业务模型
+- 禁止自行重定义 Owner / Secretary / Tenant 权限边界或角色语义
+- 禁止自行推翻冻结架构（`ARCHITECTURE_FROZEN=YES`）
+- 禁止删除现有已确认业务能力
+- 禁止削弱已确认业务事实或核心产品规则
+- 禁止 Operation ↔ Task 真值反转：Operation 永远是真值，Task 状态永远不能反向决定业务真值
 
-## Validation
-
-- After changes, run only targeted tests and existing relevant gates for the touched scope.
-- Distinguish real regression, stale test, and uncertain result explicitly.
-- Never change confirmed business facts, delete tests, skip tests, or weaken behavior just to get green.
-
-## Reporting
-
-- Final owner-facing reports are in Chinese.
-- Keep code, commands, paths, SHAs, branch names, PR URLs, and field names in English.
-- Milestone / Handoff 报告给出变更摘要、Targeted tests 结果、影响文件、已知风险。
-
-## Owner-Only Decisions
-
-只有 Owner 决定以下事项（SOLO 不自行替代）：
-
-- 改变产品方向 / 核心业务模型
-- 重新定义 Owner / Secretary / Tenant 权限边界
-- 推翻冻结架构（`ARCHITECTURE_FROZEN=YES`）
-- 删除现有已确认业务能力
-- Merge PR、production deploy、Secrets 写入
+## 4. Test & Validation Integrity
+- 禁止删除、skip、xfail 真实失败测试来制造 PASS
+- 禁止修改已确认业务事实、弱化约束或改变冻结行为来换取 green
