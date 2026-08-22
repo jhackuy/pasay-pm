@@ -72,7 +72,6 @@ from app.models.operations import (
     RecurringRule,
 )
 from app.models.property import Property, Unit
-from app.models.task import Task, TaskStatus
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.models.identity import Principal, PrincipalType
@@ -264,14 +263,46 @@ def build_copilot_context(db: Session, user: User, *, now: datetime | None = Non
     """Build the deterministic, RBAC-scoped context for ``user``.
 
     Agents see only their own tasks and entities reachable through them (plus
-    their own settlements); admins/managers see the full operational picture.
+    their own settlements); admins/managers see the full operational picture
+    but strictly organization-scoped via active Membership.
     Pure reads: the only table this function writes is never written here —
     the caller writes the ``copilot_runs`` row via ``log_context_run``.
     """
     now = now or datetime.now(timezone.utc)
     is_agent = user.role == UserRole.agent
 
-    tasks = _pending_tasks(db, user)
+    from app.services.organization_scope import list_active_org_ids_for_user
+    from app.models.lease import Lease as _LeaseModel
+
+    org_ids = list_active_org_ids_for_user(db, user.id) or [0]
+    scoped_property_ids = {
+        r[0]
+        for r in db.query(Property.id).filter(
+            Property.organization_id.in_(org_ids),
+            Property.deleted_at.is_(None),
+        ).all()
+    }
+    scoped_lease_ids = {
+        r[0]
+        for r in db.query(_LeaseModel.id).join(Unit, _LeaseModel.unit_id == Unit.id).filter(
+            Unit.property_id.in_(list(scoped_property_ids) or [0]),
+            _LeaseModel.deleted_at.is_(None),
+        ).all()
+    }
+    scoped_tenant_ids = {
+        r[0]
+        for r in db.query(Tenant.id).filter(
+            Tenant.organization_id.in_(org_ids),
+            Tenant.deleted_at.is_(None),
+        ).all()
+    }
+
+    tasks = _pending_tasks(
+        db, user,
+        scoped_property_ids=scoped_property_ids,
+        scoped_lease_ids=scoped_lease_ids,
+        scoped_tenant_ids=scoped_tenant_ids,
+    )
     task_ids = [t["id"] for t in tasks]
     lease_ids = _scoped_ids(db, tasks, "lease_id")
     property_ids = _scoped_ids(db, tasks, "property_id")
@@ -285,18 +316,35 @@ def build_copilot_context(db: Session, user: User, *, now: datetime | None = Non
         if t["source_type"] == "commission_settlement" and t["source_id"]
     }
 
-    # Lease scope: for agents, only leases their tasks reference; for
-    # privileged users, every active lease.
-    lease_filter = lease_ids if is_agent else None
+    if is_agent:
+        lease_filter = lease_ids
+        property_filter = property_ids
+        tenant_filter = tenant_ids
+        expense_filter = expense_ids
+        settlement_filter = settlement_ids
+    else:
+        lease_filter = scoped_lease_ids
+        property_filter = scoped_property_ids
+        tenant_filter = scoped_tenant_ids
+        expense_filter = None
+        settlement_filter = None
 
     overdue_rents = _overdue_rents(db, lease_filter, now=now)
     leases_expiring = _leases_expiring(db, lease_filter, now=now)
-    expenses = _pending_expenses(db, expense_ids if is_agent else None)
-    settlements = _pending_settlements(db, user, settlement_ids if is_agent else None)
-    maintenance = _maintenance_tasks(db, user)
-    recurring_rules = _recurring_rules(db, user)
-    properties = _properties(db, property_ids if is_agent else None)
-    tenants = _tenants(db, tenant_ids if is_agent else None)
+    expenses = _pending_expenses(
+        db, expense_filter, scoped_property_ids=scoped_property_ids
+    )
+    settlements = _pending_settlements(db, user, settlement_filter, scoped_lease_ids=scoped_lease_ids)
+    maintenance = _maintenance_tasks(
+        db, user,
+        scoped_property_ids=scoped_property_ids,
+        scoped_lease_ids=scoped_lease_ids,
+    )
+    recurring_rules = _recurring_rules(
+        db, user, scoped_property_ids=scoped_property_ids
+    )
+    properties = _properties(db, property_filter if is_agent else scoped_property_ids)
+    tenants = _tenants(db, tenant_filter if is_agent else scoped_tenant_ids)
     income_refs = _income_references(db, lease_filter)
 
     references = {
@@ -328,7 +376,12 @@ def build_copilot_context(db: Session, user: User, *, now: datetime | None = Non
         "scoped_to_user": is_agent,
         "free_text_policy": "data_only",
         "free_text_fields": list(FREE_TEXT_FIELDS),
-        "summary": build_operations_summary(db, user, now=now).model_dump(),
+        "summary": build_operations_summary(
+            db, user, now=now,
+            org_property_ids=scoped_property_ids,
+            org_lease_ids=scoped_lease_ids,
+            org_tenant_ids=scoped_tenant_ids,
+        ).model_dump(),
         "pending_tasks": tasks,
         "overdue_rents": overdue_rents,
         "leases_expiring": leases_expiring,
@@ -371,10 +424,27 @@ def log_context_run(
     return run
 
 
-def _pending_tasks(db: Session, user: User) -> list[dict]:
+def _pending_tasks(
+    db: Session, user: User, *,
+    scoped_property_ids: set[int] | None = None,
+    scoped_lease_ids: set[int] | None = None,
+    scoped_tenant_ids: set[int] | None = None,
+) -> list[dict]:
     query = db.query(OperationalTask).filter(
         OperationalTask.status == OperationalTaskStatus.PENDING
     )
+    if scoped_property_ids is not None or scoped_lease_ids is not None or scoped_tenant_ids is not None:
+        scope_clauses = []
+        if scoped_property_ids:
+            scope_clauses.append(OperationalTask.property_id.in_(list(scoped_property_ids)))
+        if scoped_lease_ids:
+            scope_clauses.append(OperationalTask.lease_id.in_(list(scoped_lease_ids)))
+        if scoped_tenant_ids:
+            scope_clauses.append(OperationalTask.tenant_id.in_(list(scoped_tenant_ids)))
+        if scope_clauses:
+            query = query.filter(or_(*scope_clauses))
+        else:
+            query = query.filter(False)
     if user.role == UserRole.agent:
         query = query.filter(OperationalTask.assigned_user_id == user.id)
     rows = query.all()
@@ -489,10 +559,17 @@ def _leases_expiring(db: Session, lease_ids: set[int] | None, *, now: datetime) 
     ]
 
 
-def _pending_expenses(db: Session, expense_ids: set[int] | None) -> list[dict]:
+def _pending_expenses(
+    db: Session, expense_ids: set[int] | None, *,
+    scoped_property_ids: set[int] | None = None,
+) -> list[dict]:
     query = db.query(Expense).filter(Expense.status == ExpenseStatus.pending)
     if expense_ids is not None:
         query = query.filter(Expense.id.in_(expense_ids or [0]))
+    elif scoped_property_ids is not None:
+        if not scoped_property_ids:
+            return []
+        query = query.filter(Expense.property_id.in_(list(scoped_property_ids)))
     rows = (
         query.order_by(Expense.created_at.desc(), Expense.id.desc())
         .limit(CONTEXT_CAPS["pending_expense_approvals"])
@@ -514,18 +591,36 @@ def _pending_expenses(db: Session, expense_ids: set[int] | None) -> list[dict]:
 
 
 def _pending_settlements(
-    db: Session, user: User, settlement_ids: set[int] | None
+    db: Session, user: User, settlement_ids: set[int] | None, *,
+    scoped_lease_ids: set[int] | None = None,
 ) -> list[dict]:
     query = db.query(CommissionSettlement).filter(
         CommissionSettlement.status == CommissionSettlementStatus.pending
     )
-    if user.role == UserRole.agent:
-        query = query.filter(
-            or_(
-                CommissionSettlement.agent_id == user.id,
-                CommissionSettlement.id.in_(settlement_ids or [0]),
+    if settlement_ids is not None:
+        if user.role == UserRole.agent:
+            query = query.filter(
+                or_(
+                    CommissionSettlement.agent_id == user.id,
+                    CommissionSettlement.id.in_(settlement_ids or [0]),
+                )
             )
-        )
+        else:
+            query = query.filter(CommissionSettlement.id.in_(settlement_ids or [0]))
+    elif scoped_lease_ids is not None:
+        if not scoped_lease_ids:
+            return []
+        if user.role == UserRole.agent:
+            query = query.filter(
+                or_(
+                    CommissionSettlement.agent_id == user.id,
+                    CommissionSettlement.lease_id.in_(list(scoped_lease_ids)),
+                )
+            )
+        else:
+            query = query.filter(CommissionSettlement.lease_id.in_(list(scoped_lease_ids)))
+    elif user.role == UserRole.agent:
+        query = query.filter(CommissionSettlement.agent_id == user.id)
     rows = (
         query.order_by(CommissionSettlement.created_at.desc(), CommissionSettlement.id.desc())
         .limit(CONTEXT_CAPS["pending_settlements"])
@@ -544,37 +639,35 @@ def _pending_settlements(
     ]
 
 
-def _maintenance_tasks(db: Session, user: User) -> list[dict]:
-    query = db.query(Task).filter(
-        Task.deleted_at.is_(None),
-        Task.status.in_([TaskStatus.open, TaskStatus.in_progress]),
-    )
-    if user.role == UserRole.agent:
-        query = query.filter(Task.assigned_to == user.id)
-    rows = (
-        query.order_by(Task.due_date.is_(None), Task.due_date, Task.id)
-        .limit(CONTEXT_CAPS["maintenance_tasks"])
-        .all()
-    )
-    return [
-        {
-            "id": t.id,
-            "title": t.title,
-            "description": t.description,
-            "status": t.status.value,
-            "priority": t.priority.value,
-            "due_date": t.due_date.isoformat() if t.due_date else None,
-            "assigned_to": t.assigned_to,
-            "reference": f"task:{t.id}",
-        }
-        for t in rows
-    ]
+def _maintenance_tasks(
+    db: Session, user: User, *,
+    scoped_property_ids: set[int] | None = None,
+    scoped_lease_ids: set[int] | None = None,
+) -> list[dict]:
+    """Maintenance / legacy-task section.
+
+    M004 removes active runtime dependency on the legacy ``Task`` model for
+    the canonical operational path.  The maintenance section is now
+    intentionally empty; only the canonical ``OperationalTask`` pending list
+    is the operational truth for Copilot.  We still honour the schema key so
+    older prompt contracts keep parsing, but fail-closed: nothing leaks from
+    the legacy table and no cross-org data ever surfaces.
+    """
+    _ = (db, user, scoped_property_ids, scoped_lease_ids)
+    return []
 
 
-def _recurring_rules(db: Session, user: User) -> list[dict]:
+def _recurring_rules(
+    db: Session, user: User, *,
+    scoped_property_ids: set[int] | None = None,
+) -> list[dict]:
     query = db.query(RecurringRule).filter(
         RecurringRule.enabled.is_(True), RecurringRule.deleted_at.is_(None)
     )
+    if scoped_property_ids is not None:
+        if not scoped_property_ids:
+            return []
+        query = query.filter(RecurringRule.property_id.in_(list(scoped_property_ids)))
     if user.role == UserRole.agent:
         query = query.filter(RecurringRule.assigned_user_id == user.id)
     rows = (

@@ -13,6 +13,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
@@ -399,6 +400,7 @@ def _payable_expense_rows(
 def build_quick_tasks(
     db: Session, user: User, *, now: datetime | None = None,
     owner_only: bool = False,
+    org_property_ids: set[int] | None = None,
 ) -> list[dict]:
     """Active tasks (PENDING + IN_PROGRESS) for the caller's scope.
 
@@ -411,11 +413,51 @@ def build_quick_tasks(
     filter — the Owner queue holds only approvals, their payments, decisions
     and escalations; routine operational work stays out."""
     now = now or datetime.now(timezone.utc)
+
+    from app.models.lease import Lease as _LeaseModel
+    from app.models.tenant import Tenant as _TenantModel
+
     query = _agent_scope(db.query(OperationalTask), user).filter(
         OperationalTask.status.in_(
             [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
         )
     )
+    if org_property_ids is not None:
+        if not org_property_ids:
+            query = query.filter(False)
+        else:
+            org_unit_ids = {
+                r[0] for r in db.query(Unit.id).filter(
+                    Unit.property_id.in_(list(org_property_ids)),
+                    Unit.deleted_at.is_(None),
+                ).all()
+            }
+            org_lease_ids = {
+                r[0] for r in db.query(_LeaseModel.id).filter(
+                    _LeaseModel.unit_id.in_(list(org_unit_ids) or [0]),
+                    _LeaseModel.deleted_at.is_(None),
+                ).all()
+            }
+            org_tenant_org_ids = {
+                r[0] for r in db.query(Property.organization_id).filter(
+                    Property.id.in_(list(org_property_ids))
+                ).distinct().all()
+            }
+            org_tenant_ids = {
+                r[0] for r in db.query(_TenantModel.id).filter(
+                    _TenantModel.organization_id.in_(
+                        list(org_tenant_org_ids) or [0]
+                    ),
+                    _TenantModel.deleted_at.is_(None),
+                ).all()
+            }
+            query = query.filter(
+                or_(
+                    OperationalTask.property_id.in_(list(org_property_ids)),
+                    OperationalTask.lease_id.in_(list(org_lease_ids) or [0]),
+                    OperationalTask.tenant_id.in_(list(org_tenant_ids) or [0]),
+                )
+            )
     tasks = query.order_by(OperationalTask.due_at, OperationalTask.id).all()
     if owner_only:
         from app.services.operations.owner_scope import is_owner_actionable
@@ -444,7 +486,7 @@ def build_quick_tasks(
             row["overdue_days"] = max((now - due_dt).days, 0) if due_dt < now else None
             row["due_in_days"] = (due_dt - now).days if due_dt >= now else None
     if user.role == UserRole.admin:
-        rows.extend(_payable_expense_rows(db, now=now))
+        rows.extend(_payable_expense_rows(db, now=now, org_property_ids=org_property_ids))
     return rows
 
 

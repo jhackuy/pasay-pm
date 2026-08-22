@@ -1067,14 +1067,19 @@ def quick_tasks(
     reader: User | SystemReader = Depends(get_operations_reader),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _ = membership.organization_id
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
     if isinstance(reader, SystemReader):
         if scope == "owner":
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "SYSTEM reader cannot use the owner scope"
             )
-        return quick_svc.build_quick_tasks(db, reader, owner_only=False)
-    return quick_svc.build_quick_tasks(db, reader, owner_only=(scope == "owner"))
+        return quick_svc.build_quick_tasks(
+            db, reader, owner_only=False, org_property_ids=org_prop_ids
+        )
+    return quick_svc.build_quick_tasks(
+        db, reader, owner_only=(scope == "owner"), org_property_ids=org_prop_ids
+    )
 
 
 @router.get("/quick/properties")
@@ -1298,8 +1303,17 @@ def operations_summary(
     """Operational counts for the current user (agents scoped to their own)."""
     from app.services.operations.summary import build_operations_summary
 
-    _ = membership.organization_id
-    return build_operations_summary(db, user, owner_only=(scope == "owner"))
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    org_lease_ids = _org_lease_ids(db, org_id)
+    org_tenant_ids = _org_tenant_ids(db, org_id)
+    return build_operations_summary(
+        db, user,
+        owner_only=(scope == "owner"),
+        org_property_ids=org_prop_ids,
+        org_lease_ids=org_lease_ids,
+        org_tenant_ids=org_tenant_ids,
+    )
 
 
 # ---------------------------------------------------------------------------

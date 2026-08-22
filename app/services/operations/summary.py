@@ -5,11 +5,14 @@ context builder so both always use the same counting semantics.
   ``_agent_scope``).
 - Snoozed tasks count toward ``pending_total`` but are skipped from the
   overdue / due buckets while ``snoozed_until`` is in the future.
+- Privileged callers pass ``org_property_ids`` / ``org_lease_ids`` /
+  ``org_tenant_ids`` for strict fail-closed organization scoping.
 """
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
 
+from sqlalchemy import or_ as _sa_or
 from sqlalchemy.orm import Session
 
 from app.models.operations import OperationalTask, OperationalTaskStatus
@@ -20,6 +23,9 @@ from app.schemas.operations import OperationsSummary
 def build_operations_summary(
     db: Session, user: User, *, now: datetime | None = None,
     owner_only: bool = False,
+    org_property_ids: set[int] | None = None,
+    org_lease_ids: set[int] | None = None,
+    org_tenant_ids: set[int] | None = None,
 ) -> OperationsSummary:
     """Count pending operational tasks visible to ``user`` at ``now``.
 
@@ -28,6 +34,18 @@ def build_operations_summary(
     query = db.query(OperationalTask).filter(
         OperationalTask.status == OperationalTaskStatus.PENDING
     )
+    if org_property_ids is not None or org_lease_ids is not None or org_tenant_ids is not None:
+        scope_clauses = []
+        if org_property_ids:
+            scope_clauses.append(OperationalTask.property_id.in_(list(org_property_ids)))
+        if org_lease_ids:
+            scope_clauses.append(OperationalTask.lease_id.in_(list(org_lease_ids)))
+        if org_tenant_ids:
+            scope_clauses.append(OperationalTask.tenant_id.in_(list(org_tenant_ids)))
+        if scope_clauses:
+            query = query.filter(_sa_or(*scope_clauses))
+        else:
+            query = query.filter(False)
     if user.role == UserRole.agent:
         query = query.filter(OperationalTask.assigned_user_id == user.id)
     tasks = query.all()

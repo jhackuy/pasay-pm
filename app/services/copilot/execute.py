@@ -291,18 +291,23 @@ def _revalidate_for_execute(
 
     # 5) action-specific validity (assignee eligibility / snooze window)
     try:
-        _validate_action_specific(db, action_type, proposal.payload_json, now=now)
+        t_org_id = _target_org_id(db, target_type, target)
+        _validate_action_specific(
+            db, action_type, proposal.payload_json, now=now,
+            target_org_id=t_org_id,
+        )
     except _ActionValidationError as exc:
         _reject(exc.error_code, str(exc))
     return subject
 
 
 def _validate_action_specific(
-    db: Session, action_type: str, payload: dict, *, now: datetime
+    db: Session, action_type: str, payload: dict, *, now: datetime,
+    target_org_id: int | None = None,
 ) -> None:
     if action_type in ("create_followup_task", "assign_task"):
         assignee_id = int(payload["assignee_user_id"])
-        _require_assignee(db, assignee_id)
+        _require_assignee(db, assignee_id, org_id=target_org_id)
     if action_type == "create_followup_task":
         _parse_payload_dt(db, payload["due_at"])  # must be parseable + aware
     if action_type == "snooze_task":
@@ -314,7 +319,9 @@ def _validate_action_specific(
             )
 
 
-def _require_assignee(db: Session, user_id: int) -> User:
+def _require_assignee(
+    db: Session, user_id: int, *, org_id: int | None = None,
+) -> User:
     user = db.get(User, user_id)
     eligible = {UserRole.agent, UserRole.manager, UserRole.admin}
     if user is None or not eligible_human(user) or user.role not in eligible:
@@ -322,7 +329,69 @@ def _require_assignee(db: Session, user_id: int) -> User:
             copilot_svc.ERR_ASSIGNEE_INVALID,
             f"assignee user {user_id} is not an active, eligible assignee",
         )
+    if org_id is not None:
+        from app.services.membership import has_active_membership
+        if not has_active_membership(db, user.id, org_id):
+            raise _ActionValidationError(
+                copilot_svc.ERR_ASSIGNEE_INVALID,
+                f"assignee user {user_id} has no active membership in target org",
+            )
     return user
+
+
+def _target_org_id(db: Session, target_type: str, target) -> int | None:
+    """Resolve the owning organization_id for a copilot proposal target.
+
+    Used to assert that any chosen assignee holds an ACTIVE Membership in the
+    same organization (fail-closed — cross-org assignment is rejected).
+    Returns ``None`` when ownership cannot be determined (assignee check is
+    skipped conservatively for such targets).
+    """
+    try:
+        if target_type == "property":
+            return getattr(target, "organization_id", None)
+        if target_type == "lease":
+            unit = db.get(Unit, getattr(target, "unit_id", None))
+            if unit is None:
+                return None
+            from app.models.property import Property as _P
+            row = db.query(_P.organization_id).filter(
+                _P.id == unit.property_id, _P.deleted_at.is_(None)
+            ).one_or_none()
+            return row[0] if row else None
+        if target_type == "task":
+            pid = getattr(target, "property_id", None)
+            if pid is not None:
+                from app.models.property import Property as _P
+                row = db.query(_P.organization_id).filter(
+                    _P.id == pid, _P.deleted_at.is_(None)
+                ).one_or_none()
+                if row:
+                    return row[0]
+            lid = getattr(target, "lease_id", None)
+            if lid is not None:
+                from app.models.lease import Lease as _L
+                lease = db.get(_L, lid)
+                if lease is not None:
+                    unit = db.get(Unit, lease.unit_id)
+                    if unit is not None:
+                        from app.models.property import Property as _P
+                        row = db.query(_P.organization_id).filter(
+                            _P.id == unit.property_id, _P.deleted_at.is_(None)
+                        ).one_or_none()
+                        if row:
+                            return row[0]
+            tid = getattr(target, "tenant_id", None)
+            if tid is not None:
+                from app.models.tenant import Tenant as _T
+                t_row = db.query(_T.organization_id).filter(
+                    _T.id == tid, _T.deleted_at.is_(None)
+                ).one_or_none()
+                if t_row:
+                    return t_row[0]
+        return None
+    except Exception:
+        return None
 
 
 def _parse_payload_dt(db: Session, value) -> datetime:
@@ -444,12 +513,13 @@ def _apply_followup(
     atomic create + audit + outbox path). Returns the task id or None when the
     DB dedupe boundary already holds an active followup (at-most-one effect)."""
     payload = proposal.payload_json
-    assignee_id = int(payload["assignee_user_id"])
-    _require_assignee(db, assignee_id)
-    reason_code = str(payload["reason_code"])
-    due_at = _parse_payload_dt(db, payload["due_at"])
     target_type = copilot_svc.canonicalize(proposal.target_type)
     target = copilot_svc._resolve_target(db, target_type, proposal.target_id)
+    t_org_id = _target_org_id(db, target_type, target)
+    assignee_id = int(payload["assignee_user_id"])
+    _require_assignee(db, assignee_id, org_id=t_org_id)
+    reason_code = str(payload["reason_code"])
+    due_at = _parse_payload_dt(db, payload["due_at"])
     prop_id, tenant_id, lease_id = _inherit_task_context(db, target_type, target)
     note = payload.get("note")
     title = (note or "").strip()[:120] or f"跟进 {reason_code}"
@@ -495,8 +565,11 @@ def _apply_assign(
     """ASSIGN_TASK -> update the task + outbox to the NEW assignee (same
     transaction; no second reminder path). No-op when already assigned."""
     payload = proposal.payload_json
+    target_type = copilot_svc.canonicalize(proposal.target_type)
+    target = copilot_svc._resolve_target(db, target_type, proposal.target_id)
+    t_org_id = _target_org_id(db, target_type, target)
     assignee_id = int(payload["assignee_user_id"])
-    _require_assignee(db, assignee_id)
+    _require_assignee(db, assignee_id, org_id=t_org_id)
     task = db.get(OperationalTask, proposal.target_id)
     if task is None or task.status != OperationalTaskStatus.PENDING:
         raise _ActionValidationError(

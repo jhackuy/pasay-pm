@@ -618,12 +618,16 @@ def tasks_report(
             return "in_progress"
         if s == OperationalTaskStatus.COMPLETED:
             return "completed"
-        return "scheduled"
+        if s == OperationalTaskStatus.CANCELLED:
+            return "cancelled"
+        raise ValueError(f"Unmapped OperationalTaskStatus value: {s!r}")
 
     def _map_priority(p: OperationalTaskPriority) -> str:
         if p == OperationalTaskPriority.critical:
             return "high"
-        return p.value
+        if p in (OperationalTaskPriority.high, OperationalTaskPriority.medium, OperationalTaskPriority.low):
+            return p.value
+        raise ValueError(f"Unmapped OperationalTaskPriority value: {p!r}")
 
     rows = []
     for t in tasks:
