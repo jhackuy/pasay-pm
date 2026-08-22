@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -8,8 +10,19 @@ from app.models.property import Unit, UnitStatus
 from app.models.tenant import Tenant
 from app.models.user import User
 from app.schemas.common import MessageResponse
-from app.schemas.lease import LeaseCreate, LeaseRead, LeaseUpdate
+from app.schemas.lease import (
+    LeaseAutoExpireResponse,
+    LeaseCreate,
+    LeaseDeclineRenewalRequest,
+    LeaseRead,
+    LeaseRenewalRequest,
+    LeaseUpdate,
+)
 from app.services.audit import field_changes, record_audit, serialize_row
+from app.services.move_out_workflow import (
+    apply_settled_lease_final_state,
+    validate_lease_closeable,
+)
 from app.services.organization_scope import (
     CrossOrgReference,
     OrganizationRole,
@@ -171,6 +184,20 @@ def update_lease(
 
     unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
     new_status = updates.get("status", obj.status)
+    if new_status != obj.status and new_status in (LeaseStatus.terminated, LeaseStatus.expired):
+        ok, expected, actual = validate_lease_closeable(db, obj, expected_target_status=new_status)
+        if not ok:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "lease_closeable_truth_missing",
+                    "lease_id": obj.id,
+                    "target_status": new_status.value,
+                    "expected_truth": expected,
+                    "actual_truth": actual,
+                    "hint": "Run move-out inspection + deposit settlement pipeline first; inspection evidence gate and settlement conservation must both pass.",
+                },
+            )
     if new_status == LeaseStatus.active:
         conflicting = (
             db.query(Lease)
@@ -191,12 +218,16 @@ def update_lease(
         setattr(obj, field, value)
     obj.updated_by = user.id
     db.flush()
+    if new_status != obj.status:
+        pass
     if unit is not None:
         if new_status == LeaseStatus.active:
             unit.status = UnitStatus.occupied
             unit.updated_by = user.id
         else:
             _sync_unit_status(db, unit)
+    if new_status in (LeaseStatus.terminated, LeaseStatus.expired):
+        apply_settled_lease_final_state(db, obj, actor_id=user.id, now=datetime.now(timezone.utc))
     record_audit(
         db,
         table_name="leases",
@@ -230,10 +261,24 @@ def delete_lease(
         raise HTTPException(
             status.HTTP_409_CONFLICT, "Terminate the lease before deleting it"
         )
-    from datetime import datetime, timezone
+    if obj.moved_out_settled_at is None and obj.deleted_at is None:
+        ok, expected, actual = validate_lease_closeable(db, obj)
+        if not ok:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "lease_closeable_truth_missing_before_delete",
+                    "lease_id": obj.id,
+                    "expected_truth": expected,
+                    "actual_truth": actual,
+                    "hint": "Close the inspection + settlement pipeline before soft-deleting; or mark the lease as settled first.",
+                },
+            )
 
     obj.deleted_at = datetime.now(timezone.utc)
     obj.updated_by = user.id
+    if obj.moved_out_settled_at is None:
+        apply_settled_lease_final_state(db, obj, actor_id=user.id, now=datetime.now(timezone.utc))
     unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
     if unit is not None:
         _sync_unit_status(db, unit)
@@ -247,3 +292,288 @@ def delete_lease(
     )
     db.commit()
     return MessageResponse(detail="Lease deleted")
+
+
+@router.post("/{lease_id}/renew", response_model=LeaseRead)
+def renew_lease(
+    lease_id: int,
+    payload: LeaseRenewalRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        obj, membership = scoped_get_lease(
+            db, lease_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    existing_meta = obj.renewal_metadata or {}
+    if existing_meta.get("renewed_lease_id"):
+        db.refresh(obj)
+        return obj
+    successor_unit_id = payload.unit_id or obj.unit_id
+    existing_successor = (
+        db.query(Lease)
+        .filter(
+            Lease.unit_id == successor_unit_id,
+            Lease.status == LeaseStatus.active,
+            Lease.id != obj.id,
+            Lease.deleted_at.is_(None),
+            Lease.end_date > obj.end_date,
+        )
+        .first()
+    )
+    if existing_successor is not None:
+        if not existing_meta.get("renewed_lease_id"):
+            existing_meta["renewed_lease_id"] = existing_successor.id
+            existing_meta["renewed_at"] = datetime.now(timezone.utc).isoformat()
+            obj.renewal_metadata = existing_meta
+            obj.updated_by = user.id
+            db.flush()
+        db.refresh(obj)
+        return obj
+    successor_tenant_id = payload.tenant_id or obj.tenant_id
+    try:
+        s_u_org = unit_org_id(db, successor_unit_id)
+        if s_u_org is None:
+            raise LookupError("Unit not found")
+        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=s_u_org, object_kind="Unit", object_id=successor_unit_id)
+        s_t_org = tenant_org_id(db, successor_tenant_id)
+        if s_t_org is None:
+            raise LookupError("Tenant not found")
+        assert_co_org(db, user_org_id=membership.organization_id, object_org_id=s_t_org, object_kind="Tenant", object_id=successor_tenant_id)
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    s_unit = db.query(Unit).filter(Unit.id == successor_unit_id, Unit.deleted_at.is_(None)).first()
+    if s_unit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
+    s_tenant = db.query(Tenant).filter(Tenant.id == successor_tenant_id, Tenant.deleted_at.is_(None)).first()
+    if s_tenant is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
+    conflicting_active = (
+        db.query(Lease)
+        .filter(
+            Lease.unit_id == successor_unit_id,
+            Lease.status == LeaseStatus.active,
+            Lease.id != obj.id,
+            Lease.deleted_at.is_(None),
+        )
+        .first()
+    )
+    if conflicting_active is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Successor unit is already occupied by another active lease")
+    successor = Lease(
+        unit_id=successor_unit_id,
+        tenant_id=successor_tenant_id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        accounting_start_date=None,
+        monthly_rent=payload.monthly_rent,
+        deposit=payload.deposit,
+        status=LeaseStatus.active,
+        due_day=payload.due_day or obj.due_day,
+        renewal_notice_period_days=payload.renewal_notice_period_days or obj.renewal_notice_period_days,
+        management_fee_included=obj.management_fee_included,
+        special_terms=obj.special_terms,
+    )
+    successor.created_by = user.id
+    successor.updated_by = user.id
+    db.add(successor)
+    db.flush()
+    if s_unit.status != UnitStatus.occupied:
+        s_unit.status = UnitStatus.occupied
+        s_unit.updated_by = user.id
+    old_obj = serialize_row(obj)
+    existing_meta = obj.renewal_metadata or {}
+    if not existing_meta.get("renewed_lease_id"):
+        existing_meta["renewed_lease_id"] = successor.id
+        existing_meta["renewed_at"] = datetime.now(timezone.utc).isoformat()
+        obj.renewal_metadata = existing_meta
+        obj.updated_by = user.id
+        record_audit(
+            db,
+            table_name="leases",
+            record_id=obj.id,
+            action="renewal_linked",
+            actor_id=user.id,
+            changed_fields={"renewal_metadata": ["old", "renewed -> successor #%d" % successor.id]},
+            old_value=old_obj,
+            new_value=serialize_row(obj),
+        )
+    record_audit(
+        db,
+        table_name="leases",
+        record_id=successor.id,
+        action="create_renewal_successor",
+        actor_id=user.id,
+        new_value=serialize_row(successor),
+    )
+    # Forward sync LEASE_EXPIRING task COMPLETED for predecessor
+    from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
+    now = datetime.now(timezone.utc)
+    tasks = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.task_type == OperationalTaskType.LEASE_EXPIRING,
+            OperationalTask.source_type == "lease",
+            OperationalTask.source_id == obj.id,
+            OperationalTask.status == OperationalTaskStatus.PENDING,
+        )
+        .all()
+    )
+    for t in tasks:
+        old_row = serialize_row(t)
+        t.status = OperationalTaskStatus.COMPLETED
+        t.updated_at = now
+        t.completed_at = now
+        t.completed_by = user.id
+        t.reminder_generation = t.reminder_generation + 1
+        record_audit(
+            db, table_name="operational_tasks", record_id=t.id, action="task_auto_completed",
+            actor_id=None,
+            changed_fields={"status": ["PENDING", "COMPLETED"], "reason": "lease_renewed_successor_created"},
+            old_value=old_row, new_value=serialize_row(t),
+        )
+    db.commit()
+    db.refresh(successor)
+    return successor
+
+
+@router.post("/{lease_id}/decline-renewal", response_model=LeaseRead)
+def decline_renewal(
+    lease_id: int,
+    payload: LeaseDeclineRenewalRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        obj, _membership = scoped_get_lease(
+            db, lease_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    existing_meta = obj.renewal_metadata or {}
+    if existing_meta.get("renewed_lease_id"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_already_renewed",
+                "lease_id": obj.id,
+                "renewed_lease_id": existing_meta["renewed_lease_id"],
+                "hint": "Cannot decline renewal after a successor lease has been created; use PATCH status=terminated instead.",
+            },
+        )
+    if existing_meta.get("not_renewed"):
+        return obj
+    existing_meta["not_renewed"] = True
+    existing_meta["declined_at"] = datetime.now(timezone.utc).isoformat()
+    if payload.reason is not None:
+        existing_meta["decline_reason"] = payload.reason
+    if payload.move_out_date is not None:
+        existing_meta["move_out_date"] = payload.move_out_date.isoformat()
+    old = serialize_row(obj)
+    obj.renewal_metadata = existing_meta
+    obj.updated_by = user.id
+    db.flush()
+    record_audit(
+        db,
+        table_name="leases",
+        record_id=obj.id,
+        action="decline_renewal",
+        actor_id=user.id,
+        changed_fields={"renewal_metadata": ["old", "not_renewed=true"]},
+        old_value=old,
+        new_value=serialize_row(obj),
+    )
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
+@router.post("/{lease_id}/auto-expire", response_model=LeaseAutoExpireResponse)
+def auto_expire(
+    lease_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        obj, _membership = scoped_get_lease(
+            db, lease_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    old_status = obj.status.value
+    today = datetime.now(timezone.utc).date()
+    if obj.status != LeaseStatus.active:
+        return LeaseAutoExpireResponse(
+            id=obj.id,
+            status=obj.status.value,
+            old_status=old_status,
+            new_status=obj.status.value,
+            already_expired=True,
+        )
+    existing_meta = obj.renewal_metadata or {}
+    if existing_meta.get("renewed_lease_id"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_already_renewed_successor_detected",
+                "lease_id": obj.id,
+                "renewed_lease_id": existing_meta["renewed_lease_id"],
+                "hint": "A successor active lease exists; use PATCH status=terminated after move-out settlement instead.",
+            },
+        )
+    if not existing_meta.get("not_renewed"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "decline_renewal_required_not_renewed_missing",
+                "lease_id": obj.id,
+                "not_renewed": False,
+                "hint": "Call /decline-renewal first to flag not_renewed=true before auto-expire.",
+            },
+        )
+    if obj.end_date > today:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_not_yet_expired",
+                "lease_id": obj.id,
+                "end_date": obj.end_date.isoformat(),
+                "today": today.isoformat(),
+                "hint": "auto-expire is allowed only after the lease end_date has passed.",
+            },
+        )
+    from app.services.operations.reconcile import _lease_renewed
+    renewed = _lease_renewed(db, obj)
+    if renewed:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_already_renewed_successor_detected",
+                "lease_id": obj.id,
+                "hint": "A successor active lease exists for the same unit with a later end_date; use PATCH status=terminated after settlement instead.",
+            },
+        )
+    old_row = serialize_row(obj)
+    obj.status = LeaseStatus.expired
+    obj.updated_by = user.id
+    db.flush()
+    record_audit(
+        db, table_name="leases", record_id=obj.id, action="auto_expire",
+        actor_id=user.id,
+        changed_fields={"status": [old_status, LeaseStatus.expired.value]},
+        old_value=old_row, new_value=serialize_row(obj),
+    )
+    db.commit()
+    db.refresh(obj)
+    return LeaseAutoExpireResponse(
+        id=obj.id,
+        status=LeaseStatus.expired.value,
+        old_status=old_status,
+        new_status=LeaseStatus.expired.value,
+        already_expired=False,
+    )
