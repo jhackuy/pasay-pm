@@ -94,6 +94,7 @@ from app.services.operations.redelivery import suppress_pending_redeliveries
 from app.services.operations.scheduler import run_scheduler_once
 from app.services.operations.generation import create_operational_task
 from app.services.operations.owner_scope import is_owner_actionable
+from app.services.operations.truth_validator import assert_completion_allowed
 
 router = APIRouter(prefix="/operations", tags=["operations"])
 
@@ -399,6 +400,7 @@ def complete_task(
     task = _get_task_or_404(db, task_id)
     _require_access(task, user)
     now = datetime.now(timezone.utc)
+    assert_completion_allowed(db, task)
     old = serialize_row(task)
     result = db.execute(
         update(OperationalTask)
@@ -694,6 +696,7 @@ def update_task(
     if payload.status is not None:
         updates["status"] = payload.status
         if payload.status == OperationalTaskStatus.COMPLETED:
+            assert_completion_allowed(db, task)
             updates["completed_at"] = now
             updates["completed_by"] = user.id
     if not updates:
