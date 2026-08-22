@@ -55,6 +55,14 @@ class ExpenseStatus(str, Enum):
 
 class Expense(AuditMixin, Base):
     __tablename__ = "expenses"
+    __table_args__ = (
+        Index(
+            "uq_expenses_idempotency_key",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
 
     expense_date: Mapped[date] = mapped_column(Date, nullable=False)
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -62,6 +70,7 @@ class Expense(AuditMixin, Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False)
     payee: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     unit_id: Mapped[int | None] = mapped_column(
         ForeignKey("units.id"), nullable=True, index=True
     )

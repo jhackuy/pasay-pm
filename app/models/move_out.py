@@ -19,7 +19,7 @@ class MoveOutInspection(AuditMixin, Base):
     __tablename__ = "move_out_inspections"
     __table_args__ = (
         Index(
-            "uq_move_out_inspections_active_lease",
+            "uq_move_out_inspections_active_per_lease",
             "lease_id",
             unique=True,
             postgresql_where=text("status IN ('SCHEDULED','INSPECTED')"),
