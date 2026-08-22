@@ -233,7 +233,8 @@ def test_expense_claim_fail_creates_owner_decision_task(
 
 
 # T3
-def test_expense_fully_paid_auto_closes_repair_with_evidence(
+# T3
+def test_expense_fully_paid_schedules_repair_verification_followup_not_close(
     client, owner_a, org_a, property_id, unit_id, db_session
 ):
     headers = _headers(owner_a[1])
@@ -271,9 +272,7 @@ def test_expense_fully_paid_auto_closes_repair_with_evidence(
     repair_after_proposal = r.json()
     version = repair_after_proposal.get("latest_proposal_version") or 1
 
-    # 3. Approve the quote proposal. This should either link the auto-created
-    # Expense or (depending on workflow) keep it pending. We also accept an
-    # explicit expense_id path via a scoped expense lookup below.
+    # 3. Approve the quote proposal.
     r = client.post(
         f"{API}/repairs/{rid}/decide",
         json={"decision": "approve", "version": version},
@@ -281,10 +280,7 @@ def test_expense_fully_paid_auto_closes_repair_with_evidence(
     )
     assert r.status_code == 200, r.text
 
-    # Locate the linked Expense (repair proposals usually embed the id or the
-    # latest_proposal carries expense_id).
     from app.models.financial import Expense
-
     linked = (
         db_session.query(Expense)
         .filter(
@@ -296,7 +292,6 @@ def test_expense_fully_paid_auto_closes_repair_with_evidence(
         .first()
     )
     if linked is None:
-        # Fallback: create the expense explicitly and link it to a new decide.
         e = _create_expense_approved(
             client, headers, property_id, unit_id, "800.00", category="repair"
         )
@@ -322,59 +317,105 @@ def test_expense_fully_paid_auto_closes_repair_with_evidence(
         assert r3.status_code == 200, r3.text
         eid = e["id"]
     else:
-        # If linked but still pending, approve so claim/verify/pay can run.
         if linked.status == "pending":
             appro = client.post(
                 f"{API}/expenses/{linked.id}/approve", json={}, headers=headers
             )
             if appro.status_code != 200:
-                # Some paths don't have /approve; skip if already approvable via status
                 pass
         eid = linked.id
 
     # 4. Drive linked Expense through payment truth: claim + verify + pay fully.
-    c = _claim_expense(client, headers, eid, "800.00")
-    _verify_claim(client, headers, eid, c["id"])
-    _pay_expense(client, headers, eid)
-
-    # 5. Record completion evidence. Use Repair record-result → verify with
-    # COMPLETION_EVENT signal so evidence_ids gate triggers CLOSED.
-    #   (a) Record a result first with evidence_ids placeholder.  Evidence ids
-    #       don't need to be real rows for the purpose of this assertion (the
-    #       gate only checks non-empty completion_evidence_ids list).
+    #    Before paying, drive repair to VERIFYING via canonical completion_event
+    #    evidence pathway so we can check the NEW behavior: payment creates a
+    #    followup task, does NOT mutate repair status.
     fake_evidence_id = 1
-    rec = client.post(
+    rec_pre = client.post(
         f"{API}/repairs/{rid}/record-result",
         json={
-            "verification_result": "work completed",
+            "verification_result": "work completed (pre-pay evidence)",
             "evidence_ids": [fake_evidence_id],
             "source": "contractor",
         },
         headers=headers,
     )
-    assert rec.status_code == 200, rec.text
+    assert rec_pre.status_code == 200, rec_pre.text
 
-    #   (b) Verify with COMPLETION_EVENT — because evidence_ids were planted,
-    #       the verification gate should pass and repair.status → CLOSED.
+    from app.models.operations import OperationalTask
+    from app.models.repair import RepairOperation
+
+    db_session.flush()
+    repair_before_pay = db_session.get(RepairOperation, rid)
+    assert repair_before_pay.status.value == "VERIFYING", (
+        f"sanity: repair should be VERIFYING after evidence, got {repair_before_pay.status.value}"
+    )
+    tasks_before_pay_count = (
+        db_session.query(OperationalTask.id)
+        .filter(
+            OperationalTask.source_type == "repair",
+            OperationalTask.source_id == rid,
+            OperationalTask.dedupe_key.like(
+                f"repair:{rid}:verification_followup_from_expense_%"
+            ),
+        )
+        .count()
+    )
+
+    c = _claim_expense(client, headers, eid, "800.00")
+    _verify_claim(client, headers, eid, c["id"])
+    _pay_expense(client, headers, eid)
+
+    db_session.commit()
+    repair_after_pay = db_session.get(RepairOperation, rid)
+    assert repair_after_pay is not None
+    status_after_pay = repair_after_pay.status.value
+    assert status_after_pay == "VERIFYING", (
+        f"Payment must not close repair (Expense Payment ≠ Repair Verification); "
+        f"expected VERIFYING, got status={status_after_pay}"
+    )
+    followup_tasks = (
+        db_session.query(OperationalTask)
+        .filter(
+            OperationalTask.source_type == "repair",
+            OperationalTask.source_id == rid,
+            OperationalTask.dedupe_key.like(
+                f"repair:{rid}:verification_followup_from_expense_%"
+            ),
+            OperationalTask.status.in_(["PENDING", "IN_PROGRESS"]),
+        )
+        .all()
+    )
+    assert len(followup_tasks) >= tasks_before_pay_count + 1, (
+        f"After fully_paid expected verification_followup task for repair #{rid}; "
+        f"found {len(followup_tasks)} (before-pay count={tasks_before_pay_count})"
+    )
+    ft = followup_tasks[-1]
+    assert getattr(ft, "next_action", None) == "CANONICAL_REPAIR_VERIFICATION", (
+        f"followup next_action should be CANONICAL_REPAIR_VERIFICATION got {ft.next_action}"
+    )
+    details = getattr(ft, "details", None) or {}
+    assert details.get("trigger_expense_id") == eid, (
+        f"followup details should carry trigger_expense_id={eid} got {details}"
+    )
+    assert details.get("warning") and "Payment is not verification" in details["warning"]
+
+    # 5. Canonical verification pathway MUST STILL close the repair (truth-first).
     ver = client.post(
         f"{API}/repairs/{rid}/verify",
         json={
-            "verification_result": "on-site confirmed",
+            "verification_result": "owner on-site confirmed",
             "closure_signal": "COMPLETION_EVENT",
-            "source": "owner_signoff",
+            "source": "owner_signoff_canonical",
         },
         headers=headers,
     )
     assert ver.status_code == 200, ver.text
-    repair_final = ver.json()
     db_session.commit()
-    repair_row = db_session.get(RepairOperation, rid)
-    assert repair_row is not None
-    final_status = repair_row.status.value if hasattr(repair_row.status, "value") else repair_row.status
+    repair_final_row = db_session.get(RepairOperation, rid)
+    final_status = repair_final_row.status.value
     assert final_status == "CLOSED", (
-        f"expected repair CLOSED after fully-paid linked expense + "
-        f"COMPLETION_EVENT + evidence; got status={final_status} "
-        f"api_status={repair_final.get('status')}"
+        f"Canonical verification (COMPLETION_EVENT + evidence) should close repair; "
+        f"got final_status={final_status}"
     )
 
 
