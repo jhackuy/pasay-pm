@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
@@ -34,7 +34,7 @@ from app.models.operations import (
     RecurringRule,
 )
 from app.models.lease import Lease
-from app.models.membership import Membership, MembershipState, OrganizationRole
+from app.models.membership import Membership, MembershipState, Organization, OrganizationRole
 from app.models.property import Property, Unit
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
@@ -139,6 +139,92 @@ def resolve_org_membership(
         if membership is None:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient organization role")
         return membership
+
+    return _dep
+
+
+class OperationsOrgContext:
+    """Resolved org context for operations endpoints, usable by both HUMAN and
+    SYSTEM readers.
+
+    - For HUMAN ``User``: org_id comes from the active Membership row (role
+      verified against the caller's active role; matches
+      :func:`resolve_org_membership` behavior exactly).
+    - For SYSTEM ``SystemReader``: org_id comes from ``X-Pasay-Org-Id`` header if
+      present; else the *single* active Organization row in DB. Fail-closed
+      400 if multiple orgs exist and no explicit header; 403 if the header
+      points to a missing org. No HUMAN role is assigned (``role=None`` so endpoints
+      that require a real HUMAN role must reject SYSTEM explicitly.
+    """
+
+    __slots__ = ("org_id", "role", "membership")
+
+    def __init__(self, *, org_id: int,
+                 role: OrganizationRole | None,
+                 membership: Membership | None = None):
+        self.org_id = org_id
+        self.role = role
+        self.membership = membership
+
+
+def resolve_operations_org_context(
+    role: Iterable[OrganizationRole] | None = None,
+):
+    """Depends factory: SYSTEM-aware org context resolver for deterministic
+    operations reads used on endpoints that support :class:`SystemReader` via
+    :func:`app.api.deps.get_operations_reader`.
+
+    HUMAN branch is identical to :func:`resolve_org_membership`.
+    SYSTEM branch: never falls back to a role assumption or header fallback:
+    ``X-Pasay-Org-Id`` → exactly-one-org heuristic; fail-closed otherwise.
+    The ``role`` parameter is applied ONLY for HUMAN identity — SYSTEM branch returns
+    ``role=None``, leaving endpoint guards.
+    """
+    role_set: set[OrganizationRole] = set(role) if role else set()
+
+    def _dep(
+        db: Session = Depends(get_db),
+        reader: User | SystemReader = Depends(get_operations_reader),
+        x_pasay_org_id: int | None = Header(default=None, alias="X-Pasay-Org-Id"),
+    ) -> OperationsOrgContext:
+        if isinstance(reader, User):
+            # HUMAN path — identical to resolve_org_membership(role=...)
+            org_ids = list_active_org_ids_for_user(db, reader.id)
+            if not org_ids:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
+            org_id = org_ids[0]
+            q = db.query(Membership).filter(
+                Membership.user_id == reader.id,
+                Membership.organization_id == org_id,
+                Membership.state == MembershipState.ACTIVE,
+                Membership.removed_at.is_(None),
+            )
+            if role_set:
+                q = q.filter(Membership.role.in_(role_set))
+            membership = q.first()
+            if membership is None:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient organization role")
+            return OperationsOrgContext(org_id=org_id, role=membership.role, membership=membership)
+
+        # SYSTEM reader path
+        if x_pasay_org_id is not None:
+            org_exists = db.execute(
+                select(Organization.id).where(Organization.id == x_pasay_org_id)
+            ).scalar_one_or_none()
+            if org_exists is None:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "X-Pasay-Org-Id not found")
+            return OperationsOrgContext(org_id=x_pasay_org_id, role=None, membership=None)
+
+        # No explicit header: only allow if exactly ONE Organization row exists.
+        org_ids = [r[0] for r in db.execute(select(Organization.id)).all()]
+        if len(org_ids) == 0:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "No organization configured")
+        if len(org_ids) > 1:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "X-Pasay-Org-Id header required when multiple organizations configured",
+            )
+        return OperationsOrgContext(org_id=org_ids[0], role=None, membership=None)
 
     return _dep
 
@@ -1065,9 +1151,10 @@ def quick_tasks(
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     reader: User | SystemReader = Depends(get_operations_reader),
-    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
+    ctx: OperationsOrgContext = Depends(resolve_operations_org_context(
+        role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    org_id = membership.organization_id
+    org_id = ctx.org_id
     org_prop_ids = _org_property_ids(db, org_id)
     if isinstance(reader, SystemReader):
         if scope == "owner":
@@ -1286,9 +1373,10 @@ def secretary_target(
 def daily_digest(
     db: Session = Depends(get_db),
     reader: User | SystemReader = Depends(get_operations_reader),
-    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
+    ctx: OperationsOrgContext = Depends(resolve_operations_org_context(
+        role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    org_id = membership.organization_id
+    org_id = ctx.org_id
     org_prop_ids = _org_property_ids(db, org_id)
     return quick_svc.build_digest(db, reader, org_property_ids=org_prop_ids)
 

@@ -109,7 +109,7 @@ jobs:
         run: |
           python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
-      - name: Run backend targeted pytest (Issue #18 + Issue #31 + M1 + M002 + M003)
+      - name: Run backend targeted pytest (Issue #18 + Issue #31 + M1 + M002 + M003 + M004)
         if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.cloudflare == 'true'
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
@@ -125,6 +125,7 @@ jobs:
           # M1 org-scope P0 regression (milestone/1)
           # M002: Rent closure + Repair closure + Expense payment truth + Repair AI employee
           # M003: Expense Truth Closure + Reports/Operations/Legacy Scope Unified Hardening
+          # M004: Telegram / Copilot / SYSTEM reader operational integration on canonical truths
           python -m pytest \
             tests/test_telegram_webhook_p018.py \
             tests/test_prod_arch_closeout_p0_031.py \
@@ -135,6 +136,7 @@ jobs:
             tests/test_repair_closure_m2.py \
             tests/test_fix3_blockers_m2.py \
             tests/test_m003_expense_scope_hardening.py \
+            tests/test_m004_telegram_copilot_ops.py \
             -v --tb=short -q
 
       - name: Install bot dependencies
