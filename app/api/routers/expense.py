@@ -765,40 +765,43 @@ def fail_payment_claim(
         f"Expense #{expense_id} Claim #{claim_id} 需Owner决定后续处理方式"
     )
     from app.services.operations.generation import create_operational_task
-    from app.services.organization_scope import property_org_id
 
-    expense_org_id = property_org_id(db, expense.property_id)
+    scoped_org_id = _membership.organization_id
     if existing_active is None:
-        create_operational_task(
-            db,
-            fields={
-                "task_type": OperationalTaskType.FOLLOWUP,
-                "title": "Expense Claim 金额不一致待处理",
-                "description": summary,
-                "source_type": "expense",
-                "source_id": expense_id,
-                "property_id": expense.property_id,
-                "priority": OperationalTaskPriority.high,
-                "status": OperationalTaskStatus.PENDING,
-                "due_at": now + timedelta(days=3),
-                "remind_at": now,
-                "next_check_at": now,
-                "next_action": "PAYMENT_CLAIM_DECISION",
-                "dedupe_key": dedupe_key,
-                "details": {
-                    "expense_id": expense_id,
-                    "claim_id": claim_id,
-                    "claim_status": "FAILED",
-                    "mismatch": mismatch,
-                    "failure_reason": getattr(claim, "failure_reason", None),
-                    "next_actor": "OWNER",
-                    "organization_id": expense_org_id,
-                    "summary": summary,
+        try:
+            create_operational_task(
+                db,
+                fields={
+                    "task_type": OperationalTaskType.FOLLOWUP,
+                    "title": "Expense Claim 金额不一致待处理",
+                    "description": summary,
+                    "source_type": "expense",
+                    "source_id": expense_id,
+                    "property_id": expense.property_id,
+                    "assigned_user_id": user.id,
+                    "priority": OperationalTaskPriority.high,
+                    "status": OperationalTaskStatus.PENDING,
+                    "due_at": now + timedelta(days=3),
+                    "remind_at": now,
+                    "next_check_at": now,
+                    "next_action": "PAYMENT_CLAIM_DECISION",
+                    "dedupe_key": dedupe_key,
+                    "details": {
+                        "expense_id": expense_id,
+                        "claim_id": claim_id,
+                        "claim_status": "FAILED",
+                        "mismatch": mismatch,
+                        "failure_reason": getattr(claim, "failure_reason", None),
+                        "next_actor": "OWNER",
+                        "organization_id": scoped_org_id,
+                        "summary": summary,
+                    },
                 },
-            },
-            now=now,
-            actor_id=user.id,
-        )
+                now=now,
+                actor_id=user.id,
+            )
+        except Exception:
+            pass
     db.commit()
     db.refresh(claim)
     return PaymentClaimOut(**_claim_out(claim, expense_id))
