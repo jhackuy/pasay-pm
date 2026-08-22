@@ -274,16 +274,27 @@ def _table_has_match(task: OperationalTask) -> bool:
     return wildcard_type in _PROJECTION_TABLE
 
 
+_NON_PROJECTION_SOURCE_TYPES = frozenset({
+    "",
+    "conversation",
+    "recurring_rule",
+    "manual",
+    "task",
+})
+
+
 def _is_non_projection(task: OperationalTask) -> bool:
-    """A task is 'non-projection' (human-created copilot/conversation) ONLY
-    when source_type is empty or exactly 'conversation'. Any other
-    source_type (lease, expense, repair, custom_integration_bot, ...) is
-    treated as a projection integration and MUST be registered in the
-    PROJECTION_TABLE; otherwise it fail-closes (not schema-A)."""
+    """A task is 'non-projection' (human-created copilot/conversation,
+    recurring_rule scheduled, manual operator, task-to-task followup) when
+    source_type is in the explicit NON_PROJECTION_SOURCE_TYPES set above.
+
+    All other source_types (rent, lease, expense, repair, settlement,
+    income_lease, and any unknown/future custom integration value that has
+    not been explicitly registered) are treated as projection integrations
+    and MUST be registered in PROJECTION_TABLE — otherwise they fail-close
+    (not schema-A)."""
     source_type = (task.source_type or "").strip()
-    if not source_type:
-        return True
-    return source_type == "conversation"
+    return source_type in _NON_PROJECTION_SOURCE_TYPES
 
 
 def validate_completion(db: Session, task: OperationalTask) -> TruthValidationResult:
