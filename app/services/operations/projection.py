@@ -24,10 +24,14 @@ flow through these seams.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.models.operations import (
     OperationalTask,
@@ -279,40 +283,48 @@ def reopen_closed_projections(
     now = now or datetime.now(timezone.utc)
     reopened = 0
     for tid in task_ids:
-        task = db.get(OperationalTask, tid)
-        if task is None:
-            continue
-        if task.status != OperationalTaskStatus.COMPLETED:
-            continue
-        old = serialize_row(task)
-        task.status = OperationalTaskStatus.PENDING
-        task.completed_at = None
-        task.completed_by = None
-        task.reminder_generation = (task.reminder_generation or 0) + 1
-        task.updated_by = actor_id
-        task.updated_at = now
-        task.remind_at = now
-        task.next_check_at = now
-        if task.due_at and task.due_at < now:
-            task.priority = OperationalTaskPriority.high
-        db.flush()
-        record_audit(
-            db,
-            table_name="operational_tasks",
-            record_id=task.id,
-            action="task_reopened",
-            actor_id=actor_id,
-            changed_fields={
-                "status": [old.get("status"), OperationalTaskStatus.PENDING.value],
-                "reminder_generation": [
-                    old.get("reminder_generation", 0),
-                    task.reminder_generation,
-                ],
-                "source_domain": [None, source_domain],
-                "reason": None if not reason else reason,
-            },
-            old_value=old,
-            new_value=serialize_row(task),
-        )
-        reopened += 1
+        try:
+            with db.begin_nested():
+                task = db.get(OperationalTask, tid)
+                if task is None:
+                    continue
+                if task.status != OperationalTaskStatus.COMPLETED:
+                    continue
+                old = serialize_row(task)
+                task.status = OperationalTaskStatus.PENDING
+                task.completed_at = None
+                task.completed_by = None
+                task.reminder_generation = (task.reminder_generation or 0) + 1
+                task.updated_by = actor_id
+                task.updated_at = now
+                task.remind_at = now
+                task.next_check_at = now
+                if task.due_at and task.due_at < now:
+                    task.priority = OperationalTaskPriority.high
+                db.flush()
+                record_audit(
+                    db,
+                    table_name="operational_tasks",
+                    record_id=task.id,
+                    action="task_reopened",
+                    actor_id=actor_id,
+                    changed_fields={
+                        "status": [old.get("status"), OperationalTaskStatus.PENDING.value],
+                        "reminder_generation": [
+                            old.get("reminder_generation", 0),
+                            task.reminder_generation,
+                        ],
+                        "source_domain": [None, source_domain],
+                        "reason": None if not reason else reason,
+                    },
+                    old_value=old,
+                    new_value=serialize_row(task),
+                )
+                reopened += 1
+        except IntegrityError as _e:
+            logger.info(
+                "reopen_closed_projections: skip task_id=%s active dedupe_key conflict",
+                tid,
+                exc_info=True,
+            )
     return reopened

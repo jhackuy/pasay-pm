@@ -554,7 +554,14 @@ def tasks_report(
         elif status == "completed":
             query = query.filter(OperationalTask.status == OperationalTaskStatus.COMPLETED)
         elif status == "scheduled":
-            query = query.filter(OperationalTask.status == OperationalTaskStatus.CANCELLED)
+            query = query.filter(
+                OperationalTask.status.in_([
+                    OperationalTaskStatus.PENDING,
+                    OperationalTaskStatus.IN_PROGRESS,
+                ]),
+                OperationalTask.due_at.isnot(None),
+                func.date(OperationalTask.due_at) > today,
+            )
     today = date.today()
     if overdue:
         query = query.filter(
@@ -577,7 +584,18 @@ def tasks_report(
     lease_unit_ids: dict[int, int] = {}
     lease_ids = {t.lease_id for t in tasks if t.lease_id is not None}
     if lease_ids:
-        for lid, uid in db.query(Lease.id, Lease.unit_id).filter(Lease.id.in_(lease_ids)).all():
+        for lid, uid in (
+            db.query(Lease.id, Lease.unit_id)
+            .join(Unit, Unit.id == Lease.unit_id)
+            .join(Property, Unit.property_id == Property.id)
+            .filter(
+                Lease.id.in_(list(lease_ids)),
+                Property.organization_id == org_id,
+                Lease.deleted_at.is_(None),
+                Unit.deleted_at.is_(None),
+            )
+            .all()
+        ):
             lease_unit_ids[lid] = uid
 
     unit_ids_from_leases = set(lease_unit_ids.values())
