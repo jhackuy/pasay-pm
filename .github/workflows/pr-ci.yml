@@ -88,7 +88,7 @@ jobs:
           grep -q "route:dev" GITHUB_DEV_WORKFLOW.md
           grep -q "ready-for-owner" GITHUB_DEV_WORKFLOW.md
           grep -q "CodeRabbit and \`pasay-gate\` run in parallel" GITHUB_DEV_WORKFLOW.md
-          grep -q "Long-Term Engineering Rules" AGENTS.md
+          grep -q "Permanent Engineering Truths" AGENTS.md
           grep -q "GitHub Issue 是唯一任务 ID" README.md
           grep -q "pasay-gate" README.md
 
