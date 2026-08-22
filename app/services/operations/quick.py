@@ -284,10 +284,11 @@ _SCOPE_ALL_USER = _AllUserPseudo()
 
 
 def _derive_org_scope_sets(db: Session, user_id: int | None = None):
-    """Triple-channel ownership derivation: org_property_ids ∨ org_unit_ids ∨
-    org_lease_ids ∨ org_tenant_ids, matching build_quick_tasks canonical
+    """Triple-channel ownership derivation: org_property_ids or org_unit_ids or
+    org_lease_ids or org_tenant_ids, matching build_quick_tasks canonical
     pattern. Returns four sets (may be empty) — empty set means "no rows from
-    that channel" (fail-closed).
+    that channel" (fail-closed). Tenant.organization_id is always queried
+    directly, independent of whether the org has any Property/Unit/Lease rows.
 
     user_id=None means system-level full-scope caller (scheduler / unauthenticated
     code path) — returns all organizations' scoped sets (not user_id=0 which
@@ -311,8 +312,6 @@ def _derive_org_scope_sets(db: Session, user_id: int | None = None):
             )
         ).all()
     }
-    if not org_property_ids:
-        return set(), set(), set(), set()
     org_unit_ids = {
         r for (r,) in db.execute(
             select(Unit.id).where(
@@ -320,7 +319,7 @@ def _derive_org_scope_sets(db: Session, user_id: int | None = None):
                 Unit.deleted_at.is_(None),
             )
         ).all()
-    }
+    } if org_property_ids else set()
     org_lease_ids: set[int] = set()
     org_tenant_ids: set[int] = set()
     if org_unit_ids:

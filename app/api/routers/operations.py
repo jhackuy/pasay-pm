@@ -400,7 +400,8 @@ def complete_task(
     task = _get_task_or_404(db, task_id)
     _require_access(task, user)
     now = datetime.now(timezone.utc)
-    assert_completion_allowed(db, task)
+    if task.status == OperationalTaskStatus.PENDING:
+        assert_completion_allowed(db, task)
     old = serialize_row(task)
     result = db.execute(
         update(OperationalTask)
@@ -695,7 +696,7 @@ def update_task(
         updates["details"] = merged_details
     if payload.status is not None:
         updates["status"] = payload.status
-        if payload.status == OperationalTaskStatus.COMPLETED:
+        if payload.status == OperationalTaskStatus.COMPLETED and task.status != OperationalTaskStatus.COMPLETED:
             assert_completion_allowed(db, task)
             updates["completed_at"] = now
             updates["completed_by"] = user.id
