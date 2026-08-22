@@ -1083,8 +1083,9 @@ def quick_properties(
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _ = membership.organization_id
-    return quick_svc.build_quick_properties(db)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_quick_properties(db, org_property_ids=org_prop_ids)
 
 
 @router.get("/quick/rent")
@@ -1093,8 +1094,9 @@ def quick_rent(
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _ = membership.organization_id
-    return quick_svc.build_quick_rent(db)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
 
 
 @router.get("/quick/expense")
@@ -1103,8 +1105,9 @@ def quick_expense(
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _ = membership.organization_id
-    return quick_svc.build_quick_expense(db)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
 
 
 @router.get("/quick/expense-duplicates")
@@ -1280,8 +1283,9 @@ def daily_digest(
     reader: User | SystemReader = Depends(get_operations_reader),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _ = membership.organization_id
-    return quick_svc.build_digest(db, reader)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_digest(db, reader, org_property_ids=org_prop_ids)
 
 
 @router.get("/summary", response_model=OperationsSummary)
