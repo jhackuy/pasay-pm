@@ -244,3 +244,75 @@ def close_active_projections(
         )
         closed += 1
     return closed
+
+
+# ---------------------------------------------------------------------------
+# Closed projection reopening (reverse-path seam)
+# ---------------------------------------------------------------------------
+
+
+def reopen_closed_projections(
+    db: Session,
+    *,
+    task_ids: list[int],
+    actor_id: int | None,
+    source_domain: str,
+    reason: str,
+    now: datetime | None = None,
+) -> int:
+    """Reopen COMPLETED projected tasks back to PENDING.
+
+    Used by the Expense reverse path: when a VERIFIED payment claim is reversed,
+    the PAYMENT_PENDING projection tasks that were closed at pay() time must
+    come back to life so the human workflow re-engages the payer.
+
+    Wake-up semantics:
+    - ``wake_at`` (remind_at / next_check_at) = ``now`` so the worker picks it
+      up on the next tick.
+    - If ``due_at`` has already passed, bump priority to high (silent
+      "escalation" — the task was due yesterday but was reversed today, so it
+      deserves prompt re-attention).
+
+    Tasks that are NOT in COMPLETED status are silently skipped (idempotent
+    replays / concurrent writes).
+    """
+    now = now or datetime.now(timezone.utc)
+    reopened = 0
+    for tid in task_ids:
+        task = db.get(OperationalTask, tid)
+        if task is None:
+            continue
+        if task.status != OperationalTaskStatus.COMPLETED:
+            continue
+        old = serialize_row(task)
+        task.status = OperationalTaskStatus.PENDING
+        task.completed_at = None
+        task.completed_by = None
+        task.reminder_generation = (task.reminder_generation or 0) + 1
+        task.updated_by = actor_id
+        task.updated_at = now
+        task.remind_at = now
+        task.next_check_at = now
+        if task.due_at and task.due_at < now:
+            task.priority = OperationalTaskPriority.high
+        db.flush()
+        record_audit(
+            db,
+            table_name="operational_tasks",
+            record_id=task.id,
+            action="task_reopened",
+            actor_id=actor_id,
+            changed_fields={
+                "status": [old.get("status"), OperationalTaskStatus.PENDING.value],
+                "reminder_generation": [
+                    old.get("reminder_generation", 0),
+                    task.reminder_generation,
+                ],
+                "source_domain": [None, source_domain],
+                "reason": None if not reason else reason,
+            },
+            old_value=old,
+            new_value=serialize_row(task),
+        )
+        reopened += 1
+    return reopened
