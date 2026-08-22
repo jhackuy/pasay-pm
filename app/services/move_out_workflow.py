@@ -167,6 +167,11 @@ def confirm_inspection(
                 "hint": "PATCH /move-out-inspections/{id} with evidence_ids and findings first, then retry confirm.",
             },
         )
+    lease = db.get(Lease, inspection.lease_id)
+    if inspection.unit_id is None and lease is not None:
+        inspection.unit_id = lease.unit_id
+    if inspection.tenant_id is None and lease is not None:
+        inspection.tenant_id = lease.tenant_id
     old = serialize_row(inspection)
     inspection.status = target
     inspection.confirmed_at = confirmed_at
@@ -377,6 +382,16 @@ def validate_lease_closeable(
             "MoveOutInspection.status = CONFIRMED (evidence gate passed)",
             f"inspection_id={inspection.id if inspection else None} status={inspection.status.value if inspection else 'MISSING'}",
         )
+    if inspection.lease_id != lease.id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_closeable_inspection_lease_mismatch",
+                "inspection_id": inspection.id,
+                "inspection_lease_id": inspection.lease_id,
+                "lease_id": lease.id,
+            },
+        )
     settlement = None
     if lease.deposit_settlement_id is not None:
         settlement = db.get(DepositSettlement, lease.deposit_settlement_id)
@@ -392,6 +407,26 @@ def validate_lease_closeable(
             False,
             "DepositSettlement.status in {CONFIRMED, RECONCILED} (amount conserved within 1c)",
             f"settlement_id={settlement.id if settlement else None} status={settlement.status.value if settlement else 'MISSING'}",
+        )
+    if settlement.lease_id != lease.id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_closeable_settlement_lease_mismatch",
+                "settlement_id": settlement.id,
+                "settlement_lease_id": settlement.lease_id,
+                "lease_id": lease.id,
+            },
+        )
+    if settlement.move_out_inspection_id != inspection.id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_closeable_settlement_inspection_mismatch",
+                "settlement_id": settlement.id,
+                "settlement_move_out_inspection_id": settlement.move_out_inspection_id,
+                "inspection_id": inspection.id,
+            },
         )
     gap = abs(
         Decimal(str(settlement.deposit_received))
@@ -493,4 +528,41 @@ def apply_settled_lease_final_state(
             changed_fields={"status": ["PENDING", "COMPLETED"], "reason": "lease_moved_out_settled"},
             old_value=old_row,
             new_value=serialize_row(t),
+        )
+
+
+_TERMINAL_LEASE_STATUSES = {
+    LeaseStatus.terminated,
+    LeaseStatus.expired,
+}
+
+
+def enforce_lease_terminal_immutable(
+    db: Session,
+    lease: Lease,
+    *,
+    target_status: LeaseStatus | None = None,
+) -> None:
+    """Prevent a terminal (expired/terminated) lease from reverting to active.
+
+    Raises HTTP 409 if:
+      - Current status is terminal AND target_status would move it back to non-terminal.
+    If target_status is None (no status change), this is a no-op regardless of current state
+    (since no mutation is being attempted).
+    """
+    del db
+    if target_status is None:
+        return
+    current_is_terminal = lease.status in _TERMINAL_LEASE_STATUSES
+    target_is_terminal = target_status in _TERMINAL_LEASE_STATUSES
+    if current_is_terminal and not target_is_terminal:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_terminal_immutable_cannot_revert",
+                "lease_id": lease.id,
+                "current_status": lease.status.value,
+                "target_status": target_status.value,
+                "hint": "Terminal leases (expired/terminated) cannot be reverted to active. Create a new successor lease instead.",
+            },
         )

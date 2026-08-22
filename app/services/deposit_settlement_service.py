@@ -23,6 +23,22 @@ from app.services.audit import record_audit, serialize_row
 
 _ONE_CENT = Decimal("0.01")
 
+
+def _jsonb_safe_deductions(deductions):
+    """Return JSONB-serializable deduction items (Decimal amounts → quantized str, round-trip safe)."""
+    if not deductions:
+        return deductions
+    out = []
+    for raw in deductions:
+        item = dict(raw) if not isinstance(raw, dict) else raw.copy()
+        amount = item.get("amount")
+        if amount is not None and isinstance(amount, Decimal):
+            item["amount"] = f"{amount.quantize(Decimal('0.01')):.2f}"
+        elif amount is not None and not isinstance(amount, str):
+            item["amount"] = f"{Decimal(str(amount)).quantize(Decimal('0.01')):.2f}"
+        out.append(item)
+    return out
+
 _ALLOWED_SETTLEMENT_TRANSITIONS: dict[DepositSettlementStatus, set[DepositSettlementStatus]] = {
     DepositSettlementStatus.DRAFT: {DepositSettlementStatus.CONFIRMED},
     DepositSettlementStatus.CONFIRMED: {DepositSettlementStatus.RECONCILED},
@@ -75,6 +91,8 @@ def update_settlement(
                 "hint": "Settlement is no longer DRAFT; create a new DRAFT if adjustments are required.",
             },
         )
+    if "deductions" in updates:
+        updates["deductions"] = _jsonb_safe_deductions(updates["deductions"])
     old = serialize_row(settlement)
     changed: dict = {}
     for field, value in updates.items():
@@ -109,6 +127,33 @@ def confirm_settlement(
         return settlement
     target = DepositSettlementStatus.CONFIRMED
     validate_settlement_transition(settlement.status, target)
+    deductions = settlement.deductions or []
+    if deductions:
+        try:
+            deductions_sum = sum(Decimal(str(item["amount"])) for item in deductions)
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "deposit_settlement_deduction_sum_mismatch",
+                    "settlement_id": settlement.id,
+                    "hint": "Each deduction item must have a numeric 'amount' field.",
+                },
+            )
+        total_deductions = Decimal(str(settlement.total_deductions))
+        gap_d = abs(deductions_sum - total_deductions)
+        if gap_d > Decimal("0.01"):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "deposit_settlement_deduction_sum_mismatch",
+                    "settlement_id": settlement.id,
+                    "deductions_sum": str(deductions_sum),
+                    "total_deductions": str(total_deductions),
+                    "gap": str(gap_d),
+                    "tolerance_cents": 1,
+                },
+            )
     ok, gap = check_amount_conservation(settlement)
     if not ok:
         raise HTTPException(
@@ -250,11 +295,10 @@ def _write_financial_rows_for_settlement(
     refund = Decimal(str(settlement.refund_amount))
     if refund > Decimal("0"):
         ekey = f"deposit_settlement:{settlement.id}:refund"
-        existing_exp = (
-            db.query(Expense).filter(Expense.property_id.isnot(None)).filter(Expense.description.like(f"[DepositSettlement #{settlement.id}]%"))
-            .first()
-        )
-        if existing_exp is None:
+        existing_exp = db.query(Expense).filter(Expense.idempotency_key == ekey).first()
+        if existing_exp is not None:
+            pass
+        else:
             exp = Expense(
                 expense_date=confirmed_at.date() if isinstance(confirmed_at, datetime) else date.today(),
                 due_date=None,
@@ -266,10 +310,10 @@ def _write_financial_rows_for_settlement(
                 unit_id=unit.id if unit else None,
                 status=ExpenseStatus.pending,
                 payer_user_id=None,
+                idempotency_key=ekey,
             )
             exp.created_by = confirmed_by
             exp.updated_by = confirmed_by
-            # Ensure property_id valid fallback
             if exp.property_id == 0:
                 exp.property_id = property_id or exp.property_id
             db.add(exp)
