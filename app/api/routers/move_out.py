@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.database import get_db
+from app.models.evidence import Evidence
 from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.user import User
 from app.schemas.move_out import (
@@ -17,14 +18,10 @@ from app.schemas.common import MessageResponse
 from app.services.audit import serialize_row
 from app.services.organization_scope import (
     OrganizationRole,
-    assert_co_org,
-    lease_org_id,
-    resolve_org_membership,
+    property_org_id,
     scope_exception_to_http,
     scoped_get_lease,
     scoped_get_move_out_inspection,
-    unit_org_id,
-    tenant_org_id,
 )
 from app.services.move_out_workflow import (
     cancel_inspection,
@@ -72,27 +69,62 @@ def create_inspection(
             db, payload.lease_id, for_user_id=user.id,
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
-        if payload.unit_id is not None and payload.unit_id != lease.unit_id:
-            u_org = unit_org_id(db, payload.unit_id)
-            if u_org is None:
-                raise LookupError("Unit not found")
-            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=u_org, object_kind="Unit", object_id=payload.unit_id)
-        if payload.tenant_id is not None and payload.tenant_id != lease.tenant_id:
-            t_org = tenant_org_id(db, payload.tenant_id)
-            if t_org is None:
-                raise LookupError("Tenant not found")
-            assert_co_org(db, user_org_id=membership.organization_id, object_org_id=t_org, object_kind="Tenant", object_id=payload.tenant_id)
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
+    if payload.evidence_ids:
+        evidence_rows = (
+            db.query(Evidence)
+            .filter(Evidence.id.in_(payload.evidence_ids), Evidence.deleted_at.is_(None))
+            .all()
+        )
+        found_ids = {e.id for e in evidence_rows}
+        missing_ids = [eid for eid in payload.evidence_ids if eid not in found_ids]
+        if missing_ids:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_evidence_not_found",
+                    "missing_evidence_ids": missing_ids,
+                },
+            )
+        for ev in evidence_rows:
+            if ev.unit_id != lease.unit_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail={
+                        "reason": "move_out_inspection_evidence_mismatched_org_or_unit",
+                        "evidence_id": ev.id,
+                        "expected_unit_id": lease.unit_id,
+                        "actual_unit_id": ev.unit_id,
+                    },
+                )
+            if ev.property_id is not None:
+                ev_org_id = property_org_id(db, ev.property_id)
+                if ev_org_id != membership.organization_id:
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        detail={
+                            "reason": "move_out_inspection_evidence_mismatched_org_or_unit",
+                            "evidence_id": ev.id,
+                        },
+                    )
+
     obj = schedule_inspection(
         db,
-        lease_id=payload.lease_id,
-        unit_id=payload.unit_id or lease.unit_id,
-        tenant_id=payload.tenant_id or lease.tenant_id,
+        lease_id=lease.id,
+        unit_id=lease.unit_id,
+        tenant_id=lease.tenant_id,
         scheduled_at=payload.scheduled_at,
         actor_id=user.id,
     )
+    if payload.findings is not None:
+        obj.findings = payload.findings
+    if payload.evidence_ids is not None:
+        obj.evidence_ids = payload.evidence_ids
+    if payload.notes is not None:
+        obj.notes = payload.notes
+    obj.updated_by = user.id
     db.commit()
     db.refresh(obj)
     return obj
@@ -127,39 +159,11 @@ def patch_inspection(
         raise scope_exception_to_http(exc) from exc
 
     updates = payload.model_dump(exclude_unset=True)
+    for forbidden in ("lease_id", "unit_id", "tenant_id", "status"):
+        updates.pop(forbidden, None)
     if not updates:
         return obj
 
-    transition_to = updates.pop("status", None)
-    if transition_to is not None and transition_to != obj.status and transition_to == MoveOutInspectionStatus.INSPECTED:
-        findings = updates.get("findings") if "findings" in updates else obj.findings
-        evidence_ids = updates.get("evidence_ids") if "evidence_ids" in updates else obj.evidence_ids
-        inspected_at = updates.pop("inspected_at", None) or datetime.now(timezone.utc)
-        for f, v in updates.items():
-            if hasattr(obj, f) and v is not None:
-                setattr(obj, f, v)
-        mark_inspected(
-            db, obj,
-            findings=findings,
-            evidence_ids=evidence_ids,
-            inspected_at=inspected_at,
-            actor_id=user.id,
-        )
-        db.commit()
-        db.refresh(obj)
-        return obj
-
-    if transition_to is not None and transition_to == MoveOutInspectionStatus.CANCELLED and obj.status not in (MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED):
-        for f, v in updates.items():
-            if hasattr(obj, f) and v is not None:
-                setattr(obj, f, v)
-        cancelled_at = datetime.now(timezone.utc)
-        cancel_inspection(db, obj, cancelled_at=cancelled_at, cancelled_by=user.id)
-        db.commit()
-        db.refresh(obj)
-        return obj
-
-    # Normal field-only PATCH (DRAFT data edit, no status transition)
     if obj.status not in (MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED):
         from app.services.audit import field_changes, record_audit
         old = serialize_row(obj)

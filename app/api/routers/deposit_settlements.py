@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -17,6 +18,7 @@ from app.schemas.deposit_settlement import (
 )
 from app.services.audit import field_changes, record_audit, serialize_row
 from app.services.deposit_settlement_service import (
+    _jsonb_safe_deductions,
     confirm_settlement,
     mark_reconciled,
     update_settlement,
@@ -25,6 +27,7 @@ from app.services.organization_scope import (
     OrganizationRole,
     scope_exception_to_http,
     scoped_get_deposit_settlement,
+    scoped_get_lease,
     scoped_get_move_out_inspection,
 )
 
@@ -66,6 +69,10 @@ def create_settlement(
             db, payload.move_out_inspection_id, for_user_id=user.id,
             role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
         )
+        scoped_get_lease(
+            db, insp.lease_id, for_user_id=user.id,
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
@@ -84,7 +91,14 @@ def create_settlement(
                 "hint": f"Use GET /deposit-settlements/{existing.id} to read the existing settlement; PATCH to edit DRAFT fields.",
             },
         )
-    obj = DepositSettlement(**payload.model_dump())
+
+    create_data = payload.model_dump()
+    create_data.pop("move_out_inspection_id", None)
+    create_data["deductions"] = _jsonb_safe_deductions(create_data.get("deductions"))
+    obj = DepositSettlement(**create_data)
+    obj.status = DepositSettlementStatus.DRAFT
+    obj.lease_id = insp.lease_id
+    obj.move_out_inspection_id = insp.id
     obj.created_by = user.id
     obj.updated_by = user.id
     db.add(obj)
@@ -130,6 +144,8 @@ def patch_settlement(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
     updates = payload.model_dump(exclude_unset=True)
+    for forbidden in ("status", "lease_id", "move_out_inspection_id"):
+        updates.pop(forbidden, None)
     if not updates:
         return obj
     update_settlement(db, obj, updates=updates, actor_id=user.id)
