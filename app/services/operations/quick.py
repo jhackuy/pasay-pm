@@ -283,12 +283,24 @@ class _AllUserPseudo:
 _SCOPE_ALL_USER = _AllUserPseudo()
 
 
-def _derive_org_scope_sets(db: Session):
+def _derive_org_scope_sets(db: Session, user_id: int | None = None):
     """Triple-channel ownership derivation: org_property_ids ∨ org_unit_ids ∨
     org_lease_ids ∨ org_tenant_ids, matching build_quick_tasks canonical
     pattern. Returns four sets (may be empty) — empty set means "no rows from
-    that channel" (fail-closed)."""
-    orgs = list_active_org_ids_for_user(db, 0)
+    that channel" (fail-closed).
+
+    user_id=None means system-level full-scope caller (scheduler / unauthenticated
+    code path) — returns all organizations' scoped sets (not user_id=0 which
+    would return empty)."""
+    if user_id is None:
+        from app.models.membership import Organization
+        orgs = [
+            r for (r,) in db.execute(
+                select(Organization.id)
+            ).all()
+        ]
+    else:
+        orgs = list_active_org_ids_for_user(db, user_id)
     if not orgs:
         return set(), set(), set(), set()
     org_property_ids = {
@@ -322,6 +334,16 @@ def _derive_org_scope_sets(db: Session):
                 org_lease_ids.add(lease_id)
             if tenant_id is not None:
                 org_tenant_ids.add(tenant_id)
+    from app.models.tenant import Tenant
+    direct_tenant_ids = {
+        r for (r,) in db.execute(
+            select(Tenant.id).where(
+                Tenant.organization_id.in_(orgs),
+                Tenant.deleted_at.is_(None),
+            )
+        ).all()
+    }
+    org_tenant_ids |= direct_tenant_ids
     return org_property_ids, org_unit_ids, org_lease_ids, org_tenant_ids
 
 
@@ -772,7 +794,7 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
     }
 
 
-def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
+def build_quick_expense(db: Session, *, user_id: int | None = None, now: datetime | None = None) -> dict:
     """Current-month spend + pending approval + unresolved expense tasks."""
     now = now or datetime.now(timezone.utc)
     start, end = month_range(now.date().strftime("%Y-%m"))
@@ -799,7 +821,7 @@ def build_quick_expense(db: Session, *, now: datetime | None = None) -> dict:
         .all()
     )
     pending_amount = sum((_d2(e.amount) for e in pending_rows), Decimal("0.00"))
-    org_property_ids, _org_unit_ids, org_lease_ids, org_tenant_ids = _derive_org_scope_sets(db)
+    org_property_ids, _org_unit_ids, org_lease_ids, org_tenant_ids = _derive_org_scope_sets(db, user_id=user_id)
     scope_clauses = []
     org_property_ids_list = list(org_property_ids)
     org_lease_ids_list = list(org_lease_ids)

@@ -935,9 +935,9 @@ def quick_rent(
 @router.get("/quick/expense")
 def quick_expense(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    return quick_svc.build_quick_expense(db)
+    return quick_svc.build_quick_expense(db, user_id=user.id)
 
 
 @router.get("/quick/expense-duplicates")
