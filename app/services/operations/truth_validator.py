@@ -25,8 +25,11 @@ from dataclasses import dataclass
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
+from app.models.evidence import Evidence, EvidenceCategory
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
 from app.models.repair import RepairOperation, RepairOperationStatus
 from app.services.expense_payment_truth import payment_truth as expense_payment_truth
@@ -263,6 +266,82 @@ def _repair_projection_ok(db: Session, task: OperationalTask) -> TruthValidation
     )
 
 
+def _move_out_inspection_ok(db: Session, task: OperationalTask) -> TruthValidationResult:
+    inspection_id = task.source_id
+    if inspection_id is None or (task.source_type or "") != "move_out_inspection":
+        return TruthValidationResult(
+            False,
+            "source_type=move_out_inspection with source_id",
+            f"source_type={task.source_type!r} source_id={inspection_id!r}",
+            "Move-out inspection tasks must bind source_type='move_out_inspection' + inspection source_id.",
+        )
+    inspection = db.get(MoveOutInspection, inspection_id)
+    if inspection is None:
+        return TruthValidationResult(
+            False,
+            "MoveOutInspection row exists",
+            "MoveOutInspection missing",
+            "Reconcile will cancel this orphan task.",
+        )
+    if inspection.status in (MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED):
+        return TruthValidationResult(True)
+    has_evidence = False
+    if inspection.evidence_ids:
+        eids = [eid for eid in inspection.evidence_ids if isinstance(eid, int)]
+        if eids:
+            evidence_rows = (
+                db.query(Evidence)
+                .filter(Evidence.id.in_(eids))
+                .all()
+            )
+            has_evidence = any(
+                e.category in (EvidenceCategory.move_out_photo, EvidenceCategory.move_out)
+                for e in evidence_rows
+            )
+    actual = (
+        f"status={inspection.status.value} "
+        f"has_findings={'yes' if inspection.findings else 'no'} "
+        f"has_move_out_photo={'yes' if has_evidence else 'no'}"
+    )
+    return TruthValidationResult(
+        False,
+        "MoveOutInspection.status in {CONFIRMED, CANCELLED} (or evidence+findings verified via canonical confirm endpoint)",
+        actual,
+        "Schedule then run the move-out inspection through the canonical PATCH inspect + confirm endpoints; do not PATCH COMPLETED the task as a substitute.",
+    )
+
+
+def _deposit_settlement_ok(db: Session, task: OperationalTask) -> TruthValidationResult:
+    settlement_id = task.source_id
+    if settlement_id is None or (task.source_type or "") != "deposit_settlement":
+        return TruthValidationResult(
+            False,
+            "source_type=deposit_settlement with source_id",
+            f"source_type={task.source_type!r} source_id={settlement_id!r}",
+            "Deposit settlement tasks must bind source_type='deposit_settlement' + settlement source_id.",
+        )
+    settlement = db.get(DepositSettlement, settlement_id)
+    if settlement is None:
+        return TruthValidationResult(
+            False,
+            "DepositSettlement row exists",
+            "DepositSettlement missing",
+            "Reconcile will cancel this orphan task.",
+        )
+    if settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
+        return TruthValidationResult(True)
+    from decimal import Decimal
+    gap = Decimal(str(settlement.deposit_received)) - (
+        Decimal(str(settlement.total_deductions)) + Decimal(str(settlement.refund_amount))
+    )
+    return TruthValidationResult(
+        False,
+        "DepositSettlement.status in {CONFIRMED, RECONCILED} (amount conserved ≤ 1c)",
+        f"status={settlement.status.value} conservation_gap={gap}",
+        "Review deductions and refund, then PATCH confirm the settlement through the canonical endpoint (amount must match deposit_received within 1c tolerance).",
+    )
+
+
 CheckerFn = Callable[[Session, OperationalTask], TruthValidationResult]
 
 _PROJECTION_TABLE: dict[tuple[OperationalTaskType | None, str | None], CheckerFn] = {
@@ -273,6 +352,8 @@ _PROJECTION_TABLE: dict[tuple[OperationalTaskType | None, str | None], CheckerFn
     (OperationalTaskType.PAYMENT_PENDING, "expense"): _payment_pending_ok,
     (OperationalTaskType.AC_MAINTENANCE, "repair"): _repair_projection_ok,
     (OperationalTaskType.FOLLOWUP, "repair"): _repair_projection_ok,
+    (OperationalTaskType.MOVE_OUT_INSPECTION, "move_out_inspection"): _move_out_inspection_ok,
+    (OperationalTaskType.DEPOSIT_SETTLEMENT, "deposit_settlement"): _deposit_settlement_ok,
 }
 
 

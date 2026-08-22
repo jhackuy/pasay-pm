@@ -21,8 +21,10 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.commission import CommissionSettlement, CommissionSettlementStatus
+from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.operations import (
     OperationalTask,
     OperationalTaskPriority,
@@ -251,14 +253,21 @@ def _expense_reply_markup(expense_id: int, has_receipt: bool) -> dict:
 def _insert_task_on_conflict_do_nothing(db: Session, *, fields: dict) -> OperationalTask | None:
     """Atomic create against the PENDING dedupe index; returns None when a
     conflicting active task already exists (or dedupe_key is None)."""
-    if fields.get("dedupe_key") is None:
-        obj = OperationalTask(**fields)
+    f = dict(fields)
+    auid = f.get("assigned_user_id")
+    if auid is not None:
+        from app.models.user import User
+        exists = db.query(User.id).filter(User.id == auid).first() is not None
+        if not exists:
+            f["assigned_user_id"] = None
+    if f.get("dedupe_key") is None:
+        obj = OperationalTask(**f)
         db.add(obj)
         db.flush()
         return obj
     stmt = (
         pg_insert(OperationalTask)
-        .values(**fields)
+        .values(**f)
         .on_conflict_do_nothing(
             index_elements=["dedupe_key"],
             index_where=text("status = 'PENDING'"),
@@ -902,6 +911,121 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                     "settlement_id": settlement.id,
                     "amount": str(settlement.computed_amount),
                     "agent_id": settlement.agent_id,
+                },
+            },
+            proactive=True,
+        )
+        if task is not None:
+            created += 1 if is_new else 0
+            notifications += 1 if enqueued else 0
+
+    # --- MOVE_OUT_INSPECTION -------------------------------------------------------
+    declined_leases = (
+        db.query(Lease)
+        .filter(
+            Lease.deleted_at.is_(None),
+            Lease.status == LeaseStatus.active,
+            text("(renewal_metadata->>'not_renewed')::boolean = TRUE"),
+        )
+        .all()
+    )
+    for lease in declined_leases:
+        existing_insp = (
+            db.query(MoveOutInspection)
+            .filter(
+                MoveOutInspection.lease_id == lease.id,
+                MoveOutInspection.status.in_([
+                    MoveOutInspectionStatus.SCHEDULED,
+                    MoveOutInspectionStatus.INSPECTED,
+                ]),
+            )
+            .first()
+        )
+        insp_id = existing_insp.id if existing_insp else None
+        unit = units.get(lease.unit_id)
+        due_date = lease.end_date
+        meta = lease.renewal_metadata or {}
+        if meta.get("move_out_date"):
+            try:
+                from datetime import date as _date
+                parts = str(meta["move_out_date"]).split("-")
+                if len(parts) == 3:
+                    due_date = _date(int(parts[0]), int(parts[1]), int(parts[2]))
+            except Exception:
+                pass
+        task, enqueued, is_new = _register_task(
+            db,
+            now=now,
+            fields={
+                "task_type": OperationalTaskType.MOVE_OUT_INSPECTION,
+                "title": f"退租验收 租约#{lease.id} 到期{due_date.isoformat()}",
+                "property_id": unit.property_id if unit else None,
+                "tenant_id": lease.tenant_id,
+                "lease_id": lease.id,
+                "source_type": "move_out_inspection",
+                "source_id": insp_id,
+                "assigned_user_id": secretary_assignee_id(),
+                "priority": OperationalTaskPriority.high,
+                "status": OperationalTaskStatus.PENDING,
+                "due_at": datetime.combine(due_date, time.min, tzinfo=now.tzinfo),
+                "dedupe_key": f"lease:{lease.id}:MOVE_OUT_INSPECTION",
+                "details": {
+                    "lease_id": lease.id,
+                    "inspection_id": insp_id,
+                    "end_date": lease.end_date.isoformat(),
+                    "move_out_date": due_date.isoformat(),
+                    "decline_reason": meta.get("decline_reason"),
+                },
+            },
+            proactive=True,
+        )
+        if task is not None:
+            created += 1 if is_new else 0
+            notifications += 1 if enqueued else 0
+
+    # --- DEPOSIT_SETTLEMENT --------------------------------------------------------
+    confirmed_inspections = (
+        db.query(MoveOutInspection)
+        .filter(
+            MoveOutInspection.status == MoveOutInspectionStatus.CONFIRMED,
+        )
+        .all()
+    )
+    for insp in confirmed_inspections:
+        existing_settlement = (
+            db.query(DepositSettlement)
+            .filter(DepositSettlement.move_out_inspection_id == insp.id)
+            .first()
+        )
+        if existing_settlement is None:
+            continue
+        if existing_settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
+            continue
+        lease = db.get(Lease, insp.lease_id)
+        unit = units.get(lease.unit_id) if lease else None
+        task, enqueued, is_new = _register_task(
+            db,
+            now=now,
+            fields={
+                "task_type": OperationalTaskType.DEPOSIT_SETTLEMENT,
+                "title": f"押金结算 租约#{insp.lease_id} (Deposit={_money(existing_settlement.deposit_received)})",
+                "property_id": unit.property_id if unit else None,
+                "tenant_id": lease.tenant_id if lease else None,
+                "lease_id": insp.lease_id,
+                "source_type": "deposit_settlement",
+                "source_id": existing_settlement.id,
+                "assigned_user_id": DEFAULT_ASSIGNED_USER_ID,
+                "priority": OperationalTaskPriority.high,
+                "status": OperationalTaskStatus.PENDING,
+                "due_at": now,
+                "dedupe_key": f"deposit_settlement:{existing_settlement.id}:DEPOSIT_SETTLEMENT",
+                "details": {
+                    "settlement_id": existing_settlement.id,
+                    "inspection_id": insp.id,
+                    "lease_id": insp.lease_id,
+                    "deposit_received": str(existing_settlement.deposit_received),
+                    "total_deductions": str(existing_settlement.total_deductions),
+                    "refund_amount": str(existing_settlement.refund_amount),
                 },
             },
             proactive=True,

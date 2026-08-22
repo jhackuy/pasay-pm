@@ -14,8 +14,10 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.models.commission import CommissionSettlement, CommissionSettlementStatus
+from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease, LeaseStatus
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.operations import (
     OperationalTask,
     OperationalTaskStatus,
@@ -180,6 +182,24 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
             return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "repair_closed")
         if repair.status == RepairOperationStatus.CANCELLED:
             return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "repair_cancelled")
+        return None
+
+    if task.task_type == OperationalTaskType.MOVE_OUT_INSPECTION and task.source_type == "move_out_inspection":
+        inspection = db.get(MoveOutInspection, task.source_id)
+        if inspection is None:
+            return None
+        if inspection.status == MoveOutInspectionStatus.CONFIRMED:
+            return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "move_out_inspection_confirmed")
+        if inspection.status == MoveOutInspectionStatus.CANCELLED:
+            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_cancelled")
+        return None
+
+    if task.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT and task.source_type == "deposit_settlement":
+        settlement = db.get(DepositSettlement, task.source_id)
+        if settlement is None:
+            return None
+        if settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
+            return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "deposit_settlement_confirmed")
         return None
 
     return None
