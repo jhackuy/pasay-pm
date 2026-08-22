@@ -1,4 +1,5 @@
-from datetime import date, timedelta
+import uuid
+from datetime import date, datetime, timedelta, timezone
 
 API = "/api/v1"
 
@@ -34,11 +35,73 @@ def test_second_active_lease_conflict(client, admin_headers, unit_id, tenant_id,
     assert resp.json() == {"detail": "Unit is already occupied"}
 
 
-def test_terminate_lease_releases_unit(client, admin_headers, unit_id, tenant_id, lease_id):
+def test_terminate_lease_releases_unit(client, admin_headers, unit_id, tenant_id, lease_id, db_session):
+    scheduled_at = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    insp_resp = client.post(
+        f"{API}/move-out-inspections",
+        json={"lease_id": lease_id, "scheduled_at": scheduled_at},
+        headers=admin_headers,
+    )
+    assert insp_resp.status_code in (200, 201), insp_resp.text
+    insp_id = insp_resp.json()["id"]
+
+    fid = f"moveout-photo-{uuid.uuid4().hex[:8]}"
+    evid_resp = client.post(
+        f"{API}/evidence",
+        json={
+            "storage_provider": "local",
+            "external_file_id": fid,
+            "category": "MOVE_OUT_PHOTO",
+            "unit_id": unit_id,
+        },
+        headers=admin_headers,
+    )
+    assert evid_resp.status_code == 201, evid_resp.text
+    eid = evid_resp.json()["id"]
+
+    inspect_resp = client.post(
+        f"{API}/move-out-inspections/{insp_id}/inspect",
+        json={
+            "evidence_ids": [eid],
+            "findings": [{"item": "wall paint damage", "severity": "minor"}],
+        },
+        headers=admin_headers,
+    )
+    assert inspect_resp.status_code == 200, inspect_resp.text
+
+    confirm_insp_resp = client.post(
+        f"{API}/move-out-inspections/{insp_id}/confirm",
+        headers=admin_headers,
+    )
+    assert confirm_insp_resp.status_code == 200, confirm_insp_resp.text
+
+    sett_payload = {
+        "move_out_inspection_id": insp_id,
+        "deposit_received": "24000.00",
+        "total_deductions": "5000.00",
+        "refund_amount": "19000.00",
+        "deductions": [{"description": "paint", "amount": "5000.00"}],
+    }
+    assert "lease_id" not in sett_payload
+    sett_resp = client.post(
+        f"{API}/deposit-settlements",
+        json=sett_payload,
+        headers=admin_headers,
+    )
+    assert sett_resp.status_code in (200, 201), sett_resp.text
+    sid = sett_resp.json()["id"]
+
+    confirm_sett_resp = client.post(
+        f"{API}/deposit-settlements/{sid}/confirm",
+        headers=admin_headers,
+    )
+    assert confirm_sett_resp.status_code == 200, confirm_sett_resp.text
+    db_session.expire_all()
+
     resp = client.patch(
         f"{API}/leases/{lease_id}", json={"status": "terminated"}, headers=admin_headers
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "terminated"
 
     unit = client.get(f"{API}/units/{unit_id}", headers=admin_headers).json()

@@ -4,13 +4,14 @@ Scope: ONLY Lease Renewal SM + Move-out Inspection SM + Deposit Settlement +
 Lease Close Gate + Truth→Task Projection.
 
 Groups (count >= 35 PASS contract):
-  A组 — Renewal state machine (A1-A7: 7 tests)
-  B组 — Move-out Inspection + Evidence gate (B1-B12: 12 tests)
-  C组 — Deposit Settlement + 1c conservation (C1-C10: 10 tests)
+  A组 — Renewal state machine (A1-A9: 9 tests)
+  B组 — Move-out Inspection + Evidence gate (B1-B13: 13 tests)
+  C组 — Deposit Settlement + 1c conservation (C1-C14: 14 tests)
   D组 — Lease Close gate + final state sync (D1-D8: 8 tests)
   E组 — Truth -> OperationalTask projection (E1-E5: 5 tests)
+  F组 — Anti-bypass tests (F1-F7: 7 tests)
 
-Total: 42 tests. ALL tests use EXACT assertions; no truthy/weak checks.
+Total: 49 tests. ALL tests use EXACT assertions; no truthy/weak checks.
 """
 from __future__ import annotations
 
@@ -57,15 +58,12 @@ def _create_evidence(client, headers, *, unit_id, category, file_id=None):
     return r.json()["id"]
 
 
-def _schedule_inspection_api(client, headers, *, lease_id, unit_id, tenant_id,
-                            scheduled_at=None):
+def _schedule_inspection_api(client, headers, *, lease_id, scheduled_at=None):
     when = scheduled_at or (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
     r = client.post(
         f"{API}/move-out-inspections",
         json={
             "lease_id": lease_id,
-            "unit_id": unit_id,
-            "tenant_id": tenant_id,
             "scheduled_at": when,
         },
         headers=headers,
@@ -74,12 +72,14 @@ def _schedule_inspection_api(client, headers, *, lease_id, unit_id, tenant_id,
     return r.json()
 
 
-def _schedule_and_full_inspection(client, db, headers, *, lease_id, unit_id, tenant_id):
+def _schedule_and_full_inspection(client, db, headers, *, lease_id):
     """Happy path: schedule + evidence + inspected + confirmed.
-    Returns confirmed inspection dict."""
-    insp = _schedule_inspection_api(client, headers, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    Returns confirmed inspection dict.
+    """
+    insp = _schedule_inspection_api(client, headers, lease_id=lease_id)
     insp_id = insp["id"]
+    lease = db.get(Lease, lease_id)
+    unit_id = lease.unit_id
     eid = _create_evidence(client, headers, unit_id=unit_id,
                            category=EvidenceCategory.move_out_photo)
     r = client.post(
@@ -94,7 +94,7 @@ def _schedule_and_full_inspection(client, db, headers, *, lease_id, unit_id, ten
     return r.json()
 
 
-def _full_settlement(client, db, headers, *, lease_id, inspection_id,
+def _full_settlement(client, db, headers, *, inspection_id,
                      deposit="24000.00", deductions=None, refund="19000.00"):
     """Happy path: create DRAFT + confirm with conservation. Deductions default=5000."""
     if deductions is None:
@@ -102,7 +102,6 @@ def _full_settlement(client, db, headers, *, lease_id, inspection_id,
     r = client.post(
         f"{API}/deposit-settlements",
         json={
-            "lease_id": lease_id,
             "move_out_inspection_id": inspection_id,
             "deposit_received": deposit,
             "total_deductions": str(Decimal(deposit) - Decimal(refund)),
@@ -117,6 +116,17 @@ def _full_settlement(client, db, headers, *, lease_id, inspection_id,
     assert r.status_code == 200, r.text
     db.expire_all()
     return r.json()
+
+
+def _close_lease_pipeline(client, db, headers, *, lease_id):
+    """Runs full close pipeline (inspection confirmed + settlement confirmed)."""
+    insp = _schedule_and_full_inspection(client, db, headers, lease_id=lease_id)
+    lease = db.get(Lease, lease_id)
+    deposit_d = Decimal("24000.00")
+    refund_d = Decimal("19000.00")
+    _full_settlement(client, db, headers, inspection_id=insp["id"],
+                     deposit=f"{deposit_d:.2f}", refund=f"{refund_d:.2f}")
+    db.expire_all()
 
 
 # =========================================================================
@@ -267,6 +277,7 @@ def test_a6_auto_expire_requires_end_date_past_today_and_not_renewed(
         json={"reason": "tenant gone"},
         headers=h,
     )
+    _close_lease_pipeline(client, db_session, h, lease_id=lid)
     r3 = client.post(f"{API}/leases/{lid}/auto-expire", headers=h)
     assert r3.status_code == 200, r3.text
     body = r3.json()
@@ -298,6 +309,7 @@ def test_a7_auto_expire_idempotent_on_already_inactive(
     client.post(
         f"{API}/leases/{lid}/decline-renewal", json={"reason": "x"}, headers=h,
     )
+    _close_lease_pipeline(client, db_session, h, lease_id=lid)
     r1 = client.post(f"{API}/leases/{lid}/auto-expire", headers=h)
     assert r1.status_code == 200, r1.text
     assert r1.json()["already_expired"] is False
@@ -314,8 +326,7 @@ def test_b1_schedule_inspection_creates_scheduled_row(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
     assert insp["status"] == MoveOutInspectionStatus.SCHEDULED.value
     assert insp["lease_id"] == lease_id
     row = db_session.get(MoveOutInspection, insp["id"])
@@ -327,10 +338,8 @@ def test_b2_double_schedule_is_idempotent_returns_existing(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    i1 = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                  unit_id=unit_id, tenant_id=tenant_id)
-    i2 = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                  unit_id=unit_id, tenant_id=tenant_id)
+    i1 = _schedule_inspection_api(client, h, lease_id=lease_id)
+    i2 = _schedule_inspection_api(client, h, lease_id=lease_id)
     assert i1["id"] == i2["id"]
     count = (
         db_session.query(MoveOutInspection)
@@ -344,8 +353,7 @@ def test_b3_inspected_transition_sets_status_to_inspected(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
     eid = _create_evidence(client, h, unit_id=unit_id,
                            category=EvidenceCategory.move_out_photo)
     r = client.post(
@@ -365,8 +373,7 @@ def test_b4_confirm_without_evidence_gate_409(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
     insp_id = insp["id"]
     client.post(
         f"{API}/move-out-inspections/{insp_id}/inspect",
@@ -387,8 +394,7 @@ def test_b5_confirm_without_findings_409(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
     insp_id = insp["id"]
     eid = _create_evidence(client, h, unit_id=unit_id,
                            category=EvidenceCategory.move_out)
@@ -410,7 +416,7 @@ def test_b6_confirm_with_evidence_and_findings_success(
 ):
     h = _h(owner_a[1])
     confirmed = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     assert confirmed["status"] == MoveOutInspectionStatus.CONFIRMED.value
     assert confirmed["confirmed_at"] is not None
@@ -423,7 +429,7 @@ def test_b7_confirm_is_idempotent(
 ):
     h = _h(owner_a[1])
     c1 = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     ca = c1["confirmed_at"]
     c2 = client.post(
@@ -438,11 +444,11 @@ def test_b8_invalid_transition_confirmed_to_inspected_409(
 ):
     h = _h(owner_a[1])
     c = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
-    r = client.patch(
-        f"{API}/move-out-inspections/{c['id']}",
-        json={"status": MoveOutInspectionStatus.INSPECTED.value},
+    r = client.post(
+        f"{API}/move-out-inspections/{c['id']}/inspect",
+        json={"evidence_ids": [], "findings": []},
         headers=h,
     )
     assert r.status_code == 409, r.text
@@ -452,8 +458,7 @@ def test_b9_cancel_from_scheduled_success(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
     r = client.post(
         f"{API}/move-out-inspections/{insp['id']}/cancel", headers=h
     )
@@ -466,8 +471,7 @@ def test_b10_secretary_cannot_confirm_owner_only_403(
 ):
     sec_h = _h(secretary_a[1])
     own_h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, own_h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, own_h, lease_id=lease_id)
     eid = _create_evidence(client, own_h, unit_id=unit_id,
                            category=EvidenceCategory.move_out_photo)
     client.post(
@@ -487,8 +491,7 @@ def test_b11_cross_org_owner_gets_404_on_foreign_inspection(
     unit_id, tenant_id, lease_id,
 ):
     own_a_h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, own_a_h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, own_a_h, lease_id=lease_id)
     own_b_h = _h(owner_b[1])
     r = client.get(f"{API}/move-out-inspections/{insp['id']}", headers=own_b_h)
     assert r.status_code == 404, r.text
@@ -498,8 +501,7 @@ def test_b12_wrong_evidence_category_still_fails_gate(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    insp = _schedule_inspection_api(client, h, lease_id=lease_id,
-                                    unit_id=unit_id, tenant_id=tenant_id)
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
     insp_id = insp["id"]
     wrong_eid = _create_evidence(client, h, unit_id=unit_id,
                                  category=EvidenceCategory.receipt)
@@ -523,7 +525,6 @@ def _draft_settlement(client, headers, *, lease_id, inspection_id,
     r = client.post(
         f"{API}/deposit-settlements",
         json={
-            "lease_id": lease_id,
             "move_out_inspection_id": inspection_id,
             "deposit_received": deposit,
             "total_deductions": total_deduct,
@@ -541,7 +542,7 @@ def test_c1_create_draft_settlement(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     s = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
     assert s["status"] == DepositSettlementStatus.DRAFT.value
@@ -555,13 +556,12 @@ def test_c2_double_create_unique_inspection_409_or_identical(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     s1 = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
     r2 = client.post(
         f"{API}/deposit-settlements",
         json={
-            "lease_id": lease_id,
             "move_out_inspection_id": insp["id"],
             "deposit_received": "24000.00",
             "total_deductions": "5000.00",
@@ -578,7 +578,7 @@ def test_c3_conservation_gap_zero_and_one_cent_pass(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     # gap = 0
     s1 = _draft_settlement(
@@ -594,7 +594,7 @@ def test_c4_conservation_gap_two_cents_fails_409(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     s = _draft_settlement(
         client, h, lease_id=lease_id, inspection_id=insp["id"],
@@ -612,12 +612,11 @@ def test_c5_confirm_generates_income_rows_per_deduction(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     r = client.post(
         f"{API}/deposit-settlements",
         json={
-            "lease_id": lease_id,
             "move_out_inspection_id": insp["id"],
             "deposit_received": "10000.00",
             "total_deductions": "6000.00",
@@ -657,7 +656,7 @@ def test_c6_confirm_is_idempotent_no_double_financial_rows(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     s = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
     client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=h)
@@ -676,10 +675,10 @@ def test_c7_confirm_reconciled_transition(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     s = _full_settlement(
-        client, db_session, h, lease_id=lease_id, inspection_id=insp["id"],
+        client, db_session, h, inspection_id=insp["id"],
     )
     r = client.post(f"{API}/deposit-settlements/{s['id']}/reconcile", headers=h)
     assert r.status_code == 200, r.text
@@ -691,10 +690,10 @@ def test_c8_patch_after_confirmed_409(
 ):
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     s = _full_settlement(
-        client, db_session, h, lease_id=lease_id, inspection_id=insp["id"],
+        client, db_session, h, inspection_id=insp["id"],
     )
     r = client.patch(
         f"{API}/deposit-settlements/{s['id']}",
@@ -710,7 +709,7 @@ def test_c9_confirm_requires_owner_403_for_secretary(
     own_h = _h(owner_a[1])
     sec_h = _h(secretary_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, own_h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, own_h, lease_id=lease_id,
     )
     s = _draft_settlement(client, own_h, lease_id=lease_id, inspection_id=insp["id"])
     r = client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=sec_h)
@@ -722,7 +721,7 @@ def test_c10_cross_org_scope_404(
 ):
     own_a_h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
-        client, db_session, own_a_h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, own_a_h, lease_id=lease_id,
     )
     s = _draft_settlement(client, own_a_h, lease_id=lease_id, inspection_id=insp["id"])
     own_b_h = _h(owner_b[1])
@@ -734,17 +733,14 @@ def test_c10_cross_org_scope_404(
 # D组 — Lease Close gate + final state sync (8 tests)
 # =========================================================================
 
-def _build_settled_lease(client, db, headers, *, expiring_lease_id, unit_id,
-                         tenant_id):
+def _build_settled_lease(client, db, headers, *, expiring_lease_id):
     """Build the preconditions for lease close: inspection CONFIRMED + settlement CONFIRMED conservation ok.
     Returns (inspection_id, settlement_id)."""
     insp = _schedule_and_full_inspection(
         client, db, headers, lease_id=expiring_lease_id,
-        unit_id=unit_id, tenant_id=tenant_id,
     )
     sett = _full_settlement(
-        client, db, headers, lease_id=expiring_lease_id,
-        inspection_id=insp["id"],
+        client, db, headers, inspection_id=insp["id"],
     )
     db.expire_all()
     return insp["id"], sett["id"]
@@ -771,7 +767,7 @@ def test_d2_patch_with_inspection_only_no_settlement_409(
 ):
     h = _h(owner_a[1])
     _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     r = client.patch(
         f"{API}/leases/{lease_id}",
@@ -789,7 +785,6 @@ def test_d3_patch_with_both_inspection_and_settlement_ok_success(
     h = _h(owner_a[1])
     _build_settled_lease(
         client, db_session, h, expiring_lease_id=lease_id,
-        unit_id=unit_id, tenant_id=tenant_id,
     )
     r = client.patch(
         f"{API}/leases/{lease_id}",
@@ -808,7 +803,6 @@ def test_d4_final_state_sync_unit_vacant_tenant_moved_out(
     h = _h(owner_a[1])
     _build_settled_lease(
         client, db_session, h, expiring_lease_id=lease_id,
-        unit_id=unit_id, tenant_id=tenant_id,
     )
     client.patch(
         f"{API}/leases/{lease_id}",
@@ -839,7 +833,6 @@ def test_d5_repeat_patch_is_idempotent(
     h = _h(owner_a[1])
     _build_settled_lease(
         client, db_session, h, expiring_lease_id=lease_id,
-        unit_id=unit_id, tenant_id=tenant_id,
     )
     r1 = client.patch(
         f"{API}/leases/{lease_id}",
@@ -893,7 +886,6 @@ def test_d7_delete_after_pipeline_success(
     h = _h(owner_a[1])
     _build_settled_lease(
         client, db_session, h, expiring_lease_id=lease_id,
-        unit_id=unit_id, tenant_id=tenant_id,
     )
     client.patch(
         f"{API}/leases/{lease_id}",
@@ -927,7 +919,6 @@ def test_d8_patch_to_expired_also_runs_final_state(
     lid = r.json()["id"]
     _build_settled_lease(
         client, db_session, h, expiring_lease_id=lid,
-        unit_id=unit_id, tenant_id=tenant_id,
     )
     r = client.patch(
         f"{API}/leases/{lid}",
@@ -976,8 +967,8 @@ def test_e1_generation_creates_move_out_task_after_decline(
         task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
         status=OperationalTaskStatus.PENDING,
     )
-    assert cnt >= 1, f"Expected >= 1 MOVE_OUT_INSPECTION task, got {cnt}"
-    assert pending_cnt >= 1
+    assert cnt == 1, f"Expected == 1 MOVE_OUT_INSPECTION task, got {cnt}"
+    assert pending_cnt == 1
 
 
 def test_e2_forward_path_inspection_confirm_completes_task(
@@ -995,12 +986,12 @@ def test_e2_forward_path_inspection_confirm_completes_task(
         OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
         OperationalTask.lease_id == lease_id,
     ).all()
-    assert len(tasks_before) >= 1
+    assert len(tasks_before) == 1
     pending_task_ids = [t.id for t in tasks_before
                         if t.status == OperationalTaskStatus.PENDING]
-    assert len(pending_task_ids) >= 1
+    assert len(pending_task_ids) == 1
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     db_session.expire_all()
     t_after = db_session.get(OperationalTask, pending_task_ids[0])
@@ -1017,7 +1008,7 @@ def test_e3_generation_creates_deposit_task_after_inspection_confirmed(
     db_session.expire_all()
     generate_business_tasks(db_session, now=datetime.now(timezone.utc))
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
     db_session.expire_all()
@@ -1028,7 +1019,7 @@ def test_e3_generation_creates_deposit_task_after_inspection_confirmed(
         task_type=OperationalTaskType.DEPOSIT_SETTLEMENT,
         status=OperationalTaskStatus.PENDING,
     )
-    assert cnt >= 1, f"Expected >= 1 DEPOSIT_SETTLEMENT pending task, got {cnt}"
+    assert cnt == 1, f"Expected == 1 DEPOSIT_SETTLEMENT pending task, got {cnt}"
 
 
 def test_e4_reconcile_marks_deposit_task_completed(
@@ -1040,10 +1031,10 @@ def test_e4_reconcile_marks_deposit_task_completed(
     )
     generate_business_tasks(db_session, now=datetime.now(timezone.utc))
     insp = _schedule_and_full_inspection(
-        client, db_session, h, lease_id=lease_id, unit_id=unit_id, tenant_id=tenant_id
+        client, db_session, h, lease_id=lease_id,
     )
     sett = _full_settlement(
-        client, db_session, h, lease_id=lease_id, inspection_id=insp["id"],
+        client, db_session, h, inspection_id=insp["id"],
     )
     db_session.expire_all()
     sett_row = db_session.get(DepositSettlement, sett["id"])
@@ -1096,3 +1087,223 @@ def test_e5_truth_validator_move_out_task_complete_without_inspection_409(
     detail = r.json()["detail"]
     assert isinstance(detail, dict)
     assert detail["reason"] == "task_completion_truth_missing"
+
+
+# =========================================================================
+# F组 — Anti-bypass tests (7 tests)
+# =========================================================================
+
+def test_c11_settlement_create_attempt_override_lease_id_status_422(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id
+    )
+    r = client.post(
+        f"{API}/deposit-settlements",
+        json={
+            "lease_id": lease_id,
+            "status": DepositSettlementStatus.CONFIRMED.value,
+            "move_out_inspection_id": insp["id"],
+            "deposit_received": "24000.00",
+            "total_deductions": "5000.00",
+            "refund_amount": "19000.00",
+            "deductions": [{"description": "wall", "amount": "5000.00"}],
+        },
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_b13_patch_inspection_lease_unit_tenant_status_rejected_422_then_ignored_via_allowed(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
+    insp_id = insp["id"]
+    orig = db_session.get(MoveOutInspection, insp_id)
+    orig_lease_id = orig.lease_id
+    orig_unit_id = orig.unit_id
+    orig_tenant_id = orig.tenant_id
+    orig_status = orig.status
+    r = client.patch(
+        f"{API}/move-out-inspections/{insp_id}",
+        json={
+            "lease_id": 9999999,
+            "unit_id": 9999999,
+            "tenant_id": 9999999,
+            "status": MoveOutInspectionStatus.CONFIRMED.value,
+        },
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    errors = r.json()["detail"]
+    locs = {tuple(err.get("loc", [])) for err in errors if err.get("type") == "extra_forbidden"}
+    assert ("body", "lease_id") in locs
+    assert ("body", "unit_id") in locs
+    assert ("body", "tenant_id") in locs
+    assert ("body", "status") in locs
+    db_session.expire_all()
+    after = db_session.get(MoveOutInspection, insp_id)
+    assert after.lease_id == orig_lease_id
+    assert after.unit_id == orig_unit_id
+    assert after.tenant_id == orig_tenant_id
+    assert after.status == orig_status
+    assert after.status == MoveOutInspectionStatus.SCHEDULED
+
+
+def test_c12_deductions_sum_mismatch_409_on_confirm(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id
+    )
+    r = client.post(
+        f"{API}/deposit-settlements",
+        json={
+            "move_out_inspection_id": insp["id"],
+            "deposit_received": "24000.00",
+            "total_deductions": "5000.00",
+            "refund_amount": "19000.00",
+            "deductions": [
+                {"description": "a", "amount": "3000.02"},
+                {"description": "b", "amount": "2000.00"},
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code in (200, 201), r.text
+    sid = r.json()["id"]
+    c = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
+    assert c.status_code == 409, c.text
+    detail = c.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "deposit_settlement_deduction_sum_mismatch"
+
+
+def test_a8_renewal_overlaps_predecessor_409(
+    client, db_session, owner_a, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    pred_end = date.today() + timedelta(days=30)
+    pred_start = pred_end - timedelta(days=365)
+    r = client.post(
+        f"{API}/leases",
+        json={
+            "unit_id": unit_id,
+            "tenant_id": tenant_id,
+            "start_date": pred_start.isoformat(),
+            "end_date": pred_end.isoformat(),
+            "monthly_rent": "10000.00",
+            "deposit": "20000.00",
+            "status": LeaseStatus.active.value,
+        },
+        headers=h,
+    )
+    assert r.status_code == 201, r.text
+    lid = r.json()["id"]
+    succ_start = pred_end - timedelta(days=1)
+    succ_end = succ_start + timedelta(days=365)
+    r2 = client.post(
+        f"{API}/leases/{lid}/renew",
+        json={
+            "start_date": succ_start.isoformat(),
+            "end_date": succ_end.isoformat(),
+            "monthly_rent": "10500.00",
+            "deposit": "21000.00",
+        },
+        headers=h,
+    )
+    assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "renewal_overlaps_predecessor"
+
+
+def test_a9_renewal_invalid_dates_end_before_start_409(
+    client, db_session, owner_a, lease_id
+):
+    h = _h(owner_a[1])
+    bad_start = "2027-12-31"
+    bad_end = "2027-01-01"
+    r = client.post(
+        f"{API}/leases/{lease_id}/renew",
+        json={
+            "start_date": bad_start,
+            "end_date": bad_end,
+            "monthly_rent": "12500.00",
+            "deposit": "25000.00",
+        },
+        headers=h,
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "renewal_invalid_dates_end_before_start"
+
+
+def test_c13_cross_org_settlement_create_404(
+    client, db_session, owner_a, owner_b, lease_id, unit_id, tenant_id
+):
+    own_a_h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, own_a_h, lease_id=lease_id
+    )
+    own_b_h = _h(owner_b[1])
+    r = client.post(
+        f"{API}/deposit-settlements",
+        json={
+            "move_out_inspection_id": insp["id"],
+            "deposit_received": "24000.00",
+            "total_deductions": "5000.00",
+            "refund_amount": "19000.00",
+            "deductions": [{"description": "paint", "amount": "5000.00"}],
+        },
+        headers=own_b_h,
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_c14_patch_settlement_forbidden_fields_rejected_422_refund_only_allowed(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id
+    )
+    s = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
+    sid = s["id"]
+    orig = db_session.get(DepositSettlement, sid)
+    orig_lease_id = orig.lease_id
+    orig_insp_id = orig.move_out_inspection_id
+    orig_status = orig.status
+    r = client.patch(
+        f"{API}/deposit-settlements/{sid}",
+        json={
+            "status": DepositSettlementStatus.CONFIRMED.value,
+            "lease_id": 9999,
+            "move_out_inspection_id": 9999,
+        },
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    errors = r.json()["detail"]
+    locs = {tuple(err.get("loc", [])) for err in errors if err.get("type") == "extra_forbidden"}
+    assert ("body", "status") in locs
+    assert ("body", "lease_id") in locs
+    assert ("body", "move_out_inspection_id") in locs
+    r2 = client.patch(
+        f"{API}/deposit-settlements/{sid}",
+        json={"refund_amount": "18999.99"},
+        headers=h,
+    )
+    assert r2.status_code == 200, r2.text
+    db_session.expire_all()
+    after = db_session.get(DepositSettlement, sid)
+    assert after.status == orig_status
+    assert after.status == DepositSettlementStatus.DRAFT
+    assert after.lease_id == orig_lease_id
+    assert after.move_out_inspection_id == orig_insp_id
+    assert after.refund_amount == Decimal("18999.99")
