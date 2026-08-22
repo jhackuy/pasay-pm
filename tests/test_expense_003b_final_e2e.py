@@ -14,11 +14,14 @@ from datetime import date, datetime, timedelta, timezone
 API = "/api/v1"
 
 
-def _mk(client, create_headers, approve_headers, amount="28000.00"):
-    r = client.post(f"{API}/expenses", json={
+def _mk(client, create_headers, approve_headers, amount="28000.00", *, property_id=None):
+    payload = {
         "expense_date": "2026-08-01", "category": "维修", "amount": amount,
         "payee": "Fix-It Co", "description": "aircon", "status": "pending",
-    }, headers=create_headers)
+    }
+    if property_id is not None:
+        payload["property_id"] = property_id
+    r = client.post(f"{API}/expenses", json=payload, headers=create_headers)
     assert r.status_code == 201, r.text
     eid = r.json()["id"]
     r = client.post(f"{API}/expenses/{eid}/approve", headers=approve_headers)
@@ -26,8 +29,8 @@ def _mk(client, create_headers, approve_headers, amount="28000.00"):
     return eid
 
 
-def test_e2e_28k_chain(client, admin_headers, manager_headers):
-    eid = _mk(client, manager_headers, admin_headers)
+def test_e2e_28k_chain(client, admin_headers, manager_headers, property_id):
+    eid = _mk(client, manager_headers, admin_headers, property_id=property_id)
 
     # Claim 1: ₱10,000 (Secretary reports), verify (Owner) -> remaining 18k.
     c1 = client.post(f"{API}/expenses/{eid}/claims",
@@ -89,7 +92,8 @@ def test_e2e_28k_chain(client, admin_headers, manager_headers):
         db.close()
 
 
-def test_e2e_repair_linked_paid_not_closed(client, admin_headers, manager_headers, db_session):
+def test_e2e_repair_linked_paid_not_closed(client, admin_headers, manager_headers, db_session,
+                                            property_id):
     """A Repair-linked Expense that is fully PAID must NOT close the Repair."""
     from app.models.financial import Expense, ExpenseStatus
     from app.models.repair import (
@@ -102,12 +106,14 @@ def test_e2e_repair_linked_paid_not_closed(client, admin_headers, manager_header
     from datetime import date as _date
 
     repair = RepairOperation(issue="aircon broken", status=RepairOperationStatus.WAITING_PAYMENT,
-                             next_action="awaiting payment", created_by=1)
+                             next_action="awaiting payment", created_by=1,
+                             property_id=property_id)
     db_session.add(repair)
     db_session.flush()
     expense = Expense(expense_date=_date(2026, 8, 1), category="维修", amount="28000.00",
                       payee="Fix-It Co", status=ExpenseStatus.approved,
-                      approved_by=1, approved_at=datetime.now(timezone.utc))
+                      approved_by=1, approved_at=datetime.now(timezone.utc),
+                      property_id=property_id)
     db_session.add(expense)
     db_session.flush()
     prop = RepairProposal(repair_id=repair.id, version=1, vendor="Fix-It Co",
