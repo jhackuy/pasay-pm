@@ -330,10 +330,11 @@ def test_s4_same_lease_triangle_write_allowed(
 
 def _setup_expiring_predecessor(client, db, headers, lease_id, *, expired=False):
     pred = db.get(Lease, lease_id)
+    # 绝对日期，避免本地/UTC today 时差。conftest fixture 已经是2026-06-30
     if expired:
-        pred.end_date = date.today() - timedelta(days=1)
+        pred.end_date = date(2026, 6, 29)
     else:
-        pred.end_date = date.today()
+        pred.end_date = date(2026, 6, 30)
     db.commit()
     db.expire_all()
 
@@ -462,9 +463,9 @@ def test_s7_renewal_with_existing_json_metadata_persists_canonical_and_mirror(
         meta_after_set = json.loads(meta_after_set)
     assert (meta_after_set or {}).get("notes") == "expiring soon", "DB pre-set notes should be visible"
 
-    today = date.today()
-    succ_start = today.isoformat()
-    succ_end = (today + timedelta(days=364)).isoformat()
+    # expired=True → pred.end_date=2026-06-29 → succ_start must be 2026-06-30 (seamless)
+    succ_start = date(2026, 6, 30).isoformat()
+    succ_end = (date(2026, 6, 29) + timedelta(days=364)).isoformat()
     r = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={
@@ -475,7 +476,7 @@ def test_s7_renewal_with_existing_json_metadata_persists_canonical_and_mirror(
         },
         headers=h,
     )
-    assert r.status_code in (200, 201), r.text
+    assert r.status_code == 200, r.text
     succ_id = r.json()["id"]
     assert succ_id > 0
 
@@ -514,25 +515,25 @@ def test_s8_concurrent_renew_single_successor_one_side_effect(
     renew service code directly.
     """
     h = _h(owner_a[1])
-    today = date.today()
     _setup_expiring_predecessor(client, db_session, h, lease_id, expired=True)
     db_session.commit()
     db_session.expire_all()
     pred_id = lease_id
 
+    # expired=True → pred.end=2026-06-29 → succ_start=2026-06-30
     renew_payload = {
-        "start_date": today.isoformat(),
-        "end_date": (today + timedelta(days=364)).isoformat(),
+        "start_date": date(2026, 6, 30).isoformat(),
+        "end_date": (date(2026, 6, 29) + timedelta(days=364)).isoformat(),
         "monthly_rent": "12000.00",
         "deposit": "24000.00",
     }
 
     r1 = client.post(f"{API}/leases/{pred_id}/renew", json=renew_payload, headers=h)
-    assert r1.status_code in (200, 201), f"first renew: {r1.status_code} {r1.text}"
+    assert r1.status_code == 200, f"first renew: {r1.status_code} {r1.text}"
     succ_id_1 = r1.json()["id"] if r1.content else None
 
     r2 = client.post(f"{API}/leases/{pred_id}/renew", json=renew_payload, headers=h)
-    assert r2.status_code in (200, 201), f"second renew: {r2.status_code} {r2.text}"
+    assert r2.status_code == 200, f"second renew: {r2.status_code} {r2.text}"
     succ_id_2 = r2.json()["id"] if r2.content else None
 
     assert succ_id_1 is not None and succ_id_2 is not None
@@ -557,8 +558,9 @@ def test_s9_repeat_renew_returns_exact_same_successor(
     h = _h(owner_a[1])
     _setup_expiring_predecessor(client, db_session, h, lease_id)
 
-    succ_start = (date.today() + timedelta(days=1)).isoformat()
-    succ_end = (date.today() + timedelta(days=365)).isoformat()
+    # expired=False → pred.end=2026-06-30 → succ_start=2026-07-01
+    succ_start = date(2026, 7, 1).isoformat()
+    succ_end = (date(2026, 6, 30) + timedelta(days=365)).isoformat()
     payload = {
         "start_date": succ_start,
         "end_date": succ_end,
@@ -593,9 +595,9 @@ def test_s10_missing_deleted_or_mismatched_successor_fail_closed_409(
     client, db_session, owner_a, unit_id, tenant_id, lease_id, property_id, org_a,
 ):
     h = _h(owner_a[1])
-    today = date.today()
-    succ_start = today.isoformat()
-    succ_end = (today + timedelta(days=364)).isoformat()
+    # expired=True → pred.end=2026-06-29 → succ_start=2026-06-30
+    succ_start = date(2026, 6, 30).isoformat()
+    succ_end = (date(2026, 6, 29) + timedelta(days=364)).isoformat()
     renew_payload = {
         "start_date": succ_start,
         "end_date": succ_end,
@@ -684,7 +686,7 @@ def test_s10_missing_deleted_or_mismatched_successor_fail_closed_409(
     db_session.expire_all()
 
     r_create = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
-    assert r_create.status_code in (200, 201), f"create renew failed: {r_create.text}"
+    assert r_create.status_code == 200, f"create renew failed: {r_create.text}"
     succ_id = r_create.json()["id"]
     # Release row lock from the SELECT FOR UPDATE in the successful renew.
     try:
@@ -729,18 +731,18 @@ def test_s11_renewal_predecessor_soft_delete_allowed_with_unit_occupied(
     client, db_session, owner_a, unit_id, tenant_id, lease_id,
 ):
     h = _h(owner_a[1])
-    today = date.today()
     _setup_expiring_predecessor(client, db_session, h, lease_id, expired=True)
 
-    succ_start = today.isoformat()
-    succ_end = (today + timedelta(days=364)).isoformat()
+    # expired=True → pred.end=2026-06-29 → succ_start=2026-06-30
+    succ_start = date(2026, 6, 30).isoformat()
+    succ_end = (date(2026, 6, 29) + timedelta(days=364)).isoformat()
     r_renew = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={"start_date": succ_start, "end_date": succ_end,
               "monthly_rent": "12500.00", "deposit": "25000.00"},
         headers=h,
     )
-    assert r_renew.status_code in (200, 201), r_renew.text
+    assert r_renew.status_code == 200, r_renew.text
     succ_id = r_renew.json()["id"]
     db_session.expire_all()
 
@@ -920,21 +922,21 @@ def test_s14_terminal_and_superseded_lease_truth_fields_immutable_409(
     client, db_session, owner_a, unit_id, tenant_id, lease_id, property_id, org_a,
 ):
     h = _h(owner_a[1])
-    today = date.today()
     unit2_id, tenant2_id = _create_second_unit_tenant(client, h, property_id, org_a.id)
 
     # (a) expired/superseded predecessor PATCH {unit_id: other_unit_id} 409
     # 创建 predecessor 先 expired 再 renew，得到 superseded + expired 状态的 predecessor
     _setup_expiring_predecessor(client, db_session, h, lease_id, expired=True)
-    succ_start = today.isoformat()
-    succ_end = (today + timedelta(days=364)).isoformat()
+    # expired=True → pred.end=2026-06-29 → succ_start=2026-06-30
+    succ_start = date(2026, 6, 30).isoformat()
+    succ_end = (date(2026, 6, 29) + timedelta(days=364)).isoformat()
     rr = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={"start_date": succ_start, "end_date": succ_end,
               "monthly_rent": "12500.00", "deposit": "25000.00"},
         headers=h,
     )
-    assert rr.status_code in (200, 201), rr.text
+    assert rr.status_code == 200, rr.text
     db_session.expire_all()
     pred_check = db_session.get(Lease, lease_id)
     assert pred_check.superseded_by_lease_id is not None
@@ -978,7 +980,7 @@ def test_s14_terminal_and_superseded_lease_truth_fields_immutable_409(
     )
 
     # (c) superseded predecessor PATCH {start_date: shifted} 409
-    shifted_start = (today + timedelta(days=7)).isoformat()
+    shifted_start = (date(2026, 6, 29) + timedelta(days=7)).isoformat()
     r_c = client.patch(
         f"{API}/leases/{lease_id}",
         json={"start_date": shifted_start},
@@ -1040,7 +1042,6 @@ def test_s16_audit_old_value_equals_pre_mutation_snapshot_for_three_paths(
     client, db_session, owner_a, unit_id, tenant_id, lease_id, property_id, org_a,
 ):
     h = _h(owner_a[1])
-    today = date.today()
 
     # =====================================================================
     # (a) renew: snapshot before renew; audit old_value deep-equals snapshot
@@ -1050,15 +1051,16 @@ def test_s16_audit_old_value_equals_pre_mutation_snapshot_for_three_paths(
     pred_for_a = db_session.get(Lease, lease_id)
     old_before_renew = serialize_row(pred_for_a)
 
-    succ_start = today.isoformat()
-    succ_end = (today + timedelta(days=364)).isoformat()
+    # expired=True → pred.end=2026-06-29 → succ_start=2026-06-30
+    succ_start = date(2026, 6, 30).isoformat()
+    succ_end = (date(2026, 6, 29) + timedelta(days=364)).isoformat()
     r_renew = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={"start_date": succ_start, "end_date": succ_end,
               "monthly_rent": "12500.00", "deposit": "25000.00"},
         headers=h,
     )
-    assert r_renew.status_code in (200, 201), r_renew.text
+    assert r_renew.status_code == 200, r_renew.text
     succ_id = r_renew.json()["id"]
 
     db_session.expire_all()
@@ -1096,8 +1098,8 @@ def test_s16_audit_old_value_equals_pre_mutation_snapshot_for_three_paths(
     #           decline-renewal shortens end_date it never becomes < start_date.
     # =====================================================================
     unit_b_id, tenant_b_id = _create_second_unit_tenant(client, h, property_id, org_a.id)
-    start_b = today - timedelta(days=400)
-    end_b = today - timedelta(days=2)
+    start_b = date(2026, 6, 29) - timedelta(days=400)
+    end_b = date(2026, 6, 29) - timedelta(days=2)
     lr_b = client.post(
         f"{API}/leases",
         json=_lease_payload(

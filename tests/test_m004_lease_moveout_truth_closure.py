@@ -177,9 +177,8 @@ def test_a1_renew_creates_successor_and_updates_metadata(
 ):
     h = _h(owner_a[1])
     pred = db_session.get(Lease, lease_id)
-    pred.end_date = date.today()
-    db_session.commit()
-    new_start_d = date.today() + timedelta(days=1)
+    assert pred.end_date <= date(2026, 6, 30)
+    new_start_d = pred.end_date + timedelta(days=1)
     new_end_d = new_start_d + timedelta(days=364)
     new_start = new_start_d.isoformat()
     new_end = new_end_d.isoformat()
@@ -215,10 +214,9 @@ def test_a2_renew_is_idempotent_no_duplicate_successor(
 ):
     h = _h(owner_a[1])
     pred = db_session.get(Lease, lease_id)
-    pred.end_date = date.today()
-    db_session.commit()
-    succ_start = (date.today() + timedelta(days=1)).isoformat()
-    succ_end = (date.today() + timedelta(days=365)).isoformat()
+    assert pred.end_date <= date(2026, 6, 30)
+    succ_start = (pred.end_date + timedelta(days=1)).isoformat()
+    succ_end = (pred.end_date + timedelta(days=366)).isoformat()
     payload = {
         "start_date": succ_start,
         "end_date": succ_end,
@@ -285,10 +283,9 @@ def test_a5_decline_after_renew_conflict(
 ):
     h = _h(owner_a[1])
     pred = db_session.get(Lease, lease_id)
-    pred.end_date = date.today()
-    db_session.commit()
-    succ_start = (date.today() + timedelta(days=1)).isoformat()
-    succ_end = (date.today() + timedelta(days=365)).isoformat()
+    assert pred.end_date <= date(2026, 6, 30)
+    succ_start = (pred.end_date + timedelta(days=1)).isoformat()
+    succ_end = (pred.end_date + timedelta(days=365)).isoformat()
     r_renew = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={
@@ -1408,7 +1405,7 @@ def test_a8_renewal_overlaps_predecessor_409(
     client, db_session, owner_a, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    pred_end = date.today()
+    pred_end = date(2026, 6, 30)
     pred_start = pred_end - timedelta(days=365)
     r = client.post(
         f"{API}/leases",
@@ -1576,10 +1573,9 @@ def test_g2_renew_duplicate_returns_same_successor(
 ):
     h = _h(owner_a[1])
     pred = db_session.get(Lease, lease_id)
-    pred.end_date = date.today()
-    db_session.commit()
-    succ_start = (date.today() + timedelta(days=1)).isoformat()
-    succ_end = (date.today() + timedelta(days=365)).isoformat()
+    assert pred.end_date <= date(2026, 6, 30)
+    succ_start = (pred.end_date + timedelta(days=1)).isoformat()
+    succ_end = (pred.end_date + timedelta(days=365)).isoformat()
     payload = {
         "start_date": succ_start,
         "end_date": succ_end,

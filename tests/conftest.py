@@ -362,8 +362,8 @@ def lease_id(client, owner_a, unit_id, tenant_id):
         json={
             "unit_id": unit_id,
             "tenant_id": tenant_id,
-            "start_date": "2026-01-01",
-            "end_date": "2026-12-31",
+            "start_date": "2025-07-01",
+            "end_date": "2026-06-30",
             "monthly_rent": "12000.00",
             "deposit": "24000.00",
             "status": "active",

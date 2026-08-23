@@ -228,14 +228,14 @@ def test_lease_update_accounting_start_date_out_of_range_422(
 ):
     resp = client.patch(
         f"{API}/leases/{lease_id}",
-        json={"accounting_start_date": "2027-01-01"},
+        json={"accounting_start_date": "2026-07-01"},  # end_date=2026-06-30, out of range after end
         headers=admin_headers,
     )
     assert resp.status_code == 422
 
     resp = client.patch(
         f"{API}/leases/{lease_id}",
-        json={"accounting_start_date": "2025-12-31"},
+        json={"accounting_start_date": "2025-06-30"},  # start_date=2025-07-01, out of range before start
         headers=admin_headers,
     )
     assert resp.status_code == 422
