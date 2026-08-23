@@ -88,8 +88,27 @@ def test_terminate_lease_releases_unit(client, admin_headers, unit_id, tenant_id
         json=sett_payload,
         headers=admin_headers,
     )
-    assert sett_resp.status_code in (200, 201), sett_resp.text
-    sid = sett_resp.json()["id"]
+    sid: int
+    if sett_resp.status_code in (200, 201):
+        sid = sett_resp.json()["id"]
+    elif sett_resp.status_code == 409:
+        detail = sett_resp.json().get("detail") if isinstance(sett_resp.json(), dict) else {}
+        existing_id = detail.get("existing_settlement_id") if isinstance(detail, dict) else None
+        assert existing_id is not None, f"Expected existing_settlement_id in 409: {sett_resp.text}"
+        patch_resp = client.patch(
+            f"{API}/deposit-settlements/{existing_id}",
+            json={
+                "deposit_received": "24000.00",
+                "total_deductions": "5000.00",
+                "refund_amount": "19000.00",
+                "deductions": [{"description": "paint", "amount": "5000.00"}],
+            },
+            headers=admin_headers,
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+        sid = existing_id
+    else:
+        raise AssertionError(f"Unexpected status={sett_resp.status_code}: {sett_resp.text}")
 
     confirm_sett_resp = client.post(
         f"{API}/deposit-settlements/{sid}/confirm",

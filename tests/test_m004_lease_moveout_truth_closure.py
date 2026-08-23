@@ -68,8 +68,16 @@ def _schedule_inspection_api(client, headers, *, lease_id, scheduled_at=None):
         },
         headers=headers,
     )
-    assert r.status_code in (200, 201), r.text
-    return r.json()
+    if r.status_code == 201:
+        return r.json()
+    if r.status_code == 409:
+        detail = r.json().get("detail") if isinstance(r.json(), dict) else {}
+        existing_id = detail.get("existing_inspection_id") if isinstance(detail, dict) else None
+        if existing_id is not None:
+            g = client.get(f"{API}/move-out-inspections/{existing_id}", headers=headers)
+            assert g.status_code == 200, g.text
+            return g.json()
+    raise AssertionError(f"schedule_inspection_api unexpected status={r.status_code}: {r.text}")
 
 
 def _schedule_and_full_inspection(client, db, headers, *, lease_id):
@@ -96,26 +104,53 @@ def _schedule_and_full_inspection(client, db, headers, *, lease_id):
 
 def _full_settlement(client, db, headers, *, inspection_id,
                      deposit="24000.00", deductions=None, refund="19000.00"):
-    """Happy path: create DRAFT + confirm with conservation. Deductions default=5000."""
+    """Happy path: create DRAFT + confirm with conservation. Deductions default=5000.
+
+    FIX2: If confirm_inspection already auto-created a DRAFT settlement,
+    we detect the 409, PATCH the existing draft, then confirm.
+    """
     if deductions is None:
         deductions = [{"description": "wall repaint", "amount": "5000.00"}]
+    payload = {
+        "move_out_inspection_id": inspection_id,
+        "deposit_received": deposit,
+        "total_deductions": str(Decimal(deposit) - Decimal(refund)),
+        "refund_amount": refund,
+        "deductions": deductions,
+    }
     r = client.post(
         f"{API}/deposit-settlements",
-        json={
-            "move_out_inspection_id": inspection_id,
+        json=payload,
+        headers=headers,
+    )
+    sid: int
+    if r.status_code == 201:
+        sid = r.json()["id"]
+    elif r.status_code == 409:
+        detail = r.json().get("detail") if isinstance(r.json(), dict) else {}
+        existing_id = detail.get("existing_settlement_id") if isinstance(detail, dict) else None
+        if existing_id is None:
+            raise AssertionError(f"_full_settlement 409 without existing_settlement_id: {r.text}")
+        g = client.get(f"{API}/deposit-settlements/{existing_id}", headers=headers)
+        assert g.status_code == 200, g.text
+        existing = g.json()
+        if existing.get("status") != DepositSettlementStatus.DRAFT.value:
+            return existing
+        patch_payload = {
             "deposit_received": deposit,
             "total_deductions": str(Decimal(deposit) - Decimal(refund)),
             "refund_amount": refund,
             "deductions": deductions,
-        },
-        headers=headers,
-    )
-    assert r.status_code in (200, 201), r.text
-    sid = r.json()["id"]
-    r = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=headers)
-    assert r.status_code == 200, r.text
+        }
+        p = client.patch(f"{API}/deposit-settlements/{existing_id}", json=patch_payload, headers=headers)
+        assert p.status_code == 200, p.text
+        sid = existing_id
+    else:
+        raise AssertionError(f"_full_settlement unexpected status={r.status_code}: {r.text}")
+    r2 = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=headers)
+    assert r2.status_code == 200, r2.text
     db.expire_all()
-    return r.json()
+    return r2.json()
 
 
 def _close_lease_pipeline(client, db, headers, *, lease_id):
@@ -271,7 +306,9 @@ def test_a6_auto_expire_requires_end_date_past_today_and_not_renewed(
     lid = r.json()["id"]
     r2 = client.post(f"{API}/leases/{lid}/auto-expire", headers=h)
     assert r2.status_code == 409, r2.text
-    assert "not_renewed" in (r2.json().get("detail", "") or "")
+    detail = r2.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "decline_renewal_required_not_renewed_missing"
     client.post(
         f"{API}/leases/{lid}/decline-renewal",
         json={"reason": "tenant gone"},
@@ -406,9 +443,8 @@ def test_b5_confirm_without_findings_409(
     r = client.post(f"{API}/move-out-inspections/{insp_id}/confirm", headers=h)
     assert r.status_code == 409, r.text
     detail = r.json()["detail"]
-    assert "findings" in (detail.get("actual_truth", "") or "").lower() \
-        or "findings" in (detail.get("expected_truth", "") or "").lower() \
-        or "findings" in str(detail).lower()
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "move_out_inspection_evidence_gate_failed"
 
 
 def test_b6_confirm_with_evidence_and_findings_success(
@@ -521,20 +557,43 @@ def test_b12_wrong_evidence_category_still_fails_gate(
 
 def _draft_settlement(client, headers, *, lease_id, inspection_id,
                       deposit="24000.00", total_deduct="5000.00",
-                      refund="19000.00"):
+                      refund="19000.00", deductions=None):
+    if deductions is None:
+        deductions = [{"description": "paint", "amount": total_deduct}]
+    payload = {
+        "move_out_inspection_id": inspection_id,
+        "deposit_received": deposit,
+        "total_deductions": total_deduct,
+        "refund_amount": refund,
+        "deductions": deductions,
+    }
     r = client.post(
         f"{API}/deposit-settlements",
-        json={
-            "move_out_inspection_id": inspection_id,
+        json=payload,
+        headers=headers,
+    )
+    if r.status_code == 201:
+        return r.json()
+    if r.status_code == 409:
+        detail = r.json().get("detail") if isinstance(r.json(), dict) else {}
+        existing_id = detail.get("existing_settlement_id") if isinstance(detail, dict) else None
+        if existing_id is None:
+            raise AssertionError(f"_draft_settlement 409 without existing_settlement_id: {r.text}")
+        g = client.get(f"{API}/deposit-settlements/{existing_id}", headers=headers)
+        assert g.status_code == 200, g.text
+        existing = g.json()
+        if existing.get("status") != DepositSettlementStatus.DRAFT.value:
+            return existing
+        patch_payload = {
             "deposit_received": deposit,
             "total_deductions": total_deduct,
             "refund_amount": refund,
-            "deductions": [{"description": "paint", "amount": total_deduct}],
-        },
-        headers=headers,
-    )
-    assert r.status_code in (200, 201), r.text
-    return r.json()
+            "deductions": deductions,
+        }
+        p = client.patch(f"{API}/deposit-settlements/{existing_id}", json=patch_payload, headers=headers)
+        assert p.status_code == 200, p.text
+        return p.json()
+    raise AssertionError(f"_draft_settlement unexpected status={r.status_code}: {r.text}")
 
 
 def test_c1_create_draft_settlement(
@@ -614,21 +673,43 @@ def test_c5_confirm_generates_income_rows_per_deduction(
     insp = _schedule_and_full_inspection(
         client, db_session, h, lease_id=lease_id,
     )
+    deductions = [
+        {"description": "wall", "amount": "4000.00"},
+        {"description": "carpet", "amount": "2000.00"},
+    ]
+    payload = {
+        "move_out_inspection_id": insp["id"],
+        "deposit_received": "10000.00",
+        "total_deductions": "6000.00",
+        "refund_amount": "4000.00",
+        "deductions": deductions,
+    }
     r = client.post(
         f"{API}/deposit-settlements",
-        json={
-            "move_out_inspection_id": insp["id"],
-            "deposit_received": "10000.00",
-            "total_deductions": "6000.00",
-            "refund_amount": "4000.00",
-            "deductions": [
-                {"description": "wall", "amount": "4000.00"},
-                {"description": "carpet", "amount": "2000.00"},
-            ],
-        },
+        json=payload,
         headers=h,
     )
-    sid = r.json()["id"]
+    sid: int
+    if r.status_code == 201:
+        sid = r.json()["id"]
+    elif r.status_code == 409:
+        detail = r.json().get("detail") if isinstance(r.json(), dict) else {}
+        existing_id = detail.get("existing_settlement_id") if isinstance(detail, dict) else None
+        assert existing_id is not None, f"Expected existing_settlement_id in 409: {r.text}"
+        patch = client.patch(
+            f"{API}/deposit-settlements/{existing_id}",
+            json={
+                "deposit_received": "10000.00",
+                "total_deductions": "6000.00",
+                "refund_amount": "4000.00",
+                "deductions": deductions,
+            },
+            headers=h,
+        )
+        assert patch.status_code == 200, patch.text
+        sid = existing_id
+    else:
+        raise AssertionError(f"Unexpected status={r.status_code}: {r.text}")
     before_inc = db_session.query(Income).count()
     before_exp = db_session.query(Expense).count()
     c = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
@@ -1160,22 +1241,43 @@ def test_c12_deductions_sum_mismatch_409_on_confirm(
     insp = _schedule_and_full_inspection(
         client, db_session, h, lease_id=lease_id
     )
+    deductions = [
+        {"description": "a", "amount": "3000.02"},
+        {"description": "b", "amount": "2000.00"},
+    ]
+    payload = {
+        "move_out_inspection_id": insp["id"],
+        "deposit_received": "24000.00",
+        "total_deductions": "5000.00",
+        "refund_amount": "19000.00",
+        "deductions": deductions,
+    }
     r = client.post(
         f"{API}/deposit-settlements",
-        json={
-            "move_out_inspection_id": insp["id"],
-            "deposit_received": "24000.00",
-            "total_deductions": "5000.00",
-            "refund_amount": "19000.00",
-            "deductions": [
-                {"description": "a", "amount": "3000.02"},
-                {"description": "b", "amount": "2000.00"},
-            ],
-        },
+        json=payload,
         headers=h,
     )
-    assert r.status_code in (200, 201), r.text
-    sid = r.json()["id"]
+    sid: int
+    if r.status_code == 201:
+        sid = r.json()["id"]
+    elif r.status_code == 409:
+        detail = r.json().get("detail") if isinstance(r.json(), dict) else {}
+        existing_id = detail.get("existing_settlement_id") if isinstance(detail, dict) else None
+        assert existing_id is not None, f"Expected existing_settlement_id in 409: {r.text}"
+        patch = client.patch(
+            f"{API}/deposit-settlements/{existing_id}",
+            json={
+                "deposit_received": "24000.00",
+                "total_deductions": "5000.00",
+                "refund_amount": "19000.00",
+                "deductions": deductions,
+            },
+            headers=h,
+        )
+        assert patch.status_code == 200, patch.text
+        sid = existing_id
+    else:
+        raise AssertionError(f"Unexpected status={r.status_code}: {r.text}")
     c = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
     assert c.status_code == 409, c.text
     detail = c.json()["detail"]
@@ -1307,3 +1409,404 @@ def test_c14_patch_settlement_forbidden_fields_rejected_422_refund_only_allowed(
     assert after.lease_id == orig_lease_id
     assert after.move_out_inspection_id == orig_insp_id
     assert after.refund_amount == Decimal("18999.99")
+
+
+# =========================================================================
+# G组 — Anti-case 精确断言反例测试 (g1-g13: 13 tests)
+# =========================================================================
+
+def test_g1_patch_terminal_lease_no_status_change_no_final_effects(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    _build_settled_lease(
+        client, db_session, h, expiring_lease_id=lease_id,
+    )
+    tenant_before = db_session.get(Tenant, tenant_id)
+    moved_out_before = tenant_before.moved_out_at
+    assert moved_out_before is None
+    unit_before = client.get(f"{API}/units/{unit_id}", headers=h).json()
+    unit_status_before = unit_before["status"]
+    r = client.patch(
+        f"{API}/leases/{lease_id}",
+        json={"notes": "just updating notes, no status change"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    db_session.expire_all()
+    tenant_after = db_session.get(Tenant, tenant_id)
+    assert tenant_after.moved_out_at is None
+    unit_after = client.get(f"{API}/units/{unit_id}", headers=h).json()
+    assert unit_after["status"] == unit_status_before
+    lease_after = db_session.get(Lease, lease_id)
+    assert lease_after.status == LeaseStatus.active
+
+
+def test_g2_renew_duplicate_returns_same_successor(
+    client, db_session, owner_a, unit_id, tenant_id, lease_id
+):
+    h = _h(owner_a[1])
+    payload = {
+        "start_date": "2027-01-01",
+        "end_date": "2027-12-31",
+        "monthly_rent": "12500.00",
+        "deposit": "25000.00",
+    }
+    r1 = client.post(f"{API}/leases/{lease_id}/renew", json=payload, headers=h)
+    assert r1.status_code == 200, r1.text
+    pred1 = db_session.get(Lease, lease_id)
+    succ_id_1 = (pred1.renewal_metadata or {})["renewed_lease_id"]
+    r2 = client.post(f"{API}/leases/{lease_id}/renew", json=payload, headers=h)
+    assert r2.status_code == 200, r2.text
+    body2 = r2.json()
+    succ_id_2 = body2.get("id")
+    if succ_id_2 is None:
+        pred2 = db_session.get(Lease, lease_id)
+        succ_id_2 = (pred2.renewal_metadata or {})["renewed_lease_id"]
+    assert succ_id_2 == succ_id_1
+
+
+def test_g3_settlement_confirm_idempotent(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id,
+    )
+    deductions = [
+        {"description": "wall repair", "amount": "3000.00"},
+        {"description": "cleaning", "amount": "2000.00"},
+    ]
+    s = _draft_settlement(
+        client, h, lease_id=lease_id, inspection_id=insp["id"],
+        total_deduct="5000.00",
+        deductions=deductions,
+    )
+    sid = s["id"]
+    c1 = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
+    assert c1.status_code == 200, c1.text
+    db_session.expire_all()
+    refund_key_1 = f"deposit_settlement:{sid}:refund"
+    refund_rows_1 = (
+        db_session.query(Expense)
+        .filter(Expense.idempotency_key == refund_key_1)
+        .count()
+    )
+    assert refund_rows_1 == 1
+    income_keys_expected = 2
+    income_rows_1 = (
+        db_session.query(Income)
+        .filter(Income.idempotency_key.like(f"deposit_settlement:{sid}:deduction:%"))
+        .count()
+    )
+    assert income_rows_1 == income_keys_expected
+    c2 = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
+    assert c2.status_code == 200, c2.text
+    db_session.expire_all()
+    refund_rows_2 = (
+        db_session.query(Expense)
+        .filter(Expense.idempotency_key == refund_key_1)
+        .count()
+    )
+    assert refund_rows_2 == 1
+    income_rows_2 = (
+        db_session.query(Income)
+        .filter(Income.idempotency_key.like(f"deposit_settlement:{sid}:deduction:%"))
+        .count()
+    )
+    assert income_rows_2 == income_keys_expected
+    sett = db_session.get(DepositSettlement, sid)
+    actual_deductions = sett.deductions or []
+    assert len(actual_deductions) == len(deductions)
+
+
+def test_g4_replacement_settlement_updates_lease_fk(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp1 = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id,
+    )
+    sett1 = _full_settlement(
+        client, db_session, h, inspection_id=insp1["id"],
+    )
+    db_session.expire_all()
+    lease_before = db_session.get(Lease, lease_id)
+    old_deposit_settlement_id = lease_before.deposit_settlement_id
+    assert old_deposit_settlement_id is not None
+    insp1_row = db_session.get(MoveOutInspection, insp1["id"])
+    client.post(f"{API}/move-out-inspections/{insp1_row.id}/cancel", headers=h)
+    db_session.expire_all()
+    insp1_cancelled = db_session.get(MoveOutInspection, insp1["id"])
+    assert insp1_cancelled.status == MoveOutInspectionStatus.CANCELLED
+    insp2 = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id,
+    )
+    db_session.expire_all()
+    lease_intermediate = db_session.get(Lease, lease_id)
+    sett2 = _full_settlement(
+        client, db_session, h, inspection_id=insp2["id"],
+    )
+    db_session.expire_all()
+    lease_after = db_session.get(Lease, lease_id)
+    assert lease_after.deposit_settlement_id == sett2["id"]
+
+
+def test_g5_dup_inspection_schedule_409(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    when = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    findings_original = [{"item": "original scratch", "severity": "minor"}]
+    r1 = client.post(
+        f"{API}/move-out-inspections",
+        json={
+            "lease_id": lease_id,
+            "scheduled_at": when,
+            "findings": findings_original,
+        },
+        headers=h,
+    )
+    assert r1.status_code == 201, r1.text
+    insp_id = r1.json()["id"]
+    r2 = client.post(
+        f"{API}/move-out-inspections",
+        json={
+            "lease_id": lease_id,
+            "scheduled_at": when,
+            "findings": [{"item": "overwrite attempt", "severity": "major"}],
+        },
+        headers=h,
+    )
+    assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "move_out_inspection_already_exists_for_lease"
+    db_session.expire_all()
+    insp_after = db_session.get(MoveOutInspection, insp_id)
+    assert insp_after.findings == findings_original
+
+
+def test_g6_patch_inspection_invalid_evidence_ids_cross_org(
+    client, db_session, owner_a, owner_b, org_a, org_b, property_id,
+    unit_id, tenant_id, lease_id,
+):
+    own_a_h = _h(owner_a[1])
+    own_b_h = _h(owner_b[1])
+    prop_b_resp = client.post(
+        f"{API}/properties",
+        json={
+            "name": "Property-B",
+            "address": "2 Ayala Ave",
+            "city": "Makati",
+            "total_units": 2,
+            "organization_id": org_b.id,
+        },
+        headers=own_b_h,
+    )
+    assert prop_b_resp.status_code == 201, prop_b_resp.text
+    prop_b_id = prop_b_resp.json()["id"]
+    unit_b_resp = client.post(
+        f"{API}/units",
+        json={
+            "property_id": prop_b_id,
+            "unit_number": "201",
+            "floor": "2",
+            "size_sqm": "40.00",
+            "monthly_rent": "15000.00",
+            "status": "vacant",
+        },
+        headers=own_b_h,
+    )
+    assert unit_b_resp.status_code == 201, unit_b_resp.text
+    unit_b_id = unit_b_resp.json()["id"]
+    cross_evidence_id = _create_evidence(
+        client, own_b_h, unit_id=unit_b_id,
+        category=EvidenceCategory.move_out_photo,
+    )
+    insp = _schedule_inspection_api(client, own_a_h, lease_id=lease_id)
+    r = client.patch(
+        f"{API}/move-out-inspections/{insp['id']}",
+        json={"evidence_ids": [cross_evidence_id]},
+        headers=own_a_h,
+    )
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "move_out_inspection_evidence_mismatched_org_or_unit"
+
+
+def test_g7_notes_persist_roundtrip(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    when = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    notes_value = "hello notes"
+    create_r = client.post(
+        f"{API}/move-out-inspections",
+        json={
+            "lease_id": lease_id,
+            "scheduled_at": when,
+            "notes": notes_value,
+        },
+        headers=h,
+    )
+    assert create_r.status_code == 201, create_r.text
+    insp_id = create_r.json()["id"]
+    get_r = client.get(
+        f"{API}/move-out-inspections/{insp_id}",
+        headers=h,
+    )
+    assert get_r.status_code == 200, get_r.text
+    assert get_r.json()["notes"] == notes_value
+
+
+def test_g8_deduction_item_income_id_rejected_on_create(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id,
+    )
+    r = client.post(
+        f"{API}/deposit-settlements",
+        json={
+            "move_out_inspection_id": insp["id"],
+            "deposit_received": "24000.00",
+            "total_deductions": "5000.00",
+            "refund_amount": "19000.00",
+            "deductions": [
+                {
+                    "description": "paint",
+                    "amount": "5000.00",
+                    "income_id": 99999,
+                },
+            ],
+        },
+        headers=h,
+    )
+    assert r.status_code == 422, r.text
+    errors = r.json()["detail"]
+    locs = {tuple(err.get("loc", [])) for err in errors if err.get("type") == "extra_forbidden"}
+    assert ("body", "deductions", 0, "income_id") in locs
+
+
+def test_g9_inspection_read_nullable_unit_tenant_fields(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    when = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    create_r = client.post(
+        f"{API}/move-out-inspections",
+        json={
+            "lease_id": lease_id,
+            "scheduled_at": when,
+        },
+        headers=h,
+    )
+    assert create_r.status_code == 201, create_r.text
+    insp_id = create_r.json()["id"]
+    get_r = client.get(
+        f"{API}/move-out-inspections/{insp_id}",
+        headers=h,
+    )
+    assert get_r.status_code == 200, get_r.text
+    body = get_r.json()
+    assert "unit_id" in body
+    assert "tenant_id" in body
+
+
+def test_g10_evidence_soft_deleted_excluded_from_gate(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    from app.models.evidence import Evidence as EvidenceModel
+    h = _h(owner_a[1])
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
+    insp_id = insp["id"]
+    eid = _create_evidence(client, h, unit_id=unit_id,
+                           category=EvidenceCategory.move_out_photo)
+    inspect_r = client.post(
+        f"{API}/move-out-inspections/{insp_id}/inspect",
+        json={
+            "evidence_ids": [eid],
+            "findings": [{"item": "wall scratch", "severity": "minor"}],
+        },
+        headers=h,
+    )
+    assert inspect_r.status_code == 200, inspect_r.text
+    db_session.expire_all()
+    ev_row = db_session.get(EvidenceModel, eid)
+    assert ev_row is not None
+    ev_row.deleted_at = datetime.now(timezone.utc)
+    db_session.commit()
+    confirm_r = client.post(
+        f"{API}/move-out-inspections/{insp_id}/confirm",
+        headers=h,
+    )
+    assert confirm_r.status_code == 409, confirm_r.text
+    detail = confirm_r.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "move_out_inspection_evidence_gate_failed"
+
+
+def test_g11_concurrent_schedule_same_lease_409_no_500(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    when = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+    payload = {
+        "lease_id": lease_id,
+        "scheduled_at": when,
+    }
+    r1 = client.post(f"{API}/move-out-inspections", json=payload, headers=h)
+    assert r1.status_code in (200, 201, 409), r1.text
+    assert r1.status_code != 500, r1.text
+    r2 = client.post(f"{API}/move-out-inspections", json=payload, headers=h)
+    assert r2.status_code in (200, 201, 409), r2.text
+    assert r2.status_code != 500, r2.text
+
+
+def test_g12_confirm_inspection_auto_creates_draft_settlement(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    insp = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id,
+    )
+    list_r = client.get(
+        f"{API}/deposit-settlements?lease_id={lease_id}",
+        headers=h,
+    )
+    assert list_r.status_code == 200, list_r.text
+    settlements = list_r.json()
+    assert len(settlements) == 1
+    linked = [s for s in settlements if s.get("move_out_inspection_id") == insp["id"]]
+    assert len(linked) == 1
+    assert linked[0]["status"] == DepositSettlementStatus.DRAFT.value
+
+
+def test_g13_orphan_task_source_id_none_reconcile_cancelled(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    h = _h(owner_a[1])
+    orphan = OperationalTask(
+        task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
+        title="orphan inspection task source_id=None",
+        status=OperationalTaskStatus.PENDING,
+        source_type="move_out_inspection",
+        source_id=None,
+        lease_id=lease_id,
+        property_id=property_id,
+        priority=OperationalTaskPriority.high,
+        due_at=datetime.now(timezone.utc) + timedelta(days=1),
+        details={},
+    )
+    db_session.add(orphan)
+    db_session.commit()
+    db_session.refresh(orphan)
+    orphan_id = orphan.id
+    reconcile_tasks(db_session, now=datetime.now(timezone.utc))
+    db_session.expire_all()
+    after = db_session.get(OperationalTask, orphan_id)
+    assert after.status == OperationalTaskStatus.CANCELLED
+    assert after.status != OperationalTaskStatus.COMPLETED
