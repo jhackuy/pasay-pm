@@ -19,7 +19,7 @@ class MoveOutInspectionBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scheduled_at: datetime
     inspected_at: datetime | None = None
-    findings: list[dict] | None = None
+    findings: list[FindingsItem] | None = None
     evidence_ids: list[int] | None = None
 
 
@@ -33,7 +33,7 @@ class MoveOutInspectionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scheduled_at: datetime | None = None
     inspected_at: datetime | None = None
-    findings: list[dict] | None = None
+    findings: list[FindingsItem] | None = None
     evidence_ids: list[int] | None = None
     notes: str | None = None
 

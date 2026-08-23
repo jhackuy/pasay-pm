@@ -294,25 +294,33 @@ def _write_financial_rows_for_settlement(
         )
         income.created_by = confirmed_by
         income.updated_by = confirmed_by
+        income_created_ok = False
         try:
             tx = db.begin_nested()
             db.add(income)
             db.flush()
             tx.commit()
             processed_income_ids[i] = income.id
-            record_audit(
-                db,
-                table_name="incomes",
-                record_id=income.id,
-                action="create",
-                actor_id=confirmed_by,
-                new_value=serialize_row(income),
-            )
+            income_created_ok = True
         except IntegrityError:
             tx.rollback()
             existing_row = db.query(Income).filter(Income.idempotency_key == ikey).first()
             if existing_row is not None:
                 processed_income_ids[i] = existing_row.id
+                income_created_ok = True
+            else:
+                raise
+        if income_created_ok:
+            created_or_existing_id = processed_income_ids[i]
+            live_row = db.get(Income, created_or_existing_id) or income
+            record_audit(
+                db,
+                table_name="incomes",
+                record_id=created_or_existing_id,
+                action="create",
+                actor_id=confirmed_by,
+                new_value=serialize_row(live_row),
+            )
 
     if processed_income_ids and deductions:
         updated = []
@@ -346,21 +354,33 @@ def _write_financial_rows_for_settlement(
             exp.updated_by = confirmed_by
             if exp.property_id == 0:
                 exp.property_id = property_id or exp.property_id
+            refund_created_ok = False
+            created_exp_id: int | None = None
             try:
                 tx = db.begin_nested()
                 db.add(exp)
                 db.flush()
                 tx.commit()
+                refund_created_ok = True
+                created_exp_id = exp.id
+            except IntegrityError:
+                tx.rollback()
+                existing_row = db.query(Expense).filter(Expense.idempotency_key == ekey).first()
+                if existing_row is not None:
+                    refund_created_ok = True
+                    created_exp_id = existing_row.id
+                else:
+                    raise
+            if refund_created_ok and created_exp_id is not None:
+                live_exp = db.get(Expense, created_exp_id) or exp
                 record_audit(
                     db,
                     table_name="expenses",
-                    record_id=exp.id,
+                    record_id=created_exp_id,
                     action="create",
                     actor_id=confirmed_by,
-                    new_value=serialize_row(exp),
+                    new_value=serialize_row(live_exp),
                 )
-            except IntegrityError:
-                tx.rollback()
 
 
 def _close_projection_tasks_for_settlement(

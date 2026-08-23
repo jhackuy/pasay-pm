@@ -172,6 +172,9 @@ def test_a1_renew_creates_successor_and_updates_metadata(
     client, db_session, owner_a, unit_id, tenant_id, lease_id
 ):
     h = _h(owner_a[1])
+    pred = db_session.get(Lease, lease_id)
+    pred.end_date = date.today()
+    db_session.commit()
     new_start = "2027-01-01"
     new_end = "2027-12-31"
     r = client.post(
@@ -203,6 +206,9 @@ def test_a2_renew_is_idempotent_no_duplicate_successor(
     client, db_session, owner_a, unit_id, tenant_id, lease_id
 ):
     h = _h(owner_a[1])
+    pred = db_session.get(Lease, lease_id)
+    pred.end_date = date.today()
+    db_session.commit()
     payload = {
         "start_date": "2027-01-01",
         "end_date": "2027-12-31",
@@ -268,6 +274,9 @@ def test_a5_decline_after_renew_conflict(
     client, db_session, owner_a, unit_id, tenant_id, lease_id
 ):
     h = _h(owner_a[1])
+    pred = db_session.get(Lease, lease_id)
+    pred.end_date = date.today()
+    db_session.commit()
     client.post(
         f"{API}/leases/{lease_id}/renew",
         json={
@@ -1446,6 +1455,9 @@ def test_g2_renew_duplicate_returns_same_successor(
     client, db_session, owner_a, unit_id, tenant_id, lease_id
 ):
     h = _h(owner_a[1])
+    pred = db_session.get(Lease, lease_id)
+    pred.end_date = date.today()
+    db_session.commit()
     payload = {
         "start_date": "2027-01-01",
         "end_date": "2027-12-31",
@@ -1584,7 +1596,9 @@ def test_g5_dup_inspection_schedule_409(
     assert detail["reason"] == "move_out_inspection_already_exists_for_lease"
     db_session.expire_all()
     insp_after = db_session.get(MoveOutInspection, insp_id)
-    assert insp_after.findings == findings_original
+    assert len(insp_after.findings or []) == 1
+    assert insp_after.findings[0]["item"] == "original scratch"
+    assert insp_after.findings[0]["severity"] == "minor"
 
 
 def test_g6_patch_inspection_invalid_evidence_ids_cross_org(
@@ -1810,3 +1824,332 @@ def test_g13_orphan_task_source_id_none_reconcile_cancelled(
     after = db_session.get(OperationalTask, orphan_id)
     assert after.status == OperationalTaskStatus.CANCELLED
     assert after.status != OperationalTaskStatus.COMPLETED
+
+
+def test_h1_non_confirmed_insp_create_settlement_409_exact_reason(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    h = _h(owner_a[1])
+    scheduled = _schedule_inspection_api(client, h, lease_id=lease_id)
+    scheduled_id = scheduled["id"]
+    payload_base = {
+        "move_out_inspection_id": scheduled_id,
+        "deposit_received": "24000.00",
+        "total_deductions": "0.00",
+        "refund_amount": "24000.00",
+    }
+    r_sched = client.post(f"{API}/deposit-settlements", json={
+        **payload_base,
+    }, headers=h)
+    assert r_sched.status_code == 409
+    d_sched = r_sched.json()["detail"]
+    assert d_sched["reason"] == "deposit_settlement_create_requires_confirmed_inspection"
+    assert d_sched["move_out_inspection_id"] == scheduled_id
+    assert d_sched["expected"] == MoveOutInspectionStatus.CONFIRMED.value
+
+    insp = client.post(f"{API}/move-out-inspections/{scheduled_id}/inspect", json={
+        "findings": [{"item": "wall", "severity": "low"}],
+    }, headers=h)
+    assert insp.status_code == 200, insp.text
+    r_insp = client.post(f"{API}/deposit-settlements", json={
+        **payload_base,
+    }, headers=h)
+    assert r_insp.status_code == 409
+    assert r_insp.json()["detail"]["reason"] == "deposit_settlement_create_requires_confirmed_inspection"
+
+    cancel = client.post(f"{API}/move-out-inspections/{scheduled_id}/cancel", headers=h)
+    assert cancel.status_code == 200, cancel.text
+    r_cancel = client.post(f"{API}/deposit-settlements", json={
+        **payload_base,
+    }, headers=h)
+    assert r_cancel.status_code == 409
+    assert r_cancel.json()["detail"]["reason"] == "deposit_settlement_create_requires_confirmed_inspection"
+
+
+def test_h2_confirm_draft_settle_non_confirmed_insp_409(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    from app.services.audit import record_audit as _audit_silent
+    h = _h(owner_a[1])
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
+    insp_id = insp["id"]
+    owner_uid = owner_a[0].id if hasattr(owner_a[0], "id") else int(owner_a[0])
+    settled_row = DepositSettlement(
+        move_out_inspection_id=insp_id,
+        lease_id=lease_id,
+        created_by=owner_uid,
+        updated_by=owner_uid,
+        status=DepositSettlementStatus.DRAFT,
+        refund_amount=Decimal("0"),
+        total_deductions=Decimal("0"),
+        deposit_received=Decimal("0"),
+        deductions=[],
+    )
+    db_session.add(settled_row)
+    db_session.commit()
+    db_session.refresh(settled_row)
+    draft_id = settled_row.id
+
+    confirm = client.post(f"{API}/deposit-settlements/{draft_id}/confirm", headers=h)
+    assert confirm.status_code == 409, confirm.text
+    detail = confirm.json()["detail"]
+    assert detail["reason"] == "deposit_settlement_requires_confirmed_inspection"
+    assert detail["inspection_status"] in (
+        MoveOutInspectionStatus.SCHEDULED.value,
+        MoveOutInspectionStatus.INSPECTED.value,
+        MoveOutInspectionStatus.CANCELLED.value,
+    )
+
+
+def test_h3_findings_invalid_422_and_legal_roundtrip(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    h = _h(owner_a[1])
+    r_extra = client.post(f"{API}/move-out-inspections", json={
+        "lease_id": lease_id,
+        "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "findings": [{"item": "door", "UNEXPECTED_FIELD_BAD": 123}],
+    }, headers=h)
+    assert r_extra.status_code == 422, r_extra.text
+
+    r_neg = client.post(f"{API}/move-out-inspections", json={
+        "lease_id": lease_id,
+        "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "findings": [{"item": "floor", "cost": "-12.50"}],
+    }, headers=h)
+    assert r_neg.status_code == 422, r_neg.text
+
+    r_wrong_type = client.post(f"{API}/move-out-inspections", json={
+        "lease_id": lease_id,
+        "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "findings": [{"item": 777, "cost": "not a number"}],
+    }, headers=h)
+    assert r_wrong_type.status_code == 422, r_wrong_type.text
+
+    findings_legal = [
+        {"item": "wall scratch", "description": "chipped", "severity": "low", "cost": None},
+        {"item": "appliance broken", "description": "fridge", "severity": "high", "cost": "129.99"},
+    ]
+    insp_ok = client.post(f"{API}/move-out-inspections", json={
+        "lease_id": lease_id,
+        "scheduled_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "findings": findings_legal,
+    }, headers=h)
+    assert insp_ok.status_code == 201, insp_ok.text
+    insp_id = insp_ok.json()["id"]
+
+    read1 = client.get(f"{API}/move-out-inspections/{insp_id}", headers=h)
+    assert read1.status_code == 200
+    assert read1.json()["findings"] == findings_legal
+
+    patch_ok = client.patch(f"{API}/move-out-inspections/{insp_id}", json={
+        "findings": [
+            {"item": "updated", "cost": "2.10"},
+            {"item": "second", "severity": "medium"},
+        ],
+    }, headers=h)
+    assert patch_ok.status_code == 200, patch_ok.text
+    patched_findings = patch_ok.json()["findings"]
+    assert patched_findings == [
+        {"item": "updated", "description": None, "severity": None, "cost": "2.10"},
+        {"item": "second", "description": None, "severity": "medium", "cost": None},
+    ]
+    insp_read_2 = client.get(f"{API}/move-out-inspections/{insp_id}", headers=h)
+    assert insp_read_2.status_code == 200
+    assert insp_read_2.json()["findings"] == patched_findings
+
+
+def test_h4_settlement_confirm_non_idempotency_fk_integrity_not_swallowed(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    from app.services.deposit_settlement_service import confirm_settlement
+    h = _h(owner_a[1])
+    insp = _schedule_inspection_api(client, h, lease_id=lease_id)
+    insp_id = insp["id"]
+    insp_row = db_session.get(MoveOutInspection, insp_id)
+    insp_row.status = MoveOutInspectionStatus.CONFIRMED
+    db_session.commit()
+    owner_uid = owner_a[0].id if hasattr(owner_a[0], "id") else int(owner_a[0])
+
+    settle = DepositSettlement(
+        move_out_inspection_id=insp_id,
+        lease_id=lease_id,
+        created_by=owner_uid,
+        updated_by=owner_uid,
+        status=DepositSettlementStatus.DRAFT,
+        refund_amount=Decimal("0"),
+        total_deductions=Decimal("123.45"),
+        deposit_received=Decimal("123.45"),
+        deductions=[{
+            "description": "deduction",
+            "amount": "123.45",
+        }],
+    )
+    db_session.add(settle)
+    db_session.commit()
+    db_session.refresh(settle)
+    settle_id = settle.id
+
+    from sqlalchemy import event as sqla_event
+    from sqlalchemy.exc import IntegrityError as IE
+    try:
+        from psycopg.errors import ForeignKeyViolation as FKV
+    except ModuleNotFoundError:
+        from psycopg2.errors import ForeignKeyViolation as FKV
+    triggered = {"hit": 0}
+
+    @sqla_event.listens_for(db_session.get_bind(), "before_cursor_execute")
+    def _poison(conn, cursor, statement, parameters, context, executemany):
+        if (
+            triggered["hit"] == 0
+            and isinstance(statement, str)
+            and "INSERT INTO incomes" in statement.replace("\n", " ")
+        ):
+            triggered["hit"] += 1
+            fake_orig = FKV(
+                "insert or update on table \"incomes\" violates foreign key constraint \"incomes_lease_id_fkey\""
+            )
+            raise IE(statement, parameters, fake_orig)
+
+    try:
+        from sqlalchemy.exc import IntegrityError as _IE
+        raised_ok = False
+        try:
+            confirm_settlement(
+                db_session,
+                settle,
+                confirmed_at=datetime.now(timezone.utc),
+                confirmed_by=owner_uid,
+            )
+        except _IE:
+            raised_ok = True
+            db_session.rollback()
+        assert raised_ok, "expected IntegrityError re-raised for non-idempotency FK violation, not swallowed with Settlement auto-confirmed"
+    finally:
+        sqla_event.remove(db_session.get_bind(), "before_cursor_execute", _poison)
+    db_session.rollback()
+    after = db_session.get(DepositSettlement, settle_id)
+    assert after.status == DepositSettlementStatus.DRAFT
+
+
+def test_h5_not_renewed_malformed_tolerant_batch_no_exception(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    h = _h(owner_a[1])
+    past = date.today() - timedelta(days=30)
+    cases = [
+        {"not_renewed": False},
+        {"not_renewed": None},
+        {"not_renewed": "random-string"},
+        {"not_renewed": {"nested": True}},
+        {"not_renewed": 1},
+        {"something_else": True},
+        None,
+    ]
+    created_ids = []
+    owner_uid = owner_a[0].id if hasattr(owner_a[0], "id") else int(owner_a[0])
+    for i, meta in enumerate(cases):
+        clone = Lease(
+            unit_id=unit_id,
+            tenant_id=tenant_id,
+            start_date=past - timedelta(days=365),
+            end_date=past,
+            monthly_rent=Decimal(f"{1000+i}"),
+            deposit=Decimal("2000"),
+            status=LeaseStatus.active,
+            created_by=owner_uid,
+            updated_by=owner_uid,
+            renewal_metadata=meta,
+        )
+        db_session.add(clone)
+    db_session.flush()
+    for o in db_session.new:
+        if isinstance(o, Lease) and o.monthly_rent >= Decimal("1000") and o.monthly_rent < Decimal("2000") and not created_ids:
+            continue
+    db_session.commit()
+    # retrieve created_ids after commit (for filter later — batch unique constraint may collide so skip filter anyway)
+    clone_rows = (
+        db_session.query(Lease)
+        .filter(Lease.deleted_at.is_(None), Lease.monthly_rent.between(Decimal("1000"), Decimal("1006")))
+        .all()
+    )
+    created_ids = [r.id for r in clone_rows]
+
+    try:
+        generate_business_tasks(db_session, now=datetime.now(timezone.utc))
+    except Exception as exc:
+        raise AssertionError(f"not_renewed malformed batch raised {type(exc).__name__}: {exc}") from exc
+
+    db_session.flush()
+    insps = db_session.query(MoveOutInspection).filter(
+        MoveOutInspection.lease_id.in_(created_ids) if created_ids else False
+    ).all()
+    assert insps == []
+
+    owner_uid = owner_a[0].id if hasattr(owner_a[0], "id") else int(owner_a[0])
+    good = Lease(
+        unit_id=unit_id,
+        tenant_id=tenant_id,
+        start_date=past - timedelta(days=365),
+        end_date=past,
+        monthly_rent=Decimal("9999"),
+        deposit=Decimal("2000"),
+        status=LeaseStatus.active,
+        created_by=owner_uid,
+        updated_by=owner_uid,
+        renewal_metadata={"not_renewed": True, "move_out_date": past.isoformat()},
+    )
+    db_session.add(good)
+    db_session.commit()
+    db_session.refresh(good)
+    good_id = good.id
+    generate_business_tasks(db_session, now=datetime.now(timezone.utc))
+    db_session.flush()
+    from app.models.operations import OperationalTaskType, OperationalTaskStatus
+    good_task = (
+        db_session.query(OperationalTask)
+        .filter(
+            OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTask.lease_id == good_id,
+            OperationalTask.status == OperationalTaskStatus.PENDING,
+        )
+        .first()
+    )
+    assert good_task is not None, "expected generation to create operational move_out_inspection task for good_lease with containment {not_renewed:true}"
+    bad_tasks_count = (
+        db_session.query(OperationalTask)
+        .filter(
+            OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTask.lease_id.in_(created_ids) if created_ids else False,
+        )
+        .count()
+    )
+    assert bad_tasks_count == 0, f"malformed/not_renewed leases must NOT generate move_out inspection tasks, got {bad_tasks_count}"
+
+
+def test_h6_renew_before_end_date_409_and_predecessor_still_active(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, property_id,
+):
+    from app.models.lease import Lease as LeaseModel
+    h = _h(owner_a[1])
+    lease_row = db_session.get(LeaseModel, lease_id)
+    future_end = date.today() + timedelta(days=60)
+    lease_row.end_date = future_end
+    lease_row.status = LeaseStatus.active
+    db_session.commit()
+
+    r = client.post(f"{API}/leases/{lease_id}/renew", json={
+        "start_date": (future_end + timedelta(days=1)).isoformat(),
+        "end_date": (future_end + timedelta(days=365)).isoformat(),
+        "monthly_rent": "13000.00",
+        "deposit": "26000.00",
+    }, headers=h)
+    assert r.status_code == 409, r.text
+    d = r.json()["detail"]
+    assert d["reason"] == "renewal_before_predecessor_end_date"
+    assert d["predecessor_lease_id"] == lease_id
+    assert date.fromisoformat(d["predecessor_end_date"]) == future_end
+
+    db_session.expire_all()
+    still = db_session.get(LeaseModel, lease_id)
+    assert still.status == LeaseStatus.active

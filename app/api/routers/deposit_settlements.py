@@ -77,6 +77,18 @@ def create_settlement(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
+    if insp.status != MoveOutInspectionStatus.CONFIRMED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "deposit_settlement_create_requires_confirmed_inspection",
+                "move_out_inspection_id": insp.id,
+                "inspection_status": insp.status.value,
+                "expected": MoveOutInspectionStatus.CONFIRMED.value,
+                "hint": f"POST /move-out-inspections/{insp.id}/confirm first before creating a deposit settlement for this inspection.",
+            },
+        )
+
     existing = (
         db.query(DepositSettlement)
         .filter(DepositSettlement.move_out_inspection_id == insp.id)

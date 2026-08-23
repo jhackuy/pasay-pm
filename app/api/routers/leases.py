@@ -539,6 +539,18 @@ def renew_lease(
             old_value=old_row, new_value=serialize_row(t),
         )
     if obj.status == LeaseStatus.active:
+        today = datetime.now(timezone.utc).date()
+        if today < obj.end_date:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "renewal_before_predecessor_end_date",
+                    "predecessor_lease_id": obj.id,
+                    "predecessor_end_date": obj.end_date.isoformat(),
+                    "today": today.isoformat(),
+                    "hint": f"Renewal transitions the predecessor lease to EXPIRED only on/after the predecessor end_date ({obj.end_date.isoformat()}). Do not renew before the predecessor contract has finished performance.",
+                },
+            )
         obj.status = LeaseStatus.expired
         obj.updated_by = user.id
         old_unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()

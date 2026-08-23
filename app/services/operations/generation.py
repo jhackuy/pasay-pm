@@ -16,8 +16,8 @@ import time as _time
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy import cast, text
+from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.commission import CommissionSettlement, CommissionSettlementStatus
@@ -925,7 +925,7 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         .filter(
             Lease.deleted_at.is_(None),
             Lease.status == LeaseStatus.active,
-            text("(renewal_metadata->>'not_renewed')::boolean = TRUE"),
+            Lease.renewal_metadata.op("@>")(cast({"not_renewed": True}, JSONB)),
         )
         .all()
     )

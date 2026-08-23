@@ -9,6 +9,7 @@ from app.models.evidence import Evidence
 from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.user import User
 from app.schemas.move_out import (
+    FindingsItem,
     MoveOutInspectionConfirm,
     MoveOutInspectionCreate,
     MoveOutInspectionRead,
@@ -105,7 +106,7 @@ def create_inspection(
         actor_id=user.id,
     )
     if payload.findings is not None:
-        obj.findings = payload.findings
+        obj.findings = [fi.model_dump(mode="json") for fi in payload.findings]
     if payload.evidence_ids is not None:
         obj.evidence_ids = payload.evidence_ids
     if payload.notes is not None:
@@ -174,6 +175,11 @@ def patch_inspection(
         validate_evidence_ids(db, updates["evidence_ids"], lease, _membership)
 
     from app.services.audit import field_changes, record_audit
+    if "findings" in updates and updates["findings"] is not None:
+        updates["findings"] = [
+            FindingsItem.model_validate(raw).model_dump(mode="json")
+            for raw in updates["findings"]
+        ]
     old = serialize_row(obj)
     changed = field_changes(obj, updates)
     for f, v in updates.items():
@@ -205,7 +211,13 @@ def inspect_post(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
     updates = payload.model_dump(exclude_unset=True)
-    findings = updates.get("findings", obj.findings)
+    if "findings" in updates and updates["findings"] is not None:
+        findings = [
+            FindingsItem.model_validate(raw).model_dump(mode="json")
+            for raw in updates["findings"]
+        ]
+    else:
+        findings = obj.findings
     evidence_ids = updates.get("evidence_ids", obj.evidence_ids)
     if evidence_ids is not None:
         from app.models.lease import Lease
