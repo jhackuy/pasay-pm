@@ -30,6 +30,7 @@ DOWNGRADE SAFETY (逆序还原):
 ROLLBACK:
     alembic downgrade m4b000000001
 """
+from datetime import timedelta
 from typing import Union
 
 from alembic import op
@@ -98,13 +99,20 @@ def upgrade() -> None:
             f"rows={bad_rows}"
         )
 
-    # 1d. renewal_metadata.renewed_lease_id validity
+    # 1d. renewal_metadata.renewed_lease_id validity — M2/M3 strict contract
+    #     M2: no Python date + SQL string add TypeError
+    #     M3: predecessor.status MUST == 'expired' (no auto-mutate status);
+    #         renewed_lease_id must be parseable bigint; renewed_at timestamptz;
+    #         successor not soft-deleted; same unit+tenant; seamless start_date;
+    #         at most ONE predecessor per successor id.
     bad_leases = []
+    predecessor_per_successor: dict[int, int] = {}
     lease_rows = conn.execute(
         sa.text(
             """
             SELECT
                 l.id,
+                l.status,
                 l.unit_id,
                 l.tenant_id,
                 l.end_date,
@@ -116,11 +124,35 @@ def upgrade() -> None:
         )
     ).fetchall()
     for lr in lease_rows:
+        # --- M3 #7: renewed_lease_id must be valid bigint parseable ---
         try:
-            successor_id = int(lr.renewed_lease_id_str)
+            successor_id = int(str(lr.renewed_lease_id_str).strip())
         except (TypeError, ValueError):
-            bad_leases.append(f"#{lr.id}: invalid renewed_lease_id={lr.renewed_lease_id_str!r}")
+            bad_leases.append(
+                f"lease#{lr.id}: invalid renewed_lease_id={lr.renewed_lease_id_str!r} "
+                f"(expected integer bigint). Migration will NOT auto-repair; "
+                f"fix the JSONB value first or delete the renewal_metadata entry."
+            )
             continue
+        # --- M3 #6: renewed_at (if present) must parse as timestamptz ---
+        if lr.renewed_at_str is not None:
+            try:
+                from datetime import datetime as _dt
+                _dt.fromisoformat(str(lr.renewed_at_str).replace("Z", "+00:00"))
+            except Exception as _ex:
+                bad_leases.append(
+                    f"lease#{lr.id}: renewal_metadata.renewed_at={lr.renewed_at_str!r} "
+                    f"not parseable as timestamptz ({type(_ex).__name__}: {_ex})."
+                )
+        # --- M3 #1: predecessor status must equal 'expired' exactly; NO auto-change to expired ---
+        if str(lr.status) != "expired":
+            bad_leases.append(
+                f"lease#{lr.id}: predecessor status={lr.status!r} but renewal_metadata "
+                f"points at successor#{successor_id}. Canonical superseded link requires "
+                f"predecessor.status == 'expired'. Migration refuses to auto-transition the "
+                f"lease; run renew endpoint correctly (which sets predecessor=expired) first."
+            )
+        # --- M3 #2-5: successor exists/not soft-deleted; same unit; same tenant; seamless date ---
         succ = conn.execute(
             sa.text(
                 """
@@ -131,29 +163,58 @@ def upgrade() -> None:
             {"sid": successor_id},
         ).fetchone()
         if succ is None:
-            bad_leases.append(f"#{lr.id}: successor lease #{successor_id} not found")
+            bad_leases.append(
+                f"lease#{lr.id}: successor lease #{successor_id} not found in DB. "
+                f"renewal_metadata.renewed_lease_id is dangling."
+            )
             continue
         if succ.deleted_at is not None:
-            bad_leases.append(f"#{lr.id}: successor lease #{successor_id} is soft-deleted")
+            bad_leases.append(
+                f"lease#{lr.id}: successor lease #{successor_id} is soft-deleted "
+                f"(deleted_at={succ.deleted_at}). Remove the renewal_metadata entry "
+                f"or restore the successor row BEFORE running this migration."
+            )
             continue
         if succ.unit_id != lr.unit_id:
             bad_leases.append(
-                f"#{lr.id}: successor unit_id={succ.unit_id} != predecessor unit_id={lr.unit_id}"
+                f"lease#{lr.id}: successor#{successor_id}.unit_id={succ.unit_id} "
+                f"!= predecessor.unit_id={lr.unit_id}. Renewal successor must share Unit."
             )
         if succ.tenant_id != lr.tenant_id:
             bad_leases.append(
-                f"#{lr.id}: successor tenant_id={succ.tenant_id} != predecessor tenant_id={lr.tenant_id}"
+                f"lease#{lr.id}: successor#{successor_id}.tenant_id={succ.tenant_id} "
+                f"!= predecessor.tenant_id={lr.tenant_id}. Renewal successor must share Tenant."
             )
-        expected_start = lr.end_date + sa.text("interval '1 day'").compile().string
-        if succ.start_date != (lr.end_date + __import__("datetime").timedelta(days=1)):
+        # --- M2 safe date arithmetic: Python timedelta (NOT Python + SQL literal str) ---
+        expected_start = lr.end_date + timedelta(days=1)
+        if succ.start_date != expected_start:
             bad_leases.append(
-                f"#{lr.id}: successor start_date={succ.start_date} != predecessor end_date+1="
-                f"{lr.end_date + __import__('datetime').timedelta(days=1)}"
+                f"lease#{lr.id}: successor#{successor_id}.start_date={succ.start_date} "
+                f"!= predecessor.end_date + 1 day = {expected_start}. "
+                f"Seamless renewal contract requires exactly start == end+1."
             )
+        # --- M3 #8: same successor must not be shared by another predecessor ---
+        if successor_id in predecessor_per_successor:
+            other_pred = predecessor_per_successor[successor_id]
+            bad_leases.append(
+                f"successor#{successor_id} is claimed by BOTH predecessor#{other_pred} "
+                f"AND predecessor#{lr.id}. Each successor lease must have at most ONE "
+                f"canonical predecessor (partial UNIQUE idx will later enforce this). "
+                f"Remove the stale renewal_metadata on whichever predecessor is wrong."
+            )
+        else:
+            predecessor_per_successor[successor_id] = lr.id
+
     if bad_leases:
+        # --- M3 strict: transaction ROLLBACK automatically — whole upgrade() is one Alembic tx ---
+        #     No half schema state: no constraints/columns are left behind because
+        #     we abort BEFORE running any DDL below.
+        bad_joined = "; ".join(bad_leases)
         raise Exception(
-            "Existing renewal_metadata invalid for leases: "
-            + "; ".join(bad_leases)
+            "MIGRATION ABORTED (m4c000000001 upgrade) — existing renewal_metadata fails "
+            f"canonical superseded truth validation. {len(bad_leases)} issue(s): {bad_joined}. "
+            "The entire upgrade() has been rolled back; no DDL was applied. "
+            "Fix the listed JSONB / lease status / successor rows first, then re-run upgrade."
         )
 
     # ------------------------------------------------------------------

@@ -56,13 +56,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Pre-downgrade: delete M004-only idempotency rows BEFORE dropping idempotency_key column.
-    op.execute(
-        "DELETE FROM expenses WHERE idempotency_key LIKE 'deposit_settlement:%'"
-    )
-    op.execute(
-        "DELETE FROM incomes WHERE idempotency_key LIKE 'deposit_settlement:%'"
-    )
+    # M4 contract: Accounting records MUST be preserved on downgrade.
+    #   - Income/Expense rows are immutable business truth and are NEVER deleted
+    #     by any schema migration, even when function-scope columns are removed.
+    #   - Expense.idempotency_key column is dropped below (function-scope helper);
+    #     the Expense rows themselves remain (amount/description/lease_id/property_id/
+    #     unit_id/status/PK all preserved).
+    #   - Income rows were NEVER touched by this migration (incomes.idempotency_key
+    #     existed before f4b and exists after downgrade; no row removal).
+    #
+    # Previously this function ran DELETE ... LIKE 'deposit_settlement:%' on both
+    # expenses and incomes — that was a data-integrity violation (permanent financial
+    # record loss) and has been REMOVED.
 
     # ------------------------------------------------------------------
     # 2 (reverse). move_out_inspections: 还原旧索引名
@@ -74,6 +79,9 @@ def downgrade() -> None:
 
     # ------------------------------------------------------------------
     # 1 (reverse). expenses: 先 drop index 再 drop column
+    #   — ONLY the helper idempotency_key column/index disappear;
+    #     all expense rows remain intact with their stable PK / amount /
+    #     description / lease_id / property_id / unit_id / status.
     # ------------------------------------------------------------------
     op.drop_index("uq_expenses_idempotency_key", table_name="expenses")
     op.drop_column("expenses", "idempotency_key")

@@ -14,6 +14,7 @@ Run directly:
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -58,6 +59,7 @@ from app.services.audit import record_audit, serialize_row
 RT_DB_NAME = os.getenv("PASAY_RT_TEST_DB", "pasay_pm_test_rt")
 M2A_REV = "m2a000000001"
 PROBE_FAILED = 0
+SEED_SNAPSHOT: dict[str, object] = {}
 
 
 def _rt_url():
@@ -319,6 +321,36 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
     db.add(exp)
     db.flush()
 
+    legacy_income = Income(
+        lease_id=lease.id,
+        amount=Decimal("12000.00"),
+        received_date=today - timedelta(days=30),
+        idempotency_key=None,
+        status=IncomeStatus.confirmed,
+        description="[SEED LEGACY M003] monthly rent received control",
+        confirmed_by=owner_uid,
+        confirmed_at=datetime.now(timezone.utc),
+    )
+    legacy_income.created_by = owner_uid
+    legacy_income.updated_by = owner_uid
+    legacy_expense = Expense(
+        expense_date=today - timedelta(days=45),
+        due_date=None,
+        category="maintenance_repair",
+        amount=Decimal("2500.00"),
+        payee="Local AC Repair Shop",
+        description="[SEED LEGACY M003] quarterly AC maintenance control row",
+        property_id=prop.id,
+        unit_id=unit_active.id,
+        status=ExpenseStatus.paid,
+        payer_user_id=None,
+        idempotency_key=None,
+    )
+    legacy_expense.created_by = owner_uid
+    legacy_expense.updated_by = owner_uid
+    db.add_all([legacy_income, legacy_expense])
+    db.flush()
+
     task_insp = OperationalTask(
         task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
         title="RT move-out inspection",
@@ -429,7 +461,9 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
         (e2, "evidence"),
         (settle, "deposit_settlements"),
         (income_row, "incomes"),
+        (legacy_income, "incomes"),
         (exp, "expenses"),
+        (legacy_expense, "expenses"),
         (task_insp, "operational_tasks"),
         (task_settle, "operational_tasks"),
         (task_rent_due_control, "operational_tasks"),
@@ -484,10 +518,69 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
 
 
 def probe_after_seed(db: Session) -> bool:
-    global PROBE_FAILED
+    global PROBE_FAILED, SEED_SNAPSHOT
     ok = True
     cnt_insp = db.query(MoveOutInspection).count()
     cnt_settle = db.query(DepositSettlement).count()
+    # --- M1: require M004-specific OperationalTask / RecurringRule counts >0 ---
+    # BEFORE downgrade we must have real rows present, so later 9a downgrade
+    # migration is forced to clean them (not test-side pre-cleanup).
+    cnt_m004_op = db.query(OperationalTask).filter(
+        OperationalTask.task_type.in_([
+            OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTaskType.DEPOSIT_SETTLEMENT,
+        ])
+    ).count()
+    if cnt_m004_op < 2:
+        print(f"[PROBE1 FAIL] M1 expected >=2 M004 op tasks before downgrade, got {cnt_m004_op}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE1 M1-OK] M004 op tasks present before downgrade: {cnt_m004_op}", flush=True)
+    cnt_m004_rr = db.query(RecurringRule).filter(
+        RecurringRule.rule_type.in_([
+            OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTaskType.DEPOSIT_SETTLEMENT,
+        ])
+    ).count()
+    if cnt_m004_rr < 2:
+        print(f"[PROBE1 FAIL] M1 expected >=2 M004 RecurringRule rows before downgrade, got {cnt_m004_rr}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE1 M1-OK] M004 RecurringRule present before downgrade: {cnt_m004_rr}", flush=True)
+    # --- M4: snapshot all Income/Expense rows by stable PK tuple (id,amount,description,lease_id,status) ---
+    #     Used later in probe_after_downgrade to prove NO rows deleted,
+    #     only idempotency_key column dropped.
+    # NOTE: Income has (id,lease_id,amount,status,desc) NO property_id/unit_id.
+    #       Expense has (id,property_id,unit_id,amount,status,desc) NO lease_id.
+    #       Both snapshotted as 7-tuple (id, lease_id_or_None, property_id_or_None,
+    #       unit_id_or_None, amount_str, status, desc_or_empty) via raw SQL.
+    incomes_raw = db.execute(text("""
+        SELECT id, lease_id, NULL::bigint AS property_id, NULL::bigint AS unit_id,
+               amount::text, status::text, COALESCE(description, '') AS description,
+               idempotency_key
+        FROM incomes ORDER BY id
+    """)).fetchall()
+    expenses_raw = db.execute(text("""
+        SELECT id, NULL::bigint AS lease_id, property_id, unit_id,
+               amount::text, status::text, COALESCE(description, '') AS description,
+               idempotency_key
+        FROM expenses ORDER BY id
+    """)).fetchall()
+    m004_incomes = [r for r in incomes_raw if (r[7] or "").startswith("deposit_settlement:")]
+    m004_expenses = [r for r in expenses_raw if (r[7] or "").startswith("deposit_settlement:")]
+    legacy_incomes = [r for r in incomes_raw if not (r[7] or "").startswith("deposit_settlement:")]
+    legacy_expenses = [r for r in expenses_raw if not (r[7] or "").startswith("deposit_settlement:")]
+    if len(m004_incomes) < 1 or len(m004_expenses) < 1:
+        print(f"[PROBE1 FAIL] M4 expected >=1 m004 income/expense rows, got income={len(m004_incomes)} expense={len(m004_expenses)}", flush=True)
+        ok = False
+    if len(legacy_incomes) < 1 or len(legacy_expenses) < 1:
+        print(f"[PROBE1 FAIL] M4 control legacy financial rows missing: income={len(legacy_incomes)} expense={len(legacy_expenses)}", flush=True)
+        ok = False
+    SEED_SNAPSHOT["incomes"] = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in incomes_raw]
+    SEED_SNAPSHOT["expenses"] = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in expenses_raw]
+    SEED_SNAPSHOT["cnt_m004_op"] = cnt_m004_op
+    SEED_SNAPSHOT["cnt_m004_rr"] = cnt_m004_rr
+    print(f"[PROBE1 M4-OK] financial rows snapshotted: income={len(incomes_raw)} expense={len(expenses_raw)} m004_inc={len(m004_incomes)} m004_exp={len(m004_expenses)} legacy_inc={len(legacy_incomes)} legacy_exp={len(legacy_expenses)}", flush=True)
     cnt_income = db.query(Income).count()
     cnt_expense = db.query(Expense).count()
     cnt_op = db.query(OperationalTask).filter(
@@ -609,67 +702,61 @@ def probe_after_seed(db: Session) -> bool:
     return ok
 
 
-def delete_m004_rows_before_downgrade(db: Session) -> None:
-    """Delete rows that use M004-only enum values / columns BEFORE downgrading
-    to m2a000000001, otherwise the legacy CHECK constraints on
-    operational_tasks.task_type / recurring_rules.rule_type (and others) will
-    reject the now-illegal enum values when m2a's ALTER TABLE constraints are
-    re-validated.
-
-    Order matters (FK children first):
-      1. Audit rows referencing soon-to-be-deleted records (by table_name)
-      2. OperationalTasks MOVE_OUT_INSPECTION / DEPOSIT_SETTLEMENT
-      3. RecurringRules with rule_type in new M004 values (if any)
-      4. Income / Expense rows for SEED idempotency keys
-      5. DepositSettlement
-      6. MoveOutInspection
-    """
-    tables_to_clear = [
-        "operational_tasks",
-        "recurring_rules",
-        "deposit_settlements",
-        "move_out_inspections",
-        "incomes",
-        "expenses",
-    ]
-    db.query(AuditLog).filter(AuditLog.table_name.in_(tables_to_clear)).delete(
-        synchronize_session=False
-    )
-    db.query(OperationalTask).filter(
-        OperationalTask.task_type.in_([
-            OperationalTaskType.MOVE_OUT_INSPECTION,
-            OperationalTaskType.DEPOSIT_SETTLEMENT,
-        ])
-    ).delete(synchronize_session=False)
-    rr_new = [OperationalTaskType.MOVE_OUT_INSPECTION,
-              OperationalTaskType.DEPOSIT_SETTLEMENT]
-    db.query(RecurringRule).filter(
-        RecurringRule.rule_type.in_(rr_new)
-    ).delete(synchronize_session=False)
-    db.query(Income).filter(
-        Income.idempotency_key.like("deposit_settlement:SEED:%")
-    ).delete(synchronize_session=False)
-    db.query(Expense).filter(
-        Expense.idempotency_key.like("deposit_settlement:SEED:%")
-    ).delete(synchronize_session=False)
-    db.query(DepositSettlement).delete(synchronize_session=False)
-    db.query(MoveOutInspection).delete(synchronize_session=False)
-    db.commit()
-
-
 def probe_after_downgrade(db: Session) -> bool:
-    global PROBE_FAILED
+    global PROBE_FAILED, SEED_SNAPSHOT
     ok = True
     try:
-        db.execute(text("SELECT 1 FROM units WHERE deleted_at IS NULL LIMIT 1"))
+        col_units_deleted = db.execute(text("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'units' AND column_name = 'deleted_at'
+            LIMIT 1
+        """)).scalar()
+        if col_units_deleted is None:
+            print(f"[PROBE2 FAIL] units.deleted_at column missing (info_schema)", flush=True)
+            ok = False
     except Exception as e:
-        print(f"[PROBE2 FAIL] units.deleted_at column missing: {e}", flush=True)
+        db.rollback()
+        print(f"[PROBE2 FAIL] probe units.deleted_at info_schema query error: {e}", flush=True)
         ok = False
     try:
-        db.execute(text("SELECT operational_notes FROM properties LIMIT 1"))
+        col_prop_notes = db.execute(text("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'properties' AND column_name = 'operational_notes'
+            LIMIT 1
+        """)).scalar()
+        if col_prop_notes is None:
+            print(f"[PROBE2 FAIL] properties.operational_notes missing (info_schema)", flush=True)
+            ok = False
     except Exception as e:
-        print(f"[PROBE2 FAIL] properties.operational_notes missing: {e}", flush=True)
+        db.rollback()
+        print(f"[PROBE2 FAIL] probe properties.operational_notes info_schema query error: {e}", flush=True)
         ok = False
+    # --- M1: M004-only OperationalTask/RecurringRule rows MUST be 0 now ---
+    #     (seeded earlier as >0; downgrade is handled by 9a migration itself,
+    #      NOT by any test-side delete_m004_rows_before_downgrade which we deleted.)
+    m004_op_after = db.execute(text("""
+        SELECT COUNT(*) FROM operational_tasks
+        WHERE task_type IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')
+    """)).scalar() or 0
+    expected_m004_op = int(SEED_SNAPSHOT.get("cnt_m004_op") or 0)
+    if expected_m004_op < 2:
+        print(f"[PROBE2 FAIL] M1 seed did not record expected M004 op cnt: {expected_m004_op}", flush=True)
+        ok = False
+    if m004_op_after != 0:
+        print(f"[PROBE2 FAIL] M1 9a downgrade did not clean M004 op tasks! before={expected_m004_op} after={m004_op_after} (migration must handle this, not test script)", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE2 M1-OK] M004 op tasks cleaned BY MIGRATION ALONE: before={expected_m004_op} after=0", flush=True)
+    m004_rr_after = db.execute(text("""
+        SELECT COUNT(*) FROM recurring_rules
+        WHERE rule_type IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')
+    """)).scalar() or 0
+    expected_m004_rr = int(SEED_SNAPSHOT.get("cnt_m004_rr") or 0)
+    if m004_rr_after != 0:
+        print(f"[PROBE2 FAIL] M1 9a downgrade did not clean M004 RecurringRule! before={expected_m004_rr} after={m004_rr_after}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE2 M1-OK] M004 RecurringRule cleaned BY MIGRATION: before={expected_m004_rr} after=0", flush=True)
     legacy_op_count = db.execute(text("""
         SELECT COUNT(*) FROM operational_tasks
         WHERE task_type NOT IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')
@@ -688,8 +775,44 @@ def probe_after_downgrade(db: Session) -> bool:
         ok = False
     else:
         print(f"[PROBE2 INFO] legacy recurring_rules preserved after 9a downgrade: count={legacy_rr_count}", flush=True)
+    # --- M4: financial rows preserved exactly (PK + lease+property+unit+amount+status+description match snapshot) ---
+    # After f4b downgrade: expenses.idempotency_key column has been DROPPED;
+    # income.idempotency_key still exists. All rows must remain intact.
+    # Use raw SQL with same NULL-placeholders as probe_after_seed for 7-tuple alignment.
+    incomes_after_raw = db.execute(text("""
+        SELECT id, lease_id, NULL::bigint AS property_id, NULL::bigint AS unit_id,
+               amount::text, status::text, COALESCE(description, '') AS description
+        FROM incomes ORDER BY id
+    """)).fetchall()
+    inc_tuples_after = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in incomes_after_raw]
+    inc_tuples_before = list(SEED_SNAPSHOT.get("incomes") or [])
+    if inc_tuples_after != inc_tuples_before:
+        print(f"[PROBE2 FAIL] M4 income rows changed after downgrade! before cnt={len(inc_tuples_before)} after cnt={len(inc_tuples_after)}; diff expected=empty.", flush=True)
+        if len(inc_tuples_before) == len(inc_tuples_after):
+            for i, (a, b) in enumerate(zip(inc_tuples_before, inc_tuples_after)):
+                if a != b:
+                    print(f"    M4 diff at income#{i}: before={a} after={b}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE2 M4-OK] ALL {len(inc_tuples_after)} income rows preserved after downgrade: no delete, no duplicate, no amount change.", flush=True)
+    expenses_after_raw = db.execute(text("""
+        SELECT id, NULL::bigint AS lease_id, property_id, unit_id,
+               amount::text, status::text, COALESCE(description, '') AS description
+        FROM expenses ORDER BY id
+    """)).fetchall()
+    exp_tuples_after = [(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in expenses_after_raw]
+    exp_tuples_before = list(SEED_SNAPSHOT.get("expenses") or [])
+    if exp_tuples_after != exp_tuples_before:
+        print(f"[PROBE2 FAIL] M4 expense rows changed after downgrade! before cnt={len(exp_tuples_before)} after cnt={len(exp_tuples_after)}.", flush=True)
+        if len(exp_tuples_before) == len(exp_tuples_after):
+            for i, (a, b) in enumerate(zip(exp_tuples_before, exp_tuples_after)):
+                if a != b:
+                    print(f"    M4 diff at expense#{i}: before={a} after={b}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE2 M4-OK] ALL {len(exp_tuples_after)} expense rows preserved after downgrade: idempotency_key column dropped ONLY, no business rows deleted.", flush=True)
     if ok:
-        print("[PROBE2 PASS] after-downgrade m2a columns present + legacy M003 rows retained by 9a downgrade", flush=True)
+        print("[PROBE2 PASS] after-downgrade: m2a cols ok + M1 migration-cleanup confirmed + M4 financial rows 100% preserved + legacy M003 rows retained", flush=True)
     else:
         PROBE_FAILED += 1
     return ok
@@ -777,6 +900,47 @@ def probe_after_reupgrade(db: Session) -> bool:
     return ok
 
 
+def _g4_query_fiscal(db: Session) -> dict:
+    inc_has_ik = db.execute(text("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='incomes' AND column_name='idempotency_key'
+        LIMIT 1
+    """)).scalar() == 1
+    exp_has_ik = db.execute(text("""
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='expenses' AND column_name='idempotency_key'
+        LIMIT 1
+    """)).scalar() == 1
+    inc_sql = (
+        "SELECT id, lease_id, amount::text, status, description, received_date, idempotency_key "
+        if inc_has_ik else
+        "SELECT id, lease_id, amount::text, status, description, received_date, NULL::text "
+    ) + "FROM incomes ORDER BY id"
+    exp_sql = (
+        "SELECT id, property_id, unit_id, amount::text, status, description, idempotency_key "
+        if exp_has_ik else
+        "SELECT id, property_id, unit_id, amount::text, status, description, NULL::text "
+    ) + "FROM expenses ORDER BY id"
+    incomes_raw = db.execute(text(inc_sql)).fetchall()
+    expenses_raw = db.execute(text(exp_sql)).fetchall()
+    return {
+        "income_has_idempotency_key": inc_has_ik,
+        "expense_has_idempotency_key": exp_has_ik,
+        "incomes": [list(r) for r in incomes_raw],
+        "expenses": [list(r) for r in expenses_raw],
+    }
+
+
+def _save_g4_snapshot_json(db: Session, stage_name: str) -> str:
+    payload = {"stage": stage_name, "ts_utc": datetime.now(timezone.utc).isoformat()}
+    payload.update(_g4_query_fiscal(db))
+    out_path = os.path.join(SCRIPT_DIR, f"g4_{stage_name}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    print(f"[G4-SNAP] saved {out_path} income={len(payload['incomes'])} expense={len(payload['expenses'])}", flush=True)
+    return out_path
+
+
 def main() -> int:
     print("[RT] ensure_rt_database()", flush=True)
     ensure_rt_database()
@@ -796,6 +960,7 @@ def main() -> int:
 
         with S() as db:
             probe_after_seed(db)
+            _save_g4_snapshot_json(db, "financial_before_seed")
 
         print(f"[RT] downgrade to {M2A_REV}", flush=True)
         rc = _run_alembic("downgrade", M2A_REV)
@@ -805,6 +970,7 @@ def main() -> int:
 
         with S() as db:
             probe_after_downgrade(db)
+            _save_g4_snapshot_json(db, "after_downgrade")
 
         print("[RT] re-upgrade head", flush=True)
         rc = _run_alembic("upgrade", "head")
@@ -814,6 +980,7 @@ def main() -> int:
 
         with S() as db:
             probe_after_reupgrade(db)
+            _save_g4_snapshot_json(db, "after_reupgrade")
 
     finally:
         eng.dispose()
