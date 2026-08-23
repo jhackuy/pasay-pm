@@ -184,22 +184,28 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
             return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "repair_cancelled")
         return None
 
-    if task.task_type == OperationalTaskType.MOVE_OUT_INSPECTION and task.source_type == "move_out_inspection":
-        inspection = db.get(MoveOutInspection, task.source_id)
-        if inspection is None:
-            return None
-        if inspection.status == MoveOutInspectionStatus.CONFIRMED:
-            return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "move_out_inspection_confirmed")
-        if inspection.status == MoveOutInspectionStatus.CANCELLED:
-            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_cancelled")
+    if task.task_type == OperationalTaskType.MOVE_OUT_INSPECTION:
+        if task.source_id is None:
+            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_task_orphan_source_id_none_fail_closed")
+        if task.source_type == "move_out_inspection":
+            inspection = db.get(MoveOutInspection, task.source_id)
+            if inspection is None:
+                return None
+            if inspection.status == MoveOutInspectionStatus.CONFIRMED:
+                return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "move_out_inspection_confirmed")
+            if inspection.status == MoveOutInspectionStatus.CANCELLED:
+                return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_cancelled")
         return None
 
-    if task.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT and task.source_type == "deposit_settlement":
-        settlement = db.get(DepositSettlement, task.source_id)
-        if settlement is None:
-            return None
-        if settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
-            return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "deposit_settlement_confirmed")
+    if task.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT:
+        if task.source_id is None:
+            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_task_orphan_source_id_none_fail_closed")
+        if task.source_type == "deposit_settlement":
+            settlement = db.get(DepositSettlement, task.source_id)
+            if settlement is None:
+                return None
+            if settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
+                return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "deposit_settlement_confirmed")
         return None
 
     return None

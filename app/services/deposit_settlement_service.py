@@ -12,6 +12,7 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
@@ -230,6 +231,7 @@ def _write_financial_rows_for_settlement(
     """Create Income (deductions) and Expense (refund) rows with unique idempotency keys.
 
     Idempotency: if rows for this settlement already exist, skip entirely.
+    Uses savepoints + IntegrityError handling to handle concurrent unique key races.
     """
     from app.models.property import Property, Unit
 
@@ -241,7 +243,6 @@ def _write_financial_rows_for_settlement(
     if unit is not None:
         property_id = unit.property_id
 
-    # --- Income rows: one per deduction (or one aggregated row if deductions list empty but total_deductions > 0) ---
     deductions = list(settlement.deductions or [])
     if not deductions and Decimal(str(settlement.total_deductions)) > Decimal("0"):
         deductions = [{"description": f"押金扣款汇总 #{settlement.id}", "amount": str(settlement.total_deductions)}]
@@ -268,19 +269,26 @@ def _write_financial_rows_for_settlement(
         )
         income.created_by = confirmed_by
         income.updated_by = confirmed_by
-        db.add(income)
-        db.flush()
-        processed_income_ids.append(income.id)
-        record_audit(
-            db,
-            table_name="incomes",
-            record_id=income.id,
-            action="create",
-            actor_id=confirmed_by,
-            new_value=serialize_row(income),
-        )
+        try:
+            db.begin_nested()
+            db.add(income)
+            db.flush()
+            db.commit()
+            processed_income_ids.append(income.id)
+            record_audit(
+                db,
+                table_name="incomes",
+                record_id=income.id,
+                action="create",
+                actor_id=confirmed_by,
+                new_value=serialize_row(income),
+            )
+        except IntegrityError:
+            db.rollback()
+            existing_row = db.query(Income).filter(Income.idempotency_key == ikey).first()
+            if existing_row is not None:
+                processed_income_ids.append(existing_row.id)
 
-    # Persist income_id reference back into deductions JSONB where possible
     if processed_income_ids and deductions:
         updated = []
         for j, item in enumerate(deductions):
@@ -291,14 +299,11 @@ def _write_financial_rows_for_settlement(
         settlement.deductions = updated
         settlement.updated_by = confirmed_by
 
-    # --- Expense row: refund (if refund_amount > 0) ---
     refund = Decimal(str(settlement.refund_amount))
     if refund > Decimal("0"):
         ekey = f"deposit_settlement:{settlement.id}:refund"
         existing_exp = db.query(Expense).filter(Expense.idempotency_key == ekey).first()
-        if existing_exp is not None:
-            pass
-        else:
+        if existing_exp is None:
             exp = Expense(
                 expense_date=confirmed_at.date() if isinstance(confirmed_at, datetime) else date.today(),
                 due_date=None,
@@ -316,16 +321,21 @@ def _write_financial_rows_for_settlement(
             exp.updated_by = confirmed_by
             if exp.property_id == 0:
                 exp.property_id = property_id or exp.property_id
-            db.add(exp)
-            db.flush()
-            record_audit(
-                db,
-                table_name="expenses",
-                record_id=exp.id,
-                action="create",
-                actor_id=confirmed_by,
-                new_value=serialize_row(exp),
-            )
+            try:
+                db.begin_nested()
+                db.add(exp)
+                db.flush()
+                db.commit()
+                record_audit(
+                    db,
+                    table_name="expenses",
+                    record_id=exp.id,
+                    action="create",
+                    actor_id=confirmed_by,
+                    new_value=serialize_row(exp),
+                )
+            except IntegrityError:
+                db.rollback()
 
 
 def _close_projection_tasks_for_settlement(

@@ -979,7 +979,20 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             },
             proactive=True,
         )
-        if task is not None:
+        if task is None:
+            if insp_id is not None:
+                existing_task = _get_active_task_by_dedupe(db, f"lease:{lease.id}:MOVE_OUT_INSPECTION")
+                if existing_task is not None and existing_task.source_id is None:
+                    existing_task.source_id = insp_id
+                    existing_task.source_type = "move_out_inspection"
+                    existing_task.updated_at = now
+                    db.flush()
+        else:
+            if insp_id is not None and task.source_id is None:
+                task.source_id = insp_id
+                task.source_type = "move_out_inspection"
+                task.updated_at = now
+                db.flush()
             created += 1 if is_new else 0
             notifications += 1 if enqueued else 0
 

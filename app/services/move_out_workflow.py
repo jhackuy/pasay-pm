@@ -12,6 +12,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import Lease, LeaseStatus, Tenant, Unit
@@ -21,12 +22,59 @@ from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
 from app.models.property import UnitLifecycleEvent, UnitStatus
 from app.services.audit import record_audit, serialize_row
+from app.services.organization_scope import property_org_id
+
+
+def validate_evidence_ids(
+    db: Session,
+    evidence_ids: list[int] | None,
+    lease: Lease,
+    membership,
+) -> None:
+    if not evidence_ids:
+        return
+    evidence_rows = (
+        db.query(Evidence)
+        .filter(Evidence.id.in_(evidence_ids), Evidence.deleted_at.is_(None))
+        .all()
+    )
+    found_ids = {e.id for e in evidence_rows}
+    missing_ids = [eid for eid in evidence_ids if eid not in found_ids]
+    if missing_ids:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "move_out_inspection_evidence_not_found",
+                "missing_evidence_ids": missing_ids,
+            },
+        )
+    for ev in evidence_rows:
+        if ev.unit_id != lease.unit_id:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_evidence_mismatched_org_or_unit",
+                    "evidence_id": ev.id,
+                    "expected_unit_id": lease.unit_id,
+                    "actual_unit_id": ev.unit_id,
+                },
+            )
+        if ev.property_id is not None:
+            ev_org_id = property_org_id(db, ev.property_id)
+            if ev_org_id != membership.organization_id:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail={
+                        "reason": "move_out_inspection_evidence_mismatched_org_or_unit",
+                        "evidence_id": ev.id,
+                    },
+                )
 
 
 _ALLOWED_INSPECTION_TRANSITIONS: dict[MoveOutInspectionStatus, set[MoveOutInspectionStatus]] = {
     MoveOutInspectionStatus.SCHEDULED: {MoveOutInspectionStatus.INSPECTED, MoveOutInspectionStatus.CANCELLED},
     MoveOutInspectionStatus.INSPECTED: {MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED, MoveOutInspectionStatus.SCHEDULED},
-    MoveOutInspectionStatus.CONFIRMED: set(),
+    MoveOutInspectionStatus.CONFIRMED: {MoveOutInspectionStatus.CANCELLED},
     MoveOutInspectionStatus.CANCELLED: set(),
 }
 
@@ -51,7 +99,7 @@ def evidence_gate_passed(db: Session, inspection: MoveOutInspection) -> tuple[bo
     valid_ids = [eid for eid in eids if isinstance(eid, int)]
     if not valid_ids:
         return False, "No evidence_ids linked to this inspection (need at least 1 move_out_photo / move_out category)."
-    evidence_rows = db.query(Evidence).filter(Evidence.id.in_(valid_ids)).all()
+    evidence_rows = db.query(Evidence).filter(Evidence.id.in_(valid_ids), Evidence.deleted_at.is_(None)).all()
     move_out_categories = {EvidenceCategory.move_out, EvidenceCategory.move_out_photo}
     has_photo = any(e.category in move_out_categories for e in evidence_rows)
     if not has_photo:
@@ -92,7 +140,21 @@ def schedule_inspection(
     obj.created_by = actor_id
     obj.updated_by = actor_id
     db.add(obj)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing = (
+            db.query(MoveOutInspection)
+            .filter(
+                MoveOutInspection.lease_id == lease_id,
+                MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
+            )
+            .first()
+        )
+        if existing is not None:
+            return existing
+        raise
     lease = db.get(Lease, lease_id)
     if lease is not None and lease.move_out_inspection_id is None:
         lease.move_out_inspection_id = obj.id
@@ -192,6 +254,7 @@ def confirm_inspection(
     )
     # --- Forward sync: close any PENDING MOVE_OUT_INSPECTION task for this inspection ---
     _close_projection_tasks_for_inspection(db, inspection, actor_id, confirmed_at)
+    _ensure_draft_settlement_for(db, inspection, actor_id)
     return inspection
 
 
@@ -327,9 +390,21 @@ def _ensure_draft_settlement_for(
     obj.updated_by = actor_id
     db.add(obj)
     db.flush()
-    if lease is not None and lease.deposit_settlement_id is None:
-        lease.deposit_settlement_id = obj.id
-        lease.updated_by = actor_id
+    if lease is not None:
+        should_set_fk = False
+        if lease.deposit_settlement_id is None:
+            should_set_fk = True
+        elif inspection.id == lease.move_out_inspection_id:
+            should_set_fk = True
+        else:
+            existing_sett = db.get(DepositSettlement, lease.deposit_settlement_id)
+            if existing_sett is not None:
+                existing_insp = db.get(MoveOutInspection, existing_sett.move_out_inspection_id)
+                if existing_insp is not None and existing_insp.status == MoveOutInspectionStatus.CANCELLED:
+                    should_set_fk = True
+        if should_set_fk:
+            lease.deposit_settlement_id = obj.id
+            lease.updated_by = actor_id
     record_audit(
         db,
         table_name="deposit_settlements",
