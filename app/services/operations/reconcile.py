@@ -185,9 +185,41 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
         return None
 
     if task.task_type == OperationalTaskType.MOVE_OUT_INSPECTION:
-        if task.source_id is None:
+        # #14 orphan: provisional tasks source_type=lease source_id=lease.id are NEVER orphans;
+        # only treat as orphan when BOTH source_id is None AND source_type not in BUSINESS_SOURCE_TYPES
+        # AND cannot match by dedupe_key to active lease/inspection.
+        BUSINESS_SOURCE_TYPES = frozenset({"lease", "expense", "commission_settlement"})
+        is_business_orphan_safe = (
+            task.source_type in BUSINESS_SOURCE_TYPES and task.source_id is not None
+        )
+        dedupe = task.dedupe_key or ""
+        lease_id_from_dedupe: int | None = None
+        if dedupe.startswith("lease:"):
+            try:
+                lease_id_from_dedupe = int(dedupe.split(":", 3)[1])
+            except (ValueError, IndexError):
+                lease_id_from_dedupe = None
+        matched_by_dedupe = False
+        if lease_id_from_dedupe is not None:
+            lk = db.get(Lease, lease_id_from_dedupe)
+            if lk is not None and lk.deleted_at is None:
+                matched_by_dedupe = True
+            ik = (
+                db.query(MoveOutInspection)
+                .filter(
+                    MoveOutInspection.lease_id == lease_id_from_dedupe,
+                    MoveOutInspection.status.in_([
+                        MoveOutInspectionStatus.SCHEDULED,
+                        MoveOutInspectionStatus.INSPECTED,
+                    ]),
+                )
+                .first()
+            )
+            if ik is not None:
+                matched_by_dedupe = True
+        if task.source_id is None and not is_business_orphan_safe and not matched_by_dedupe:
             return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_task_orphan_source_id_none_fail_closed")
-        if task.source_type == "move_out_inspection":
+        if task.source_type == "move_out_inspection" and task.source_id is not None:
             inspection = db.get(MoveOutInspection, task.source_id)
             if inspection is None:
                 return None
@@ -195,6 +227,17 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
                 return _transition(db, task, OperationalTaskStatus.COMPLETED, now, "move_out_inspection_confirmed")
             if inspection.status == MoveOutInspectionStatus.CANCELLED:
                 return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_cancelled")
+        elif task.source_type == "lease" and task.source_id is not None:
+            # Provisional task bound to lease; inspect lease truth + any inspection
+            lease = db.get(Lease, task.source_id)
+            if lease is None or lease.deleted_at is not None:
+                return None
+            if lease.status != LeaseStatus.active:
+                return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_provisional_lease_inactive")
+            meta = lease.renewal_metadata or {}
+            if not meta.get("not_renewed"):
+                return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_provisional_not_renewed_cleared")
+            # If an active inspection now exists for this lease, it stays PENDING (forward sync handles it)
         return None
 
     if task.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT:

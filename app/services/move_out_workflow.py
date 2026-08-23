@@ -23,6 +23,52 @@ from app.models.operations import OperationalTask, OperationalTaskStatus, Operat
 from app.models.property import UnitLifecycleEvent, UnitStatus
 from app.services.audit import record_audit, serialize_row
 from app.services.organization_scope import property_org_id
+from app.services.shared import sync_unit_status
+
+
+def _close_tasks_by_query(
+    db: Session,
+    query,
+    *,
+    actor_id: int | None,
+    now: datetime,
+    target_status: OperationalTaskStatus,
+    reason: str,
+    extra_pre: callable | None = None,
+    exclude_ids: set[int] | None = None,
+) -> None:
+    """Common helper: close every PENDING task returned by ``query`` with a
+    task_auto_completed / task_auto_cancelled audit row. ``extra_pre(task)`` is
+    invoked for each row before status changes (e.g. to patch source_id from
+    provisional -> concrete). Rows whose .id is in ``exclude_ids`` are
+    skipped.
+    """
+    tasks = query.all()
+    for t in tasks:
+        if exclude_ids and t.id in exclude_ids:
+            continue
+        old_row = serialize_row(t)
+        if extra_pre is not None:
+            extra_pre(t)
+        t.status = target_status
+        t.updated_at = now
+        t.completed_at = now if target_status == OperationalTaskStatus.COMPLETED else None
+        t.completed_by = actor_id
+        t.reminder_generation = t.reminder_generation + 1
+        action = "task_auto_cancelled" if target_status == OperationalTaskStatus.CANCELLED else "task_auto_completed"
+        record_audit(
+            db,
+            table_name="operational_tasks",
+            record_id=t.id,
+            action=action,
+            actor_id=None,
+            changed_fields={
+                "status": [OperationalTaskStatus.PENDING.value, target_status.value],
+                "reason": reason,
+            },
+            old_value=old_row,
+            new_value=serialize_row(t),
+        )
 
 
 def validate_evidence_ids(
@@ -119,8 +165,11 @@ def schedule_inspection(
     tenant_id: int | None,
     scheduled_at: datetime,
     actor_id: int,
-) -> MoveOutInspection:
-    """Idempotent: returns existing SCHEDULED/INSPECTED row for this lease without creating a duplicate."""
+) -> tuple[MoveOutInspection, bool]:
+    """Idempotent: returns existing SCHEDULED/INSPECTED row for this lease without creating a duplicate.
+
+    Returns (obj, created: bool) — created=True if a new row was inserted, False if existing returned.
+    """
     existing = (
         db.query(MoveOutInspection)
         .filter(
@@ -130,7 +179,7 @@ def schedule_inspection(
         .first()
     )
     if existing is not None:
-        return existing
+        return existing, False
     obj = MoveOutInspection(
         lease_id=lease_id,
         unit_id=unit_id,
@@ -141,9 +190,9 @@ def schedule_inspection(
     obj.updated_by = actor_id
     db.add(obj)
     try:
-        db.flush()
+        with db.begin_nested():
+            db.flush()
     except IntegrityError:
-        db.rollback()
         existing = (
             db.query(MoveOutInspection)
             .filter(
@@ -153,7 +202,7 @@ def schedule_inspection(
             .first()
         )
         if existing is not None:
-            return existing
+            return existing, False
         raise
     lease = db.get(Lease, lease_id)
     if lease is not None and lease.move_out_inspection_id is None:
@@ -167,7 +216,7 @@ def schedule_inspection(
         actor_id=actor_id,
         new_value=serialize_row(obj),
     )
-    return obj
+    return obj, True
 
 
 def mark_inspected(
@@ -215,34 +264,48 @@ def confirm_inspection(
     actor_id: int,
 ) -> MoveOutInspection:
     target = MoveOutInspectionStatus.CONFIRMED
-    if inspection.status == target:
-        return inspection
-    validate_inspection_transition(inspection.status, target)
-    passed, reason = evidence_gate_passed(db, inspection)
+    locked = (
+        db.query(MoveOutInspection)
+        .filter(MoveOutInspection.id == inspection.id)
+        .with_for_update()
+        .first()
+    )
+    if locked is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={
+                "reason": "move_out_inspection_not_found",
+                "inspection_id": inspection.id,
+            },
+        )
+    if locked.status == target:
+        return locked
+    validate_inspection_transition(locked.status, target)
+    passed, reason = evidence_gate_passed(db, locked)
     if not passed:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
                 "reason": "move_out_inspection_evidence_gate_failed",
-                "inspection_id": inspection.id,
+                "inspection_id": locked.id,
                 "detail": reason,
                 "hint": "PATCH /move-out-inspections/{id} with evidence_ids and findings first, then retry confirm.",
             },
         )
-    lease = db.get(Lease, inspection.lease_id)
-    if inspection.unit_id is None and lease is not None:
-        inspection.unit_id = lease.unit_id
-    if inspection.tenant_id is None and lease is not None:
-        inspection.tenant_id = lease.tenant_id
-    old = serialize_row(inspection)
-    inspection.status = target
-    inspection.confirmed_at = confirmed_at
-    inspection.confirmed_by = actor_id
-    inspection.updated_by = actor_id
+    lease = db.get(Lease, locked.lease_id)
+    if locked.unit_id is None and lease is not None:
+        locked.unit_id = lease.unit_id
+    if locked.tenant_id is None and lease is not None:
+        locked.tenant_id = lease.tenant_id
+    old = serialize_row(locked)
+    locked.status = target
+    locked.confirmed_at = confirmed_at
+    locked.confirmed_by = actor_id
+    locked.updated_by = actor_id
     record_audit(
         db,
         table_name="move_out_inspections",
-        record_id=inspection.id,
+        record_id=locked.id,
         action="confirm",
         actor_id=actor_id,
         changed_fields={
@@ -250,12 +313,12 @@ def confirm_inspection(
             "confirmed_at": [None, confirmed_at.isoformat()],
         },
         old_value=old,
-        new_value=serialize_row(inspection),
+        new_value=serialize_row(locked),
     )
     # --- Forward sync: close any PENDING MOVE_OUT_INSPECTION task for this inspection ---
-    _close_projection_tasks_for_inspection(db, inspection, actor_id, confirmed_at)
-    _ensure_draft_settlement_for(db, inspection, actor_id)
-    return inspection
+    _close_projection_tasks_for_inspection(db, locked, actor_id, confirmed_at)
+    _ensure_draft_settlement_for(db, locked, actor_id)
+    return locked
 
 
 def cancel_inspection(
@@ -266,21 +329,44 @@ def cancel_inspection(
     cancelled_by: int,
 ) -> MoveOutInspection:
     target = MoveOutInspectionStatus.CANCELLED
-    validate_inspection_transition(inspection.status, target)
-    if inspection.status == MoveOutInspectionStatus.CONFIRMED:
-        from app.models.lease import Lease
-        lease = db.get(Lease, inspection.lease_id)
-        if lease is not None and lease.moved_out_settled_at is not None:
-            from fastapi import HTTPException
-            from starlette import status
+    lease = db.get(Lease, inspection.lease_id)
+    if inspection.status == MoveOutInspectionStatus.CONFIRMED and lease is not None:
+        if lease.status in {LeaseStatus.expired, LeaseStatus.terminated}:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail={
-                    "reason": "move_out_inspection_immutable_lease_settled",
+                    "reason": "move_out_inspection_cancel_lease_already_terminal",
                     "inspection_id": inspection.id,
                     "lease_id": lease.id,
+                    "lease_status": lease.status.value,
                 },
             )
+    if inspection.status == MoveOutInspectionStatus.CONFIRMED:
+        settl = (
+            db.query(DepositSettlement)
+            .filter(DepositSettlement.move_out_inspection_id == inspection.id)
+            .first()
+        )
+        if settl is not None and settl.status in {DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED}:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_cancel_settlement_already_confirmed",
+                    "inspection_id": inspection.id,
+                    "settlement_id": settl.id,
+                    "settlement_status": settl.status.value,
+                },
+            )
+    if inspection.status == MoveOutInspectionStatus.CONFIRMED and lease is not None and lease.moved_out_settled_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "move_out_inspection_immutable_lease_settled",
+                "inspection_id": inspection.id,
+                "lease_id": lease.id,
+            },
+        )
+    validate_inspection_transition(inspection.status, target)
     old = serialize_row(inspection)
     inspection.status = target
     inspection.cancelled_at = cancelled_at
@@ -310,68 +396,78 @@ def _close_projection_tasks_for_inspection(
 ) -> None:
     target_status = OperationalTaskStatus.CANCELLED if cancelled else OperationalTaskStatus.COMPLETED
     reason = "move_out_inspection_cancelled" if cancelled else "move_out_inspection_confirmed_forward_sync"
-    tasks = (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
-            OperationalTask.source_type == "move_out_inspection",
-            OperationalTask.source_id == inspection.id,
-            OperationalTask.status == OperationalTaskStatus.PENDING,
-        )
-        .all()
+    q1 = db.query(OperationalTask).filter(
+        OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
+        OperationalTask.source_type == "move_out_inspection",
+        OperationalTask.source_id == inspection.id,
+        OperationalTask.status == OperationalTaskStatus.PENDING,
     )
-    for t in tasks:
-        old_row = serialize_row(t)
-        t.status = target_status
-        t.updated_at = now
-        t.completed_at = now if target_status == OperationalTaskStatus.COMPLETED else None
-        t.completed_by = actor_id
-        t.reminder_generation = t.reminder_generation + 1
-        record_audit(
-            db,
-            table_name="operational_tasks",
-            record_id=t.id,
-            action="task_auto_cancelled" if cancelled else "task_auto_completed",
-            actor_id=None,
-            changed_fields={
-                "status": [OperationalTaskStatus.PENDING.value, target_status.value],
-                "reason": reason,
-            },
-            old_value=old_row,
-            new_value=serialize_row(t),
-        )
+    already_closed_ids: set[int] = set()
+    tasks1 = q1.all()
+    for t in tasks1:
+        already_closed_ids.add(t.id)
+    _close_tasks_by_query(
+        db, q1,
+        actor_id=actor_id, now=now,
+        target_status=target_status, reason=reason,
+    )
     # Also dedupe_key route: lease:{id}:MOVE_OUT_INSPECTION (may still have source_id=None at generation time before inspection created)
-    by_lease = (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
-            OperationalTask.status == OperationalTaskStatus.PENDING,
-            OperationalTask.dedupe_key == f"lease:{inspection.lease_id}:MOVE_OUT_INSPECTION",
-        )
-        .all()
-    )
-    for t in by_lease:
-        if any(x.id == t.id for x in tasks):
-            continue
-        old_row = serialize_row(t)
+    def _patch_provisional(t: OperationalTask) -> None:
         if t.source_id is None:
             t.source_id = inspection.id
             t.source_type = "move_out_inspection"
-        t.status = target_status
-        t.updated_at = now
-        t.completed_at = now if target_status == OperationalTaskStatus.COMPLETED else None
-        t.completed_by = actor_id
-        t.reminder_generation = t.reminder_generation + 1
-        record_audit(
-            db,
-            table_name="operational_tasks",
-            record_id=t.id,
-            action="task_auto_cancelled" if cancelled else "task_auto_completed",
-            actor_id=None,
-            changed_fields={"status": [OperationalTaskStatus.PENDING.value, target_status.value], "reason": reason},
-            old_value=old_row,
-            new_value=serialize_row(t),
-        )
+    q2 = db.query(OperationalTask).filter(
+        OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
+        OperationalTask.status == OperationalTaskStatus.PENDING,
+        OperationalTask.dedupe_key == f"lease:{inspection.lease_id}:MOVE_OUT_INSPECTION",
+    )
+    _close_tasks_by_query(
+        db, q2,
+        actor_id=actor_id, now=now,
+        target_status=target_status, reason=reason,
+        extra_pre=_patch_provisional,
+        exclude_ids=already_closed_ids,
+    )
+
+
+def _close_projection_tasks_for_settlement(
+    db: Session,
+    settlement: DepositSettlement,
+    actor_id: int | None,
+    now: datetime,
+    *,
+    cancelled: bool = False,
+) -> None:
+    """Shared helper future-use: close DEPOSIT_SETTLEMENT projection tasks
+    for a confirmed/cancelled settlement. Currently unused but exists so
+    settlement forward-sync can reuse the same pattern as inspection.
+    """
+    target_status = OperationalTaskStatus.CANCELLED if cancelled else OperationalTaskStatus.COMPLETED
+    reason = "deposit_settlement_cancelled" if cancelled else "deposit_settlement_confirmed_forward_sync"
+    q1 = db.query(OperationalTask).filter(
+        OperationalTask.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT,
+        OperationalTask.source_type == "deposit_settlement",
+        OperationalTask.source_id == settlement.id,
+        OperationalTask.status == OperationalTaskStatus.PENDING,
+    )
+    _close_tasks_by_query(
+        db, q1,
+        actor_id=actor_id, now=now,
+        target_status=target_status, reason=reason,
+    )
+    if settlement.move_out_inspection_id is not None:
+        insp = db.get(MoveOutInspection, settlement.move_out_inspection_id)
+        if insp is not None:
+            q2 = db.query(OperationalTask).filter(
+                OperationalTask.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT,
+                OperationalTask.status == OperationalTaskStatus.PENDING,
+                OperationalTask.dedupe_key == f"deposit_settlement:{settlement.id}:DEPOSIT_SETTLEMENT",
+            )
+            _close_tasks_by_query(
+                db, q2,
+                actor_id=actor_id, now=now,
+                target_status=target_status, reason=reason,
+            )
 
 
 def _ensure_draft_settlement_for(
@@ -550,9 +646,8 @@ def apply_settled_lease_final_state(
     # --- Unit status ---
     unit = db.get(Unit, lease.unit_id)
     if unit is not None:
-        from app.api.routers.leases import _sync_unit_status
         old_unit = serialize_row(unit)
-        _sync_unit_status(db, unit)
+        sync_unit_status(db, unit)
         unit.updated_by = actor_id
         if old_unit.get("status") != unit.status:
             record_audit(

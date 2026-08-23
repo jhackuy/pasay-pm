@@ -81,6 +81,12 @@ class LeaseRenewalRequest(BaseModel):
     due_day: int | None = Field(default=None, ge=1, le=31)
     renewal_notice_period_days: int | None = Field(default=None, ge=0, le=365)
 
+    @model_validator(mode="after")
+    def validate_dates(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date must be >= start_date")
+        return self
+
 
 class LeaseDeclineRenewalRequest(BaseModel):
     reason: str | None = None

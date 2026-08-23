@@ -11,6 +11,7 @@ only read; their real state transitions stay in the V1.1 routers.
 """
 from __future__ import annotations
 
+import logging
 import secrets
 import time as _time
 from datetime import datetime, time, timedelta
@@ -19,6 +20,8 @@ from decimal import Decimal
 from sqlalchemy import cast, text
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.models.commission import CommissionSettlement, CommissionSettlementStatus
 from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
@@ -259,6 +262,7 @@ def _insert_task_on_conflict_do_nothing(db: Session, *, fields: dict) -> Operati
         from app.models.user import User
         exists = db.query(User.id).filter(User.id == auid).first() is not None
         if not exists:
+            logger.warning("assigned_user_id %d not found", auid)
             f["assigned_user_id"] = None
     if f.get("dedupe_key") is None:
         obj = OperationalTask(**f)
@@ -948,11 +952,16 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
         if meta.get("move_out_date"):
             try:
                 from datetime import date as _date
-                parts = str(meta["move_out_date"]).split("-")
-                if len(parts) == 3:
-                    due_date = _date(int(parts[0]), int(parts[1]), int(parts[2]))
-            except Exception:
-                pass
+                due_date = _date.fromisoformat(str(meta["move_out_date"]))
+            except ValueError as e:
+                logger.warning("invalid move_out_date in renewal_metadata for lease %d: %s", lease.id, e)
+        # #14 provisional task source_type: when insp_id is None, use source_type=lease/source_id=lease.id
+        if insp_id:
+            source_type = "move_out_inspection"
+            source_id = insp_id
+        else:
+            source_type = "lease"
+            source_id = lease.id
         task, enqueued, is_new = _register_task(
             db,
             now=now,
@@ -962,8 +971,8 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
                 "property_id": unit.property_id if unit else None,
                 "tenant_id": lease.tenant_id,
                 "lease_id": lease.id,
-                "source_type": "move_out_inspection",
-                "source_id": insp_id,
+                "source_type": source_type,
+                "source_id": source_id,
                 "assigned_user_id": secretary_assignee_id(),
                 "priority": OperationalTaskPriority.high,
                 "status": OperationalTaskStatus.PENDING,
@@ -979,20 +988,13 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             },
             proactive=True,
         )
-        if task is None:
-            if insp_id is not None:
-                existing_task = _get_active_task_by_dedupe(db, f"lease:{lease.id}:MOVE_OUT_INSPECTION")
-                if existing_task is not None and existing_task.source_id is None:
-                    existing_task.source_id = insp_id
-                    existing_task.source_type = "move_out_inspection"
-                    existing_task.updated_at = now
-                    db.flush()
-        else:
-            if insp_id is not None and task.source_id is None:
-                task.source_id = insp_id
-                task.source_type = "move_out_inspection"
-                task.updated_at = now
-                db.flush()
+        # #15 Duplicate run stability: only modify source_id/type when is_new=True
+        if task is not None and is_new and insp_id is not None and task.source_id is None:
+            task.source_id = insp_id
+            task.source_type = "move_out_inspection"
+            task.updated_at = now
+            db.flush()
+        if task is not None:
             created += 1 if is_new else 0
             notifications += 1 if enqueued else 0
 

@@ -125,20 +125,34 @@ def confirm_settlement(
     confirmed_by: int,
 ) -> DepositSettlement:
     """Idempotent: when already CONFIRMED/RECONCILED, return unchanged with no side effects."""
-    if settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
-        return settlement
+    locked = (
+        db.query(DepositSettlement)
+        .filter(DepositSettlement.id == settlement.id)
+        .with_for_update()
+        .first()
+    )
+    if locked is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail={
+                "reason": "deposit_settlement_not_found",
+                "settlement_id": settlement.id,
+            },
+        )
+    if locked.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
+        return locked
     target = DepositSettlementStatus.CONFIRMED
-    validate_settlement_transition(settlement.status, target)
+    validate_settlement_transition(locked.status, target)
     insp = None
-    if getattr(settlement, "move_out_inspection_id", None):
-        insp = db.get(MoveOutInspection, settlement.move_out_inspection_id)
+    if getattr(locked, "move_out_inspection_id", None):
+        insp = db.get(MoveOutInspection, locked.move_out_inspection_id)
         if insp is None:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail={
                     "reason": "deposit_settlement_inspection_missing",
-                    "settlement_id": settlement.id,
-                    "move_out_inspection_id": settlement.move_out_inspection_id,
+                    "settlement_id": locked.id,
+                    "move_out_inspection_id": locked.move_out_inspection_id,
                 },
             )
         if insp.status != MoveOutInspectionStatus.CONFIRMED:
@@ -146,14 +160,14 @@ def confirm_settlement(
                 status.HTTP_409_CONFLICT,
                 detail={
                     "reason": "deposit_settlement_requires_confirmed_inspection",
-                    "settlement_id": settlement.id,
-                    "move_out_inspection_id": settlement.move_out_inspection_id,
+                    "settlement_id": locked.id,
+                    "move_out_inspection_id": locked.move_out_inspection_id,
                     "inspection_status": insp.status.value,
                     "expected": MoveOutInspectionStatus.CONFIRMED.value,
                     "hint": f"POST /move-out-inspections/{insp.id}/confirm first before confirming this deposit settlement.",
                 },
             )
-    deductions = settlement.deductions or []
+    deductions = locked.deductions or []
     if deductions:
         try:
             deductions_sum = sum(Decimal(str(item["amount"])) for item in deductions)
@@ -162,48 +176,51 @@ def confirm_settlement(
                 status.HTTP_409_CONFLICT,
                 detail={
                     "reason": "deposit_settlement_deduction_sum_mismatch",
-                    "settlement_id": settlement.id,
+                    "settlement_id": locked.id,
                     "hint": "Each deduction item must have a numeric 'amount' field.",
                 },
             )
-        total_deductions = Decimal(str(settlement.total_deductions))
+        total_deductions = Decimal(str(locked.total_deductions))
         gap_d = abs(deductions_sum - total_deductions)
         if gap_d > Decimal("0.01"):
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail={
                     "reason": "deposit_settlement_deduction_sum_mismatch",
-                    "settlement_id": settlement.id,
+                    "settlement_id": locked.id,
                     "deductions_sum": str(deductions_sum),
                     "total_deductions": str(total_deductions),
                     "gap": str(gap_d),
                     "tolerance_cents": 1,
                 },
             )
-    ok, gap = check_amount_conservation(settlement)
+    ok, gap = check_amount_conservation(locked)
     if not ok:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
                 "reason": "deposit_settlement_not_conserved",
-                "settlement_id": settlement.id,
-                "deposit_received": str(settlement.deposit_received),
-                "total_deductions": str(settlement.total_deductions),
-                "refund_amount": str(settlement.refund_amount),
+                "settlement_id": locked.id,
+                "deposit_received": str(locked.deposit_received),
+                "total_deductions": str(locked.total_deductions),
+                "refund_amount": str(locked.refund_amount),
                 "gap": str(gap),
                 "tolerance_cents": 1,
                 "hint": "Adjust total_deductions + refund_amount to equal deposit_received within 1c.",
             },
         )
-    old = serialize_row(settlement)
-    settlement.status = target
-    settlement.confirmed_at = confirmed_at
-    settlement.confirmed_by = confirmed_by
-    settlement.updated_by = confirmed_by
+    # --- Idempotent financial row generation (MUST succeed BEFORE status change) ---
+    _write_financial_rows_for_settlement(db, locked, confirmed_at, confirmed_by)
+    # --- Status change + audit only after financial rows fully written ---
+    old = serialize_row(locked)
+    locked.status = target
+    locked.confirmed_at = confirmed_at
+    locked.confirmed_by = confirmed_by
+    locked.updated_by = confirmed_by
     record_audit(
         db,
         table_name="deposit_settlements",
-        record_id=settlement.id,
+        record_id=locked.id,
         action="confirm",
         actor_id=confirmed_by,
         changed_fields={
@@ -211,13 +228,11 @@ def confirm_settlement(
             "confirmed_at": [None, confirmed_at.isoformat()],
         },
         old_value=old,
-        new_value=serialize_row(settlement),
+        new_value=serialize_row(locked),
     )
-    # --- Idempotent financial row generation ---
-    _write_financial_rows_for_settlement(db, settlement, confirmed_at, confirmed_by)
     # --- Forward projection sync ---
-    _close_projection_tasks_for_settlement(db, settlement, confirmed_by, confirmed_at)
-    return settlement
+    _close_projection_tasks_for_settlement(db, locked, confirmed_by, confirmed_at)
+    return locked
 
 
 def mark_reconciled(
@@ -268,6 +283,19 @@ def _write_financial_rows_for_settlement(
     if unit is not None:
         property_id = unit.property_id
 
+    refund = Decimal(str(settlement.refund_amount))
+    if refund > Decimal("0"):
+        if property_id is None or property_id == 0:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "deposit_settlement_refund_property_unresolved",
+                    "settlement_id": settlement.id,
+                    "lease_id": settlement.lease_id,
+                    "unit_id": unit.id if unit else None,
+                },
+            )
+
     deductions = list(settlement.deductions or [])
     if not deductions and Decimal(str(settlement.total_deductions)) > Decimal("0"):
         deductions = [{"description": f"押金扣款汇总 #{settlement.id}", "amount": str(settlement.total_deductions)}]
@@ -295,23 +323,23 @@ def _write_financial_rows_for_settlement(
         income.created_by = confirmed_by
         income.updated_by = confirmed_by
         income_created_ok = False
+        created_or_existing_id: int | None = None
         try:
-            tx = db.begin_nested()
-            db.add(income)
-            db.flush()
-            tx.commit()
-            processed_income_ids[i] = income.id
-            income_created_ok = True
+            with db.begin_nested():
+                db.add(income)
+                db.flush()
+                processed_income_ids[i] = income.id
+                created_or_existing_id = income.id
+                income_created_ok = True
         except IntegrityError:
-            tx.rollback()
             existing_row = db.query(Income).filter(Income.idempotency_key == ikey).first()
             if existing_row is not None:
                 processed_income_ids[i] = existing_row.id
+                created_or_existing_id = existing_row.id
                 income_created_ok = True
             else:
                 raise
-        if income_created_ok:
-            created_or_existing_id = processed_income_ids[i]
+        if income_created_ok and created_or_existing_id is not None:
             live_row = db.get(Income, created_or_existing_id) or income
             record_audit(
                 db,
@@ -332,7 +360,6 @@ def _write_financial_rows_for_settlement(
         settlement.deductions = updated
         settlement.updated_by = confirmed_by
 
-    refund = Decimal(str(settlement.refund_amount))
     if refund > Decimal("0"):
         ekey = f"deposit_settlement:{settlement.id}:refund"
         existing_exp = db.query(Expense).filter(Expense.idempotency_key == ekey).first()
@@ -344,7 +371,7 @@ def _write_financial_rows_for_settlement(
                 amount=refund,
                 payee="TENANT_REFUND",
                 description=f"[DepositSettlement #{settlement.id}] 押金退款 - Lease #{settlement.lease_id}",
-                property_id=property_id or 0,
+                property_id=property_id,
                 unit_id=unit.id if unit else None,
                 status=ExpenseStatus.pending,
                 payer_user_id=None,
@@ -352,19 +379,15 @@ def _write_financial_rows_for_settlement(
             )
             exp.created_by = confirmed_by
             exp.updated_by = confirmed_by
-            if exp.property_id == 0:
-                exp.property_id = property_id or exp.property_id
             refund_created_ok = False
             created_exp_id: int | None = None
             try:
-                tx = db.begin_nested()
-                db.add(exp)
-                db.flush()
-                tx.commit()
-                refund_created_ok = True
-                created_exp_id = exp.id
+                with db.begin_nested():
+                    db.add(exp)
+                    db.flush()
+                    refund_created_ok = True
+                    created_exp_id = exp.id
             except IntegrityError:
-                tx.rollback()
                 existing_row = db.query(Expense).filter(Expense.idempotency_key == ekey).first()
                 if existing_row is not None:
                     refund_created_ok = True

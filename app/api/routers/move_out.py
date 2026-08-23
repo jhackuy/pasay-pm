@@ -74,30 +74,10 @@ def create_inspection(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
-    existing = (
-        db.query(MoveOutInspection)
-        .filter(
-            MoveOutInspection.lease_id == lease.id,
-            MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
-        )
-        .first()
-    )
-    if existing is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "reason": "move_out_inspection_already_exists_for_lease",
-                "lease_id": payload.lease_id,
-                "existing_inspection_id": existing.id,
-                "existing_status": existing.status.value,
-                "hint": "GET /move-out-inspections/{id}",
-            },
-        )
-
     if payload.evidence_ids is not None:
         validate_evidence_ids(db, payload.evidence_ids, lease, membership)
 
-    obj = schedule_inspection(
+    obj, created = schedule_inspection(
         db,
         lease_id=lease.id,
         unit_id=lease.unit_id,
@@ -105,6 +85,16 @@ def create_inspection(
         scheduled_at=payload.scheduled_at,
         actor_id=user.id,
     )
+    if not created:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "move_out_inspection_already_exists_for_lease",
+                "lease_id": lease.id,
+                "existing_inspection_id": obj.id,
+                "existing_status": obj.status.value if hasattr(obj.status, "value") else str(obj.status),
+            },
+        )
     if payload.findings is not None:
         obj.findings = [fi.model_dump(mode="json") for fi in payload.findings]
     if payload.evidence_ids is not None:
@@ -210,6 +200,8 @@ def inspect_post(
         )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    from app.services.move_out_workflow import validate_inspection_transition
+    validate_inspection_transition(obj.status, MoveOutInspectionStatus.INSPECTED)
     updates = payload.model_dump(exclude_unset=True)
     if "findings" in updates and updates["findings"] is not None:
         findings = [
@@ -218,8 +210,8 @@ def inspect_post(
         ]
     else:
         findings = obj.findings
-    evidence_ids = updates.get("evidence_ids", obj.evidence_ids)
-    if evidence_ids is not None:
+    evidence_ids_arg = updates.get("evidence_ids")
+    if evidence_ids_arg is not None:
         from app.models.lease import Lease
         lease = db.get(Lease, obj.lease_id)
         if lease is None:
@@ -230,7 +222,8 @@ def inspect_post(
                     "missing_evidence_ids": [],
                 },
             )
-        validate_evidence_ids(db, evidence_ids, lease, _membership)
+        validate_evidence_ids(db, evidence_ids_arg, lease, _membership)
+    evidence_ids = evidence_ids_arg if evidence_ids_arg is not None else obj.evidence_ids
     inspected_at = updates.pop("inspected_at", None) or datetime.now(timezone.utc)
     mark_inspected(
         db, obj,

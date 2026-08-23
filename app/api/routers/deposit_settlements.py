@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -77,6 +78,13 @@ def create_settlement(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
+    insp = (
+        db.query(MoveOutInspection)
+        .filter(MoveOutInspection.id == insp.id)
+        .with_for_update(key_share=True)
+        .first()
+    )
+
     if insp.status != MoveOutInspectionStatus.CONFIRMED:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -89,23 +97,6 @@ def create_settlement(
             },
         )
 
-    existing = (
-        db.query(DepositSettlement)
-        .filter(DepositSettlement.move_out_inspection_id == insp.id)
-        .with_for_update(key_share=True)
-        .first()
-    )
-    if existing is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "reason": "deposit_settlement_already_exists_for_inspection",
-                "move_out_inspection_id": insp.id,
-                "existing_settlement_id": existing.id,
-                "hint": f"Use GET /deposit-settlements/{existing.id} to read the existing settlement; PATCH to edit DRAFT fields.",
-            },
-        )
-
     create_data = payload.model_dump()
     create_data.pop("move_out_inspection_id", None)
     create_data["deductions"] = _jsonb_safe_deductions(create_data.get("deductions"))
@@ -115,24 +106,42 @@ def create_settlement(
     obj.move_out_inspection_id = insp.id
     obj.created_by = user.id
     obj.updated_by = user.id
-    db.add(obj)
-    db.flush()
-    lease = db.get(Lease, obj.lease_id)
-    if lease is not None:
-        should_set_fk = False
-        if lease.deposit_settlement_id is None:
-            should_set_fk = True
-        elif insp.id == lease.move_out_inspection_id:
-            should_set_fk = True
-        else:
-            existing_sett = db.get(DepositSettlement, lease.deposit_settlement_id)
-            if existing_sett is not None:
-                existing_insp = db.get(MoveOutInspection, existing_sett.move_out_inspection_id)
-                if existing_insp is not None and existing_insp.status == MoveOutInspectionStatus.CANCELLED:
+    try:
+        with db.begin_nested():
+            db.add(obj)
+            db.flush()
+            lease = db.get(Lease, obj.lease_id)
+            if lease is not None:
+                should_set_fk = False
+                if lease.deposit_settlement_id is None:
                     should_set_fk = True
-        if should_set_fk:
-            lease.deposit_settlement_id = obj.id
-            lease.updated_by = user.id
+                elif insp.id == lease.move_out_inspection_id:
+                    should_set_fk = True
+                else:
+                    existing_sett = db.get(DepositSettlement, lease.deposit_settlement_id)
+                    if existing_sett is not None:
+                        existing_insp = db.get(MoveOutInspection, existing_sett.move_out_inspection_id)
+                        if existing_insp is not None and existing_insp.status == MoveOutInspectionStatus.CANCELLED:
+                            should_set_fk = True
+                if should_set_fk:
+                    lease.deposit_settlement_id = obj.id
+                    lease.updated_by = user.id
+    except IntegrityError:
+        existing = (
+            db.query(DepositSettlement)
+            .filter(DepositSettlement.move_out_inspection_id == insp.id)
+            .first()
+        )
+        if existing is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "deposit_settlement_already_exists_for_inspection",
+                    "move_out_inspection_id": insp.id,
+                    "existing_settlement_id": existing.id,
+                },
+            )
+        raise
     record_audit(
         db, table_name="deposit_settlements", record_id=obj.id, action="create",
         actor_id=user.id, new_value=serialize_row(obj),

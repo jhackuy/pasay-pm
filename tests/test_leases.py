@@ -42,7 +42,8 @@ def test_terminate_lease_releases_unit(client, admin_headers, unit_id, tenant_id
         json={"lease_id": lease_id, "scheduled_at": scheduled_at},
         headers=admin_headers,
     )
-    assert insp_resp.status_code in (200, 201), insp_resp.text
+    assert insp_resp.status_code == 201, insp_resp.text
+    assert insp_resp.json()["status"] == "SCHEDULED"
     insp_id = insp_resp.json()["id"]
 
     fid = f"moveout-photo-{uuid.uuid4().hex[:8]}"

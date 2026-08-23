@@ -175,8 +175,10 @@ def test_a1_renew_creates_successor_and_updates_metadata(
     pred = db_session.get(Lease, lease_id)
     pred.end_date = date.today()
     db_session.commit()
-    new_start = "2027-01-01"
-    new_end = "2027-12-31"
+    new_start_d = date.today() + timedelta(days=1)
+    new_end_d = new_start_d + timedelta(days=364)
+    new_start = new_start_d.isoformat()
+    new_end = new_end_d.isoformat()
     r = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={
@@ -190,16 +192,18 @@ def test_a1_renew_creates_successor_and_updates_metadata(
     assert r.status_code == 200, r.text
     pred = db_session.get(Lease, lease_id)
     assert pred is not None
-    meta = pred.renewal_metadata or {}
-    assert "renewed_lease_id" in meta
-    succ_id = meta["renewed_lease_id"]
-    succ = db_session.get(Lease, succ_id)
+    succ = r.json()
     assert succ is not None
-    assert succ.status == LeaseStatus.active
-    assert str(succ.start_date) == new_start
-    assert str(succ.end_date) == new_end
-    assert succ.monthly_rent == Decimal("12500.00")
-    assert succ.deposit == Decimal("25000.00")
+    succ_id_from_resp = succ["id"]
+    meta = pred.renewal_metadata or {}
+    assert meta["renewed_lease_id"] == succ_id_from_resp
+    succ_row = db_session.get(Lease, succ_id_from_resp)
+    assert succ_row is not None
+    assert succ_row.status == LeaseStatus.active
+    assert str(succ_row.start_date) == new_start
+    assert str(succ_row.end_date) == new_end
+    assert succ_row.monthly_rent == Decimal("12500.00")
+    assert succ_row.deposit == Decimal("25000.00")
 
 
 def test_a2_renew_is_idempotent_no_duplicate_successor(
@@ -209,9 +213,11 @@ def test_a2_renew_is_idempotent_no_duplicate_successor(
     pred = db_session.get(Lease, lease_id)
     pred.end_date = date.today()
     db_session.commit()
+    succ_start = (date.today() + timedelta(days=1)).isoformat()
+    succ_end = (date.today() + timedelta(days=365)).isoformat()
     payload = {
-        "start_date": "2027-01-01",
-        "end_date": "2027-12-31",
+        "start_date": succ_start,
+        "end_date": succ_end,
         "monthly_rent": "12500.00",
         "deposit": "25000.00",
     }
@@ -277,10 +283,12 @@ def test_a5_decline_after_renew_conflict(
     pred = db_session.get(Lease, lease_id)
     pred.end_date = date.today()
     db_session.commit()
+    succ_start = (date.today() + timedelta(days=1)).isoformat()
+    succ_end = (date.today() + timedelta(days=365)).isoformat()
     client.post(
         f"{API}/leases/{lease_id}/renew",
         json={
-            "start_date": "2027-01-01", "end_date": "2027-12-31",
+            "start_date": succ_start, "end_date": succ_end,
             "monthly_rent": "12500.00", "deposit": "25000.00",
         },
         headers=h,
@@ -627,6 +635,7 @@ def test_c2_double_create_unique_inspection_409_or_identical(
         client, db_session, h, lease_id=lease_id,
     )
     s1 = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
+    existing_id = s1["id"]
     r2 = client.post(
         f"{API}/deposit-settlements",
         json={
@@ -639,22 +648,42 @@ def test_c2_double_create_unique_inspection_409_or_identical(
         headers=h,
     )
     assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "deposit_settlement_already_exists_for_inspection"
+    assert detail["existing_settlement_id"] == existing_id
 
 
 def test_c3_conservation_gap_zero_and_one_cent_pass(
     client, db_session, owner_a, lease_id, unit_id, tenant_id
 ):
+    from app.services.deposit_settlement_service import check_amount_conservation
     h = _h(owner_a[1])
     insp = _schedule_and_full_inspection(
         client, db_session, h, lease_id=lease_id,
     )
-    # gap = 0
     s1 = _draft_settlement(
         client, h, lease_id=lease_id, inspection_id=insp["id"],
         deposit="100.00", total_deduct="60.00", refund="40.00",
     )
     r1 = client.post(f"{API}/deposit-settlements/{s1['id']}/confirm", headers=h)
     assert r1.status_code == 200, r1.text
+
+    insp2 = _schedule_and_full_inspection(
+        client, db_session, h, lease_id=lease_id,
+    )
+    db_session.expire_all()
+    s2 = _draft_settlement(
+        client, h, lease_id=lease_id, inspection_id=insp2["id"],
+        deposit="100.00", total_deduct="60.00", refund="39.99",
+    )
+    set2_row = db_session.get(DepositSettlement, s2["id"])
+    assert set2_row is not None
+    ok_2, gap_2 = check_amount_conservation(set2_row)
+    assert ok_2 is True
+    assert gap_2 == Decimal("0.01")
+    r2 = client.post(f"{API}/deposit-settlements/{s2['id']}/confirm", headers=h)
+    assert r2.status_code == 200, r2.text
 
 
 def test_c4_conservation_gap_two_cents_fails_409(
@@ -1036,8 +1065,20 @@ def _task_count(db, *, task_type, source_type=None, source_id=None, status=None)
 
 
 def test_e1_generation_creates_move_out_task_after_decline(
-    client, db_session, owner_a, lease_id, unit_id, tenant_id,
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, monkeypatch,
 ):
+    from app.services.operations import generation, config as ops_config
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner_a[0].id)
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    from datetime import datetime, timezone, timedelta
+    lease = db_session.get(Lease, lease_id)
+    today = datetime.now(timezone.utc).date()
+    target_end = today + timedelta(days=14)
+    if lease.end_date > (today + timedelta(days=30)):
+        lease.end_date = target_end
+        lease.updated_by = owner_a[0].id
+        db_session.flush()
     h = _h(owner_a[1])
     client.post(
         f"{API}/leases/{lease_id}/decline-renewal",
@@ -1047,23 +1088,39 @@ def test_e1_generation_creates_move_out_task_after_decline(
     db_session.expire_all()
     generate_business_tasks(db_session, now=datetime.now(timezone.utc))
     db_session.expire_all()
-    cnt = _task_count(
+    total_cnt = _task_count(
         db_session,
         task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
-        source_type="move_out_inspection",
     )
     pending_cnt = _task_count(
         db_session,
         task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
         status=OperationalTaskStatus.PENDING,
     )
-    assert cnt == 1, f"Expected == 1 MOVE_OUT_INSPECTION task, got {cnt}"
-    assert pending_cnt == 1
+    assert total_cnt == 1, f"Expected == 1 MOVE_OUT_INSPECTION task total, got {total_cnt}"
+    assert pending_cnt == 1, f"Expected == 1 PENDING, got {pending_cnt}"
+    task = db_session.query(OperationalTask).filter(
+        OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
+    ).one()
+    assert task.source_type == "lease"
+    assert task.source_id == lease_id
 
 
 def test_e2_forward_path_inspection_confirm_completes_task(
-    client, db_session, owner_a, lease_id, unit_id, tenant_id,
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, monkeypatch,
 ):
+    from app.services.operations import generation, config as ops_config
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner_a[0].id)
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    from datetime import datetime, timezone, timedelta
+    lease = db_session.get(Lease, lease_id)
+    today = datetime.now(timezone.utc).date()
+    target_end = today + timedelta(days=14)
+    if lease.end_date > (today + timedelta(days=30)):
+        lease.end_date = target_end
+        lease.updated_by = owner_a[0].id
+        db_session.flush()
     h = _h(owner_a[1])
     client.post(
         f"{API}/leases/{lease_id}/decline-renewal",
@@ -1089,8 +1146,20 @@ def test_e2_forward_path_inspection_confirm_completes_task(
 
 
 def test_e3_generation_creates_deposit_task_after_inspection_confirmed(
-    client, db_session, owner_a, lease_id, unit_id, tenant_id,
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, monkeypatch,
 ):
+    from app.services.operations import generation, config as ops_config
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner_a[0].id)
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    from datetime import datetime, timezone, timedelta
+    lease = db_session.get(Lease, lease_id)
+    today = datetime.now(timezone.utc).date()
+    target_end = today + timedelta(days=14)
+    if lease.end_date > (today + timedelta(days=30)):
+        lease.end_date = target_end
+        lease.updated_by = owner_a[0].id
+        db_session.flush()
     h = _h(owner_a[1])
     client.post(
         f"{API}/leases/{lease_id}/decline-renewal", json={"reason": "x"}, headers=h,
@@ -1113,8 +1182,20 @@ def test_e3_generation_creates_deposit_task_after_inspection_confirmed(
 
 
 def test_e4_reconcile_marks_deposit_task_completed(
-    client, db_session, owner_a, lease_id, unit_id, tenant_id,
+    client, db_session, owner_a, lease_id, unit_id, tenant_id, monkeypatch,
 ):
+    from app.services.operations import generation, config as ops_config
+    monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner_a[0].id)
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", owner_a[0].id)
+    from datetime import datetime, timezone, timedelta
+    lease = db_session.get(Lease, lease_id)
+    today = datetime.now(timezone.utc).date()
+    target_end = today + timedelta(days=14)
+    if lease.end_date > (today + timedelta(days=30)):
+        lease.end_date = target_end
+        lease.updated_by = owner_a[0].id
+        db_session.flush()
     h = _h(owner_a[1])
     client.post(
         f"{API}/leases/{lease_id}/decline-renewal", json={"reason": "x"}, headers=h,
@@ -1204,6 +1285,14 @@ def test_c11_settlement_create_attempt_override_lease_id_status_422(
         headers=h,
     )
     assert r.status_code == 422, r.text
+    errors = r.json()["detail"]
+    assert isinstance(errors, list)
+    assert len(errors) == 2
+    locs = {tuple(err.get("loc", [])) for err in errors}
+    types = {err.get("type") for err in errors}
+    assert ("body", "lease_id") in locs
+    assert ("body", "status") in locs
+    assert types == {"extra_forbidden"}
 
 
 def test_b13_patch_inspection_lease_unit_tenant_status_rejected_422_then_ignored_via_allowed(
@@ -1229,7 +1318,13 @@ def test_b13_patch_inspection_lease_unit_tenant_status_rejected_422_then_ignored
     )
     assert r.status_code == 422, r.text
     errors = r.json()["detail"]
-    locs = {tuple(err.get("loc", [])) for err in errors if err.get("type") == "extra_forbidden"}
+    assert isinstance(errors, list)
+    assert len(errors) == 4
+    for err in errors:
+        assert "loc" in err
+        assert "type" in err
+        assert err["type"] == "extra_forbidden"
+    locs = {tuple(err["loc"]) for err in errors}
     assert ("body", "lease_id") in locs
     assert ("body", "unit_id") in locs
     assert ("body", "tenant_id") in locs
@@ -1298,7 +1393,7 @@ def test_a8_renewal_overlaps_predecessor_409(
     client, db_session, owner_a, unit_id, tenant_id
 ):
     h = _h(owner_a[1])
-    pred_end = date.today() + timedelta(days=30)
+    pred_end = date.today()
     pred_start = pred_end - timedelta(days=365)
     r = client.post(
         f"{API}/leases",
@@ -1349,10 +1444,14 @@ def test_a9_renewal_invalid_dates_end_before_start_409(
         },
         headers=h,
     )
-    assert r.status_code == 409, r.text
-    detail = r.json()["detail"]
-    assert isinstance(detail, dict)
-    assert detail["reason"] == "renewal_invalid_dates_end_before_start"
+    assert r.status_code == 422, r.text
+    errors = r.json()["detail"]
+    assert isinstance(errors, list)
+    assert len(errors) == 1
+    err0 = errors[0]
+    assert "loc" in err0
+    assert tuple(err0["loc"]) == ("body",)
+    assert err0["type"] == "value_error"
 
 
 def test_c13_cross_org_settlement_create_404(
@@ -1401,7 +1500,13 @@ def test_c14_patch_settlement_forbidden_fields_rejected_422_refund_only_allowed(
     )
     assert r.status_code == 422, r.text
     errors = r.json()["detail"]
-    locs = {tuple(err.get("loc", [])) for err in errors if err.get("type") == "extra_forbidden"}
+    assert isinstance(errors, list)
+    assert len(errors) == 3
+    for err in errors:
+        assert "loc" in err
+        assert "type" in err
+        assert err["type"] == "extra_forbidden"
+    locs = {tuple(err["loc"]) for err in errors}
     assert ("body", "status") in locs
     assert ("body", "lease_id") in locs
     assert ("body", "move_out_inspection_id") in locs
@@ -1458,9 +1563,11 @@ def test_g2_renew_duplicate_returns_same_successor(
     pred = db_session.get(Lease, lease_id)
     pred.end_date = date.today()
     db_session.commit()
+    succ_start = (date.today() + timedelta(days=1)).isoformat()
+    succ_end = (date.today() + timedelta(days=365)).isoformat()
     payload = {
-        "start_date": "2027-01-01",
-        "end_date": "2027-12-31",
+        "start_date": succ_start,
+        "end_date": succ_end,
         "monthly_rent": "12500.00",
         "deposit": "25000.00",
     }
@@ -1539,15 +1646,16 @@ def test_g4_replacement_settlement_updates_lease_fk(
     insp1 = _schedule_and_full_inspection(
         client, db_session, h, lease_id=lease_id,
     )
-    sett1 = _full_settlement(
-        client, db_session, h, inspection_id=insp1["id"],
+    sett1 = _draft_settlement(
+        client, h, lease_id=lease_id, inspection_id=insp1["id"],
     )
     db_session.expire_all()
     lease_before = db_session.get(Lease, lease_id)
     old_deposit_settlement_id = lease_before.deposit_settlement_id
     assert old_deposit_settlement_id is not None
     insp1_row = db_session.get(MoveOutInspection, insp1["id"])
-    client.post(f"{API}/move-out-inspections/{insp1_row.id}/cancel", headers=h)
+    cancel_r = client.post(f"{API}/move-out-inspections/{insp1_row.id}/cancel", headers=h)
+    assert cancel_r.status_code == 200, cancel_r.text
     db_session.expire_all()
     insp1_cancelled = db_session.get(MoveOutInspection, insp1["id"])
     assert insp1_cancelled.status == MoveOutInspectionStatus.CANCELLED
@@ -1726,8 +1834,8 @@ def test_g9_inspection_read_nullable_unit_tenant_fields(
     )
     assert get_r.status_code == 200, get_r.text
     body = get_r.json()
-    assert "unit_id" in body
-    assert "tenant_id" in body
+    assert body["unit_id"] == unit_id
+    assert body["tenant_id"] == tenant_id
 
 
 def test_g10_evidence_soft_deleted_excluded_from_gate(
@@ -1773,11 +1881,9 @@ def test_g11_concurrent_schedule_same_lease_409_no_500(
         "scheduled_at": when,
     }
     r1 = client.post(f"{API}/move-out-inspections", json=payload, headers=h)
-    assert r1.status_code in (200, 201, 409), r1.text
-    assert r1.status_code != 500, r1.text
+    assert r1.status_code == 201, r1.text
     r2 = client.post(f"{API}/move-out-inspections", json=payload, headers=h)
-    assert r2.status_code in (200, 201, 409), r2.text
-    assert r2.status_code != 500, r2.text
+    assert r2.status_code == 409, r2.text
 
 
 def test_g12_confirm_inspection_auto_creates_draft_settlement(
@@ -1894,11 +2000,7 @@ def test_h2_confirm_draft_settle_non_confirmed_insp_409(
     assert confirm.status_code == 409, confirm.text
     detail = confirm.json()["detail"]
     assert detail["reason"] == "deposit_settlement_requires_confirmed_inspection"
-    assert detail["inspection_status"] in (
-        MoveOutInspectionStatus.SCHEDULED.value,
-        MoveOutInspectionStatus.INSPECTED.value,
-        MoveOutInspectionStatus.CANCELLED.value,
-    )
+    assert detail["inspection_status"] == MoveOutInspectionStatus.SCHEDULED.value
 
 
 def test_h3_findings_invalid_422_and_legal_roundtrip(
@@ -1911,6 +2013,13 @@ def test_h3_findings_invalid_422_and_legal_roundtrip(
         "findings": [{"item": "door", "UNEXPECTED_FIELD_BAD": 123}],
     }, headers=h)
     assert r_extra.status_code == 422, r_extra.text
+    errors_extra = r_extra.json()["detail"]
+    assert isinstance(errors_extra, list)
+    assert len(errors_extra) == 1
+    err_extra_0 = errors_extra[0]
+    assert "loc" in err_extra_0
+    assert "type" in err_extra_0
+    assert err_extra_0["type"] == "extra_forbidden"
 
     r_neg = client.post(f"{API}/move-out-inspections", json={
         "lease_id": lease_id,
@@ -1918,6 +2027,13 @@ def test_h3_findings_invalid_422_and_legal_roundtrip(
         "findings": [{"item": "floor", "cost": "-12.50"}],
     }, headers=h)
     assert r_neg.status_code == 422, r_neg.text
+    errors_neg = r_neg.json()["detail"]
+    assert isinstance(errors_neg, list)
+    assert len(errors_neg) == 1
+    err_neg_0 = errors_neg[0]
+    assert "loc" in err_neg_0
+    assert "type" in err_neg_0
+    assert err_neg_0["type"] == "greater_than_equal"
 
     r_wrong_type = client.post(f"{API}/move-out-inspections", json={
         "lease_id": lease_id,
@@ -1925,6 +2041,15 @@ def test_h3_findings_invalid_422_and_legal_roundtrip(
         "findings": [{"item": 777, "cost": "not a number"}],
     }, headers=h)
     assert r_wrong_type.status_code == 422, r_wrong_type.text
+    errors_wrong = r_wrong_type.json()["detail"]
+    assert isinstance(errors_wrong, list)
+    assert len(errors_wrong) == 2
+    for e in errors_wrong:
+        assert "loc" in e
+        assert "type" in e
+    wrong_types = {e["type"] for e in errors_wrong}
+    assert "string_type" in wrong_types
+    assert "decimal_parsing" in wrong_types
 
     findings_legal = [
         {"item": "wall scratch", "description": "chipped", "severity": "low", "cost": None},
@@ -2063,9 +2188,6 @@ def test_h5_not_renewed_malformed_tolerant_batch_no_exception(
         )
         db_session.add(clone)
     db_session.flush()
-    for o in db_session.new:
-        if isinstance(o, Lease) and o.monthly_rent >= Decimal("1000") and o.monthly_rent < Decimal("2000") and not created_ids:
-            continue
     db_session.commit()
     # retrieve created_ids after commit (for filter later — batch unique constraint may collide so skip filter anyway)
     clone_rows = (
