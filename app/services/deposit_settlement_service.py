@@ -246,7 +246,7 @@ def _write_financial_rows_for_settlement(
     deductions = list(settlement.deductions or [])
     if not deductions and Decimal(str(settlement.total_deductions)) > Decimal("0"):
         deductions = [{"description": f"押金扣款汇总 #{settlement.id}", "amount": str(settlement.total_deductions)}]
-    processed_income_ids: list[int] = []
+    processed_income_ids: dict[int, int] = {}
     for i, item in enumerate(deductions):
         amount = Decimal(str(item.get("amount", 0)))
         if amount <= Decimal("0"):
@@ -254,7 +254,7 @@ def _write_financial_rows_for_settlement(
         ikey = f"deposit_settlement:{settlement.id}:deduction:{i}"
         existing = db.query(Income).filter(Income.idempotency_key == ikey).first()
         if existing is not None:
-            processed_income_ids.append(existing.id)
+            processed_income_ids[i] = existing.id
             continue
         desc = item.get("description") or f"押金扣款 - Settlement #{settlement.id}"
         income = Income(
@@ -270,11 +270,11 @@ def _write_financial_rows_for_settlement(
         income.created_by = confirmed_by
         income.updated_by = confirmed_by
         try:
-            db.begin_nested()
+            tx = db.begin_nested()
             db.add(income)
             db.flush()
-            db.commit()
-            processed_income_ids.append(income.id)
+            tx.commit()
+            processed_income_ids[i] = income.id
             record_audit(
                 db,
                 table_name="incomes",
@@ -284,16 +284,16 @@ def _write_financial_rows_for_settlement(
                 new_value=serialize_row(income),
             )
         except IntegrityError:
-            db.rollback()
+            tx.rollback()
             existing_row = db.query(Income).filter(Income.idempotency_key == ikey).first()
             if existing_row is not None:
-                processed_income_ids.append(existing_row.id)
+                processed_income_ids[i] = existing_row.id
 
     if processed_income_ids and deductions:
         updated = []
         for j, item in enumerate(deductions):
             d = dict(item)
-            if j < len(processed_income_ids) and not d.get("income_id"):
+            if j in processed_income_ids and not d.get("income_id"):
                 d["income_id"] = processed_income_ids[j]
             updated.append(d)
         settlement.deductions = updated
@@ -322,10 +322,10 @@ def _write_financial_rows_for_settlement(
             if exp.property_id == 0:
                 exp.property_id = property_id or exp.property_id
             try:
-                db.begin_nested()
+                tx = db.begin_nested()
                 db.add(exp)
                 db.flush()
-                db.commit()
+                tx.commit()
                 record_audit(
                     db,
                     table_name="expenses",
@@ -335,7 +335,7 @@ def _write_financial_rows_for_settlement(
                     new_value=serialize_row(exp),
                 )
             except IntegrityError:
-                db.rollback()
+                tx.rollback()
 
 
 def _close_projection_tasks_for_settlement(

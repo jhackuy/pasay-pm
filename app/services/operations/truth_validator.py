@@ -291,7 +291,7 @@ def _move_out_inspection_ok(db: Session, task: OperationalTask) -> TruthValidati
         if eids:
             evidence_rows = (
                 db.query(Evidence)
-                .filter(Evidence.id.in_(eids))
+                .filter(Evidence.id.in_(eids), Evidence.deleted_at.is_(None))
                 .all()
             )
             has_evidence = any(

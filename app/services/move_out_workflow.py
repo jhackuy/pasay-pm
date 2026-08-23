@@ -267,6 +267,20 @@ def cancel_inspection(
 ) -> MoveOutInspection:
     target = MoveOutInspectionStatus.CANCELLED
     validate_inspection_transition(inspection.status, target)
+    if inspection.status == MoveOutInspectionStatus.CONFIRMED:
+        from app.models.lease import Lease
+        lease = db.get(Lease, inspection.lease_id)
+        if lease is not None and lease.moved_out_settled_at is not None:
+            from fastapi import HTTPException
+            from starlette import status
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_immutable_lease_settled",
+                    "inspection_id": inspection.id,
+                    "lease_id": lease.id,
+                },
+            )
     old = serialize_row(inspection)
     inspection.status = target
     inspection.cancelled_at = cancelled_at

@@ -199,7 +199,7 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
 
     if task.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT:
         if task.source_id is None:
-            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_task_orphan_source_id_none_fail_closed")
+            return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "deposit_settlement_task_orphan_source_id_none_fail_closed")
         if task.source_type == "deposit_settlement":
             settlement = db.get(DepositSettlement, task.source_id)
             if settlement is None:

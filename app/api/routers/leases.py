@@ -193,9 +193,10 @@ def update_lease(
 
     unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
     new_status = updates.get("status", obj.status)
+    status_changed = new_status != obj.status
 
     was_terminal = obj.status in (LeaseStatus.terminated, LeaseStatus.expired)
-    no_transition = new_status == obj.status
+    no_transition = not status_changed
     if was_terminal and no_transition:
         old = serialize_row(obj)
         changed = field_changes(obj, updates)
@@ -217,7 +218,7 @@ def update_lease(
         db.refresh(obj)
         return obj
 
-    if new_status != obj.status and new_status in (LeaseStatus.terminated, LeaseStatus.expired):
+    if status_changed and new_status in (LeaseStatus.terminated, LeaseStatus.expired):
         ok, expected, actual = validate_lease_closeable(db, obj, expected_target_status=new_status)
         if not ok:
             raise HTTPException(
@@ -231,6 +232,28 @@ def update_lease(
                     "hint": "Run move-out inspection + deposit settlement pipeline first; inspection evidence gate and settlement conservation must both pass.",
                 },
             )
+    eff_start = updates.get("start_date", obj.start_date)
+    eff_end = updates.get("end_date", obj.end_date)
+    acc_start = updates.get("accounting_start_date", obj.accounting_start_date)
+    if eff_end < eff_start:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_end_before_start",
+                "start_date": eff_start.isoformat(),
+                "end_date": eff_end.isoformat(),
+            },
+        )
+    if acc_start is not None and acc_start < eff_start:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_accounting_before_effective_start",
+                "effective_start_date": eff_start.isoformat(),
+                "accounting_start_date": acc_start.isoformat(),
+            },
+        )
+
     if new_status == LeaseStatus.active:
         conflicting = (
             db.query(Lease)
@@ -251,7 +274,7 @@ def update_lease(
         setattr(obj, field, value)
     obj.updated_by = user.id
     db.flush()
-    if new_status != obj.status:
+    if status_changed:
         pass
     if unit is not None:
         if new_status == LeaseStatus.active:
@@ -259,7 +282,7 @@ def update_lease(
             unit.updated_by = user.id
         else:
             _sync_unit_status(db, unit)
-    if new_status in (LeaseStatus.terminated, LeaseStatus.expired):
+    if status_changed and new_status in (LeaseStatus.terminated, LeaseStatus.expired):
         apply_settled_lease_final_state(db, obj, actor_id=user.id, now=datetime.now(timezone.utc))
     record_audit(
         db,
@@ -347,6 +370,23 @@ def renew_lease(
         successor = db.query(Lease).filter(Lease.id == successor_id, Lease.deleted_at.is_(None)).first()
         if successor is not None:
             return successor
+    if obj.status != LeaseStatus.active:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "renewal_requires_active_lease",
+                "lease_id": obj.id,
+                "current_status": obj.status.value,
+            },
+        )
+    if existing_meta.get("not_renewed"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_renewal_already_declined",
+                "lease_id": obj.id,
+            },
+        )
 
     if payload.start_date > payload.end_date:
         raise HTTPException(
@@ -498,13 +538,23 @@ def renew_lease(
             changed_fields={"status": ["PENDING", "COMPLETED"], "reason": "lease_renewed_successor_created"},
             old_value=old_row, new_value=serialize_row(t),
         )
+    if obj.status == LeaseStatus.active:
+        obj.status = LeaseStatus.expired
+        obj.updated_by = user.id
+        old_unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
+        if old_unit is not None:
+            _sync_unit_status(db, old_unit)
+
     db.flush()
     db.refresh(obj)
     successor_id_in_meta = (obj.renewal_metadata or {}).get("renewed_lease_id")
     if successor_id_in_meta and successor_id_in_meta != successor.id:
         db.rollback()
-        winner = db.get(Lease, successor_id_in_meta)
-        db.refresh(winner)
+        winner = db.query(Lease).filter(Lease.id == successor_id_in_meta, Lease.deleted_at.is_(None)).first()
+        if winner is not None:
+            db.refresh(winner)
+            return winner
+        winner = db.query(Lease).filter(Lease.id == successor_id_in_meta).first()
         return winner
     db.commit()
     db.refresh(successor)

@@ -997,23 +997,21 @@ def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
             notifications += 1 if enqueued else 0
 
     # --- DEPOSIT_SETTLEMENT --------------------------------------------------------
-    confirmed_inspections = (
-        db.query(MoveOutInspection)
+    pending_settlements = (
+        db.query(DepositSettlement, MoveOutInspection)
+        .join(
+            MoveOutInspection,
+            MoveOutInspection.id == DepositSettlement.move_out_inspection_id,
+        )
         .filter(
             MoveOutInspection.status == MoveOutInspectionStatus.CONFIRMED,
+            DepositSettlement.status.notin_(
+                [DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED]
+            ),
         )
         .all()
     )
-    for insp in confirmed_inspections:
-        existing_settlement = (
-            db.query(DepositSettlement)
-            .filter(DepositSettlement.move_out_inspection_id == insp.id)
-            .first()
-        )
-        if existing_settlement is None:
-            continue
-        if existing_settlement.status in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
-            continue
+    for existing_settlement, insp in pending_settlements:
         lease = db.get(Lease, insp.lease_id)
         unit = units.get(lease.unit_id) if lease else None
         task, enqueued, is_new = _register_task(
