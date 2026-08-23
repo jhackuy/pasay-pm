@@ -266,11 +266,18 @@ def update_lease(
     obj.updated_by = user.id
     db.flush()
     if unit is not None:
-        if new_status == LeaseStatus.active:
-            unit.status = UnitStatus.occupied
-            unit.updated_by = user.id
-        else:
-            _sync_unit_status(db, unit)
+        # --- S5·3: lock Unit row, populate existing, compare enum values; actual diff -> write; else silent ---
+        locked_unit = db.query(Unit).filter(Unit.id == unit.id).with_for_update().populate_existing().first()
+        if locked_unit is not None:
+            if new_status == LeaseStatus.active:
+                desired = UnitStatus.occupied
+                if getattr(locked_unit.status, "value", locked_unit.status) != getattr(desired, "value", desired):
+                    locked_unit.status = desired
+                    locked_unit.updated_by = user.id
+            else:
+                old_s, new_s = _sync_unit_status(db, locked_unit)
+                if getattr(old_s, "value", old_s) != getattr(new_s, "value", new_s):
+                    locked_unit.updated_by = user.id
     if status_changed and new_status in (LeaseStatus.terminated, LeaseStatus.expired):
         apply_settled_lease_final_state(db, obj, actor_id=user.id, now=datetime.now(timezone.utc))
     record_audit(
@@ -303,7 +310,7 @@ def delete_lease(
         raise scope_exception_to_http(exc) from exc
 
     # --- B2: Re-lock after scoped_get ---
-    obj = db.query(Lease).filter(Lease.id == obj.id).with_for_update().first()
+    obj = db.query(Lease).filter(Lease.id == obj.id).with_for_update().populate_existing().first()
     if obj is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
 
@@ -370,9 +377,11 @@ def delete_lease(
         obj.updated_by = user.id
         if obj.moved_out_settled_at is None:
             apply_settled_lease_final_state(db, obj, actor_id=user.id, now=datetime.now(timezone.utc))
-        unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
+        unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).with_for_update().populate_existing().first()
         if unit is not None:
-            _sync_unit_status(db, unit)
+            old_s, new_s = _sync_unit_status(db, unit)
+            if getattr(old_s, "value", old_s) != getattr(new_s, "value", new_s):
+                unit.updated_by = user.id
         record_audit(
             db,
             table_name="leases",
@@ -385,7 +394,7 @@ def delete_lease(
         return MessageResponse(detail="Lease deleted")
 
 
-@router.post("/{lease_id}/renew", response_model=LeaseRead)
+@router.post("/{lease_id}/renew", response_model=LeaseRead, status_code=200)
 def renew_lease(
     lease_id: int,
     payload: LeaseRenewalRequest,
@@ -406,6 +415,7 @@ def renew_lease(
         db.query(Lease)
         .filter(Lease.id == obj.id)
         .with_for_update()
+        .populate_existing()
         .first()
     )
     if locked_predecessor is None:
@@ -445,25 +455,25 @@ def renew_lease(
             db.query(Unit)
             .filter(Unit.id == obj.unit_id)
             .with_for_update()
+            .populate_existing()
             .first()
         )
-    # --- Check renewed_lease_id AFTER acquiring lock (JSONB fallback) ---
+    # --- M6: JSONB fallback strictness ---
+    # Canonical superseded_by_lease_id is AUTHORITATIVE. renewal_metadata is
+    # a COMPATIBILITY MIRROR only. If metadata has renewed_lease_id but
+    # canonical link is NULL, this is a truth mismatch → precise 409.
     existing_meta = obj.renewal_metadata or {}
-    if existing_meta.get("renewed_lease_id"):
-        successor_id = existing_meta["renewed_lease_id"]
-        successor = db.get(Lease, successor_id)
-        if successor is not None and successor.deleted_at is None:
-            return successor
-        if successor is None:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail={
-                    "reason": "renewal_concurrent_successor_unavailable",
-                    "predecessor_lease_id": obj.id,
-                    "renewed_lease_id": successor_id,
-                },
-            )
-        return successor
+    meta_successor_id = existing_meta.get("renewed_lease_id")
+    if meta_successor_id is not None and obj.superseded_by_lease_id is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "renewal_successor_truth_invalid",
+                "predecessor_lease_id": obj.id,
+                "hint": "renewal_metadata has renewed_lease_id but canonical superseded_by_lease_id is NULL; manual repair required (truth-mismatch).",
+            },
+        )
+    # If canonical is present but metadata does not, that's fine (canonical wins; already handled above).
 
     # --- #13 Capture old_obj audit row IMMEDIATELY after locks, BEFORE any mutation ---
     old_obj = serialize_row(obj)
@@ -575,7 +585,7 @@ def renew_lease(
     if s_tenant is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found")
 
-    obj = db.query(Lease).filter(Lease.id == obj.id).with_for_update().one()
+    obj = db.query(Lease).filter(Lease.id == obj.id).with_for_update().populate_existing().one()
 
     # Guard: unit occupied conflicting (other active lease)
     conflicting_active = (
@@ -587,6 +597,7 @@ def renew_lease(
             Lease.deleted_at.is_(None),
         )
         .with_for_update()
+        .populate_existing()
         .first()
     )
     if conflicting_active is not None:
@@ -664,9 +675,11 @@ def renew_lease(
         obj.status = LeaseStatus.expired
         obj.updated_by = user.id
         predecessor_was_updated = True
-        old_unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
+        old_unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).with_for_update().populate_existing().first()
         if old_unit is not None:
-            _sync_unit_status(db, old_unit)
+            old_s, new_s = _sync_unit_status(db, old_unit)
+            if getattr(old_s, "value", old_s) != getattr(new_s, "value", new_s):
+                old_unit.updated_by = user.id
     # --- Write predecessor audit LAST — AFTER ALL predecessor mutations done (status=expired + canonical + JSONB) ---
     if predecessor_was_updated or obj.superseded_by_lease_id is not None:
         record_audit(

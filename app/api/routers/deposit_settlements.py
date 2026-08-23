@@ -82,6 +82,7 @@ def create_settlement(
         db.query(MoveOutInspection)
         .filter(MoveOutInspection.id == insp.id)
         .with_for_update(key_share=True)
+        .populate_existing()
         .first()
     )
 
@@ -206,6 +207,7 @@ def confirm_post(
         db.query(DepositSettlement)
         .filter(DepositSettlement.id == obj.id)
         .with_for_update()
+        .populate_existing()
         .first()
     )
     if locked is not None and getattr(locked, "move_out_inspection_id", None):
@@ -213,6 +215,7 @@ def confirm_post(
             db.query(MoveOutInspection)
             .filter(MoveOutInspection.id == locked.move_out_inspection_id)
             .with_for_update(key_share=True)
+            .populate_existing()
             .first()
         )
         if insp is not None and insp.status != MoveOutInspectionStatus.CONFIRMED:
