@@ -15,12 +15,18 @@ class DeductionItem(BaseModel):
     income_id: int | None = None
 
 
+class DeductionItemCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    description: str
+    amount: Decimal = money_field(ge=0)
+
+
 class DepositSettlementBase(BaseModel):
     model_config = ConfigDict(extra="forbid")
     deposit_received: Decimal = money_field(ge=0)
     total_deductions: Decimal = money_field(ge=0, default=Decimal("0.00"))
     refund_amount: Decimal = money_field(ge=0, default=Decimal("0.00"))
-    deductions: list[DeductionItem] | None = None
+    deductions: list[DeductionItemCreate] | None = None
     notes: str | None = None
 
 
@@ -34,7 +40,7 @@ class DepositSettlementUpdate(BaseModel):
     deposit_received: Decimal | None = money_field(ge=0, default=None)
     total_deductions: Decimal | None = money_field(ge=0, default=None)
     refund_amount: Decimal | None = money_field(ge=0, default=None)
-    deductions: list[DeductionItem] | None = None
+    deductions: list[DeductionItemCreate] | None = None
     notes: str | None = None
 
 
@@ -49,5 +55,6 @@ class DepositSettlementRead(DepositSettlementBase, AuditFields):
     lease_id: int
     move_out_inspection_id: int
     status: DepositSettlementStatus
+    deductions: list[DeductionItem] | None = None
     confirmed_at: datetime | None = None
     confirmed_by: int | None = None

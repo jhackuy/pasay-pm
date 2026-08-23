@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -44,5 +44,6 @@ class MoveOutInspection(AuditMixin, Base):
     )
     findings: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     evidence_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     confirmed_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     cancelled_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

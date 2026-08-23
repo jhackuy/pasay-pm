@@ -47,7 +47,8 @@ class MoveOutInspectionRead(MoveOutInspectionBase, AuditFields):
     model_config = ConfigDict(extra="allow")
     id: int
     lease_id: int
-    unit_id: int
-    tenant_id: int
+    unit_id: int | None
+    tenant_id: int | None
     status: MoveOutInspectionStatus
     confirmed_at: datetime | None = None
+    notes: str | None = None
