@@ -93,43 +93,8 @@ def create_inspection(
             },
         )
 
-    if payload.evidence_ids:
-        evidence_rows = (
-            db.query(Evidence)
-            .filter(Evidence.id.in_(payload.evidence_ids), Evidence.deleted_at.is_(None))
-            .all()
-        )
-        found_ids = {e.id for e in evidence_rows}
-        missing_ids = [eid for eid in payload.evidence_ids if eid not in found_ids]
-        if missing_ids:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail={
-                    "reason": "move_out_inspection_evidence_not_found",
-                    "missing_evidence_ids": missing_ids,
-                },
-            )
-        for ev in evidence_rows:
-            if ev.unit_id != lease.unit_id:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    detail={
-                        "reason": "move_out_inspection_evidence_mismatched_org_or_unit",
-                        "evidence_id": ev.id,
-                        "expected_unit_id": lease.unit_id,
-                        "actual_unit_id": ev.unit_id,
-                    },
-                )
-            if ev.property_id is not None:
-                ev_org_id = property_org_id(db, ev.property_id)
-                if ev_org_id != membership.organization_id:
-                    raise HTTPException(
-                        status.HTTP_409_CONFLICT,
-                        detail={
-                            "reason": "move_out_inspection_evidence_mismatched_org_or_unit",
-                            "evidence_id": ev.id,
-                        },
-                    )
+    if payload.evidence_ids is not None:
+        validate_evidence_ids(db, payload.evidence_ids, lease, membership)
 
     obj = schedule_inspection(
         db,
@@ -185,6 +150,16 @@ def patch_inspection(
     if not updates:
         return obj
 
+    if obj.status in (MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "inspection_not_editable",
+                "status": obj.status.value,
+                "hint": "CONFIRMED / CANCELLED inspections are immutable",
+            },
+        )
+
     if "evidence_ids" in updates and updates["evidence_ids"] is not None:
         from app.models.lease import Lease
         lease = db.get(Lease, obj.lease_id)
@@ -198,31 +173,21 @@ def patch_inspection(
             )
         validate_evidence_ids(db, updates["evidence_ids"], lease, _membership)
 
-    if obj.status not in (MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED):
-        from app.services.audit import field_changes, record_audit
-        old = serialize_row(obj)
-        changed = field_changes(obj, updates)
-        for f, v in updates.items():
-            if hasattr(obj, f):
-                setattr(obj, f, v)
-        obj.updated_by = user.id
-        db.flush()
-        record_audit(
-            db, table_name="move_out_inspections", record_id=obj.id, action="update",
-            actor_id=user.id, changed_fields=changed, old_value=old, new_value=serialize_row(obj),
-        )
-        db.commit()
-        db.refresh(obj)
-        return obj
-
-    raise HTTPException(
-        status.HTTP_409_CONFLICT,
-        detail={
-            "reason": "inspection_not_editable",
-            "status": obj.status.value,
-            "hint": "CONFIRMED / CANCELLED inspections are immutable",
-        },
+    from app.services.audit import field_changes, record_audit
+    old = serialize_row(obj)
+    changed = field_changes(obj, updates)
+    for f, v in updates.items():
+        if hasattr(obj, f):
+            setattr(obj, f, v)
+    obj.updated_by = user.id
+    db.flush()
+    record_audit(
+        db, table_name="move_out_inspections", record_id=obj.id, action="update",
+        actor_id=user.id, changed_fields=changed, old_value=old, new_value=serialize_row(obj),
     )
+    db.commit()
+    db.refresh(obj)
+    return obj
 
 
 @router.post("/{inspection_id}/inspect", response_model=MoveOutInspectionRead)

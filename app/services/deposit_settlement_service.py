@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
 from app.models.lease import Lease
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
 from app.services.audit import record_audit, serialize_row
 
@@ -128,6 +129,30 @@ def confirm_settlement(
         return settlement
     target = DepositSettlementStatus.CONFIRMED
     validate_settlement_transition(settlement.status, target)
+    insp = None
+    if getattr(settlement, "move_out_inspection_id", None):
+        insp = db.get(MoveOutInspection, settlement.move_out_inspection_id)
+        if insp is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "deposit_settlement_inspection_missing",
+                    "settlement_id": settlement.id,
+                    "move_out_inspection_id": settlement.move_out_inspection_id,
+                },
+            )
+        if insp.status != MoveOutInspectionStatus.CONFIRMED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "deposit_settlement_requires_confirmed_inspection",
+                    "settlement_id": settlement.id,
+                    "move_out_inspection_id": settlement.move_out_inspection_id,
+                    "inspection_status": insp.status.value,
+                    "expected": MoveOutInspectionStatus.CONFIRMED.value,
+                    "hint": f"POST /move-out-inspections/{insp.id}/confirm first before confirming this deposit settlement.",
+                },
+            )
     deductions = settlement.deductions or []
     if deductions:
         try:

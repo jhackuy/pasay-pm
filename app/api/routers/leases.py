@@ -195,6 +195,28 @@ def update_lease(
     new_status = updates.get("status", obj.status)
     status_changed = new_status != obj.status
 
+    eff_start = updates.get("start_date", obj.start_date)
+    eff_end = updates.get("end_date", obj.end_date)
+    acc_start = updates.get("accounting_start_date", obj.accounting_start_date)
+    if eff_end < eff_start:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_end_before_start",
+                "start_date": eff_start.isoformat(),
+                "end_date": eff_end.isoformat(),
+            },
+        )
+    if acc_start is not None and acc_start < eff_start:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "lease_accounting_before_effective_start",
+                "effective_start_date": eff_start.isoformat(),
+                "accounting_start_date": acc_start.isoformat(),
+            },
+        )
+
     was_terminal = obj.status in (LeaseStatus.terminated, LeaseStatus.expired)
     no_transition = not status_changed
     if was_terminal and no_transition:
@@ -232,28 +254,6 @@ def update_lease(
                     "hint": "Run move-out inspection + deposit settlement pipeline first; inspection evidence gate and settlement conservation must both pass.",
                 },
             )
-    eff_start = updates.get("start_date", obj.start_date)
-    eff_end = updates.get("end_date", obj.end_date)
-    acc_start = updates.get("accounting_start_date", obj.accounting_start_date)
-    if eff_end < eff_start:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "reason": "lease_end_before_start",
-                "start_date": eff_start.isoformat(),
-                "end_date": eff_end.isoformat(),
-            },
-        )
-    if acc_start is not None and acc_start < eff_start:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "reason": "lease_accounting_before_effective_start",
-                "effective_start_date": eff_start.isoformat(),
-                "accounting_start_date": acc_start.isoformat(),
-            },
-        )
-
     if new_status == LeaseStatus.active:
         conflicting = (
             db.query(Lease)
