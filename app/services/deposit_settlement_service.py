@@ -324,14 +324,16 @@ def _write_financial_rows_for_settlement(
         income.updated_by = confirmed_by
         income_created_ok = False
         created_or_existing_id: int | None = None
+        tx = db.begin_nested()
         try:
-            with db.begin_nested():
-                db.add(income)
-                db.flush()
-                processed_income_ids[i] = income.id
-                created_or_existing_id = income.id
-                income_created_ok = True
+            db.add(income)
+            db.flush()
+            processed_income_ids[i] = income.id
+            created_or_existing_id = income.id
+            income_created_ok = True
+            tx.commit()
         except IntegrityError:
+            tx.rollback()
             existing_row = db.query(Income).filter(Income.idempotency_key == ikey).first()
             if existing_row is not None:
                 processed_income_ids[i] = existing_row.id
@@ -381,13 +383,15 @@ def _write_financial_rows_for_settlement(
             exp.updated_by = confirmed_by
             refund_created_ok = False
             created_exp_id: int | None = None
+            tx = db.begin_nested()
             try:
-                with db.begin_nested():
-                    db.add(exp)
-                    db.flush()
-                    refund_created_ok = True
-                    created_exp_id = exp.id
+                db.add(exp)
+                db.flush()
+                refund_created_ok = True
+                created_exp_id = exp.id
+                tx.commit()
             except IntegrityError:
+                tx.rollback()
                 existing_row = db.query(Expense).filter(Expense.idempotency_key == ekey).first()
                 if existing_row is not None:
                     refund_created_ok = True

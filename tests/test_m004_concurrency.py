@@ -73,21 +73,18 @@ class _DebugExceptionMiddleware(BaseHTTPMiddleware):
                 },
             )
 
-if not any(isinstance(m.cls, _DebugExceptionMiddleware.__class__) if hasattr(m, "cls") else False for m in getattr(app, "user_middleware", [])):
+if not any(getattr(m, "cls", None) is _DebugExceptionMiddleware for m in getattr(app, "user_middleware", [])):
     app.add_middleware(_DebugExceptionMiddleware)
 
 _tls = threading.local()
 
-_dep_registered = False
 _dep_lock = threading.Lock()
 _global_engine_ref = None
 
 
 def _register_tls_override():
-    global _dep_registered, _global_engine_ref
+    global _global_engine_ref
     with _dep_lock:
-        if _dep_registered:
-            return
         def _fresh_per_request_db():
             if _global_engine_ref is None:
                 raise RuntimeError("Engine not ready for per-request session factory")
@@ -101,7 +98,6 @@ def _register_tls_override():
                 except Exception:
                     pass
         app.dependency_overrides[get_db] = _fresh_per_request_db
-        _dep_registered = True
 
 
 def _set_engine_ref(engine):
@@ -169,10 +165,14 @@ def concurrency_db(concurrency_engine):
 def c_client(concurrency_db):
     def override_get_db():
         yield concurrency_db
+    prev = app.dependency_overrides.get(get_db)
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as c:
         yield c
-    app.dependency_overrides.clear()
+    if prev is None:
+        app.dependency_overrides.pop(get_db, None)
+    else:
+        app.dependency_overrides[get_db] = prev
 
 
 def _make_user(db, username, role, active=True):

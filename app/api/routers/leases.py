@@ -142,21 +142,6 @@ def update_lease(
             target_status = target_status_raw
     enforce_lease_terminal_immutable(db, obj, target_status=target_status)
 
-    if {"accounting_start_date", "start_date", "end_date"} & updates.keys():
-        effective_start = updates.get("start_date", obj.start_date)
-        effective_end = updates.get("end_date", obj.end_date)
-        effective_accounting_start = updates.get(
-            "accounting_start_date", obj.accounting_start_date
-        )
-        if effective_accounting_start is not None and (
-            effective_accounting_start < effective_start
-            or effective_accounting_start > effective_end
-        ):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "accounting_start_date must be within [start_date, end_date]",
-            )
-
     try:
         if updates.get("unit_id") is not None and updates["unit_id"] != obj.unit_id:
             new_unit_org = unit_org_id(db, updates["unit_id"])
@@ -187,6 +172,14 @@ def update_lease(
     eff_start = updates.get("start_date", obj.start_date)
     eff_end = updates.get("end_date", obj.end_date)
     acc_start = updates.get("accounting_start_date", obj.accounting_start_date)
+    if acc_start is not None and (
+        acc_start < eff_start
+        or acc_start > eff_end
+    ):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "accounting_start_date must be within [start_date, end_date]",
+        )
     if eff_end < eff_start:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -438,13 +431,14 @@ def renew_lease(
             },
         )
     pred_end_plus_1 = obj.end_date + timedelta(days=1)
-    if payload.start_date < obj.end_date:
+    if payload.start_date < pred_end_plus_1:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
                 "reason": "renewal_overlaps_predecessor",
                 "predecessor_end_date": obj.end_date.isoformat(),
                 "successor_start_date": payload.start_date.isoformat(),
+                "expected_start_date": pred_end_plus_1.isoformat(),
             },
         )
     if payload.start_date > pred_end_plus_1:
@@ -591,6 +585,15 @@ def renew_lease(
             db.refresh(winner)
             return winner
         winner = db.query(Lease).filter(Lease.id == successor_id_in_meta).first()
+        if winner is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "renewal_concurrent_successor_unavailable",
+                    "lease_id": obj.id,
+                    "renewed_lease_id": successor_id_in_meta,
+                },
+            )
         return winner
     db.commit()
     db.refresh(successor)

@@ -134,8 +134,15 @@ def _full_settlement(client, db, headers, *, inspection_id,
         g = client.get(f"{API}/deposit-settlements/{existing_id}", headers=headers)
         assert g.status_code == 200, g.text
         existing = g.json()
-        if existing.get("status") != DepositSettlementStatus.DRAFT.value:
+        if existing.get("status") == DepositSettlementStatus.DRAFT.value:
+            pass
+        elif existing.get("status") in (
+            DepositSettlementStatus.CONFIRMED.value,
+            DepositSettlementStatus.RECONCILED.value,
+        ):
             return existing
+        else:
+            assert False, f"_full_settlement unexpected existing status={existing.get('status')}"
         patch_payload = {
             "deposit_received": deposit,
             "total_deductions": str(Decimal(deposit) - Decimal(refund)),
@@ -150,7 +157,12 @@ def _full_settlement(client, db, headers, *, inspection_id,
     r2 = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=headers)
     assert r2.status_code == 200, r2.text
     db.expire_all()
-    return r2.json()
+    confirmed = r2.json()
+    assert confirmed.get("status") in (
+        DepositSettlementStatus.CONFIRMED.value,
+        DepositSettlementStatus.RECONCILED.value,
+    ), f"_full_settlement final status={confirmed.get('status')}"
+    return confirmed
 
 
 def _close_lease_pipeline(client, db, headers, *, lease_id):
@@ -285,7 +297,7 @@ def test_a5_decline_after_renew_conflict(
     db_session.commit()
     succ_start = (date.today() + timedelta(days=1)).isoformat()
     succ_end = (date.today() + timedelta(days=365)).isoformat()
-    client.post(
+    r_renew = client.post(
         f"{API}/leases/{lease_id}/renew",
         json={
             "start_date": succ_start, "end_date": succ_end,
@@ -293,6 +305,7 @@ def test_a5_decline_after_renew_conflict(
         },
         headers=h,
     )
+    assert r_renew.status_code == 200, r_renew.text
     r = client.post(
         f"{API}/leases/{lease_id}/decline-renewal",
         json={"reason": "too late"},
@@ -359,6 +372,7 @@ def test_a7_auto_expire_idempotent_on_already_inactive(
         },
         headers=h,
     )
+    assert r.status_code == 201, r.text
     lid = r.json()["id"]
     client.post(
         f"{API}/leases/{lid}/decline-renewal", json={"reason": "x"}, headers=h,
@@ -599,18 +613,26 @@ def _draft_settlement(client, headers, *, lease_id, inspection_id,
         g = client.get(f"{API}/deposit-settlements/{existing_id}", headers=headers)
         assert g.status_code == 200, g.text
         existing = g.json()
-        if existing.get("status") != DepositSettlementStatus.DRAFT.value:
-            return existing
-        patch_payload = {
-            "deposit_received": deposit,
-            "total_deductions": total_deduct,
-            "refund_amount": refund,
-            "deductions": deductions,
-        }
-        p = client.patch(f"{API}/deposit-settlements/{existing_id}", json=patch_payload, headers=headers)
-        assert p.status_code == 200, p.text
-        return p.json()
-    raise AssertionError(f"_draft_settlement unexpected status={r.status_code}: {r.text}")
+        if existing.get("status") == DepositSettlementStatus.DRAFT.value:
+            patch_payload = {
+                "deposit_received": deposit,
+                "total_deductions": total_deduct,
+                "refund_amount": refund,
+                "deductions": deductions,
+            }
+            p = client.patch(f"{API}/deposit-settlements/{existing_id}", json=patch_payload, headers=headers)
+            assert p.status_code == 200, p.text
+            result = p.json()
+        else:
+            assert False, f"_draft_settlement unexpected existing status={existing.get('status')}, expected DRAFT"
+    else:
+        raise AssertionError(f"_draft_settlement unexpected status={r.status_code}: {r.text}")
+    if r.status_code == 201:
+        result = r.json()
+    assert result.get("status") == DepositSettlementStatus.DRAFT.value, (
+        f"_draft_settlement final status={result.get('status')}"
+    )
+    return result
 
 
 def test_c1_create_draft_settlement(
@@ -778,7 +800,8 @@ def test_c6_confirm_is_idempotent_no_double_financial_rows(
         client, db_session, h, lease_id=lease_id,
     )
     s = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
-    client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=h)
+    c1 = client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=h)
+    assert c1.status_code == 200, c1.text
     after1_inc = db_session.query(Income).count()
     after1_exp = db_session.query(Expense).count()
     c2 = client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=h)
@@ -1882,8 +1905,13 @@ def test_g11_concurrent_schedule_same_lease_409_no_500(
     }
     r1 = client.post(f"{API}/move-out-inspections", json=payload, headers=h)
     assert r1.status_code == 201, r1.text
+    existing_insp_id = r1.json()["id"]
     r2 = client.post(f"{API}/move-out-inspections", json=payload, headers=h)
     assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["reason"] == "move_out_inspection_already_exists_for_lease"
+    assert detail.get("existing_inspection_id") == existing_insp_id
 
 
 def test_g12_confirm_inspection_auto_creates_draft_settlement(
@@ -1949,9 +1977,9 @@ def test_h1_non_confirmed_insp_create_settlement_409_exact_reason(
     }, headers=h)
     assert r_sched.status_code == 409
     d_sched = r_sched.json()["detail"]
-    assert d_sched["reason"] == "deposit_settlement_create_requires_confirmed_inspection"
-    assert d_sched["move_out_inspection_id"] == scheduled_id
-    assert d_sched["expected"] == MoveOutInspectionStatus.CONFIRMED.value
+    assert d_sched["reason"] == "move_out_inspection_not_confirmed"
+    assert d_sched["inspection_id"] == scheduled_id
+    assert d_sched["current_status"] == MoveOutInspectionStatus.SCHEDULED.value
 
     insp = client.post(f"{API}/move-out-inspections/{scheduled_id}/inspect", json={
         "findings": [{"item": "wall", "severity": "low"}],
@@ -1961,7 +1989,7 @@ def test_h1_non_confirmed_insp_create_settlement_409_exact_reason(
         **payload_base,
     }, headers=h)
     assert r_insp.status_code == 409
-    assert r_insp.json()["detail"]["reason"] == "deposit_settlement_create_requires_confirmed_inspection"
+    assert r_insp.json()["detail"]["reason"] == "move_out_inspection_not_confirmed"
 
     cancel = client.post(f"{API}/move-out-inspections/{scheduled_id}/cancel", headers=h)
     assert cancel.status_code == 200, cancel.text
@@ -1969,7 +1997,7 @@ def test_h1_non_confirmed_insp_create_settlement_409_exact_reason(
         **payload_base,
     }, headers=h)
     assert r_cancel.status_code == 409
-    assert r_cancel.json()["detail"]["reason"] == "deposit_settlement_create_requires_confirmed_inspection"
+    assert r_cancel.json()["detail"]["reason"] == "move_out_inspection_not_confirmed"
 
 
 def test_h2_confirm_draft_settle_non_confirmed_insp_409(
@@ -1999,8 +2027,8 @@ def test_h2_confirm_draft_settle_non_confirmed_insp_409(
     confirm = client.post(f"{API}/deposit-settlements/{draft_id}/confirm", headers=h)
     assert confirm.status_code == 409, confirm.text
     detail = confirm.json()["detail"]
-    assert detail["reason"] == "deposit_settlement_requires_confirmed_inspection"
-    assert detail["inspection_status"] == MoveOutInspectionStatus.SCHEDULED.value
+    assert detail["reason"] == "move_out_inspection_not_confirmed"
+    assert detail["current_status"] == MoveOutInspectionStatus.SCHEDULED.value
 
 
 def test_h3_findings_invalid_422_and_legal_roundtrip(

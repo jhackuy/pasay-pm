@@ -330,6 +330,27 @@ def cancel_inspection(
 ) -> MoveOutInspection:
     target = MoveOutInspectionStatus.CANCELLED
     lease = db.get(Lease, inspection.lease_id)
+    if lease is not None and lease.moved_out_settled_at is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "move_out_inspection_cancel_lease_already_settled",
+                "inspection_id": inspection.id,
+                "lease_id": lease.id,
+            },
+        )
+    if lease is not None and lease.deposit_settlement_id is not None:
+        settl_fk = db.get(DepositSettlement, lease.deposit_settlement_id)
+        if settl_fk is not None and settl_fk.status in {DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED}:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_cancel_settlement_already_confirmed",
+                    "inspection_id": inspection.id,
+                    "settlement_id": settl_fk.id,
+                    "settlement_status": settl_fk.status.value,
+                },
+            )
     if inspection.status == MoveOutInspectionStatus.CONFIRMED and lease is not None:
         if lease.status in {LeaseStatus.expired, LeaseStatus.terminated}:
             raise HTTPException(
@@ -357,15 +378,6 @@ def cancel_inspection(
                     "settlement_status": settl.status.value,
                 },
             )
-    if inspection.status == MoveOutInspectionStatus.CONFIRMED and lease is not None and lease.moved_out_settled_at is not None:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT,
-            detail={
-                "reason": "move_out_inspection_immutable_lease_settled",
-                "inspection_id": inspection.id,
-                "lease_id": lease.id,
-            },
-        )
     validate_inspection_transition(inspection.status, target)
     old = serialize_row(inspection)
     inspection.status = target

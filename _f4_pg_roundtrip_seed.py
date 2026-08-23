@@ -273,7 +273,11 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
     income_row.updated_by = owner_uid
     db.add(income_row)
     db.flush()
-    (settle.deductions or [])[0]["income_id"] = income_row.id
+    deductions = [dict(d) for d in (settle.deductions or [])]
+    if deductions:
+        deductions[0]["income_id"] = income_row.id
+        settle.deductions = deductions
+        db.flush()
 
     ekey = "deposit_settlement:SEED:refund"
     exp = Expense(

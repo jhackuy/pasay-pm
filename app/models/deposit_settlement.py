@@ -19,6 +19,18 @@ class DepositSettlement(AuditMixin, Base):
     __tablename__ = "deposit_settlements"
     __table_args__ = (
         CheckConstraint(
+            "deposit_received >= 0",
+            name="ck_deposit_settlements_deposit_received_non_negative",
+        ),
+        CheckConstraint(
+            "total_deductions >= 0",
+            name="ck_deposit_settlements_total_deductions_non_negative",
+        ),
+        CheckConstraint(
+            "refund_amount >= 0",
+            name="ck_deposit_settlements_refund_amount_non_negative",
+        ),
+        CheckConstraint(
             "status IN ('DRAFT','CONFIRMED','RECONCILED')",
             name="ck_deposit_settlements_status",
         ),

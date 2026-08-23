@@ -145,7 +145,7 @@ def patch_inspection(
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
-                "reason": "inspection_not_editable",
+                "reason": "move_out_inspection_not_editable",
                 "status": obj.status.value,
                 "hint": "CONFIRMED / CANCELLED inspections are immutable",
             },

@@ -89,11 +89,9 @@ def create_settlement(
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
-                "reason": "deposit_settlement_create_requires_confirmed_inspection",
-                "move_out_inspection_id": insp.id,
-                "inspection_status": insp.status.value,
-                "expected": MoveOutInspectionStatus.CONFIRMED.value,
-                "hint": f"POST /move-out-inspections/{insp.id}/confirm first before creating a deposit settlement for this inspection.",
+                "reason": "move_out_inspection_not_confirmed",
+                "inspection_id": insp.id,
+                "current_status": insp.status.value,
             },
         )
 
@@ -203,6 +201,30 @@ def confirm_post(
         )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+
+    locked = (
+        db.query(DepositSettlement)
+        .filter(DepositSettlement.id == obj.id)
+        .with_for_update()
+        .first()
+    )
+    if locked is not None and getattr(locked, "move_out_inspection_id", None):
+        insp = (
+            db.query(MoveOutInspection)
+            .filter(MoveOutInspection.id == locked.move_out_inspection_id)
+            .with_for_update(key_share=True)
+            .first()
+        )
+        if insp is not None and insp.status != MoveOutInspectionStatus.CONFIRMED:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_not_confirmed",
+                    "inspection_id": insp.id,
+                    "current_status": insp.status.value,
+                },
+            )
+
     confirm_settlement(db, obj, confirmed_at=datetime.now(timezone.utc), confirmed_by=user.id)
     db.commit()
     db.refresh(obj)
