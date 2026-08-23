@@ -9,6 +9,7 @@ Implements:
 from __future__ import annotations
 
 from datetime import date, datetime
+import decimal
 from decimal import Decimal
 
 from fastapi import HTTPException, status
@@ -129,6 +130,7 @@ def confirm_settlement(
         db.query(DepositSettlement)
         .filter(DepositSettlement.id == settlement.id)
         .with_for_update()
+        .populate_existing()
         .first()
     )
     if locked is None:
@@ -171,13 +173,13 @@ def confirm_settlement(
     if deductions:
         try:
             deductions_sum = sum(Decimal(str(item["amount"])) for item in deductions)
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, decimal.InvalidOperation):
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail={
-                    "reason": "deposit_settlement_deduction_sum_mismatch",
+                    "reason": "deduction_amount_invalid_jsonb",
                     "settlement_id": locked.id,
-                    "hint": "Each deduction item must have a numeric 'amount' field.",
+                    "hint": "Each deduction item must have a numeric 'amount' field parseable as Decimal.",
                 },
             )
         total_deductions = Decimal(str(locked.total_deductions))

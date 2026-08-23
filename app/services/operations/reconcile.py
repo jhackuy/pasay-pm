@@ -200,10 +200,13 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
             except (ValueError, IndexError):
                 lease_id_from_dedupe = None
         matched_by_dedupe = False
+        lease_for_dedupe: Lease | None = None
         if lease_id_from_dedupe is not None:
             lk = db.get(Lease, lease_id_from_dedupe)
-            if lk is not None and lk.deleted_at is None:
+            # --- M8: dedupe match requires lease EXISTS + NOT deleted + status == active ONLY ---
+            if lk is not None and lk.deleted_at is None and lk.status == LeaseStatus.active:
                 matched_by_dedupe = True
+                lease_for_dedupe = lk
             ik = (
                 db.query(MoveOutInspection)
                 .filter(
@@ -217,6 +220,41 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
             )
             if ik is not None:
                 matched_by_dedupe = True
+        # --- M8: inactive lease + no pending inspection → sourceless task CANCELLED ---
+        # Case 1: matched_by_dedupe has a lease but it's INACTIVE (not active) + no SCHEDULED/INSPECTED inspection
+        if lease_id_from_dedupe is not None and lease_for_dedupe is None:
+            lk_raw = db.get(Lease, lease_id_from_dedupe)
+            lease_inactive = False
+            if lk_raw is None:
+                lease_inactive = True
+            elif lk_raw.deleted_at is not None:
+                lease_inactive = True
+            elif lk_raw.status != LeaseStatus.active:
+                lease_inactive = True
+            pending_insp_exists = (
+                db.query(MoveOutInspection.id)
+                .filter(
+                    MoveOutInspection.lease_id == lease_id_from_dedupe,
+                    MoveOutInspection.status.in_([
+                        MoveOutInspectionStatus.SCHEDULED,
+                        MoveOutInspectionStatus.INSPECTED,
+                    ]),
+                )
+                .first()
+                is not None
+            )
+            is_sourceless_provisional = (
+                task.source_id is None and task.source_type is None
+            ) or (
+                not is_business_orphan_safe and not matched_by_dedupe
+            )
+            if lease_inactive and not pending_insp_exists and is_sourceless_provisional:
+                if task.status != OperationalTaskStatus.CANCELLED:
+                    return _transition(
+                        db, task, OperationalTaskStatus.CANCELLED, now,
+                        "move_out_task_cancelled_inactive_lease_no_pending_inspection",
+                    )
+                return None
         if task.source_id is None and not is_business_orphan_safe and not matched_by_dedupe:
             return _transition(db, task, OperationalTaskStatus.CANCELLED, now, "move_out_inspection_task_orphan_source_id_none_fail_closed")
         if task.source_type == "move_out_inspection" and task.source_id is not None:

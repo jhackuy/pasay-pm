@@ -8,7 +8,7 @@ Implements:
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import HTTPException, status
@@ -208,6 +208,24 @@ def schedule_inspection(
     if lease is not None and lease.move_out_inspection_id is None:
         lease.move_out_inspection_id = obj.id
         lease.updated_by = actor_id
+    # --- S5·1: Rebind existing provisional lease-bound MOVE_OUT_INSPECTION task to source=inspection (1 task, no duplicate notifications) ---
+    from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
+    existing_provisional = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTask.source_type == "lease",
+            OperationalTask.source_id == lease_id,
+            OperationalTask.status == OperationalTaskStatus.PENDING,
+        )
+        .first()
+    )
+    if existing_provisional is not None:
+        existing_provisional.source_type = "move_out_inspection"
+        existing_provisional.source_id = obj.id
+        existing_provisional.updated_at = datetime.now(timezone.utc)
+        existing_provisional.details = dict(existing_provisional.details or {})
+        existing_provisional.details["inspection_id"] = obj.id
     record_audit(
         db,
         table_name="move_out_inspections",
@@ -268,6 +286,7 @@ def confirm_inspection(
         db.query(MoveOutInspection)
         .filter(MoveOutInspection.id == inspection.id)
         .with_for_update()
+        .populate_existing()
         .first()
     )
     if locked is None:
@@ -302,6 +321,9 @@ def confirm_inspection(
     locked.confirmed_at = confirmed_at
     locked.confirmed_by = actor_id
     locked.updated_by = actor_id
+    if lease is not None:
+        lease.move_out_inspection_id = locked.id
+        lease.updated_by = actor_id
     record_audit(
         db,
         table_name="move_out_inspections",
@@ -384,6 +406,9 @@ def cancel_inspection(
     inspection.cancelled_at = cancelled_at
     inspection.cancelled_by = cancelled_by
     inspection.updated_by = cancelled_by
+    if lease is not None and lease.move_out_inspection_id == inspection.id:
+        lease.move_out_inspection_id = None
+        lease.updated_by = cancelled_by
     record_audit(
         db,
         table_name="move_out_inspections",
@@ -526,10 +551,23 @@ def validate_lease_closeable(
     inspection = None
     if lease.move_out_inspection_id is not None:
         inspection = db.get(MoveOutInspection, lease.move_out_inspection_id)
+    # --- M7: stale pointer CANCELLED/SCHEDULED/INSPECTED/MISSING → fallback LATEST *CONFIRMED* inspection, NOT arbitrary latest ---
+    use_fallback_inspection = False
     if inspection is None:
+        use_fallback_inspection = True
+    elif inspection.status in (
+        MoveOutInspectionStatus.CANCELLED,
+        MoveOutInspectionStatus.SCHEDULED,
+        MoveOutInspectionStatus.INSPECTED,
+    ):
+        use_fallback_inspection = True
+    if use_fallback_inspection:
         inspection = (
             db.query(MoveOutInspection)
-            .filter(MoveOutInspection.lease_id == lease.id)
+            .filter(
+                MoveOutInspection.lease_id == lease.id,
+                MoveOutInspection.status == MoveOutInspectionStatus.CONFIRMED,
+            )
             .order_by(MoveOutInspection.id.desc())
             .first()
         )
@@ -550,20 +588,21 @@ def validate_lease_closeable(
             },
         )
     settlement = None
-    if lease.deposit_settlement_id is not None:
-        settlement = db.get(DepositSettlement, lease.deposit_settlement_id)
-    if settlement is None:
-        settlement = (
-            db.query(DepositSettlement)
-            .filter(DepositSettlement.lease_id == lease.id)
-            .order_by(DepositSettlement.id.desc())
-            .first()
+    # --- M7: stale DS pointer must NOT shadow current inspection's Settlement; always look up by inspection.id + CONFIRMED/RECONCILED ---
+    settlement = (
+        db.query(DepositSettlement)
+        .filter(
+            DepositSettlement.move_out_inspection_id == inspection.id,
+            DepositSettlement.status.in_((DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED)),
         )
+        .order_by(DepositSettlement.id.desc())
+        .first()
+    )
     if settlement is None or settlement.status not in (DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED):
         return (
             False,
             "DepositSettlement.status in {CONFIRMED, RECONCILED} (amount conserved within 1c)",
-            f"settlement_id={settlement.id if settlement else None} status={settlement.status.value if settlement else 'MISSING'}",
+            f"settlement_id={settlement.id if settlement else None} status={settlement.status.value if settlement else 'MISSING'} (settlement linked to confirmed inspection.id={inspection.id})",
         )
     if settlement.lease_id != lease.id:
         raise HTTPException(
@@ -613,34 +652,44 @@ def apply_settled_lease_final_state(
     """
     if lease.moved_out_settled_at is not None:
         return  # Idempotent: never double-apply
+    # --- N2: serialize before ANY mutation ---
+    old_lease = serialize_row(lease)
     lease.moved_out_settled_at = now
     lease.updated_by = actor_id
-    # --- Unit status ---
-    unit = db.get(Unit, lease.unit_id)
+    # --- Unit status: lock unit row FOR UPDATE, then compare enum values, audit only on real change ---
+    unit = None
+    if lease.unit_id is not None:
+        unit = (
+            db.query(Unit)
+            .filter(Unit.id == lease.unit_id)
+            .with_for_update()
+            .populate_existing()
+            .first()
+        )
     if unit is not None:
         old_unit = serialize_row(unit)
-        sync_unit_status(db, unit)
+        old_status, new_status = sync_unit_status(db, unit)
         unit.updated_by = actor_id
-        if old_unit.get("status") != unit.status:
+        if getattr(old_status, "value", old_status) != getattr(new_status, "value", new_status):
             record_audit(
                 db,
                 table_name="units",
                 record_id=unit.id,
                 action="update",
                 actor_id=actor_id,
-                changed_fields={"status": [old_unit.get("status"), unit.status]},
+                changed_fields={"status": [getattr(old_status, "value", old_status), getattr(new_status, "value", new_status)]},
                 old_value=old_unit,
                 new_value=serialize_row(unit),
             )
-        evt = UnitLifecycleEvent(
-            unit_id=unit.id,
-            from_status=old_unit.get("status"),
-            to_status=unit.status,
-            reason="move_out_settled",
-            occurred_at=now,
-        )
-        evt.created_by = actor_id
-        db.add(evt)
+            evt = UnitLifecycleEvent(
+                unit_id=unit.id,
+                from_status=getattr(old_status, "value", old_status),
+                to_status=getattr(new_status, "value", new_status),
+                reason="move_out_settled",
+                occurred_at=now,
+            )
+            evt.created_by = actor_id
+            db.add(evt)
     # --- Tenant move-out timestamp (idempotent by lease.tenant_id) ---
     tenant = db.get(Tenant, lease.tenant_id)
     if tenant is not None and tenant.moved_out_at is None:
