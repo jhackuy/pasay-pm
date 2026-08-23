@@ -3,15 +3,7 @@
 Scope: ONLY Lease Renewal SM + Move-out Inspection SM + Deposit Settlement +
 Lease Close Gate + Truth→Task Projection.
 
-Groups (count >= 35 PASS contract):
-  A组 — Renewal state machine (A1-A9: 9 tests)
-  B组 — Move-out Inspection + Evidence gate (B1-B13: 13 tests)
-  C组 — Deposit Settlement + 1c conservation (C1-C14: 14 tests)
-  D组 — Lease Close gate + final state sync (D1-D8: 8 tests)
-  E组 — Truth -> OperationalTask projection (E1-E5: 5 tests)
-  F组 — Anti-bypass tests (F1-F7: 7 tests)
-
-Total: 49 tests. ALL tests use EXACT assertions; no truthy/weak checks.
+（已重新 assertion audit 每状态码/reason/ID 精确，禁止 ≥1 / contains / A or B / !500 弱断言。Section 六 #20 完成）
 """
 from __future__ import annotations
 

@@ -194,6 +194,27 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
     db.add(lease)
     db.flush()
 
+    pred_start = today - timedelta(days=730)
+    pred_end = start_d - timedelta(days=1)
+    lease_pred = Lease(
+        unit_id=unit_active.id,
+        tenant_id=tenant.id,
+        start_date=pred_start,
+        end_date=pred_end,
+        accounting_start_date=pred_start,
+        monthly_rent=Decimal("11000.00"),
+        deposit=Decimal("45000.00"),
+        deposit_received=Decimal("45000.00"),
+        status=LeaseStatus.expired,
+        superseded_by_lease_id=lease.id,
+        superseded_at=datetime.combine(start_d, datetime.min.time(), tzinfo=timezone.utc),
+        renewal_metadata={"renewed_to_lease_id": lease.id, "renewed_at": start_d.isoformat()},
+    )
+    lease_pred.created_by = owner_uid
+    lease_pred.updated_by = owner_uid
+    db.add(lease_pred)
+    db.flush()
+
     insp = MoveOutInspection(
         lease_id=lease.id,
         unit_id=unit_active.id,
@@ -331,12 +352,28 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
     )
     task_settle.created_by = owner_uid
     task_settle.updated_by = owner_uid
-    db.add_all([task_insp, task_settle])
+    task_rent_due_control = OperationalTask(
+        task_type=OperationalTaskType.RENT_DUE,
+        title="RT monthly rent due (M003 control)",
+        property_id=prop.id,
+        tenant_id=tenant.id,
+        lease_id=lease.id,
+        source_type="rent_due",
+        source_id=None,
+        priority=OperationalTaskPriority.medium,
+        status=OperationalTaskStatus.PENDING,
+        due_at=datetime.now(timezone.utc) + timedelta(days=3),
+        dedupe_key=f"lease:{lease.id}:RENT_DUE:control",
+        details={"seed": True, "m003_control": True},
+    )
+    task_rent_due_control.created_by = owner_uid
+    task_rent_due_control.updated_by = owner_uid
+    db.add_all([task_insp, task_settle, task_rent_due_control])
     db.flush()
 
     rr1 = RecurringRule(
-        rule_type=OperationalTaskType.RENT_DUE,
-        title="RT monthly rent rule",
+        rule_type=OperationalTaskType.MOVE_OUT_INSPECTION,
+        title="RT move-out inspection rule (M004)",
         property_id=prop.id,
         recurrence=Recurrence.monthly,
         next_run_at=datetime.now(timezone.utc) + timedelta(days=5),
@@ -345,8 +382,8 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
     rr1.created_by = owner_uid
     rr1.updated_by = owner_uid
     rr2 = RecurringRule(
-        rule_type=OperationalTaskType.AC_MAINTENANCE,
-        title="RT quarterly AC rule",
+        rule_type=OperationalTaskType.DEPOSIT_SETTLEMENT,
+        title="RT deposit settlement rule (M004)",
         property_id=prop.id,
         recurrence=Recurrence.quarterly,
         next_run_at=datetime.now(timezone.utc) + timedelta(days=90),
@@ -354,7 +391,27 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
     )
     rr2.created_by = owner_uid
     rr2.updated_by = owner_uid
-    db.add_all([rr1, rr2])
+    rr3 = RecurringRule(
+        rule_type=OperationalTaskType.RENT_DUE,
+        title="RT monthly rent rule (M003 control)",
+        property_id=prop.id,
+        recurrence=Recurrence.monthly,
+        next_run_at=datetime.now(timezone.utc) + timedelta(days=7),
+        enabled=True,
+    )
+    rr3.created_by = owner_uid
+    rr3.updated_by = owner_uid
+    rr4 = RecurringRule(
+        rule_type=OperationalTaskType.AC_MAINTENANCE,
+        title="RT quarterly AC rule (M003 control)",
+        property_id=prop.id,
+        recurrence=Recurrence.quarterly,
+        next_run_at=datetime.now(timezone.utc) + timedelta(days=120),
+        enabled=True,
+    )
+    rr4.created_by = owner_uid
+    rr4.updated_by = owner_uid
+    db.add_all([rr1, rr2, rr3, rr4])
     db.flush()
 
     for obj, tname in [
@@ -365,6 +422,7 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
         (unit_active, "units"),
         (unit_deleted, "units"),
         (tenant, "tenants"),
+        (lease_pred, "leases"),
         (lease, "leases"),
         (insp, "move_out_inspections"),
         (e1, "evidence"),
@@ -374,8 +432,11 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
         (exp, "expenses"),
         (task_insp, "operational_tasks"),
         (task_settle, "operational_tasks"),
+        (task_rent_due_control, "operational_tasks"),
         (rr1, "recurring_rules"),
         (rr2, "recurring_rules"),
+        (rr3, "recurring_rules"),
+        (rr4, "recurring_rules"),
     ]:
         record_audit(
             db,
@@ -399,6 +460,25 @@ def seed_m004_rows(db: Session) -> tuple[dict, int]:
                 OperationalTaskType.DEPOSIT_SETTLEMENT,
             ])
         ).count(),
+        "leases": db.query(Lease).count(),
+        "legacy_op_tasks": db.query(OperationalTask).filter(
+            OperationalTask.task_type.notin_([
+                OperationalTaskType.MOVE_OUT_INSPECTION,
+                OperationalTaskType.DEPOSIT_SETTLEMENT,
+            ])
+        ).count(),
+        "legacy_rr": db.query(RecurringRule).filter(
+            RecurringRule.rule_type.notin_([
+                OperationalTaskType.MOVE_OUT_INSPECTION,
+                OperationalTaskType.DEPOSIT_SETTLEMENT,
+            ])
+        ).count(),
+        "m004_rr": db.query(RecurringRule).filter(
+            RecurringRule.rule_type.in_([
+                OperationalTaskType.MOVE_OUT_INSPECTION,
+                OperationalTaskType.DEPOSIT_SETTLEMENT,
+            ])
+        ).count(),
     }
     return counts, owner_uid
 
@@ -416,6 +496,19 @@ def probe_after_seed(db: Session) -> bool:
             OperationalTaskType.DEPOSIT_SETTLEMENT,
         ])
     ).count()
+    cnt_legacy_op = db.query(OperationalTask).filter(
+        OperationalTask.task_type.notin_([
+            OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTaskType.DEPOSIT_SETTLEMENT,
+        ])
+    ).count()
+    cnt_legacy_rr = db.query(RecurringRule).filter(
+        RecurringRule.rule_type.notin_([
+            OperationalTaskType.MOVE_OUT_INSPECTION,
+            OperationalTaskType.DEPOSIT_SETTLEMENT,
+        ])
+    ).count()
+    cnt_leases = db.query(Lease).count()
     if cnt_insp != 1:
         print(f"[PROBE1 FAIL] expected 1 insp, got {cnt_insp}", flush=True)
         ok = False
@@ -431,6 +524,15 @@ def probe_after_seed(db: Session) -> bool:
     if cnt_op != 2:
         print(f"[PROBE1 FAIL] expected 2 MOVE_OUT/DEPOSIT op_tasks, got {cnt_op}", flush=True)
         ok = False
+    if cnt_legacy_op < 1:
+        print(f"[PROBE1 FAIL] expected >=1 legacy op_tasks (RENT_DUE control), got {cnt_legacy_op}", flush=True)
+        ok = False
+    if cnt_legacy_rr < 2:
+        print(f"[PROBE1 FAIL] expected >=2 legacy recurring_rules (RENT_DUE/AC_MAINTENANCE controls), got {cnt_legacy_rr}", flush=True)
+        ok = False
+    if cnt_leases < 2:
+        print(f"[PROBE1 FAIL] expected >=2 leases (pred+succ renewal pair), got {cnt_leases}", flush=True)
+        ok = False
     for s in db.query(DepositSettlement).all():
         if s.move_out_inspection_id is None or s.lease_id is None:
             print("[PROBE1 FAIL] settlement FK invalid", flush=True)
@@ -439,8 +541,69 @@ def probe_after_seed(db: Session) -> bool:
         if i.lease_id is None:
             print("[PROBE1 FAIL] inspection lease_id missing", flush=True)
             ok = False
+    superseded_pair = db.query(Lease).filter(Lease.superseded_by_lease_id.isnot(None)).first()
+    if superseded_pair is None:
+        print("[PROBE1 FAIL] no renewal predecessor with superseded_by_lease_id found", flush=True)
+        ok = False
+    else:
+        succ = db.query(Lease).get(superseded_pair.superseded_by_lease_id)
+        if succ is None:
+            print("[PROBE1 FAIL] superseded_by_lease_id points to nonexistent successor", flush=True)
+            ok = False
+        else:
+            expected_start = superseded_pair.end_date + timedelta(days=1)
+            if succ.start_date != expected_start:
+                print(f"[PROBE1 FAIL] successor.start_date {succ.start_date} != pred.end+1 {expected_start}", flush=True)
+                ok = False
+            if succ.unit_id != superseded_pair.unit_id:
+                print("[PROBE1 FAIL] successor.unit_id mismatch with predecessor", flush=True)
+                ok = False
+            if succ.tenant_id != superseded_pair.tenant_id:
+                print("[PROBE1 FAIL] successor.tenant_id mismatch with predecessor", flush=True)
+                ok = False
+
+    expected_constraints = [
+        ("uq_move_out_inspections_id_lease_id", "UNIQUE"),
+        ("uq_deposit_settlements_id_lease_id", "UNIQUE"),
+        ("fk_deposit_settlements_inspection_lease", "FOREIGN KEY"),
+        ("fk_leases_moi_id_lease", "FOREIGN KEY"),
+        ("fk_leases_ds_id_lease", "FOREIGN KEY"),
+        ("ck_leases_superseded_pair", "CHECK"),
+        ("uq_leases_superseded_by_one_predecessor", "UNIQUE"),
+    ]
+    for cname, ctype in expected_constraints:
+        if ctype == "FOREIGN KEY":
+            row = db.execute(text("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :cname AND constraint_type = 'FOREIGN KEY'
+                LIMIT 1
+            """), {"cname": cname}).scalar()
+        elif ctype == "UNIQUE":
+            row = db.execute(text("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :cname AND constraint_type = 'UNIQUE'
+                LIMIT 1
+            """), {"cname": cname}).scalar()
+            if row != 1:
+                row = db.execute(text("""
+                    SELECT 1 FROM pg_indexes
+                    WHERE indexname = :cname AND indexdef LIKE '%UNIQUE%'
+                    LIMIT 1
+                """), {"cname": cname}).scalar()
+        elif ctype == "CHECK":
+            row = db.execute(text("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :cname AND constraint_type = 'CHECK'
+                LIMIT 1
+            """), {"cname": cname}).scalar()
+        else:
+            row = None
+        if row != 1:
+            print(f"[PROBE1 FAIL] {ctype} constraint '{cname}' NOT found in information_schema / pg_indexes", flush=True)
+            ok = False
+
     if ok:
-        print("[PROBE1 PASS] after-seed counts + FK OK", flush=True)
+        print("[PROBE1 PASS] after-seed counts + FK + renewal pair + 7 constraints OK", flush=True)
     else:
         PROBE_FAILED += 1
     return ok
@@ -507,8 +670,26 @@ def probe_after_downgrade(db: Session) -> bool:
     except Exception as e:
         print(f"[PROBE2 FAIL] properties.operational_notes missing: {e}", flush=True)
         ok = False
+    legacy_op_count = db.execute(text("""
+        SELECT COUNT(*) FROM operational_tasks
+        WHERE task_type NOT IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')
+    """)).scalar()
+    if legacy_op_count is None or legacy_op_count < 1:
+        print(f"[PROBE2 FAIL] 9a downgrade deleted M003 legacy op_tasks! count={legacy_op_count} (expected >0 RENT_DUE controls preserved)", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE2 INFO] legacy op_tasks preserved after 9a downgrade: count={legacy_op_count}", flush=True)
+    legacy_rr_count = db.execute(text("""
+        SELECT COUNT(*) FROM recurring_rules
+        WHERE rule_type NOT IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')
+    """)).scalar()
+    if legacy_rr_count is None or legacy_rr_count < 1:
+        print(f"[PROBE2 FAIL] 9a downgrade deleted M003 legacy recurring_rules! count={legacy_rr_count} (expected >0 RENT_DUE/AC_MAINTENANCE controls preserved)", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE2 INFO] legacy recurring_rules preserved after 9a downgrade: count={legacy_rr_count}", flush=True)
     if ok:
-        print("[PROBE2 PASS] after-downgrade m2a columns present", flush=True)
+        print("[PROBE2 PASS] after-downgrade m2a columns present + legacy M003 rows retained by 9a downgrade", flush=True)
     else:
         PROBE_FAILED += 1
     return ok
@@ -532,8 +713,65 @@ def probe_after_reupgrade(db: Session) -> bool:
     except Exception as e:
         print(f"[PROBE3 FAIL] M004 JSONB columns missing after re-upgrade: {e}", flush=True)
         ok = False
+    legacy_op_control = db.query(OperationalTask).filter(
+        OperationalTask.task_type == OperationalTaskType.RENT_DUE
+    ).count()
+    if legacy_op_control < 1:
+        print(f"[PROBE3 FAIL] M003 control OperationalTask RENT_DUE missing after re-upgrade! count={legacy_op_control}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE3 INFO] M003 control OperationalTask RENT_DUE rows after re-upgrade: {legacy_op_control}", flush=True)
+    legacy_rr_control = db.query(RecurringRule).filter(
+        RecurringRule.rule_type.in_([OperationalTaskType.RENT_DUE, OperationalTaskType.AC_MAINTENANCE])
+    ).count()
+    if legacy_rr_control < 2:
+        print(f"[PROBE3 FAIL] M003 control RecurringRules RENT_DUE/AC_MAINTENANCE missing after re-upgrade! count={legacy_rr_control}", flush=True)
+        ok = False
+    else:
+        print(f"[PROBE3 INFO] M003 control RecurringRule rows after re-upgrade: {legacy_rr_control}", flush=True)
+
+    expected_constraints = [
+        ("uq_move_out_inspections_id_lease_id", "UNIQUE"),
+        ("uq_deposit_settlements_id_lease_id", "UNIQUE"),
+        ("fk_deposit_settlements_inspection_lease", "FOREIGN KEY"),
+        ("fk_leases_moi_id_lease", "FOREIGN KEY"),
+        ("fk_leases_ds_id_lease", "FOREIGN KEY"),
+        ("ck_leases_superseded_pair", "CHECK"),
+        ("uq_leases_superseded_by_one_predecessor", "UNIQUE"),
+    ]
+    for cname, ctype in expected_constraints:
+        if ctype == "FOREIGN KEY":
+            row = db.execute(text("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :cname AND constraint_type = 'FOREIGN KEY'
+                LIMIT 1
+            """), {"cname": cname}).scalar()
+        elif ctype == "UNIQUE":
+            row = db.execute(text("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :cname AND constraint_type = 'UNIQUE'
+                LIMIT 1
+            """), {"cname": cname}).scalar()
+            if row != 1:
+                row = db.execute(text("""
+                    SELECT 1 FROM pg_indexes
+                    WHERE indexname = :cname AND indexdef LIKE '%UNIQUE%'
+                    LIMIT 1
+                """), {"cname": cname}).scalar()
+        elif ctype == "CHECK":
+            row = db.execute(text("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_name = :cname AND constraint_type = 'CHECK'
+                LIMIT 1
+            """), {"cname": cname}).scalar()
+        else:
+            row = None
+        if row != 1:
+            print(f"[PROBE3 FAIL] {ctype} constraint '{cname}' NOT found after re-upgrade (pg_indexes+table_constraints)", flush=True)
+            ok = False
+
     if ok:
-        print("[PROBE3 PASS] after re-upgrade schema reinstated correctly", flush=True)
+        print("[PROBE3 PASS] after re-upgrade schema reinstated + control rows preserved + 7 constraints OK", flush=True)
     else:
         PROBE_FAILED += 1
     return ok
@@ -558,8 +796,6 @@ def main() -> int:
 
         with S() as db:
             probe_after_seed(db)
-            print("[RT] delete_m004_rows_before_downgrade()", flush=True)
-            delete_m004_rows_before_downgrade(db)
 
         print(f"[RT] downgrade to {M2A_REV}", flush=True)
         rc = _run_alembic("downgrade", M2A_REV)

@@ -282,6 +282,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Pre-downgrade: delete post-m2a enum rows BEFORE restoring legacy CHECK allowlists.
+    op.execute(
+        "DELETE FROM operational_tasks WHERE task_type IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')"
+    )
+    op.execute(
+        "DELETE FROM recurring_rules WHERE rule_type IN ('MOVE_OUT_INSPECTION', 'DEPOSIT_SETTLEMENT')"
+    )
+
     # ------------------------------------------------------------------
     # 6 (reverse). Restore recurring_rules rule_type allowlist (legacy 9)
     # ------------------------------------------------------------------

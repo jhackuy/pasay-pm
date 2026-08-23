@@ -442,46 +442,6 @@ def _close_projection_tasks_for_inspection(
     )
 
 
-def _close_projection_tasks_for_settlement(
-    db: Session,
-    settlement: DepositSettlement,
-    actor_id: int | None,
-    now: datetime,
-    *,
-    cancelled: bool = False,
-) -> None:
-    """Shared helper future-use: close DEPOSIT_SETTLEMENT projection tasks
-    for a confirmed/cancelled settlement. Currently unused but exists so
-    settlement forward-sync can reuse the same pattern as inspection.
-    """
-    target_status = OperationalTaskStatus.CANCELLED if cancelled else OperationalTaskStatus.COMPLETED
-    reason = "deposit_settlement_cancelled" if cancelled else "deposit_settlement_confirmed_forward_sync"
-    q1 = db.query(OperationalTask).filter(
-        OperationalTask.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT,
-        OperationalTask.source_type == "deposit_settlement",
-        OperationalTask.source_id == settlement.id,
-        OperationalTask.status == OperationalTaskStatus.PENDING,
-    )
-    _close_tasks_by_query(
-        db, q1,
-        actor_id=actor_id, now=now,
-        target_status=target_status, reason=reason,
-    )
-    if settlement.move_out_inspection_id is not None:
-        insp = db.get(MoveOutInspection, settlement.move_out_inspection_id)
-        if insp is not None:
-            q2 = db.query(OperationalTask).filter(
-                OperationalTask.task_type == OperationalTaskType.DEPOSIT_SETTLEMENT,
-                OperationalTask.status == OperationalTaskStatus.PENDING,
-                OperationalTask.dedupe_key == f"deposit_settlement:{settlement.id}:DEPOSIT_SETTLEMENT",
-            )
-            _close_tasks_by_query(
-                db, q2,
-                actor_id=actor_id, now=now,
-                target_status=target_status, reason=reason,
-            )
-
-
 def _ensure_draft_settlement_for(
     db: Session,
     inspection: MoveOutInspection,
@@ -732,33 +692,92 @@ _TERMINAL_LEASE_STATUSES = {
     LeaseStatus.expired,
 }
 
+# Truth fields for terminal / superseded leases. Only `notes` and fields not in this
+# set are allowed to change on expired/terminated/superseded leases.
+_LEASE_TRUTH_FIELDS = {
+    "status", "unit_id", "tenant_id", "start_date", "end_date",
+    "monthly_rent", "deposit", "accounting_start_date", "due_day",
+    "management_fee_included", "renewal_notice_period_days",
+    "special_terms", "deposit_received", "deposit_refund", "deposit_deductions",
+    "move_out_inspection_id", "deposit_settlement_id", "moved_out_settled_at",
+    "renewal_metadata", "superseded_by_lease_id", "superseded_at",
+}
+
 
 def enforce_lease_terminal_immutable(
     db: Session,
     lease: Lease,
     *,
     target_status: LeaseStatus | None = None,
+    updates: dict | None = None,
 ) -> None:
-    """Prevent a terminal (expired/terminated) lease from reverting to active.
+    """Prevent terminal (expired/terminated) or superseded lease truth-field mutation.
 
-    Raises HTTP 409 if:
-      - Current status is terminal AND target_status would move it back to non-terminal.
-    If target_status is None (no status change), this is a no-op regardless of current state
-    (since no mutation is being attempted).
+    Two strict layers:
+    1. Status-revert: terminal → non-terminal status change is blocked (original close gate).
+    2. Truth-field block: on ANY terminal (expired/terminated) OR superseded
+       (superseded_by_lease_id != NULL) lease, mutation of truth fields (dates,
+       unit/tenant, rent/deposit amounts, pointers, metadata, superseded links)
+       is blocked with exact 409. Non-truth fields (e.g. notes) are always allowed.
     """
     del db
-    if target_status is None:
-        return
+    updates = updates or {}
+
+    # 1) Status-revert guard (unchanged contract, stronger now also raises when truth changes)
+    if target_status is not None:
+        current_is_terminal = lease.status in _TERMINAL_LEASE_STATUSES
+        target_is_terminal = target_status in _TERMINAL_LEASE_STATUSES
+        if current_is_terminal and not target_is_terminal:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "lease_terminal_immutable_cannot_revert",
+                    "lease_id": lease.id,
+                    "current_status": lease.status.value,
+                    "target_status": target_status.value,
+                    "hint": "Terminal leases (expired/terminated) cannot be reverted to active. Create a new successor lease instead.",
+                },
+            )
+
+    # 2) Truth-field immutability: terminal OR superseded blocks truth mutations
     current_is_terminal = lease.status in _TERMINAL_LEASE_STATUSES
-    target_is_terminal = target_status in _TERMINAL_LEASE_STATUSES
-    if current_is_terminal and not target_is_terminal:
+    is_superseded = getattr(lease, "superseded_by_lease_id", None) is not None
+    if not (current_is_terminal or is_superseded):
+        return
+
+    # Filter out idempotent patches (same value) — idempotent status/amount updates are always allowed
+    really_changed_truth = []
+    for field in (updates.keys() & _LEASE_TRUTH_FIELDS):
+        new_val = updates[field]
+        # For Enums / date objects compare value not object
+        current_val = getattr(lease, field, None)
+        if hasattr(current_val, "value"):
+            current_cmp = current_val.value
+        else:
+            current_cmp = current_val
+        if hasattr(new_val, "value"):
+            new_cmp = new_val.value
+        else:
+            new_cmp = new_val
+        if current_cmp != new_cmp:
+            really_changed_truth.append(field)
+
+    attempted_truth = sorted(really_changed_truth)
+    if attempted_truth:
+        if is_superseded and not current_is_terminal:
+            reason = "superseded_lease_truth_fields_immutable"
+        else:
+            reason = "terminal_lease_truth_fields_immutable"
+        allowed_only = sorted(list(set(updates.keys()) - _LEASE_TRUTH_FIELDS)) or ["notes (non-truth only)"]
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             detail={
-                "reason": "lease_terminal_immutable_cannot_revert",
+                "reason": reason,
                 "lease_id": lease.id,
-                "current_status": lease.status.value,
-                "target_status": target_status.value,
-                "hint": "Terminal leases (expired/terminated) cannot be reverted to active. Create a new successor lease instead.",
+                "lease_status": lease.status.value,
+                "superseded_by_lease_id": getattr(lease, "superseded_by_lease_id", None),
+                "attempted_fields": attempted_truth,
+                "allowed_only_non_truth": allowed_only,
+                "hint": "Expired / terminated / renewal-superseded leases are truth-immutable. Only notes (non-contract / non-truth) may change.",
             },
         )

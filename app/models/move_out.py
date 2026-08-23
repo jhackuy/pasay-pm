@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Text, text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,6 +28,7 @@ class MoveOutInspection(AuditMixin, Base):
             "status IN ('SCHEDULED','INSPECTED','CONFIRMED','CANCELLED')",
             name="ck_move_out_inspections_status",
         ),
+        UniqueConstraint('id', 'lease_id', name='uq_move_out_inspections_id_lease_id'),
     )
 
     lease_id: Mapped[int] = mapped_column(ForeignKey("leases.id"), nullable=False, index=True)

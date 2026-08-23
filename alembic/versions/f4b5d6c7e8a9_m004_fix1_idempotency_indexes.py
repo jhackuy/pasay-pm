@@ -56,6 +56,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Pre-downgrade: delete M004-only idempotency rows BEFORE dropping idempotency_key column.
+    op.execute(
+        "DELETE FROM expenses WHERE idempotency_key LIKE 'deposit_settlement:%'"
+    )
+    op.execute(
+        "DELETE FROM incomes WHERE idempotency_key LIKE 'deposit_settlement:%'"
+    )
+
     # ------------------------------------------------------------------
     # 2 (reverse). move_out_inspections: 还原旧索引名
     # ------------------------------------------------------------------

@@ -2,7 +2,7 @@ from datetime import date, datetime
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Integer, Numeric, String, Text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Date, DateTime, ForeignKey, ForeignKeyConstraint, Index, Integer, Numeric, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -50,3 +50,40 @@ class Lease(AuditMixin, SoftDeleteMixin, Base):
     )
     moved_out_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     renewal_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    superseded_by_lease_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ['move_out_inspection_id', 'id'],
+            ['move_out_inspections.id', 'move_out_inspections.lease_id'],
+            name='fk_leases_moi_id_lease',
+        ),
+        ForeignKeyConstraint(
+            ['deposit_settlement_id', 'id'],
+            ['deposit_settlements.id', 'deposit_settlements.lease_id'],
+            name='fk_leases_ds_id_lease',
+        ),
+        ForeignKeyConstraint(
+            ['superseded_by_lease_id'],
+            ['leases.id'],
+            name='fk_leases_superseded_by',
+            ondelete='RESTRICT',
+            use_alter=True,
+        ),
+        CheckConstraint(
+            "(superseded_by_lease_id IS NULL AND superseded_at IS NULL) OR "
+            "(superseded_by_lease_id IS NOT NULL AND superseded_at IS NOT NULL AND status = 'expired')",
+            name='ck_leases_superseded_pair',
+        ),
+        CheckConstraint(
+            "superseded_by_lease_id IS NULL OR superseded_by_lease_id != id",
+            name='ck_leases_superseded_not_self',
+        ),
+        Index(
+            'uq_leases_superseded_by_one_predecessor',
+            'superseded_by_lease_id',
+            unique=True,
+            postgresql_where=text("superseded_by_lease_id IS NOT NULL"),
+        ),
+    )

@@ -91,12 +91,38 @@ def test_engine():
         engine.dispose()
 
 
+def _pg_drop_all_tables_cascade(conn):
+    """Drop every public table with CASCADE, bypassing SQLA's fragile
+    metadata-driven constraint-drop order that raises UndefinedObject for
+    cross-table composite FKs (leases<->moi<->ds triangle + self-ref FK) when
+    the schema is empty or in a partial state.
+    """
+    rows = conn.execute(text(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+    )).all()
+    for (tablename,) in rows:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{tablename}" CASCADE'))
+    for seq in conn.execute(text(
+        "SELECT sequencename FROM pg_sequences WHERE schemaname = 'public'"
+    )).all():
+        conn.execute(text(f'DROP SEQUENCE IF EXISTS "{seq[0]}" CASCADE'))
+    for enum_t in conn.execute(text(
+        "SELECT t.typname FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+        "JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = 'public' "
+        "GROUP BY t.typname"
+    )).all():
+        conn.execute(text(f'DROP TYPE IF EXISTS "{enum_t[0]}" CASCADE'))
+
+
 @pytest.fixture()
 def db_session(test_engine):
     """Rebuild the schema for every test (simple, deterministic)."""
     audit_context.set((None, None, None, None))
-    Base.metadata.drop_all(test_engine)
-    Base.metadata.create_all(test_engine)
+    with test_engine.connect() as conn:
+        _pg_drop_all_tables_cascade(conn)
+        conn.commit()
+        Base.metadata.create_all(conn)
+        conn.commit()
     Session = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
     db = Session()
     for name in ("scheduler", "reconcile", "notifier", "backfill"):

@@ -139,6 +139,7 @@ class AuditAction(str, Enum):
     create_renewal_successor = "create_renewal_successor"
     decline_renewal = "decline_renewal"
     auto_expire = "auto_expire"
+    renewal_predecessor_archived = "renewal_predecessor_archived"
 
 
 class AuditLog(AuditMixin, Base):

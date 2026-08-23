@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Numeric, Text
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, ForeignKeyConstraint, Numeric, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -33,6 +33,12 @@ class DepositSettlement(AuditMixin, Base):
         CheckConstraint(
             "status IN ('DRAFT','CONFIRMED','RECONCILED')",
             name="ck_deposit_settlements_status",
+        ),
+        UniqueConstraint('id', 'lease_id', name='uq_deposit_settlements_id_lease_id'),
+        ForeignKeyConstraint(
+            ['move_out_inspection_id', 'lease_id'],
+            ['move_out_inspections.id', 'move_out_inspections.lease_id'],
+            name='fk_deposit_settlements_inspection_lease',
         ),
     )
 

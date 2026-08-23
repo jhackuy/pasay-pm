@@ -114,6 +114,25 @@ def _test_url():
     return make_url(settings.database_url).set(database=TEST_DB_NAME)
 
 
+def _pg_drop_all_tables_cascade(conn):
+    """Mirror conftest._pg_drop_all_tables_cascade: robust schema reset."""
+    rows = conn.execute(text(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+    )).all()
+    for (tablename,) in rows:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{tablename}" CASCADE'))
+    for seq in conn.execute(text(
+        "SELECT sequencename FROM pg_sequences WHERE schemaname = 'public'"
+    )).all():
+        conn.execute(text(f'DROP SEQUENCE IF EXISTS "{seq[0]}" CASCADE'))
+    for enum_t in conn.execute(text(
+        "SELECT t.typname FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid "
+        "JOIN pg_namespace n ON n.oid = t.typnamespace WHERE n.nspname = 'public' "
+        "GROUP BY t.typname"
+    )).all():
+        conn.execute(text(f'DROP TYPE IF EXISTS "{enum_t[0]}" CASCADE'))
+
+
 @pytest.fixture(scope="session")
 def concurrency_engine():
     base_url = make_url(settings.database_url)
@@ -139,8 +158,11 @@ def concurrency_engine():
 @pytest.fixture()
 def concurrency_db(concurrency_engine):
     audit_context.set((None, None, None, None))
-    Base.metadata.drop_all(concurrency_engine)
-    Base.metadata.create_all(concurrency_engine)
+    with concurrency_engine.connect() as conn:
+        _pg_drop_all_tables_cascade(conn)
+        conn.commit()
+        Base.metadata.create_all(conn)
+        conn.commit()
     Session = sessionmaker(bind=concurrency_engine, autoflush=False, expire_on_commit=False)
     db = Session()
     for name in ("scheduler", "reconcile", "notifier", "backfill"):
@@ -262,6 +284,11 @@ def c_confirmed_insp(c_client, concurrency_db, c_owner, c_lease_active, c_unit):
     concurrency_db.expire_all()
     existing = concurrency_db.query(DepositSettlement).filter(DepositSettlement.move_out_inspection_id == insp_id).first()
     if existing is not None:
+        # Composite FK fk_leases_ds_id_lease (RESTRICT): null lease pointers first
+        for l in concurrency_db.query(Lease).filter(Lease.deposit_settlement_id == existing.id).all():
+            l.deposit_settlement_id = None
+        concurrency_db.flush()
+        # Composite FK fk_deposit_settlements_inspection_lease (RESTRICT): also null if MOI cascading ever happens
         concurrency_db.delete(existing)
         concurrency_db.commit()
         concurrency_db.expire_all()
