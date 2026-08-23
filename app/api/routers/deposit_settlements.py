@@ -8,6 +8,7 @@ from app.api.deps import get_current_user
 from app.database import get_db
 from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.lease import Lease
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.deposit_settlement import (
@@ -79,6 +80,7 @@ def create_settlement(
     existing = (
         db.query(DepositSettlement)
         .filter(DepositSettlement.move_out_inspection_id == insp.id)
+        .with_for_update(key_share=True)
         .first()
     )
     if existing is not None:
@@ -104,9 +106,21 @@ def create_settlement(
     db.add(obj)
     db.flush()
     lease = db.get(Lease, obj.lease_id)
-    if lease is not None and lease.deposit_settlement_id is None:
-        lease.deposit_settlement_id = obj.id
-        lease.updated_by = user.id
+    if lease is not None:
+        should_set_fk = False
+        if lease.deposit_settlement_id is None:
+            should_set_fk = True
+        elif insp.id == lease.move_out_inspection_id:
+            should_set_fk = True
+        else:
+            existing_sett = db.get(DepositSettlement, lease.deposit_settlement_id)
+            if existing_sett is not None:
+                existing_insp = db.get(MoveOutInspection, existing_sett.move_out_inspection_id)
+                if existing_insp is not None and existing_insp.status == MoveOutInspectionStatus.CANCELLED:
+                    should_set_fk = True
+        if should_set_fk:
+            lease.deposit_settlement_id = obj.id
+            lease.updated_by = user.id
     record_audit(
         db, table_name="deposit_settlements", record_id=obj.id, action="create",
         actor_id=user.id, new_value=serialize_row(obj),

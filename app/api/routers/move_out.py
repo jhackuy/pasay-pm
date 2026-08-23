@@ -28,6 +28,7 @@ from app.services.move_out_workflow import (
     confirm_inspection,
     mark_inspected,
     schedule_inspection,
+    validate_evidence_ids,
 )
 
 router = APIRouter(prefix="/move-out-inspections", tags=["move_out_inspections"])
@@ -71,6 +72,26 @@ def create_inspection(
         )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+
+    existing = (
+        db.query(MoveOutInspection)
+        .filter(
+            MoveOutInspection.lease_id == lease.id,
+            MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
+        )
+        .first()
+    )
+    if existing is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "reason": "move_out_inspection_already_exists_for_lease",
+                "lease_id": payload.lease_id,
+                "existing_inspection_id": existing.id,
+                "existing_status": existing.status.value,
+                "hint": "GET /move-out-inspections/{id}",
+            },
+        )
 
     if payload.evidence_ids:
         evidence_rows = (
@@ -164,6 +185,19 @@ def patch_inspection(
     if not updates:
         return obj
 
+    if "evidence_ids" in updates and updates["evidence_ids"] is not None:
+        from app.models.lease import Lease
+        lease = db.get(Lease, obj.lease_id)
+        if lease is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_evidence_not_found",
+                    "missing_evidence_ids": [],
+                },
+            )
+        validate_evidence_ids(db, updates["evidence_ids"], lease, _membership)
+
     if obj.status not in (MoveOutInspectionStatus.CONFIRMED, MoveOutInspectionStatus.CANCELLED):
         from app.services.audit import field_changes, record_audit
         old = serialize_row(obj)
@@ -208,6 +242,18 @@ def inspect_post(
     updates = payload.model_dump(exclude_unset=True)
     findings = updates.get("findings", obj.findings)
     evidence_ids = updates.get("evidence_ids", obj.evidence_ids)
+    if evidence_ids is not None:
+        from app.models.lease import Lease
+        lease = db.get(Lease, obj.lease_id)
+        if lease is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "move_out_inspection_evidence_not_found",
+                    "missing_evidence_ids": [],
+                },
+            )
+        validate_evidence_ids(db, evidence_ids, lease, _membership)
     inspected_at = updates.pop("inspected_at", None) or datetime.now(timezone.utc)
     mark_inspected(
         db, obj,

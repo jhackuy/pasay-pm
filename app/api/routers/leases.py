@@ -193,6 +193,30 @@ def update_lease(
 
     unit = db.query(Unit).filter(Unit.id == obj.unit_id, Unit.deleted_at.is_(None)).first()
     new_status = updates.get("status", obj.status)
+
+    was_terminal = obj.status in (LeaseStatus.terminated, LeaseStatus.expired)
+    no_transition = new_status == obj.status
+    if was_terminal and no_transition:
+        old = serialize_row(obj)
+        changed = field_changes(obj, updates)
+        for field, value in updates.items():
+            setattr(obj, field, value)
+        obj.updated_by = user.id
+        db.flush()
+        record_audit(
+            db,
+            table_name="leases",
+            record_id=obj.id,
+            action="update",
+            actor_id=user.id,
+            changed_fields=changed,
+            old_value=old,
+            new_value=serialize_row(obj),
+        )
+        db.commit()
+        db.refresh(obj)
+        return obj
+
     if new_status != obj.status and new_status in (LeaseStatus.terminated, LeaseStatus.expired):
         ok, expected, actual = validate_lease_closeable(db, obj, expected_target_status=new_status)
         if not ok:
@@ -375,6 +399,7 @@ def renew_lease(
             Lease.id != obj.id,
             Lease.deleted_at.is_(None),
         )
+        .with_for_update()
         .first()
     )
     if conflicting_active is not None:
@@ -387,6 +412,21 @@ def renew_lease(
         successor = db.query(Lease).filter(Lease.id == successor_id, Lease.deleted_at.is_(None)).first()
         if successor is not None:
             return successor
+
+    conflicting_active = (
+        db.query(Lease)
+        .filter(
+            Lease.unit_id == successor_unit_id,
+            Lease.status == LeaseStatus.active,
+            Lease.id != obj.id,
+            Lease.deleted_at.is_(None),
+        )
+        .with_for_update()
+        .first()
+    )
+    if conflicting_active is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Successor unit is already occupied by another active lease")
+
     successor = Lease(
         unit_id=successor_unit_id,
         tenant_id=successor_tenant_id,
@@ -433,7 +473,6 @@ def renew_lease(
         actor_id=user.id,
         new_value=serialize_row(successor),
     )
-    # Forward sync LEASE_EXPIRING task COMPLETED for predecessor
     from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
     now = datetime.now(timezone.utc)
     tasks = (
@@ -463,9 +502,8 @@ def renew_lease(
     db.refresh(obj)
     successor_id_in_meta = (obj.renewal_metadata or {}).get("renewed_lease_id")
     if successor_id_in_meta and successor_id_in_meta != successor.id:
-        db.expunge(successor)
+        db.rollback()
         winner = db.get(Lease, successor_id_in_meta)
-        db.commit()
         db.refresh(winner)
         return winner
     db.commit()
