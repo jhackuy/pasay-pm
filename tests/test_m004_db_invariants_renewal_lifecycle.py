@@ -328,6 +328,38 @@ def test_s4_same_lease_triangle_write_allowed(
 # Section八 #5-10: Renewal 状态机精确反例 (HTTP API 层)
 # =========================================================================
 
+def _probe_raw_sql(db, work):
+    """Run raw-SQL probes that may raise IntegrityError.
+
+    Raw probes (e.g. attempting to wire a MISMATCHED successor link) often
+    raise IntegrityError because the newly added composite same-party FK
+    refuses mismatched (id, unit_id, tenant_id) at write time. Those errors
+    **are the invariant** but must not abort pytest's outer session: run them
+    inside a SAVEPOINT and return any caught IntegrityError (or None) so the
+    test can assert the invariant AND continue to exercise the API-level
+    fail-closed validator on top of it.
+    """
+    bind = db.get_bind()
+    conn = bind.connect()
+    caught = None
+    try:
+        tx = conn.begin_nested()
+        try:
+            work(conn)
+            tx.commit()
+        except IntegrityError as exc:
+            tx.rollback()
+            caught = exc
+    finally:
+        conn.close()
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    db.expire_all()
+    return caught
+
+
 def _setup_expiring_predecessor(client, db, headers, lease_id, *, expired=False):
     pred = db.get(Lease, lease_id)
     # 绝对日期，避免本地/UTC today 时差。conftest fixture 已经是2026-06-30
@@ -609,9 +641,10 @@ def test_s10_missing_deleted_or_mismatched_successor_fail_closed_409(
     db_session.expire_all()
     bind = db_session.get_bind()
 
-    # (a) MISMATCHED successor: build a real, FK-valid lease on a DIFFERENT
-    #     unit+tenant, then raw-wire predecessor.superseded_by to point at it.
-    #     Canonical validation must fail-closed with 409.
+    # (a) MISMATCHED successor probe: attempt to raw-wire predecessor.superseded_by
+    #     at a FK-valid lease on a DIFFERENT unit+tenant. The composite same-party
+    #     FK MUST abort this write with IntegrityError (DB-level invariant), which
+    #     the canonical validator also enforces as a 409.
     unit_fake, tenant_fake = _create_second_unit_tenant(client, h, property_id, org_a.id)
     fake_succ_resp = client.post(
         f"{API}/leases",
@@ -635,60 +668,21 @@ def test_s10_missing_deleted_or_mismatched_successor_fail_closed_409(
             "WHERE id = :lid"
         ), {"fake_sid": fake_succ_id, "lid": lease_id})
 
-    _conn = bind.connect()
-    try:
-        _do_a(_conn)
-        _conn.commit()
-    finally:
-        _conn.close()
-    try:
-        db_session.rollback()
-    except Exception:
-        pass
-    db_session.expire_all()
-
-    r_a = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
-    assert r_a.status_code == 409, f"(a) expected 409 got {r_a.status_code}: {r_a.text}"
-    detail_a = r_a.json()["detail"]
-    assert isinstance(detail_a, dict)
-    assert detail_a["reason"] == "renewal_successor_truth_invalid", (
-        f"(a) expected reason renewal_successor_truth_invalid got {detail_a.get('reason')!r}"
+    caught_integrity = _probe_raw_sql(db_session, _do_a)
+    assert caught_integrity is not None, (
+        "(a) DB-level same-party composite FK must reject mismatched successor link write"
     )
-    # IMPORTANT: renew (SELECT FOR UPDATE) leaves a row-level lock on
-    # predecessor held in the db_session tx.  Roll back explicitly so the
-    # following raw-connection UPDATE on the same row doesn't deadlock.
-    try:
-        db_session.rollback()
-    except Exception:
-        pass
-    db_session.expire_all()
-
-    # (b) undo (a), create valid predecessor/successor via real renew,
-    #     then soft-delete successor (row still exists but deleted_at is set),
-    #     then renew predecessor triggers 409 fail-closed.
-    def _do_undo(conn):
-        conn.execute(text(
-            "UPDATE leases SET status = 'active', "
-            "  superseded_by_lease_id = NULL, superseded_at = NULL, "
-            "  updated_by = 1 WHERE id = :lid"
-        ), {"lid": lease_id})
-
-    _conn = bind.connect()
-    try:
-        _do_undo(_conn)
-        _conn.commit()
-    finally:
-        _conn.close()
-    try:
-        db_session.rollback()
-    except Exception:
-        pass
-    db_session.expire_all()
-
+    assert "fk_leases_superseded_same_party" in str(caught_integrity).lower() or (
+        "foreign key" in str(caught_integrity).lower()
+        and "superseded" in str(caught_integrity).lower()
+    ), f"unexpected integrity error: {caught_integrity!r}"
+    # After the DB-invariant probe the write was rolled back (SAVEPOINT). Now
+    # create a valid same-party successor via renew, and then soft-delete that
+    # successor via raw SQL so the canonical validator catches the DELETED
+    # successor case with a 409.
     r_create = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
     assert r_create.status_code == 200, f"create renew failed: {r_create.text}"
     succ_id = r_create.json()["id"]
-    # Release row lock from the SELECT FOR UPDATE in the successful renew.
     try:
         db_session.rollback()
     except Exception:
@@ -712,15 +706,129 @@ def test_s10_missing_deleted_or_mismatched_successor_fail_closed_409(
         pass
     db_session.expire_all()
 
-    r_b = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
-    assert r_b.status_code == 409, (
-        f"(b) expected 409 NOT 500, got {r_b.status_code}: {r_b.text}"
+    r_deleted = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
+    assert r_deleted.status_code == 409, (
+        f"deleted-successor expected 409 got {r_deleted.status_code}: {r_deleted.text}"
     )
-    detail_b = r_b.json()["detail"]
-    assert isinstance(detail_b, dict)
-    assert detail_b["reason"] == "renewal_successor_truth_invalid", (
-        f"(b) expected renewal_successor_truth_invalid got {detail_b.get('reason')!r}"
+    detail_deleted = r_deleted.json()["detail"]
+    assert isinstance(detail_deleted, dict)
+    assert detail_deleted["reason"] == "renewal_successor_truth_invalid", (
+        f"deleted-successor expected renewal_successor_truth_invalid got {detail_deleted.get('reason')!r}"
     )
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    # (b) MISSING successor: We can't wire link at a non-existent id because
+    #     the composite same-party FK (DB-level invariant) blocks it.  Instead
+    #     simulate the missing-successor case via the existing DB-invariant:
+    #     the validator branch at leases.py L426 tests `successor is None or
+    #     successor.deleted_at is not None` → deleted_successor IS the
+    #     truth_invalid code path and was already asserted above.  Skip the
+    #     direct `link at non-existent id` probe (it can't happen thanks to
+    #     the FK invariant we already asserted in (a) & (d)) and continue with
+    #     the stale/date-mismatch probe which tests the other truth branch.
+    def _undo_pred_link(conn):
+        conn.execute(text(
+            "UPDATE leases SET status = 'active', "
+            "  superseded_by_lease_id = NULL, superseded_at = NULL, "
+            "  renewal_metadata = NULL::jsonb, "
+            "  updated_by = 1 WHERE id = :lid"
+        ), {"lid": lease_id})
+
+    _conn = bind.connect()
+    try:
+        _undo_pred_link(_conn)
+        _conn.commit()
+    finally:
+        _conn.close()
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    # (c) Stale/DATE-mismatch successor: re-create valid same-party successor,
+    #     then overwrite successor.start_date so start_date != pred.end+1 while
+    #     unit/tenant/same-party composite FK still holds. Validator must 409.
+    # First undo predecessor link state to allow re-renew.
+    def _undo_pred(conn):
+        conn.execute(text(
+            "UPDATE leases SET status = 'active', "
+            "  superseded_by_lease_id = NULL, superseded_at = NULL, "
+            "  updated_by = 1 WHERE id = :lid"
+        ), {"lid": lease_id})
+
+    _conn = bind.connect()
+    try:
+        _undo_pred(_conn)
+        _conn.commit()
+    finally:
+        _conn.close()
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    r_recreate = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
+    assert r_recreate.status_code == 200, f"recreate renew failed: {r_recreate.text}"
+    succ_v2_id = r_recreate.json()["id"]
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    def _corrupt_start(conn):
+        conn.execute(text(
+            "UPDATE leases SET start_date = start_date + interval '1 day', updated_by = 1 "
+            "WHERE id = :sid"
+        ), {"sid": succ_v2_id})
+
+    _conn = bind.connect()
+    try:
+        _corrupt_start(_conn)
+        _conn.commit()
+    finally:
+        _conn.close()
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    r_a = client.post(f"{API}/leases/{lease_id}/renew", json=renew_payload, headers=h)
+    assert r_a.status_code == 409, f"(a) expected 409 got {r_a.status_code}: {r_a.text}"
+    detail_a = r_a.json()["detail"]
+    assert isinstance(detail_a, dict)
+    assert detail_a["reason"] == "renewal_successor_truth_invalid", (
+        f"(a) expected reason renewal_successor_truth_invalid got {detail_a.get('reason')!r}"
+    )
+    # IMPORTANT: renew (SELECT FOR UPDATE) leaves a row-level lock on
+    # predecessor held in the db_session tx.  Roll back explicitly so any
+    # follow-up probes on the same row don't deadlock.
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    # (d) Also assert that attempting to write the mismatched successor link
+    #     via raw SQL again AFTER a clean slate still gets caught by composite FK
+    #     (fail-closed on all paths — redudant probe for closeout strength).
+    def _do_retry_a(conn):
+        conn.execute(text(
+            "UPDATE leases SET "
+            "  superseded_by_lease_id = :fake_sid,"
+            "  updated_by = 1 "
+            "WHERE id = :lid"
+        ), {"fake_sid": fake_succ_id, "lid": lease_id})
+
+    caught2 = _probe_raw_sql(db_session, _do_retry_a)
+    assert caught2 is not None, "mismatched successor link must still be rejected by FK"
 
 
 # =========================================================================
@@ -800,10 +908,6 @@ def test_s12_forged_stale_successor_link_409_on_delete_zero_side_effects(
     client, db_session, owner_a, unit_id, tenant_id, lease_id, property_id, org_a,
 ):
     h = _h(owner_a[1])
-    today = date.today()
-    succ_start = today.isoformat()
-    succ_end = (today + timedelta(days=364)).isoformat()
-
     pred_before = db_session.get(Lease, lease_id)
     pred_deleted_before = pred_before.deleted_at
     tenant_before = db_session.get(Tenant, tenant_id)
@@ -823,6 +927,19 @@ def test_s12_forged_stale_successor_link_409_on_delete_zero_side_effects(
     db_session.expire_all()
 
     unit_fake, tenant_fake = _create_second_unit_tenant(client, h, property_id, org_a.id)
+
+    # expired=True → pred.end=2026-06-29 → succ_start=2026-06-30
+    succ_start = date(2026, 6, 30).isoformat()
+    succ_end = (date(2026, 6, 29) + timedelta(days=364)).isoformat()
+
+    # Path 1: FORGED link via raw SQL at fake (different unit+tenant) successor
+    # → DB-level composite same-party FK MUST reject it. If this ever stops
+    #   firing, the validator catch below (API-level for stale link) becomes
+    #   the defense-in-depth fail-closed.
+    _setup_expiring_predecessor(client, db_session, h, lease_id, expired=True)
+    db_session.commit()
+    db_session.expire_all()
+
     fake_succ_resp = client.post(
         f"{API}/leases",
         json=_lease_payload(
@@ -835,10 +952,8 @@ def test_s12_forged_stale_successor_link_409_on_delete_zero_side_effects(
     fake_succ_id = fake_succ_resp.json()["id"]
     db_session.expire_all()
 
-    bind = db_session.get_bind()
-    _conn = bind.connect()
-    try:
-        _conn.execute(text(
+    def _do_forge_link(conn):
+        conn.execute(text(
             "UPDATE leases SET "
             "  status = 'expired',"
             "  superseded_by_lease_id = :fake_sid,"
@@ -846,6 +961,40 @@ def test_s12_forged_stale_successor_link_409_on_delete_zero_side_effects(
             "  updated_by = 1 "
             "WHERE id = :lid"
         ), {"fake_sid": fake_succ_id, "lid": lease_id})
+
+    caught_forge = _probe_raw_sql(db_session, _do_forge_link)
+    assert caught_forge is not None, (
+        "Forge (different unit+tenant) successor link MUST be rejected by DB composite FK"
+    )
+
+    # Path 2: Create valid same-party successor via renew → soft-delete it →
+    #   then try to soft-delete predecessor. The predecessor delete validator
+    #   MUST catch deleted_successor (truth invalid before delete) with 409
+    #   WITHOUT producing zero side effects.
+    r_renew = client.post(
+        f"{API}/leases/{lease_id}/renew",
+        json={"start_date": succ_start, "end_date": succ_end,
+              "monthly_rent": "12500.00", "deposit": "25000.00"},
+        headers=h,
+    )
+    assert r_renew.status_code == 200, r_renew.text
+    succ_id = r_renew.json()["id"]
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    bind = db_session.get_bind()
+
+    def _soft_del_succ(conn):
+        conn.execute(text(
+            "UPDATE leases SET deleted_at = now(), updated_by = 1 WHERE id = :sid"
+        ), {"sid": succ_id})
+
+    _conn = bind.connect()
+    try:
+        _soft_del_succ(_conn)
         _conn.commit()
     finally:
         _conn.close()
@@ -861,6 +1010,52 @@ def test_s12_forged_stale_successor_link_409_on_delete_zero_side_effects(
     assert isinstance(detail, dict)
     assert detail["reason"] == "renewal_successor_truth_invalid_before_delete", (
         f"Expected renewal_successor_truth_invalid_before_delete, got {detail.get('reason')!r}"
+    )
+
+    # Path 3 (stale/date-mismatch): restore successor (un-delete), then shift
+    # successor.start_date so it no longer equals pred.end + 1 while composite
+    # FK still holds → predecessor delete still fails 409 with zero side effects.
+    def _undel_succ(conn):
+        conn.execute(text(
+            "UPDATE leases SET deleted_at = NULL, updated_by = 1 WHERE id = :sid"
+        ), {"sid": succ_id})
+
+    _conn = bind.connect()
+    try:
+        _undel_succ(_conn)
+        _conn.commit()
+    finally:
+        _conn.close()
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    def _shift_succ_date(conn):
+        conn.execute(text(
+            "UPDATE leases SET start_date = start_date + interval '1 day', updated_by = 1 "
+            "WHERE id = :sid"
+        ), {"sid": succ_id})
+
+    _conn = bind.connect()
+    try:
+        _shift_succ_date(_conn)
+        _conn.commit()
+    finally:
+        _conn.close()
+    try:
+        db_session.rollback()
+    except Exception:
+        pass
+    db_session.expire_all()
+
+    del_r2 = client.delete(f"{API}/leases/{lease_id}", headers=h)
+    assert del_r2.status_code == 409, del_r2.text
+    detail2 = del_r2.json()["detail"]
+    assert isinstance(detail2, dict)
+    assert detail2["reason"] == "renewal_successor_truth_invalid_before_delete", (
+        f"stale-date-mismatch still expected truth_invalid_before_delete got {detail2.get('reason')!r}"
     )
 
     db_session.expire_all()

@@ -192,3 +192,84 @@ jobs:
           # real package cannot be loaded in Node.js because it imports
           # the Cloudflare-only virtual module "cloudflare:workers").
           npx tsx --tsconfig tsconfig.tests.json tests/index.spec.ts
+
+  m004-gate:
+    name: m004-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ""
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files (backend scope)
+        id: changed
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$base" ] || [ -z "$head" ]; then
+            backend=true
+          else
+            files="$(git diff --name-only "$base" "$head")"
+            backend=false
+            while IFS= read -r f; do
+              case "$f" in
+                .github/workflows/*|app/*|alembic/*|tests/*|requirements*.txt|pyproject.toml|setup.py|conftest.py)
+                  backend=true
+                  ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "backend=$backend" >> $GITHUB_OUTPUT
+
+      - name: Set up Python 3.11
+        if: steps.changed.outputs.backend == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        if: steps.changed.outputs.backend == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: M004 Gate — exact 6 tests (0 FAIL / 0 ERROR contract)
+        if: steps.changed.outputs.backend == 'true'
+        timeout-minutes: 28
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/postgres
+          DATABASE_URL_UNPOOLED: postgresql+psycopg2://postgres:postgres@localhost:5432/postgres
+          PASAY_TEST_DB_NAME: pasay_pm_test_m004
+          TELEGRAM_BOT_TOKEN: fake-token-for-ci-pass-12345
+          TELEGRAM_WEBHOOK_SECRET: fake-webhook-secret-for-ci
+          PASAY_CONTAINER_INGEST_TOKEN: fake-ingest-token-for-ci
+          PASAY_RUNTIME_MODE: ci
+        run: |
+          python -m pytest \
+            tests/test_m004_lease_moveout_truth_closure.py \
+            tests/test_m004_db_invariants.py \
+            tests/test_m004_db_invariants_renewal_lifecycle.py \
+            tests/test_m004_concurrency.py \
+            tests/test_leases.py \
+            tests/test_m003_operations_truth_closure.py \
+            -q -p no:cacheprovider --tb=short \
+            --ignore=eval
