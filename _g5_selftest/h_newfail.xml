@@ -1,0 +1,1 @@
+<testsuite tests="2"><testcase classname="mod" name="only_in_head_fail"><failure msg="x"/></testcase><testcase classname="mod" name="shared"/></testsuite>
