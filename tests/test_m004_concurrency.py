@@ -15,13 +15,14 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, Session as SASession
 
 from app import models  # noqa: F401
 from app.config import settings
@@ -938,27 +939,74 @@ def test_13_migration_m004_roundtrip_seed_script():
     assert proc.returncode == 0, f"roundtrip exit={proc.returncode}; STDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}"
 
 
-# ===== 14. concurrent schedule_inspection savepoint boundary (no PendingRollbackError) =====
+# ===== 14. concurrent schedule_inspection savepoint boundary (DETERMINISTIC, no sleep) =====
 def test_14_concurrent_schedule_inspection_savepoint_no_500(concurrency_engine, c_client, concurrency_db, c_owner, c_lease_active):
     """Direct service-layer concurrency on schedule_inspection().
 
-    Verifies:
-    - No 500 / PendingRollbackError on the loser path.
-    - Exactly 1 active inspection row persists (partial unique index enforced).
-    - Loser returns winner's row via existing lookup (created=False).
-    - No broad Exception swallowing (IntegrityError re-raised if no existing found).
+    DETERMINISTIC algorithm (NO sleep / luck):
+      1. Both sessions complete initial state load and see 0 active inspections.
+      2. Both arrive at barrier_start (threads aligned after 0-rows verified).
+      3. Both call schedule_inspection() independently.
+      4. First Inspection new-object flush wins "counter == 1"; second gets counter == 2.
+      5. Both inspection-flush before_flush handlers rendezvous at barrier_flush (2 parties).
+         This guarantees both INSERT SQL have been issued with row locks held,
+         so when both return from the barrier and one commits, the other MUST hit
+         a deterministic PostgreSQL partial unique violation (SQLSTATE 23505).
+      6. schedule_inspection IntegrityError branch returns winner, created=False.
+      7. No 500 / PendingRollbackError ever.
+      8. Final DB: exactly 1 active inspection row; winner_id == loser_id.
     """
     from app.services.move_out_workflow import schedule_inspection as _svc_sched
     lease_id = c_lease_active
     actor_id = c_owner[0].id
     scheduled_at = datetime.now(timezone.utc) + timedelta(days=3)
     SessionT = sessionmaker(bind=concurrency_engine, autoflush=False, expire_on_commit=False)
-    barrier = threading.Barrier(2, timeout=10)
+
+    barrier_start = threading.Barrier(2, timeout=20)
+    barrier_flush = threading.Barrier(2, timeout=20)
+    inspection_flush_count: dict[str, int] = {"counter": 0}
+    observed_integrity_errors: list[bool] = [False, False]
+    state_lock = threading.Lock()
+
+    sess_to_worker: dict[int, int] = {}
+
+    def _bf_handler(session: SASession, flush_context, instances):
+        sid = id(session)
+        if sid not in sess_to_worker:
+            return
+        new_inspections = [o for o in session.new if isinstance(o, MoveOutInspection)]
+        if not new_inspections:
+            return
+        with state_lock:
+            inspection_flush_count["counter"] += 1
+        try:
+            barrier_flush.wait(timeout=20)
+        except Exception:
+            raise
+
+    event.listen(SessionT, "before_flush", _bf_handler)
 
     def _worker(i):
-        barrier.wait(timeout=10)
-        time.sleep(0.005)
+        sess_verify = SessionT()
+        try:
+            seen = (
+                sess_verify.query(MoveOutInspection)
+                .filter(
+                    MoveOutInspection.lease_id == lease_id,
+                    MoveOutInspection.status.in_(
+                        [MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]
+                    ),
+                )
+                .count()
+            )
+            assert seen == 0, f"Worker {i}: expected 0 active inspections before start, got {seen}"
+        finally:
+            sess_verify.close()
+
+        barrier_start.wait(timeout=20)
+
         sess = SessionT()
+        sess_to_worker[id(sess)] = i
         try:
             insp, created = _svc_sched(
                 sess,
@@ -969,116 +1017,237 @@ def test_14_concurrent_schedule_inspection_savepoint_no_500(concurrency_engine, 
                 actor_id=actor_id,
             )
             sess.commit()
-            return 200, (insp.id, created)
+            return 200, (insp.id, created, False)
         except IntegrityError as e:
             sess.rollback()
-            return 409, ("IntegrityError", str(e)[:200])
-        except Exception as e:
-            sess.rollback()
-            return 500, (type(e).__name__, str(e)[:500])
+            observed_integrity_errors[i] = True
+            diag = getattr(getattr(e, "orig", None), "pgcode", None)
+            return 409, ("IntegrityError", diag or str(e)[:120])
         finally:
             sess.close()
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        futs = [ex.submit(_worker, i) for i in range(2)]
-        wait(futs, timeout=30)
-        results = [f.result(timeout=10) for f in futs]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_worker, i) for i in range(2)]
+            wait(futs, timeout=60)
+            results = [f.result(timeout=10) for f in futs]
+    finally:
+        event.remove(SessionT, "before_flush", _bf_handler)
 
     codes = sorted([r[0] for r in results])
-    assert 500 not in codes, f"Got 500 (PendingRollbackError or other) in savepoint path! results={results}"
-    assert codes == [200, 200], f"Expected both threads 200 (one creates, one returns existing). codes={codes}; results={results}"
-    winner = [r for r in results if r[1][1] is True]
-    loser = [r for r in results if r[1][1] is False]
-    assert len(winner) == 1, f"Exactly 1 creator expected, winners={winner}; all={results}"
-    assert len(loser) == 1, f"Exactly 1 returner (created=False) expected, losers={loser}; all={results}"
-    winner_id = winner[0][1][0]
-    loser_id = loser[0][1][0]
-    assert winner_id == loser_id, f"Winner and loser must return same inspection id! winner_id={winner_id} loser_id={loser_id}"
+    assert 500 not in codes, f"Got 500 in savepoint deterministic path! results={results}"
+    assert 409 not in codes, f"IntegrityError leaked outside schedule_inspection! results={results}"
+    assert observed_integrity_errors == [False, False], (
+        f"IntegrityError fired at raw session level outside savepoint handler: "
+        f"{observed_integrity_errors}"
+    )
+    assert codes == [200, 200], f"Expected both 200. codes={codes}; all={results}"
+
+    created_values = [r[1][1] for r in results]
+    inspection_ids = [r[1][0] for r in results]
+    assert sorted(created_values) == [False, True], (
+        f"Expected exactly one winner (created=True) and one loser (created=False). "
+        f"Got created_values={created_values}; results={results}"
+    )
+    assert inspection_ids[0] == inspection_ids[1], (
+        f"Winner id={inspection_ids[0]} != loser id={inspection_ids[1]}; "
+        f"savepoint recovery must return the winner row id from both threads."
+    )
+    assert inspection_flush_count["counter"] == 2, (
+        f"Expected exactly 2 Inspection before_flush rendezvous (one per thread). "
+        f"Got counter={inspection_flush_count['counter']}"
+    )
+
     concurrency_db.expire_all()
     active_rows = concurrency_db.query(MoveOutInspection).filter(
         MoveOutInspection.lease_id == lease_id,
         MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
     ).all()
-    assert len(active_rows) == 1, f"Partial unique index violated! active_rows={[r.id for r in active_rows]}"
-    assert active_rows[0].id == winner_id
+    assert len(active_rows) == 1, f"Partial unique index violated! active_rows count={len(active_rows)}"
+    assert active_rows[0].id == inspection_ids[0]
 
 
-# ===== 15. savepoint boundary preserves outer transaction modifications =====
+# ===== 15. savepoint boundary preserves outer transaction modifications (DETERMINISTIC) =====
 def test_15_savepoint_outer_tx_preserved_on_conflict(concurrency_engine, concurrency_db, c_owner, c_lease_active, c_unit):
-    """After IntegrityError handled via savepoint, outer tx modifications must NOT be rolled back.
+    """After a DETERMINISTIC IntegrityError handled via savepoint, outer tx modifications STAY.
 
-    Steps:
-    1. In one session, make an unrelated outer modification (Unit.notes = marker).
-    2. Call schedule_inspection() which should succeed, commit -> this creates active insp#1.
-    3. In a SECOND session (simulating separate request within same outer tx):
-       a. First make a DIFFERENT outer modification (Unit.floor = marker_floor)
-          BEFORE calling schedule_inspection().
-       b. Now call schedule_inspection() for same lease -> triggers partial unique
-          IntegrityError -> savepoint rollback.
-       c. Conflict handler returns existing (created=False) without full Session rollback.
-       d. Session.commit().
-    4. Assert: the outer modification (floor) from step 3a STILL EXISTS in DB.
-       If the old code's full db.rollback() were present, this marker would be lost.
+    SAVEPOINT OUTER-TX THEOREM (test_15 statement):
+      Given session S in state Dirty[S1] (contains pending non-savepoint dirty writes).
+      When inside a nested SAVEPOINT, S performs:
+          INSERT row ON same table — UNIQUE INDEX CONFLICT (23505).
+      Then:
+          (a) savepoint rolls back ONLY the INSERT (the dirty writes outside the
+              savepoint scope are NOT rolled back), and
+          (b) subsequent S.commit() persists the Dirty[S1] writes to DB.
+
+    Implementation (1 thread modifies outer-tx, 1 thread pure Inspector — NO same-row
+    update contention, NO row-locks between the 2 concurrent threads, deterministic 23505
+    via before_flush Barrier on Inspection new-object):
+      Thread 0 ("Inspector pure"): NO outer-tx modifications. Only runs schedule_inspection.
+      Thread 1 ("Inspector with outer-dirty Unit"): sets Unit.floor=marker_state2 (outer-tx
+        dirty), then flush()es (Unit is then clean in ORM state, already written to DB),
+        then runs schedule_inspection. When it is the 23505 loser, savepoint rollback
+        affects ONLY the inner Inspection INSERT, NOT the earlier Unit floor update.
+        Finally sess.commit() persists floor=marker_state2.
+      Both threads rendezvous at barrier_inspection_contention inside before_flush when
+      session.new contains a MoveOutInspection (both do) — producing deterministic row lock
+      overlap leading to one winner (created=True) one loser (created=False via recovery).
     """
     from app.services.move_out_workflow import schedule_inspection as _svc_sched
     lease_id = c_lease_active
     actor_id = c_owner[0].id
     unit_id = c_unit
-    scheduled_at_1 = datetime.now(timezone.utc) + timedelta(days=4)
-    scheduled_at_2 = datetime.now(timezone.utc) + timedelta(days=5)
+    scheduled_at_0 = datetime.now(timezone.utc) + timedelta(days=4)
+    scheduled_at_1 = datetime.now(timezone.utc) + timedelta(days=5)
     SessionT = sessionmaker(bind=concurrency_engine, autoflush=False, expire_on_commit=False)
 
-    marker_state1 = f"S1-{uuid.uuid4().hex[:5]}"
-    marker_state2 = f"S2-{uuid.uuid4().hex[:5]}"
+    marker_state2 = f"L2-{uuid.uuid4().hex[:6]}"
+    barrier_after_setup = threading.Barrier(2, timeout=20)
+    barrier_inspection_contention = threading.Barrier(2, timeout=20)
+    counters: dict[str, int] = {"inspection_flush_count": 0}
+    state_lock = threading.Lock()
+    sess_to_worker: dict[int, int] = {}
 
-    sess1 = SessionT()
+    def _bf_handler(session: SASession, flush_context, instances):
+        sid = id(session)
+        if sid not in sess_to_worker:
+            return
+        new_inspections = [o for o in session.new if isinstance(o, MoveOutInspection)]
+        if not new_inspections:
+            return
+        with state_lock:
+            counters["inspection_flush_count"] += 1
+        try:
+            barrier_inspection_contention.wait(timeout=20)
+        except Exception:
+            raise
+
+    event.listen(SessionT, "before_flush", _bf_handler)
+
+    def _thread_pure_inspector():
+        """Thread 0: NO outer-tx dirty work. Only pure schedule_inspection."""
+        sess = SessionT()
+        sess_to_worker[id(sess)] = 0
+        try:
+            # Rendezvous: both threads' setup done before either races.
+            barrier_after_setup.wait(timeout=20)
+            insp, created = _svc_sched(
+                sess,
+                lease_id=lease_id,
+                unit_id=unit_id,
+                tenant_id=None,
+                scheduled_at=scheduled_at_0,
+                actor_id=actor_id,
+            )
+            sess.commit()
+            return 200, (insp.id, created)
+        except IntegrityError as e:
+            sess.rollback()
+            diag = getattr(getattr(e, "orig", None), "pgcode", None)
+            return 409, ("IntegrityError", diag or str(e)[:120])
+        finally:
+            sess.close()
+
+    def _thread_dirty_outer_then_inspect():
+        """Thread 1: Apply outer-tx dirty Unit.floor, THEN schedule_inspection."""
+        sess = SessionT()
+        sess_to_worker[id(sess)] = 1
+        try:
+            # === Outer-tx dirty modification BEFORE schedule_inspection ===
+            u = sess.get(Unit, unit_id)
+            assert u is not None, "Unit fixture not found"
+            u.floor = marker_state2
+            # Flush dirty Unit BEFORE schedule_inspection so that SQLAlchemy begin_nested
+            # snapshot auto-flush does NOT fire (Unit is already clean in session state).
+            # This eliminates the hidden before_flush that broke earlier barrier counts.
+            # After flush, floor=marker_state2 is pending committed in DB but not yet
+            # visible to other REPEATABLE READ snapshots; but sess.commit() at the end
+            # will make it persistent. If schedule_inspection savepoint rolls back,
+            # this Unit update is NOT in the savepoint scope and MUST survive.
+            sess.flush()
+            # ==================================================================
+            barrier_after_setup.wait(timeout=20)
+            insp, created = _svc_sched(
+                sess,
+                lease_id=lease_id,
+                unit_id=unit_id,
+                tenant_id=None,
+                scheduled_at=scheduled_at_1,
+                actor_id=actor_id,
+            )
+            sess.commit()
+            return 200, (insp.id, created)
+        except IntegrityError as e:
+            sess.rollback()
+            diag = getattr(getattr(e, "orig", None), "pgcode", None)
+            return 409, ("IntegrityError", diag or str(e)[:120])
+        finally:
+            sess.close()
+
     try:
-        u1 = sess1.get(Unit, unit_id)
-        assert u1 is not None
-        u1.unit_state = marker_state1
-        insp1, created1 = _svc_sched(
-            sess1,
-            lease_id=lease_id,
-            unit_id=unit_id,
-            tenant_id=None,
-            scheduled_at=scheduled_at_1,
-            actor_id=actor_id,
-        )
-        assert created1 is True
-        sess1.commit()
-        insp1_id = insp1.id
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_pure = ex.submit(_thread_pure_inspector)
+            f_dirty = ex.submit(_thread_dirty_outer_then_inspect)
+            wait([f_pure, f_dirty], timeout=60)
+            try:
+                r_dirty = f_dirty.result(timeout=10)
+            except Exception as e:
+                raise AssertionError(f"Thread_dirty (outer-tx modifier) FAILED with: {type(e).__name__}: {e}") from e
+            try:
+                r_pure = f_pure.result(timeout=10)
+            except Exception as e:
+                raise AssertionError(f"Thread_pure (pure inspector) FAILED with: {type(e).__name__}: {e}") from e
     finally:
-        sess1.close()
+        event.remove(SessionT, "before_flush", _bf_handler)
 
-    sess2 = SessionT()
-    try:
-        u2 = sess2.get(Unit, unit_id)
-        assert u2 is not None
-        u2.floor = marker_state2
-        insp2, created2 = _svc_sched(
-            sess2,
-            lease_id=lease_id,
-            unit_id=unit_id,
-            tenant_id=None,
-            scheduled_at=scheduled_at_2,
-            actor_id=actor_id,
-        )
-        assert created2 is False, f"Expected existing returned (created=False), got created={created2} insp2.id={insp2.id}"
-        assert insp2.id == insp1_id
-        sess2.commit()
-    except IntegrityError as e:
-        sess2.rollback()
-        raise AssertionError(f"IntegrityError leaked — savepoint handler should have returned existing. e={e}")
-    finally:
-        sess2.close()
+    results = [r_pure, r_dirty]
 
+    # === Contention invariants (same proof as test_14) ===
+    codes = sorted([r[0] for r in results])
+    assert 500 not in codes, f"Got 500 in savepoint path! results={results}"
+    assert 409 not in codes, f"IntegrityError leaked outside schedule_inspection! results={results}"
+    assert codes == [200, 200], f"Expected both 200. codes={codes}; all={results}"
+
+    created_values = [r[1][1] for r in results]
+    insp_ids = [r[1][0] for r in results]
+    assert sorted(created_values) == [False, True], (
+        f"Expected exactly one True/False created flag. Got created_values={created_values}; results={results}"
+    )
+    assert insp_ids[0] == insp_ids[1], (
+        f"savepoint recovery returned different ids? insp_ids={insp_ids}; results={results}"
+    )
+    assert counters["inspection_flush_count"] == 2, (
+        f"Expected BOTH threads to hit Inspection new-object before_flush "
+        f"(proof deterministic contention). counters={counters}"
+    )
+
+    # DB-level truth: exactly 1 active inspection row with id == winner id.
     concurrency_db.expire_all()
+    active_rows = (
+        concurrency_db.query(MoveOutInspection)
+        .filter(
+            MoveOutInspection.lease_id == lease_id,
+            MoveOutInspection.status.in_(
+                [MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]
+            ),
+        )
+        .all()
+    )
+    assert len(active_rows) == 1, f"Partial unique index violated! count={len(active_rows)}"
+    assert active_rows[0].id == insp_ids[0]
+
+    # === THE CORE SAVEPOINT THEOREM ASSERTION FOR test_15 ===
+    # Thread1's Unit.floor = marker_state2 was applied BEFORE schedule_inspection began.
+    # If thread1 was LOSER (created=False → savepoint IntegrityError rolled back),
+    # the savepoint rollback CANNOT touch outer-tx state — marker_state2 must persist.
+    # If thread1 was WINNER (created=True → no savepoint rollback needed), marker_state2
+    # also persists trivially. Either way marker_state2 survives to committed DB.
     u_final = concurrency_db.get(Unit, unit_id)
     assert u_final is not None
     assert u_final.floor == marker_state2, (
-        f"OUTER TRANSACTION MODIFICATION WAS ROLLED BACK! "
-        f"Expected floor='{marker_state2}', got floor='{u_final.floor}'. "
-        f"This proves the old db.rollback() was nuking outer-tx changes. "
-        f"(unit_state from sess1 should still be '{marker_state1}': got '{u_final.unit_state}')"
+        f"TEST_15 CORE FAILURE: outer-tx dirty modification (Unit.floor=marker_state2) "
+        f"was LOST! Expected floor='{marker_state2}', got floor='{u_final.floor}'. "
+        f"This is the EXACT full-Session-rollback-on-IntegrityError defect: savepoint "
+        f"rollback must not revert outer-tx dirty in the SAME session. "
+        f"thread created_values={created_values} (Loser was thread with created=False)."
     )
-    assert u_final.unit_state == marker_state1
