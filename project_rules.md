@@ -1,8 +1,17 @@
-# Pasay — Project Rules（TRAE SOLO Execution Contract）
+# Pasay — Engineering Execution Reference
 
-> **STATUS: CANONICAL**
-> 本文件是 PASAY-SOLO-TRANSITION-001（Issue #34）后正式生效的项目级工程规则。
-> TRAE SOLO 日常开发唯一遵循本文件 + `SOLO_HANDOFF.md` + `CURRENT_ARCHITECTURE.md`。
+> **STATUS: NON-CANONICAL REFERENCE（非宪法级，工程细节参考）**
+>
+> 本文件是工程执行细节参考文档，**NOT the project constitution**。
+>
+> **Canonical Constitution Chain（权威链，优先级递减）：**
+> 1. `AGENTS.md` — 项目宪法（永久真相 + 身份 + 边界 + 加载指针）
+> 2. `.trae/rules/pasay-governance.md` — alwaysApply 硬安全禁令（Hard Bans ONLY）
+> 3. **本文件** — 工程执行细节参考（不与上两层冲突时有效）
+> 4. `SOLO_HANDOFF.md` — 历史接手合同与项目快照
+> 5. `CURRENT_ARCHITECTURE.md` — 架构冻结记录
+>
+> 本文件任何内容与上两层冲突时，**以上两层为准**。
 >
 > 历史 ND 微任务工作流规则已退役（见 `AI_WORKFLOW_RULES.md` HISTORICAL）。
 

@@ -412,7 +412,8 @@ def _task_row(db: Session, task: OperationalTask, unit_number_by_lease: dict[int
 
 
 def _payable_expense_rows(
-    db: Session, *, now: datetime | None = None
+    db: Session, *, now: datetime | None = None,
+    org_property_ids: set[int] | None = None,
 ) -> list[dict]:
     """Owner-actionable payable expenses: every expense that still has REAL
     remaining money to pay (APPROVED, PARTIALLY_PAID, or PAYMENT_CLAIMED with a
@@ -425,15 +426,20 @@ def _payable_expense_rows(
     possible-duplicate warning."""
     from app.services.expense_payment_truth import payment_truth
 
+    expense_filters = [
+        Expense.status.in_([
+            ExpenseStatus.approved,
+            ExpenseStatus.partially_paid,
+            ExpenseStatus.payment_claimed,
+        ])
+    ]
+    if org_property_ids is not None:
+        if not org_property_ids:
+            return []
+        expense_filters.append(Expense.property_id.in_(list(org_property_ids)))
     expenses = (
         db.query(Expense)
-        .filter(
-            Expense.status.in_([
-                ExpenseStatus.approved,
-                ExpenseStatus.partially_paid,
-                ExpenseStatus.payment_claimed,
-            ])
-        )
+        .filter(*expense_filters)
         .order_by(Expense.expense_date, Expense.id)
         .all()
     )
@@ -589,7 +595,10 @@ def find_similar_paid_expenses(
     return rows
 
 
-def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[dict]:
+def build_quick_properties(
+    db: Session, *, now: datetime | None = None,
+    org_property_ids: set[int] | None = None,
+) -> list[dict]:
     """One asset row per active unit for the frozen Units page.
 
     The Units page is an asset directory, not an operations workbench, so the
@@ -598,9 +607,14 @@ def build_quick_properties(db: Session, *, now: datetime | None = None) -> list[
     Overdue/follow-up/payment workload stays on Home / Tasks / Rent / Expense.
     """
     now = now or datetime.now(timezone.utc)
+    unit_filters = [Unit.deleted_at.is_(None), Unit.is_active.is_(True)]
+    if org_property_ids is not None:
+        if not org_property_ids:
+            return []
+        unit_filters.append(Unit.property_id.in_(list(org_property_ids)))
     units = (
         db.query(Unit)
-        .filter(Unit.deleted_at.is_(None), Unit.is_active.is_(True))
+        .filter(*unit_filters)
         .order_by(Unit.property_id, Unit.unit_number)
         .all()
     )
@@ -673,7 +687,10 @@ def _current_month_collected(confirmed_by_lease: dict[int, list[Income]], lease_
     return total
 
 
-def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
+def build_quick_rent(
+    db: Session, *, now: datetime | None = None,
+    org_property_ids: set[int] | None = None,
+) -> dict:
     """Overdue units + outstanding total, plus the CURRENT month's rent
     statistics (expected / collected / outstanding / collection rate / unpaid
     unit count). Same period semantics as /overdue-rents and the financial
@@ -685,11 +702,32 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
     now = now or datetime.now(timezone.utc)
     today = now.date()
     month = today.strftime("%Y-%m")
-    leases = (
-        db.query(Lease)
-        .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
-        .all()
-    )
+    lease_filters = [Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None)]
+    if org_property_ids is not None:
+        if not org_property_ids:
+            return {
+                "overdue": [],
+                "outstanding_total": Decimal("0.00"),
+                "month": month,
+                "expected_rent_total": Decimal("0.00"),
+                "collected_rent": Decimal("0.00"),
+                "outstanding_rent": Decimal("0.00"),
+                "collection_rate": Decimal("0.00"),
+                "unpaid_unit_count": 0,
+            }
+        lease_filters.append(Unit.property_id.in_(list(org_property_ids)))
+        leases = (
+            db.query(Lease)
+            .join(Unit, Unit.id == Lease.unit_id)
+            .filter(*lease_filters)
+            .all()
+        )
+    else:
+        leases = (
+            db.query(Lease)
+            .filter(*lease_filters)
+            .all()
+        )
     confirmed_by_lease: dict[int, list[Income]] = {}
     if leases:
         for income in (
@@ -793,80 +831,91 @@ def build_quick_rent(db: Session, *, now: datetime | None = None) -> dict:
     }
 
 
-def build_quick_expense(db: Session, *, user_id: int | None = None, now: datetime | None = None) -> dict:
-    """Current-month spend + pending approval + unresolved expense tasks."""
+def build_quick_expense(
+    db: Session, *, now: datetime | None = None,
+    org_property_ids: set[int] | None = None,
+    user_id: int | None = None,
+) -> dict:
+    """Current-month spend + pending approval + unresolved expense tasks.
+
+    Scope resolution (fail-closed, first-match in order):
+    1. If org_property_ids is explicitly provided → use directly (Router path,
+       resolves membership for the request org-id, M003 Expense scope hardening).
+       Empty org_property_ids (set()==Falsy) → returns fully zeroed result.
+    2. Else if user_id is provided → derive scope via _derive_org_scope_sets
+       (backward-compatible test path; M004 tests call this).
+    3. Else both None → system-wide full scope (convenience for test helpers
+       that want all rows when no user/org context exists; still fail-closed
+       if DB has no orgs, zeroed).
+    """
     now = now or datetime.now(timezone.utc)
+    if org_property_ids is None:
+        (derived_prop_ids, _, _, _) = _derive_org_scope_sets(db, user_id=user_id)
+        org_property_ids = derived_prop_ids
+    if not org_property_ids:
+        return {
+            "month_total": Decimal("0.00"),
+            "pending_approval_count": 0,
+            "pending_approval_amount": Decimal("0.00"),
+            "unresolved_expense_tasks": [],
+            "records": [],
+            "payable": [],
+            "paid_records": [],
+        }
     start, end = month_range(now.date().strftime("%Y-%m"))
+    def _expense_filter(extra_statuses: list | None = None):
+        statuses = extra_statuses or [
+            ExpenseStatus.approved,
+            ExpenseStatus.paid,
+            ExpenseStatus.partially_paid,
+            ExpenseStatus.payment_claimed,
+        ]
+        f = [Expense.status.in_(statuses), Expense.expense_date >= start, Expense.expense_date <= end]
+        f.append(Expense.property_id.in_(list(org_property_ids)))
+        return f
     month_total = Decimal("0.00")
     for amount, in (
         db.query(Expense.amount)
-        .filter(
-            Expense.status.in_([
-                ExpenseStatus.approved,
-                ExpenseStatus.paid,
-                ExpenseStatus.partially_paid,
-                ExpenseStatus.payment_claimed,
-            ]),
-            Expense.expense_date >= start,
-            Expense.expense_date <= end,
-        )
+        .filter(*_expense_filter())
         .all()
     ):
         month_total += _d2(amount)
+    pending_filter = [
+        Expense.status == ExpenseStatus.pending,
+        Expense.property_id.in_(list(org_property_ids)),
+    ]
     pending_rows = (
         db.query(Expense)
-        .filter(Expense.status == ExpenseStatus.pending)
+        .filter(*pending_filter)
         .order_by(Expense.expense_date)
         .all()
     )
     pending_amount = sum((_d2(e.amount) for e in pending_rows), Decimal("0.00"))
-    org_property_ids, _org_unit_ids, org_lease_ids, org_tenant_ids = _derive_org_scope_sets(db, user_id=user_id)
-    scope_clauses = []
-    org_property_ids_list = list(org_property_ids)
-    org_lease_ids_list = list(org_lease_ids)
-    org_tenant_ids_list = list(org_tenant_ids)
-    if org_property_ids_list:
-        scope_clauses.append(OperationalTask.property_id.in_(org_property_ids_list))
-    if org_lease_ids_list:
-        scope_clauses.append(OperationalTask.lease_id.in_(org_lease_ids_list))
-    if org_tenant_ids_list:
-        scope_clauses.append(OperationalTask.tenant_id.in_(org_tenant_ids_list))
-    if not scope_clauses:
-        unresolved: list[OperationalTask] = []
-    else:
-        unresolved = (
-            db.query(OperationalTask)
-            .filter(
-                OperationalTask.task_type.in_(
-                    [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
-                ),
-                OperationalTask.status.in_(
-                    [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-                ),
-                or_(*scope_clauses),
-            )
-            .order_by(OperationalTask.due_at)
-            .all()
-        )
+    unresolved_filter = [
+        OperationalTask.task_type.in_(
+            [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
+        ),
+        OperationalTask.status.in_(
+            [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+        ),
+        OperationalTask.property_id.in_(list(org_property_ids)),
+    ]
+    unresolved = (
+        db.query(OperationalTask)
+        .filter(*unresolved_filter)
+        .order_by(OperationalTask.due_at)
+        .all()
+    )
     unit_number_by_lease: dict[int, str] = {}
-    # P1-EXPENSE-QUICKVIEW-LIST-001: this month's real expense records so the
-    # quick view shows actual spend, not only unresolved items.
-    # PENDING/APPROVED/PAID are real spend; REJECTED (cancelled) and REVERSED
-    # records are not normal expenses and never appear. The month_total
-    # semantics (approved + paid) are unchanged.
     month_records = (
         db.query(Expense)
-        .filter(
-            Expense.status.in_([
-                ExpenseStatus.pending,
-                ExpenseStatus.approved,
-                ExpenseStatus.paid,
-                ExpenseStatus.partially_paid,
-                ExpenseStatus.payment_claimed,
-            ]),
-            Expense.expense_date >= start,
-            Expense.expense_date <= end,
-        )
+        .filter(*_expense_filter([
+            ExpenseStatus.pending,
+            ExpenseStatus.approved,
+            ExpenseStatus.paid,
+            ExpenseStatus.partially_paid,
+            ExpenseStatus.payment_claimed,
+        ]))
         .order_by(Expense.expense_date.desc(), Expense.id.desc())
         .limit(20)
         .all()
@@ -894,11 +943,7 @@ def build_quick_expense(db: Session, *, user_id: int | None = None, now: datetim
         }
         for e in month_records
     ]
-    # EXPENSE-UX-FIX-001: the pending-payment section is built from the REAL
-    # expense records (APPROVED, not PAID), never from operational-task titles
-    # that used to embed a raw `??` category. `paid_records` is this month's
-    # PAID spend so an APPROVED expense appears exactly once per page.
-    payable = _payable_expense_rows(db, now=now)
+    payable = _payable_expense_rows(db, now=now, org_property_ids=org_property_ids)
     paid_records = [r for r in records if r["status"] == "paid"]
     return {
         "month_total": month_total,
@@ -929,7 +974,10 @@ def _digest_unit_label(db: Session, lease: Lease) -> str:
     return _unit_label(db, unit) or (unit.unit_number if unit else str(lease.unit_id))
 
 
-def _overdue_rent_digest_rows(db: Session, *, now: datetime) -> list[dict]:
+def _overdue_rent_digest_rows(
+    db: Session, *, now: datetime,
+    org_property_ids: set[int] | None = None,
+) -> list[dict]:
     """🔴 ACT-NOW overdue-rent items built from the SAME real truth source as the
     Rent Quick View (TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §7 / §11): one item per
     lease that has overdue uncovered periods, carrying the TOTAL arrears
@@ -937,11 +985,23 @@ def _overdue_rent_digest_rows(db: Session, *, now: datetime) -> list[dict]:
     days. Never a monthly rent in place of the outstanding and never the
     operational_tasks table."""
     today = now.date()
-    leases = (
-        db.query(Lease)
-        .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
-        .all()
-    )
+    lease_filters = [Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None)]
+    if org_property_ids is not None:
+        if not org_property_ids:
+            return []
+        lease_filters.append(Unit.property_id.in_(list(org_property_ids)))
+        leases = (
+            db.query(Lease)
+            .join(Unit, Unit.id == Lease.unit_id)
+            .filter(*lease_filters)
+            .all()
+        )
+    else:
+        leases = (
+            db.query(Lease)
+            .filter(*lease_filters)
+            .all()
+        )
     if not leases:
         return []
     confirmed_by_lease: dict[int, list[Income]] = {}
@@ -1011,23 +1071,39 @@ def _overdue_rent_digest_rows(db: Session, *, now: datetime) -> list[dict]:
     return rows
 
 
-def _lease_expiring_digest_rows(db: Session, *, now: datetime) -> list[dict]:
+def _lease_expiring_digest_rows(
+    db: Session, *, now: datetime,
+    org_property_ids: set[int] | None = None,
+) -> list[dict]:
     """🟡 UPCOMING lease-expiry items: active leases whose end date falls
     inside the near-term window (>= today). The user action is to prepare the
     renewal / handover — never the same bucket as an overdue rent chase."""
     today = now.date()
     window_end = today + timedelta(days=_LEASE_EXPIRY_DIGEST_WINDOW_DAYS)
-    leases = (
-        db.query(Lease)
-        .filter(
-            Lease.status == LeaseStatus.active,
-            Lease.deleted_at.is_(None),
-            Lease.end_date >= today,
-            Lease.end_date <= window_end,
+    lease_filters = [
+        Lease.status == LeaseStatus.active,
+        Lease.deleted_at.is_(None),
+        Lease.end_date >= today,
+        Lease.end_date <= window_end,
+    ]
+    if org_property_ids is not None:
+        if not org_property_ids:
+            return []
+        lease_filters.append(Unit.property_id.in_(list(org_property_ids)))
+        leases = (
+            db.query(Lease)
+            .join(Unit, Unit.id == Lease.unit_id)
+            .filter(*lease_filters)
+            .order_by(Lease.end_date, Lease.id)
+            .all()
         )
-        .order_by(Lease.end_date, Lease.id)
-        .all()
-    )
+    else:
+        leases = (
+            db.query(Lease)
+            .filter(*lease_filters)
+            .order_by(Lease.end_date, Lease.id)
+            .all()
+        )
     rows = []
     for lease in leases:
         rows.append(
@@ -1058,7 +1134,10 @@ def _human_completion_kind(task: OperationalTask) -> str:
     return "generic"
 
 
-def _human_done_digest_rows(db: Session, *, now: datetime) -> list[dict]:
+def _human_done_digest_rows(
+    db: Session, *, now: datetime,
+    org_property_ids: set[int] | None = None,
+) -> list[dict]:
     """✅ DONE-TODAY items: only tasks completed by a REAL human principal today
     (``completed_by IS NOT NULL``) — never a scheduler auto-completion, a
     supersede, a reconcile, a generator replacement or a duplicate-cleanup
@@ -1069,15 +1148,22 @@ def _human_done_digest_rows(db: Session, *, now: datetime) -> list[dict]:
     ph_today = philippines_local_date(now)
     day_start = datetime.fromisoformat(f"{ph_today}T00:00:00+08:00").astimezone(timezone.utc)
     day_end = day_start + timedelta(days=1)
+    commits_filter = [
+        OperationalTask.status == OperationalTaskStatus.COMPLETED,
+        OperationalTask.completed_by.isnot(None),
+        OperationalTask.completed_at.isnot(None),
+        OperationalTask.completed_at >= day_start,
+        OperationalTask.completed_at < day_end,
+    ]
+    if org_property_ids is not None:
+        if not org_property_ids:
+            return []
+        commits_filter.append(
+            OperationalTask.property_id.in_(list(org_property_ids))
+        )
     commits = (
         db.query(OperationalTask)
-        .filter(
-            OperationalTask.status == OperationalTaskStatus.COMPLETED,
-            OperationalTask.completed_by.isnot(None),
-            OperationalTask.completed_at.isnot(None),
-            OperationalTask.completed_at >= day_start,
-            OperationalTask.completed_at < day_end,
-        )
+        .filter(*commits_filter)
         .order_by(OperationalTask.completed_at.desc(), OperationalTask.id.desc())
         .all()
     )
@@ -1116,7 +1202,10 @@ def _human_done_digest_rows(db: Session, *, now: datetime) -> list[dict]:
     return rows
 
 
-def build_digest(db: Session, user: User, *, now: datetime | None = None) -> dict:
+def build_digest(
+    db: Session, user: User, *, now: datetime | None = None,
+    org_property_ids: set[int] | None = None,
+) -> dict:
     """Daily Tasks Digest — the three-section human-action view.
 
     The digest answers ONE question: **what does someone need to do today?**
@@ -1138,14 +1227,14 @@ def build_digest(db: Session, user: User, *, now: datetime | None = None) -> dic
     history can never flood the UI.
     """
     now = now or datetime.now(timezone.utc)
-    overdue = _overdue_rent_digest_rows(db, now=now)
+    overdue = _overdue_rent_digest_rows(db, now=now, org_property_ids=org_property_ids)
     payable = [
         {
             **{k: v for k, v in r.items() if k != "unit_code"},
             "sort_anchor": -(r.get("waiting_days") or 0),
             "sort_tie": r["expense_id"],
         }
-        for r in _payable_expense_rows(db, now=now)
+        for r in _payable_expense_rows(db, now=now, org_property_ids=org_property_ids)
     ]
     # --- 🔴 ACT NOW: overdue rents (severity = more days first), then payable
     # expenses (more waiting first); deterministic stable tie-breakers only. ---
@@ -1157,8 +1246,8 @@ def build_digest(db: Session, user: User, *, now: datetime | None = None) -> dic
             -r.get("sort_tie", 0) if r.get("kind") == "rent_overdue" else r.get("sort_tie", 0),
         ),
     )
-    upcoming = _lease_expiring_digest_rows(db, now=now)
-    done_today = _human_done_digest_rows(db, now=now)
+    upcoming = _lease_expiring_digest_rows(db, now=now, org_property_ids=org_property_ids)
+    done_today = _human_done_digest_rows(db, now=now, org_property_ids=org_property_ids)
 
     act_hidden = max(len(act_now) - _DIGEST_ACT_MAX, 0)
     upcoming_hidden = max(len(upcoming) - _DIGEST_UPCOMING_MAX, 0)
