@@ -27,6 +27,7 @@ _RT_DB_URL_FROM_ENV = os.getenv("PASAY_RT_DB_URL")
 if _RT_DB_URL_FROM_ENV:
     os.environ["DATABASE_URL"] = _RT_DB_URL_FROM_ENV
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg2://pasay_pm:pasay_pm@localhost:5432/pasay_pm")
+RT_ADMIN_DB_OVERRIDE = os.getenv("PASAY_RT_ADMIN_DB_OVERRIDE")
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
@@ -91,6 +92,21 @@ def _run_alembic(verb: str, rev: str) -> int:
 
 
 def ensure_rt_database() -> None:
+    if RT_ADMIN_DB_OVERRIDE:
+        admin_url = make_url(RT_ADMIN_DB_OVERRIDE)
+        eng = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+        try:
+            with eng.connect() as conn:
+                row = conn.execute(
+                    text("SELECT 1 FROM pg_database WHERE datname = :n"),
+                    {"n": RT_DB_NAME},
+                ).scalar()
+                if row:
+                    conn.execute(text(f'DROP DATABASE IF EXISTS "{RT_DB_NAME}"'))
+                conn.execute(text(f'CREATE DATABASE "{RT_DB_NAME}"'))
+        finally:
+            eng.dispose()
+        return
     base = make_url(settings.database_url)
     admin_url = base.set(database="postgres")
     eng = create_engine(admin_url, isolation_level="AUTOCOMMIT")
