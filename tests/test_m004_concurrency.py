@@ -936,3 +936,149 @@ def test_13_migration_m004_roundtrip_seed_script():
     cmd = [venv_python, script]
     proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True, timeout=600)
     assert proc.returncode == 0, f"roundtrip exit={proc.returncode}; STDOUT:\n{proc.stdout[-2000:]}\nSTDERR:\n{proc.stderr[-2000:]}"
+
+
+# ===== 14. concurrent schedule_inspection savepoint boundary (no PendingRollbackError) =====
+def test_14_concurrent_schedule_inspection_savepoint_no_500(concurrency_engine, c_client, concurrency_db, c_owner, c_lease_active):
+    """Direct service-layer concurrency on schedule_inspection().
+
+    Verifies:
+    - No 500 / PendingRollbackError on the loser path.
+    - Exactly 1 active inspection row persists (partial unique index enforced).
+    - Loser returns winner's row via existing lookup (created=False).
+    - No broad Exception swallowing (IntegrityError re-raised if no existing found).
+    """
+    from app.services.move_out_workflow import schedule_inspection as _svc_sched
+    lease_id = c_lease_active
+    actor_id = c_owner[0].id
+    scheduled_at = datetime.now(timezone.utc) + timedelta(days=3)
+    SessionT = sessionmaker(bind=concurrency_engine, autoflush=False, expire_on_commit=False)
+    barrier = threading.Barrier(2, timeout=10)
+
+    def _worker(i):
+        barrier.wait(timeout=10)
+        time.sleep(0.005)
+        sess = SessionT()
+        try:
+            insp, created = _svc_sched(
+                sess,
+                lease_id=lease_id,
+                unit_id=None,
+                tenant_id=None,
+                scheduled_at=scheduled_at,
+                actor_id=actor_id,
+            )
+            sess.commit()
+            return 200, (insp.id, created)
+        except IntegrityError as e:
+            sess.rollback()
+            return 409, ("IntegrityError", str(e)[:200])
+        except Exception as e:
+            sess.rollback()
+            return 500, (type(e).__name__, str(e)[:500])
+        finally:
+            sess.close()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [ex.submit(_worker, i) for i in range(2)]
+        wait(futs, timeout=30)
+        results = [f.result(timeout=10) for f in futs]
+
+    codes = sorted([r[0] for r in results])
+    assert 500 not in codes, f"Got 500 (PendingRollbackError or other) in savepoint path! results={results}"
+    assert codes == [200, 200], f"Expected both threads 200 (one creates, one returns existing). codes={codes}; results={results}"
+    winner = [r for r in results if r[1][1] is True]
+    loser = [r for r in results if r[1][1] is False]
+    assert len(winner) == 1, f"Exactly 1 creator expected, winners={winner}; all={results}"
+    assert len(loser) == 1, f"Exactly 1 returner (created=False) expected, losers={loser}; all={results}"
+    winner_id = winner[0][1][0]
+    loser_id = loser[0][1][0]
+    assert winner_id == loser_id, f"Winner and loser must return same inspection id! winner_id={winner_id} loser_id={loser_id}"
+    concurrency_db.expire_all()
+    active_rows = concurrency_db.query(MoveOutInspection).filter(
+        MoveOutInspection.lease_id == lease_id,
+        MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
+    ).all()
+    assert len(active_rows) == 1, f"Partial unique index violated! active_rows={[r.id for r in active_rows]}"
+    assert active_rows[0].id == winner_id
+
+
+# ===== 15. savepoint boundary preserves outer transaction modifications =====
+def test_15_savepoint_outer_tx_preserved_on_conflict(concurrency_engine, concurrency_db, c_owner, c_lease_active, c_unit):
+    """After IntegrityError handled via savepoint, outer tx modifications must NOT be rolled back.
+
+    Steps:
+    1. In one session, make an unrelated outer modification (Unit.notes = marker).
+    2. Call schedule_inspection() which should succeed, commit -> this creates active insp#1.
+    3. In a SECOND session (simulating separate request within same outer tx):
+       a. First make a DIFFERENT outer modification (Unit.floor = marker_floor)
+          BEFORE calling schedule_inspection().
+       b. Now call schedule_inspection() for same lease -> triggers partial unique
+          IntegrityError -> savepoint rollback.
+       c. Conflict handler returns existing (created=False) without full Session rollback.
+       d. Session.commit().
+    4. Assert: the outer modification (floor) from step 3a STILL EXISTS in DB.
+       If the old code's full db.rollback() were present, this marker would be lost.
+    """
+    from app.services.move_out_workflow import schedule_inspection as _svc_sched
+    lease_id = c_lease_active
+    actor_id = c_owner[0].id
+    unit_id = c_unit
+    scheduled_at_1 = datetime.now(timezone.utc) + timedelta(days=4)
+    scheduled_at_2 = datetime.now(timezone.utc) + timedelta(days=5)
+    SessionT = sessionmaker(bind=concurrency_engine, autoflush=False, expire_on_commit=False)
+
+    marker_state1 = f"S1-{uuid.uuid4().hex[:5]}"
+    marker_state2 = f"S2-{uuid.uuid4().hex[:5]}"
+
+    sess1 = SessionT()
+    try:
+        u1 = sess1.get(Unit, unit_id)
+        assert u1 is not None
+        u1.unit_state = marker_state1
+        insp1, created1 = _svc_sched(
+            sess1,
+            lease_id=lease_id,
+            unit_id=unit_id,
+            tenant_id=None,
+            scheduled_at=scheduled_at_1,
+            actor_id=actor_id,
+        )
+        assert created1 is True
+        sess1.commit()
+        insp1_id = insp1.id
+    finally:
+        sess1.close()
+
+    sess2 = SessionT()
+    try:
+        u2 = sess2.get(Unit, unit_id)
+        assert u2 is not None
+        u2.floor = marker_state2
+        insp2, created2 = _svc_sched(
+            sess2,
+            lease_id=lease_id,
+            unit_id=unit_id,
+            tenant_id=None,
+            scheduled_at=scheduled_at_2,
+            actor_id=actor_id,
+        )
+        assert created2 is False, f"Expected existing returned (created=False), got created={created2} insp2.id={insp2.id}"
+        assert insp2.id == insp1_id
+        sess2.commit()
+    except IntegrityError as e:
+        sess2.rollback()
+        raise AssertionError(f"IntegrityError leaked — savepoint handler should have returned existing. e={e}")
+    finally:
+        sess2.close()
+
+    concurrency_db.expire_all()
+    u_final = concurrency_db.get(Unit, unit_id)
+    assert u_final is not None
+    assert u_final.floor == marker_state2, (
+        f"OUTER TRANSACTION MODIFICATION WAS ROLLED BACK! "
+        f"Expected floor='{marker_state2}', got floor='{u_final.floor}'. "
+        f"This proves the old db.rollback() was nuking outer-tx changes. "
+        f"(unit_state from sess1 should still be '{marker_state1}': got '{u_final.unit_state}')"
+    )
+    assert u_final.unit_state == marker_state1
