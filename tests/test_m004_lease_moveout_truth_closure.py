@@ -11,6 +11,10 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
+from sqlalchemy import func as sqla_func
+from sqlalchemy.orm import sessionmaker
+
+from app.models.audit_log import AuditLog
 from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.evidence import EvidenceCategory
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
@@ -26,6 +30,7 @@ from app.models.property import UnitLifecycleEvent, UnitStatus
 from app.models.tenant import Tenant
 from app.services.operations.generation import generate_business_tasks
 from app.services.operations.reconcile import reconcile_tasks
+from app.database import SessionLocal
 
 API = "/api/v1"
 
@@ -788,17 +793,89 @@ def test_c6_confirm_is_idempotent_no_double_financial_rows(
     insp = _schedule_and_full_inspection(
         client, db_session, h, lease_id=lease_id,
     )
-    s = _draft_settlement(client, h, lease_id=lease_id, inspection_id=insp["id"])
-    c1 = client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=h)
+    deductions = [
+        {"description": "wall repair", "amount": "3000.00"},
+        {"description": "cleaning fee", "amount": "2000.00"},
+    ]
+    deposit = Decimal("24000.00")
+    expected_inc_sum_delta = sum(Decimal(d["amount"]) for d in deductions)  # 5000
+    expected_refund = deposit - expected_inc_sum_delta  # 19000
+    s = _draft_settlement(
+        client, h, lease_id=lease_id, inspection_id=insp["id"],
+        total_deduct=str(expected_inc_sum_delta),
+        refund=str(expected_refund),
+        deductions=deductions,
+    )
+    sid = s["id"]
+    refund_key = f"deposit_settlement:{sid}:refund"
+    income_keys_expected = [f"deposit_settlement:{sid}:deduction:{i}" for i in range(len(deductions))]
+    income_keys_set_expected = frozenset(income_keys_expected)
+
+    baseline_inc_count = db_session.query(Income).count()
+    baseline_exp_count = db_session.query(Expense).count()
+    baseline_inc_sum = (db_session.query(sqla_func.sum(Income.amount)).scalar() or Decimal("0"))
+    baseline_exp_sum = (db_session.query(sqla_func.sum(Expense.amount)).scalar() or Decimal("0"))
+
+    c1 = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
     assert c1.status_code == 200, c1.text
-    after1_inc = db_session.query(Income).count()
-    after1_exp = db_session.query(Expense).count()
-    c2 = client.post(f"{API}/deposit-settlements/{s['id']}/confirm", headers=h)
+    db_session.expire_all()
+    after1_inc_count = db_session.query(Income).count()
+    after1_exp_count = db_session.query(Expense).count()
+    after1_inc_sum = (db_session.query(sqla_func.sum(Income.amount)).scalar() or Decimal("0"))
+    after1_exp_sum = (db_session.query(sqla_func.sum(Expense.amount)).scalar() or Decimal("0"))
+    income_delta = after1_inc_count - baseline_inc_count
+    expense_delta = after1_exp_count - baseline_exp_count
+    assert income_delta == len(deductions), (
+        f"expected +{len(deductions)} income rows after first confirm, got +{income_delta}"
+    )
+    assert expense_delta == 1, (
+        f"expected +1 expense refund row after first confirm, got +{expense_delta}"
+    )
+    expected_exp_sum_delta = expected_refund
+    assert (after1_inc_sum - baseline_inc_sum) == expected_inc_sum_delta
+    assert (after1_exp_sum - baseline_exp_sum) == expected_exp_sum_delta
+    after1_income_rows = {
+        row.idempotency_key: (row.amount, row.status.value)
+        for row in db_session.query(Income).filter(
+            Income.idempotency_key.in_(income_keys_expected)
+        ).all()
+    }
+    assert set(after1_income_rows.keys()) == income_keys_set_expected
+    for i, ikey in enumerate(income_keys_expected):
+        got_amount = after1_income_rows[ikey][0]
+        want_amount = Decimal(deductions[i]["amount"])
+        assert got_amount == want_amount, (
+            f"income[{ikey}] amount got {got_amount} want {want_amount}"
+        )
+    refund1 = db_session.query(Expense).filter(Expense.idempotency_key == refund_key).one()
+    assert refund1.amount == expected_exp_sum_delta
+
+    c2 = client.post(f"{API}/deposit-settlements/{sid}/confirm", headers=h)
     assert c2.status_code == 200, c2.text
-    after2_inc = db_session.query(Income).count()
-    after2_exp = db_session.query(Expense).count()
-    assert after2_inc == after1_inc
-    assert after2_exp == after1_exp
+    db_session.expire_all()
+    after2_inc_count = db_session.query(Income).count()
+    after2_exp_count = db_session.query(Expense).count()
+    after2_inc_sum = (db_session.query(sqla_func.sum(Income.amount)).scalar() or Decimal("0"))
+    after2_exp_sum = (db_session.query(sqla_func.sum(Expense.amount)).scalar() or Decimal("0"))
+    assert after2_inc_count == after1_inc_count
+    assert after2_exp_count == after1_exp_count
+    assert after2_inc_sum == after1_inc_sum
+    assert after2_exp_sum == after1_exp_sum
+    after2_income_keys = {
+        r.idempotency_key for r in db_session.query(Income).filter(
+            Income.idempotency_key.like(f"deposit_settlement:{sid}:deduction:%")
+        ).all()
+    }
+    assert after2_income_keys == income_keys_set_expected
+    after2_refund_rows = (
+        db_session.query(Expense)
+        .filter(Expense.idempotency_key == refund_key)
+        .all()
+    )
+    assert len(after2_refund_rows) == 1
+    sett = db_session.get(DepositSettlement, sid)
+    actual_deductions = sett.deductions or []
+    assert len(actual_deductions) == len(deductions)
 
 
 def test_c7_confirm_reconciled_transition(
@@ -1574,7 +1651,8 @@ def test_g2_renew_duplicate_returns_same_successor(
     h = _h(owner_a[1])
     pred = db_session.get(Lease, lease_id)
     assert pred.end_date <= date(2026, 6, 30)
-    succ_start = (pred.end_date + timedelta(days=1)).isoformat()
+    succ_start_date = pred.end_date + timedelta(days=1)
+    succ_start = succ_start_date.isoformat()
     succ_end = (pred.end_date + timedelta(days=365)).isoformat()
     payload = {
         "start_date": succ_start,
@@ -1584,16 +1662,49 @@ def test_g2_renew_duplicate_returns_same_successor(
     }
     r1 = client.post(f"{API}/leases/{lease_id}/renew", json=payload, headers=h)
     assert r1.status_code == 200, r1.text
+    b1 = r1.json()
+    assert "id" in b1, "first renew response MUST contain direct integer id field"
+    assert isinstance(b1["id"], int), (
+        f"first renew id must be integer, got {type(b1['id']).__name__}"
+    )
     pred1 = db_session.get(Lease, lease_id)
-    succ_id_1 = (pred1.renewal_metadata or {})["renewed_lease_id"]
+    succ_db_1 = db_session.get(Lease, pred1.superseded_by_lease_id)
+    assert succ_db_1 is not None
+    assert b1["id"] == succ_db_1.id, (
+        f"first renew response id {b1['id']} must equal DB successor.id {succ_db_1.id}"
+    )
+    succ_count_1 = (
+        db_session.query(Lease)
+        .filter(
+            Lease.unit_id == pred.unit_id,
+            Lease.tenant_id == pred.tenant_id,
+            Lease.start_date == succ_start_date,
+            Lease.deleted_at.is_(None),
+        )
+        .count()
+    )
+    assert succ_count_1 == 1, (
+        f"successor rows for unit+tenant+start after first renew must equal 1, got {succ_count_1}"
+    )
     r2 = client.post(f"{API}/leases/{lease_id}/renew", json=payload, headers=h)
     assert r2.status_code == 200, r2.text
-    body2 = r2.json()
-    succ_id_2 = body2.get("id")
-    if succ_id_2 is None:
-        pred2 = db_session.get(Lease, lease_id)
-        succ_id_2 = (pred2.renewal_metadata or {})["renewed_lease_id"]
-    assert succ_id_2 == succ_id_1
+    b2 = r2.json()
+    assert "id" in b2, "second renew response MUST still contain id directly (metadata fallback FORBIDDEN)"
+    assert isinstance(b2["id"], int)
+    assert b2["id"] == b1["id"], (
+        f"idempotent renew must return exact same successor id, got r2.id={b2['id']} vs r1.id={b1['id']}"
+    )
+    succ_count_2 = (
+        db_session.query(Lease)
+        .filter(
+            Lease.unit_id == pred.unit_id,
+            Lease.tenant_id == pred.tenant_id,
+            Lease.start_date == succ_start_date,
+            Lease.deleted_at.is_(None),
+        )
+        .count()
+    )
+    assert succ_count_2 == 1
 
 
 def test_g3_settlement_confirm_idempotent(
@@ -2291,3 +2402,280 @@ def test_h6_renew_before_end_date_409_and_predecessor_still_active(
     db_session.expire_all()
     still = db_session.get(LeaseModel, lease_id)
     assert still.status == LeaseStatus.active
+
+
+# ========================================================================
+# H组 Owner 5 Actionable 精确反例 + 其他新增 counterexamples
+# ========================================================================
+
+
+def test_h7_task_cancel_ab_isolation_dedupe_key_must_not_cancel_other_inspection(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    """Owner PASAY-TASK-012 #3 exact A/B counterexample.
+
+    Instead of depending on generation/reconcile side-effects to create
+    inspection-bound tasks (which are async), we manually create the four
+    task scenarios: task_A_before_cancel (tied to insp_A by source_type/id),
+    task_B (tied to insp_B), and task_A_after_cancel.  We exercise
+    cancel_inspection and confirm_inspection and ensure that the service
+    cancel/confirm routine only modifies the tasks matching the explicit
+    q1 + q2 contract.
+    """
+    from app.models.operations import (
+        OperationalTask as OT,
+        OperationalTaskType as OTT,
+        OperationalTaskStatus as OTS,
+        OperationalTaskPriority as OTP,
+    )
+    from datetime import timezone
+    h = _h(owner_a[1])
+    actor_id = owner_a[0].id
+    now = datetime.now(timezone.utc)
+    dedupe_key = f"lease:{lease_id}:MOVE_OUT_INSPECTION"
+
+    def _mk_task(*, source_type, source_id, status=OTS.PENDING) -> OT:
+        t = OT(
+            task_type=OTT.MOVE_OUT_INSPECTION,
+            status=status,
+            priority=OTP.medium,
+            title=f"insp task {source_type}={source_id}",
+            lease_id=lease_id,
+            source_type=source_type,
+            source_id=source_id,
+            dedupe_key=dedupe_key,
+            due_at=now + timedelta(days=7),
+        )
+        db_session.add(t)
+        db_session.flush()
+        return t
+
+    # inspection A creation
+    insp_a = _schedule_inspection_api(client, h, lease_id=lease_id)
+    # explicit task_A tied to insp A
+    task_a = _mk_task(source_type="move_out_inspection", source_id=insp_a["id"])
+    task_a_id = task_a.id
+    # cancel inspection A — this is what should close exactly task_a
+    r_cancel = client.post(f"{API}/move-out-inspections/{insp_a['id']}/cancel", headers=h)
+    assert r_cancel.status_code == 200, r_cancel.text
+    insp_a_closed = r_cancel.json()
+    assert insp_a_closed["id"] == insp_a["id"]
+    assert insp_a_closed["status"] == MoveOutInspectionStatus.CANCELLED.value
+    db_session.expire_all()
+    task_a_row = db_session.get(OT, task_a_id)
+    assert task_a_row is not None
+    assert task_a_row.status == OTS.CANCELLED, (
+        f"task_A must be CANCELLED after cancel insp A; got status={task_a_row.status.value}; "
+        "this validates cancel_inspection q1 closes insp-A-bound tasks correctly."
+    )
+
+    # Now create inspection B and its task B
+    insp_b = _schedule_inspection_api(client, h, lease_id=lease_id)
+    task_b = _mk_task(source_type="move_out_inspection", source_id=insp_b["id"])
+    task_b_id = task_b.id
+    db_session.expire_all()
+    task_b_preconfirm = db_session.get(OT, task_b_id)
+    assert task_b_preconfirm.status == OTS.PENDING, (
+        f"task_B must remain PENDING after insp_A cancel (same dedupe_key, DIFFERENT source_id). "
+        f"Got status={task_b_preconfirm.status.value}."
+    )
+    # Count A and B rows each bound by exact source_type/id = must be exactly 1 each
+    a_task_count = db_session.query(OT).filter(
+        OT.task_type == OTT.MOVE_OUT_INSPECTION,
+        OT.source_type == "move_out_inspection",
+        OT.source_id == insp_a["id"],
+    ).count()
+    b_task_count = db_session.query(OT).filter(
+        OT.task_type == OTT.MOVE_OUT_INSPECTION,
+        OT.source_type == "move_out_inspection",
+        OT.source_id == insp_b["id"],
+    ).count()
+    assert a_task_count == b_task_count == 1, (
+        f"A/B tasks each must have exactly 1 row with exact (source_type,source_id). "
+        f"Got a={a_task_count} b={b_task_count}. No >=1 or contains allowed."
+    )
+    # Confirm B via real pipeline — first POST /inspect (SCHEDULED→INSPECTED)
+    # then POST /confirm (INSPECTED→CONFIRMED). PATCH only updates metadata
+    # fields, does NOT transition status (state machine enforced by service).
+    insp_b_id = insp_b["id"]
+    ev = [
+        _create_evidence(client, h, unit_id=unit_id, category=EvidenceCategory.move_out_photo)
+        for _ in range(2)
+    ]
+    insp_patch = client.patch(f"{API}/move-out-inspections/{insp_b_id}", json={
+        "notes": "inspection B pre-patch",
+    }, headers=h)
+    assert insp_patch.status_code == 200, insp_patch.text
+    mark_inspected = client.post(f"{API}/move-out-inspections/{insp_b_id}/inspect", json={
+        "evidence_ids": ev,
+        "findings": [
+            {"item": "door", "description": "good condition"},
+            {"item": "walls", "severity": "low", "description": "minor wear"},
+        ],
+    }, headers=h)
+    assert mark_inspected.status_code == 200, mark_inspected.text
+    confirm_b = client.post(f"{API}/move-out-inspections/{insp_b_id}/confirm", headers=h)
+    assert confirm_b.status_code == 200, confirm_b.text
+    insp_b_confirm_payload = confirm_b.json()
+    assert insp_b_confirm_payload["id"] == insp_b_id
+    assert insp_b_confirm_payload["status"] == MoveOutInspectionStatus.CONFIRMED.value
+    db_session.expire_all()
+    task_a_post = db_session.get(OT, task_a_id)
+    task_b_post = db_session.get(OT, task_b_id)
+    assert task_a_post.status == OTS.CANCELLED, (
+        f"task_A status must remain CANCELLED after insp_B confirm (no cross-inspection write). "
+        f"Got {task_a_post.status.value}"
+    )
+    assert task_b_post.status == OTS.COMPLETED, (
+        f"task_B status must be COMPLETED after insp_B confirm. Got {task_b_post.status.value}"
+    )
+
+
+def test_h8_decline_renewal_json_copy_persistence_fresh_session(
+    client, db_session, owner_a, lease_id, unit_id, tenant_id
+):
+    h = _h(owner_a[1])
+    user = owner_a[0]
+    user_id = user.id
+
+    seeded_meta = {"preexisting_metadata": "untouched-h8", "notes": {"a": "b"}}
+    lease_before = db_session.get(Lease, lease_id)
+    lease_before.renewal_metadata = dict(seeded_meta)
+    db_session.commit()
+
+    reason_text = "tenant-declined-H8-test"
+    r1 = client.post(f"{API}/leases/{lease_id}/decline-renewal", json={
+        "reason": reason_text,
+    }, headers=h)
+    assert r1.status_code == 200, r1.text
+    first_body = r1.json()
+    assert first_body["id"] == lease_id
+
+    # close + new session (fresh reload) using same engine as fixture to get
+    # the test DB with current schema — do NOT use SessionLocal() which binds
+    # the default app DATABASE_URL engine pointing to a different/schema-stale DB.
+    db_session.close()
+    FreshSession = sessionmaker(
+        bind=db_session.get_bind(), autoflush=False, expire_on_commit=False,
+    )
+    fresh = FreshSession()
+    try:
+        reloaded = fresh.get(Lease, lease_id)
+        meta = dict(reloaded.renewal_metadata or {})
+        # 1) declined flag persisted
+        assert meta.get("not_renewed") is True, (
+            f"not_renewed flag not persisted after decline; got meta={meta}"
+        )
+        # 2) actor / timestamp / reason persisted
+        assert meta.get("declined_by") == user_id, (
+            f"declined_by actor id not persisted, got {meta.get('declined_by')}; want user_id={user_id}"
+        )
+        assert isinstance(meta.get("declined_at"), str) and len(meta["declined_at"]) > 0
+        assert meta.get("decline_reason") == reason_text
+        # 3) pre-existing metadata preserved
+        for k, v in seeded_meta.items():
+            assert meta.get(k) == v, (
+                f"pre-existing metadata key={k} destroyed after decline persistence; got {meta.get(k)!r} vs want {v!r}"
+            )
+        # 5) exactly 1 decline_renewal audit event
+        audits = (
+            fresh.query(AuditLog)
+            .filter(
+                AuditLog.table_name == "leases",
+                AuditLog.record_id == lease_id,
+                AuditLog.action == "decline_renewal",
+            )
+            .all()
+        )
+        assert len(audits) == 1, (
+            f"expected exactly 1 decline_renewal audit event, got {len(audits)}: {audits}"
+        )
+    finally:
+        fresh.close()
+
+    # reopen db_session (fixture's session)
+    db_session.begin()
+    # 4) duplicate decline request is idempotent -> status 200 & no new metadata rows
+    r2 = client.post(f"{API}/leases/{lease_id}/decline-renewal", json={
+        "reason": "duplicate-request-should-be-idempotent",
+    }, headers=h)
+    assert r2.status_code == 200, r2.text
+    db_session.expire_all()
+    lease_r2 = db_session.get(Lease, lease_id)
+    meta_after = dict(lease_r2.renewal_metadata or {})
+    assert meta_after.get("decline_reason") == reason_text, (
+        f"second decline mutated decline_reason (idempotent violation); got {meta_after.get('decline_reason')!r}"
+    )
+    audit_after = (
+        db_session.query(AuditLog)
+        .filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == lease_id,
+            AuditLog.action == "decline_renewal",
+        )
+        .count()
+    )
+    assert audit_after == 1, (
+        f"idempotent second decline produced another audit row; count={audit_after}"
+    )
+
+
+def test_h9_truth_validator_provisional_lease_source_registered(
+    db_session, lease_id, unit_id, tenant_id
+):
+    from app.services.operations.truth_validator import (
+        _PROJECTION_TABLE, validate_completion,
+    )
+    from app.models.operations import (
+        OperationalTask,
+        OperationalTaskType,
+        OperationalTaskStatus,
+        OperationalTaskPriority,
+    )
+    registered_keys = set(_PROJECTION_TABLE.keys())
+    assert (OperationalTaskType.MOVE_OUT_INSPECTION, "lease") in registered_keys, (
+        "(MOVE_OUT_INSPECTION, lease) provisional source tuple MUST be in _PROJECTION_TABLE "
+        "for canonical provisional-task contract (generation.py L962). Current keys: "
+        f"{[k for k in registered_keys if k[0]==OperationalTaskType.MOVE_OUT_INSPECTION]}"
+    )
+    task_sourceid_none = OperationalTask(
+        task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
+        source_type="move_out_inspection",
+        source_id=None,
+        lease_id=lease_id,
+        dedupe_key=f"lease:{lease_id}:MOVE_OUT_INSPECTION",
+        status=OperationalTaskStatus.PENDING,
+        priority=OperationalTaskPriority.medium,
+        title="sourceless",
+        due_at=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+    db_session.add(task_sourceid_none)
+    db_session.flush()
+    v_none = validate_completion(db_session, task_sourceid_none)
+    assert v_none.ok is False, (
+        "source_id=None task CANNOT pass truth validator (Owner #13); reconciliation must fail-close CANCELLED. "
+        f"Got ok={v_none.ok!r} expected=false"
+    )
+    assert v_none.expected_truth != ""
+    db_session.rollback()
+
+    valid_provisional = OperationalTask(
+        task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
+        source_type="lease",
+        source_id=lease_id,
+        lease_id=lease_id,
+        dedupe_key=f"lease:{lease_id}:MOVE_OUT_INSPECTION",
+        status=OperationalTaskStatus.PENDING,
+        priority=OperationalTaskPriority.medium,
+        title="legal-provisional",
+        due_at=datetime.now(timezone.utc) + timedelta(days=7),
+    )
+    db_session.add(valid_provisional)
+    db_session.flush()
+    # Does NOT raise an unregistered tuple KeyError → tuple is legal.
+    result = validate_completion(db_session, valid_provisional)
+    assert isinstance(result.ok, bool), (
+        "truth validator on provisional (MOI, lease) must return bool result, not throw unregistered"
+    )
+    db_session.rollback()
+
