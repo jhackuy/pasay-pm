@@ -193,6 +193,7 @@ def schedule_inspection(
         with db.begin_nested():
             db.flush()
     except IntegrityError:
+        db.rollback()
         existing = (
             db.query(MoveOutInspection)
             .filter(
