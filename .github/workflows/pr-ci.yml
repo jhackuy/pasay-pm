@@ -260,6 +260,7 @@ jobs:
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
           PASAY_TEST_DB_NAME: "pasay_pm_test_m004"
           PASAY_RT_DB_NAME: "pasay_pm_test_rt"
+          PASAY_RT_DB_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
           TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"

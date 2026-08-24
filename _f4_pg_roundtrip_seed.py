@@ -23,6 +23,9 @@ from decimal import Decimal
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
+_RT_DB_URL_FROM_ENV = os.getenv("PASAY_RT_DB_URL")
+if _RT_DB_URL_FROM_ENV:
+    os.environ["DATABASE_URL"] = _RT_DB_URL_FROM_ENV
 os.environ.setdefault("DATABASE_URL", "postgresql+psycopg2://pasay_pm:pasay_pm@localhost:5432/pasay_pm")
 
 from sqlalchemy import create_engine, text
