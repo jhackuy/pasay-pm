@@ -69,9 +69,13 @@ def _rt_url():
     return base.set(database=RT_DB_NAME)
 
 
+def _rt_url_str():
+    return str(_rt_url().render_as_string(hide_password=False))
+
+
 def _alembic_cmd(verb: str, rev: str) -> list[str]:
     py_exe = sys.executable
-    rt_str = str(_rt_url())
+    rt_str = _rt_url_str()
     env = os.environ.copy()
     env["DATABASE_URL"] = rt_str
     return [
