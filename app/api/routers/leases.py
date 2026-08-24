@@ -321,7 +321,10 @@ def delete_lease(
     if obj.superseded_by_lease_id is not None:
         # --- RENEWAL_SUPERSESSION_PATH ---
         from datetime import timedelta
-        successor = db.get(Lease, obj.superseded_by_lease_id)
+        successor = db.query(Lease).filter(
+            Lease.id == obj.superseded_by_lease_id,
+            Lease.deleted_at.is_(None),
+        ).with_for_update().populate_existing().first()
         expected_start = obj.end_date + timedelta(days=1)
         if (
             successor is None

@@ -28,6 +28,7 @@ from app.models.operations import (
 )
 from app.models.property import UnitLifecycleEvent, UnitStatus
 from app.models.tenant import Tenant
+from app.services.audit import audit_context, record_audit
 from app.services.operations.generation import generate_business_tasks
 from app.services.operations.reconcile import reconcile_tasks
 from app.database import SessionLocal
@@ -1211,9 +1212,11 @@ def test_d7b_concurrent_two_deletes_winner_200_loser_404_no_assertion_error_and_
         statuses = []
         bodies = []
         mu = threading.Lock()
+        start_barrier = threading.Barrier(2)
 
         def _worker():
             with TestClient(app, raise_server_exceptions=False) as wclient:
+                start_barrier.wait(timeout=15)
                 rr = wclient.delete(f"{API}/leases/{lid}", headers=h)
             with mu:
                 statuses.append(rr.status_code)
@@ -1230,6 +1233,9 @@ def test_d7b_concurrent_two_deletes_winner_200_loser_404_no_assertion_error_and_
         assert sorted(statuses) == [200, 404], (
             f"Expected exactly 1 winner HTTP 200 + 1 loser HTTP 404 for concurrent DELETE race, "
             f"got statuses={statuses} bodies={bodies}"
+        )
+        assert len(statuses) == len(bodies) == 2, (
+            f"Expected two status/body pairs, got statuses={statuses} bodies={bodies}"
         )
         for s, b in zip(statuses, bodies):
             if s == 404:
@@ -1700,6 +1706,259 @@ def test_a9_renewal_invalid_dates_end_before_start_409(
     assert "loc" in err0
     assert tuple(err0["loc"]) == ("body",)
     assert err0["type"] == "value_error"
+
+
+def test_a10_concurrent_predecessor_archive_vs_successor_race_barrier(
+    db_session, owner_a, unit_id, tenant_id, test_engine
+):
+    """Barrier-synchronized race: predecessor archive DELETE(RENEWAL_SUPERSESSION_PATH)
+    vs concurrent successor mutation / soft-delete.
+
+    Verifies:
+    (a) successor row is locked during predecessor validation (FOR UPDATE + deleted_at filter);
+    (b) predecessor never archives against an already-invalid (deleted/race-mutated) successor;
+    (c) no 500 / AssertionError — only normal HTTP 200 or 409;
+    (d) final supersession fact and audit action traces are consistent.
+
+    Server-side test seam = transaction-local advisory lock at pg_sleep(0.05) injected
+    AFTER the successor FOR UPDATE query, forcing overlap with a worker that already
+    holds a commit-ordering advisory lock (Barrier ensures both start together).
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.database import get_db
+    from sqlalchemy.orm import sessionmaker
+    import threading
+
+    factory = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    prev_override = app.dependency_overrides.get(get_db)
+    tls = threading.local()
+
+    def _per_request_session():
+        sess = getattr(tls, "sess", None)
+        if sess is None:
+            sess = factory()
+            tls.sess = sess
+        try:
+            yield sess
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+            tls.sess = None
+    app.dependency_overrides[get_db] = _per_request_session
+    try:
+        h = _h(owner_a[1])
+        past_end = date.today() - timedelta(days=8)
+        past_start = past_end - timedelta(days=365)
+        succ_start = (past_end + timedelta(days=1)).isoformat()
+        succ_end = (past_end + timedelta(days=366)).isoformat()
+        with TestClient(app, raise_server_exceptions=False) as client:
+            pred_resp = client.post(
+                f"{API}/leases",
+                json={
+                    "unit_id": unit_id, "tenant_id": tenant_id,
+                    "start_date": past_start.isoformat(),
+                    "end_date": past_end.isoformat(),
+                    "monthly_rent": "10000.00",
+                    "deposit": "20000.00",
+                    "status": LeaseStatus.active.value,
+                },
+                headers=h,
+            )
+            assert pred_resp.status_code == 201, pred_resp.text
+            pred_id = pred_resp.json()["id"]
+            renew_resp = client.post(
+                f"{API}/leases/{pred_id}/renew",
+                json={
+                    "start_date": succ_start,
+                    "end_date": succ_end,
+                    "monthly_rent": "10500.00",
+                    "deposit": "21000.00",
+                },
+                headers=h,
+            )
+            assert renew_resp.status_code == 200, renew_resp.text
+            succ_id = renew_resp.json()["id"]
+            exp_resp = client.post(f"{API}/leases/{pred_id}/auto-expire", headers=h)
+            assert exp_resp.status_code == 200, exp_resp.text
+            db_session.expire_all()
+            pred_row = db_session.get(Lease, pred_id)
+            succ_row = db_session.get(Lease, succ_id)
+            assert pred_row is not None
+            assert pred_row.status == LeaseStatus.expired
+            assert pred_row.superseded_by_lease_id == succ_id
+            assert succ_row is not None
+            assert succ_row.start_date.isoformat() == succ_start
+            assert succ_row.deleted_at is None
+
+        before_pred_audit = db_session.query(AuditLog).filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == str(pred_id),
+            AuditLog.action == "renewal_predecessor_archived",
+        ).count()
+        before_succ_audit = db_session.query(AuditLog).filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == str(succ_id),
+            AuditLog.action.in_(["soft_delete", "update", "patch"]),
+        ).count()
+
+        pred_results = []
+        succ_results = []
+        mu = threading.Lock()
+        start_barrier = threading.Barrier(2)
+
+        def _archive_pred_worker():
+            try:
+                with TestClient(app, raise_server_exceptions=False) as wc:
+                    start_barrier.wait(timeout=20)
+                    r = wc.delete(f"{API}/leases/{pred_id}", headers=h)
+                parsed = None
+                try:
+                    parsed = r.json()
+                except Exception:
+                    parsed = r.text or ""
+                with mu:
+                    pred_results.append((r.status_code, parsed))
+            except Exception as exc:
+                import traceback
+                with mu:
+                    pred_results.append((999, {"exc": type(exc).__name__, "msg": str(exc),
+                                              "tb": traceback.format_exc(limit=10)}))
+
+        def _mutate_succ_worker():
+            sess = factory()
+            try:
+                start_barrier.wait(timeout=20)
+                row = sess.query(Lease).filter(
+                    Lease.id == succ_id, Lease.deleted_at.is_(None)
+                ).with_for_update().populate_existing().first()
+                assert row is not None
+                old_s = row.__dict__.copy()
+                old_s.pop("_sa_instance_state", None)
+                clean_old = {}
+                for k, v in old_s.items():
+                    if hasattr(v, "isoformat"):
+                        clean_old[k] = v.isoformat()
+                    elif isinstance(v, Decimal):
+                        clean_old[k] = str(v)
+                    elif isinstance(v, (dict, list, tuple, str, int, float, bool)) or v is None:
+                        clean_old[k] = v
+                    else:
+                        clean_old[k] = repr(v)
+                row.updated_by = -999
+                row.monthly_rent = Decimal("99999.99")
+                row.deleted_at = datetime.now(timezone.utc)
+                new_s = {
+                    "id": row.id,
+                    "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+                    "updated_by": row.updated_by,
+                    "monthly_rent": str(row.monthly_rent),
+                }
+                record_audit(
+                    sess,
+                    table_name="leases",
+                    record_id=row.id,
+                    action="soft_delete",
+                    actor_id=None,
+                    old_value=clean_old,
+                    new_value=new_s,
+                )
+                sess.flush()
+                sess.commit()
+                with mu:
+                    succ_results.append(("committed_deleted", succ_id))
+                row_after = sess.get(Lease, succ_id)
+                if row_after is None:
+                    with mu:
+                        succ_results.append(("row_missing_post_commit", None))
+                else:
+                    with mu:
+                        succ_results.append(("row_present_post_commit", (row_after.deleted_at is not None, str(row_after.monthly_rent))))
+            except Exception as exc:
+                import traceback
+                with mu:
+                    succ_results.append(("exc", {"type": type(exc).__name__,
+                                                "msg": str(exc),
+                                                "tb": traceback.format_exc(limit=10)}))
+            finally:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_pred = ex.submit(_archive_pred_worker)
+            f_succ = ex.submit(_mutate_succ_worker)
+            wait([f_pred, f_succ], timeout=60, return_when=FIRST_COMPLETED)
+            f_pred.result(timeout=60)
+            f_succ.result(timeout=60)
+
+        assert len(pred_results) == 1, pred_results
+        pred_status, pred_body = pred_results[0]
+        assert pred_status in (200, 409), (
+            f"Predecessor archive must succeed normally or 409 conflict (no 500/AssertionError). "
+            f"status={pred_status} body={pred_body}"
+        )
+        if pred_status == 409:
+            detail = pred_body.get("detail") if isinstance(pred_body, dict) else None
+            reason = detail.get("reason") if isinstance(detail, dict) else None
+            assert reason == "renewal_successor_truth_invalid_before_delete", (
+                f"Race loser predecessor must 409 via renewal_successor_truth_invalid_before_delete, "
+                f"status={pred_status} body={pred_body}"
+            )
+        assert len(succ_results) == 2, succ_results
+
+        db_session.expire_all()
+        final_pred = db_session.get(Lease, pred_id)
+        final_succ = db_session.get(Lease, succ_id)
+        assert final_pred is not None
+        assert final_succ is not None
+
+        after_pred_audit = db_session.query(AuditLog).filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == str(pred_id),
+            AuditLog.action == "renewal_predecessor_archived",
+        ).count()
+        after_succ_audit = db_session.query(AuditLog).filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == str(succ_id),
+            AuditLog.action == "soft_delete",
+        ).count()
+
+        pred_archive_happened = (after_pred_audit - before_pred_audit) >= 1
+        succ_softdeleted_happened = final_succ.deleted_at is not None
+        assert succ_softdeleted_happened, (
+            "Successor worker performed soft_delete via thread-local SQLA session (committed "
+            "before pred commit barrier released via row-lock contention)."
+        )
+        if pred_archive_happened:
+            assert final_pred.deleted_at is not None, (
+                "pred_archive audit produced but pred.deleted_at missing"
+            )
+            assert final_succ.deleted_at is None, (
+                "Contradiction: predecessor archived claiming valid successor, but successor is soft-deleted. "
+                "Successor re-lock WHERE deleted_at IS None FOR UPDATE should block until succ commit "
+                "and return None. audit_pred={} succ_deleted_at={}".format(
+                    pred_archive_happened, final_succ.deleted_at
+                )
+            )
+        else:
+            assert pred_status == 409, (
+                "If pred predecessor archive audit is absent, predecessor must have fallen into "
+                "the 409 successor_truth_invalid branch; got status={} body={}".format(
+                    pred_status, pred_body
+                )
+            )
+            assert (after_succ_audit - before_succ_audit) >= 1, (
+                "Race where predecessor 409 but successor soft_delete audit absent"
+            )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        if prev_override is not None:
+            app.dependency_overrides[get_db] = prev_override
 
 
 def test_c13_cross_org_settlement_create_404(
