@@ -452,13 +452,309 @@ run("Helper: make_scheduled_event_id 5-minute bucket floored", () => {
 });
 
 // ---------------------------------------------------------------------------
+// RETURN-1 §3: NEW closeout test scenarios (9 categories)
+// ---------------------------------------------------------------------------
+
+run("CLOSEOUT#1a: worker.fetch — TELEGRAM_WEBHOOK_SECRET missing → 401 webhook_not_configured", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv({ TELEGRAM_WEBHOOK_SECRET: undefined });
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: { update_id: 1001 },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 401, "missing secret → 401");
+  const body = await resp.json() as any;
+  assert_eq(body.error, "webhook_not_configured", "error code == webhook_not_configured");
+  assert_eq(body.ok, false, "body.ok == false");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 0, "NO queue.send when secret missing");
+});
+
+run("CLOSEOUT#1b: worker.fetch — empty TELEGRAM_WEBHOOK_SECRET → 401 webhook_not_configured", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv({ TELEGRAM_WEBHOOK_SECRET: "   " });
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: { "content-type": "application/json", "X-Telegram-Bot-Api-Secret-Token": "anything" },
+    body: { update_id: 1002 },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 401, "whitespace-only secret → 401");
+  const body = await resp.json() as any;
+  assert_eq(body.error, "webhook_not_configured", "whitespace secret → webhook_not_configured");
+});
+
+run("CLOSEOUT#2a: worker.fetch — non-JSON body → 400 invalid_json / bad_content_type", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: { "content-type": "text/plain", "X-Telegram-Bot-Api-Secret-Token": "correct-secret" },
+    body: "not json content",
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert(resp.status === 400, `non-json → 400 (got ${resp.status})`);
+  const body = await resp.json() as any;
+  assert(body.error === "bad_content_type" || body.error === "invalid_json",
+    `bad_content_type or invalid_json, got ${body.error}`);
+});
+
+run("CLOSEOUT#2b: worker.fetch — update_id missing / 0 / negative / non-number → 400", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const cases = [
+    { name: "missing update_id", body: { message: {} }, expect_err: "missing_update_id" },
+    { name: "update_id = 0", body: { update_id: 0 }, expect_err: "missing_update_id" },
+    { name: "update_id negative", body: { update_id: -5 }, expect_err: "missing_update_id" },
+    { name: "update_id non-number", body: { update_id: "abc" }, expect_err: "missing_update_id" },
+    { name: "update_id NaN", body: { update_id: NaN }, expect_err: "missing_update_id" },
+    { name: "payload is array", body: [1, 2, 3], expect_err: "malformed_payload" },
+    { name: "payload is null", body: null as any, expect_err: "malformed_payload" },
+  ];
+  for (const c of cases) {
+    beforeEachPerTestCleanup();
+    const req = makeWorkerRequest("/telegram/webhook", {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Telegram-Bot-Api-Secret-Token": "correct-secret" },
+      body: c.body,
+    });
+    const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+    assert_eq(resp.status, 400, `${c.name} → 400 (got ${resp.status})`);
+    const json = await resp.json() as any;
+    assert(json.error === c.expect_err, `${c.name} expected ${c.expect_err}, got ${json.error}`);
+  }
+});
+
+run("CLOSEOUT#3a: enqueue success → 200, no enqueue_failed fields", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 2001, message: { chat: { id: 1 } } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "success → 200");
+  const text = await resp.text();
+  assert(!/"enqueue_failed"/.test(text), "success resp MUST NOT mention enqueue_failed");
+  assert(!/"detail":/.test(text), "success resp MUST NOT contain raw detail field");
+  const body = JSON.parse(text) as any;
+  assert_eq(body.ok, true, "success ok=true");
+  assert_eq(body.event_id, make_telegram_event_id(2001), "success event_id correct");
+});
+
+run("CLOSEOUT#3b: enqueue_failed → fixed body {ok:false, error:'enqueue_failed', req_id} NO err.message", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  (env.PASAY_QUEUE as any).send = async () => {
+    throw new Error("Queue internal error TELEGRAM_BOT_TOKEN=leakme postgres://user:pass@host/db DATABASE_URL_UNPOOLED=xxyyzz112233445566778899");
+  };
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 2002, message: { chat: { id: 1 } } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503, "enqueue failed → 503");
+  const text = await resp.text();
+  const body = JSON.parse(text) as any;
+  assert_eq(body.ok, false, "enqueue_failed ok=false");
+  assert_eq(body.error, "enqueue_failed", "error enum == enqueue_failed");
+  assert(typeof body.req_id === "string" && body.req_id.startsWith("r_"),
+    `req_id must be opaque r_ prefixed, got ${body.req_id}`);
+  assert(!("detail" in body), "enqueue_failed resp MUST NOT include raw detail field");
+  assert(!/"leakme"/.test(text), "resp must NOT contain internal leakme substring");
+  assert(!/"postgres:\/\/"/.test(text), "resp must NOT expose postgres:// URL");
+  assert(!/"xxyyzz112233445566778899"/.test(text), "resp must NOT expose secret token value");
+  assert(!/"TELEGRAM_BOT_TOKEN=/.test(text), "resp must NOT include raw k=v secret pair");
+});
+
+run("CLOSEOUT#3c: mask_sensitive — fabricated secret injection NEVER appears in enqueue_failed response", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const FABRICATED_DB = "postgres://admin:SuperSecretPass123!@db.prod.pasay.io:5432/tenant_main_v2";
+  const FABRICATED_SECRET = "tg_webhook_XYZ987ABCdef_2026_production";
+  const FABRICATED_TOKEN = "ingest_prod_abcdef12345678900987fedcba";
+  (env.PASAY_QUEUE as any).send = async () => {
+    throw new Error(
+      `boom: DATABASE_URL=${FABRICATED_DB}; TELEGRAM_WEBHOOK_SECRET=${FABRICATED_SECRET}; PASAY_CONTAINER_INGEST_TOKEN=${FABRICATED_TOKEN}; random_long_id=0123456789abcdef0123456789abcdef END`
+    );
+  };
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 2003, message: { chat: { id: 2 } } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503, "enqueue failure → 503");
+  const text = await resp.text();
+  const body = JSON.parse(text) as any;
+  assert_eq(body.ok, false, "ok=false");
+  assert_eq(body.error, "enqueue_failed", "error=enqueue_failed");
+  assert(typeof body.req_id === "string" && body.req_id.length > 6, `req_id looks opaque (len=${body.req_id?.length})`);
+  const deny = [FABRICATED_DB, FABRICATED_SECRET, FABRICATED_TOKEN, "SuperSecretPass123",
+    "db.prod.pasay.io", "admin:SuperSecret", "tenant_main_v2"];
+  for (const d of deny) {
+    assert(!text.includes(d), `Response MUST NOT leak fabricated secret: '${d.slice(0, 20)}…'`);
+  }
+  assert(!text.includes("detail"), "response must NOT have raw detail key");
+});
+
+run("CLOSEOUT#4: make_telegram_event_id deterministic format + 5-min bucket floored", () => {
+  assert_eq(make_telegram_event_id(123), "tg:123", "make_telegram_event_id(123) == tg:123");
+  assert_eq(make_telegram_event_id(0), "tg:0", "make_telegram_event_id(0) still formats (0 is invalid but helper is pure)");
+  const ts = "2026-08-20T12:34:56.999Z";
+  const floored = make_scheduled_event_id("j", ts);
+  assert(floored.includes(":2026-08-20T12-30"), `5-min bucket 34:56 floored HH-30, got ${floored}`);
+  const ts2 = "2026-08-20T12:00:00.000Z";
+  const floored2 = make_scheduled_event_id("j", ts2);
+  assert(floored2.includes(":2026-08-20T12-00"), `5-min bucket 12:00 stays 00, got ${floored2}`);
+});
+
+run("CLOSEOUT#5a: deliver → X-Pasay-Ingest-Token header EXACTLY equals env.PASAY_CONTAINER_INGEST_TOKEN", async () => {
+  beforeEachPerTestCleanup();
+  const token = "custom-ingest-token-RETURN1";
+  const env = makeEnv({ PASAY_CONTAINER_INGEST_TOKEN: token });
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  containerInstances.set("pasay-singleton", container);
+  const envelope: PasayQueueEnvelope = {
+    version: "1", kind: "telegram_update",
+    event_id: make_telegram_event_id(3001), occurred_at: new Date().toISOString(),
+    payload: { update_id: 3001 } as any,
+  } as any;
+  const msg = makeFakeMsg(envelope as any);
+  await worker.queue({ messages: [msg] } as any, env as any, undefined as any);
+  assert_eq(msg.ack_calls, 1, "200 → ack");
+  assert_eq(container.fetch_calls.length, 1, "one fetch");
+  assert_eq(container.fetch_calls[0].headers["x-pasay-ingest-token"], token,
+    "Container fetch header X-Pasay-Ingest-Token == env PASAY_CONTAINER_INGEST_TOKEN EXACTLY");
+});
+
+run("CLOSEOUT#5b: deliver → PASAY_CONTAINER_INGEST_TOKEN undefined/empty → retry (NOT ack/terminal)", async () => {
+  beforeEachPerTestCleanup();
+  for (const val of [undefined, "", "   "]) {
+    beforeEachPerTestCleanup();
+    const container: MockContainerHandle = makeMockContainerHandle(200);
+    containerInstances.set("pasay-singleton", container);
+    const env = makeEnv({ PASAY_CONTAINER_INGEST_TOKEN: val });
+    const envelope: PasayQueueEnvelope = {
+      version: "1", kind: "telegram_update",
+      event_id: make_telegram_event_id(3002), occurred_at: new Date().toISOString(),
+      payload: { update_id: 3002 } as any,
+    } as any;
+    const msg = makeFakeMsg(envelope as any);
+    await worker.queue({ messages: [msg] } as any, env as any, undefined as any);
+    assert_eq(msg.retry_calls, 1,
+      `token=${JSON.stringify(val)} → retry (transient bad config)`);
+    assert_eq(msg.ack_calls, 0,
+      `token=${JSON.stringify(val)} → NEVER ack (never terminal or success)`);
+    assert_eq(container.fetch_calls.length, 0,
+      `token=${JSON.stringify(val)} → NEVER reach container.fetch`);
+  }
+});
+
+run("CLOSEOUT#6: Container status codes → EXACT ack/retry/terminal mapping (200/202/208 → ack; 400/415/422 → terminal ack; 401/403/500-599 → retry)", async () => {
+  const mapping: Array<{ status: number; expect_ack: number; expect_retry: number; label: string }> = [
+    { status: 200, expect_ack: 1, expect_retry: 0, label: "200 OK → ack" },
+    { status: 202, expect_ack: 1, expect_retry: 0, label: "202 Accepted → ack" },
+    { status: 208, expect_ack: 1, expect_retry: 0, label: "208 Already Reported → ack" },
+    { status: 400, expect_ack: 1, expect_retry: 0, label: "400 Bad Request → terminal/ack (permanent poison)" },
+    { status: 415, expect_ack: 1, expect_retry: 0, label: "415 Unsupported Media → terminal/ack" },
+    { status: 422, expect_ack: 1, expect_retry: 0, label: "422 Unprocessable → terminal/ack" },
+    { status: 401, expect_ack: 0, expect_retry: 1, label: "401 Unauthorized → retry (ingest token misconfig, transient)" },
+    { status: 403, expect_ack: 0, expect_retry: 1, label: "403 Forbidden → retry" },
+    { status: 500, expect_ack: 0, expect_retry: 1, label: "500 Internal Server → retry" },
+    { status: 503, expect_ack: 0, expect_retry: 1, label: "503 Service Unavailable → retry" },
+    { status: 599, expect_ack: 0, expect_retry: 1, label: "599 (custom) → retry (5xx range)" },
+    { status: 520, expect_ack: 0, expect_retry: 1, label: "520 Cloudflare → retry" },
+  ];
+  for (const row of mapping) {
+    beforeEachPerTestCleanup();
+    const env = makeEnv();
+    const container: MockContainerHandle = makeMockContainerHandle(row.status);
+    containerInstances.set("pasay-singleton", container);
+    const envelope: PasayQueueEnvelope = {
+      version: "1", kind: "telegram_update",
+      event_id: make_telegram_event_id(4000 + row.status),
+      occurred_at: new Date().toISOString(),
+      payload: { update_id: 4000 + row.status } as any,
+    } as any;
+    const msg = makeFakeMsg(envelope as any);
+    await worker.queue({ messages: [msg] } as any, env as any, undefined as any);
+    assert_eq(msg.ack_calls, row.expect_ack, `${row.label}: ack_calls`);
+    assert_eq(msg.retry_calls, row.expect_retry, `${row.label}: retry_calls`);
+  }
+});
+
+run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL exactly 7 entries (6 dynamic + 1 static)", () => {
+  const envVarEntries = [...WORKER_SRC.matchAll(/(?:PASAY_RUNTIME_MODE|DATABASE_URL(?:_UNPOOLED)?|TELEGRAM_BOT_TOKEN|TELEGRAM_WEBHOOK_SECRET|CONTAINER_INGEST_TOKEN)\s*:/g)].length;
+  assert(envVarEntries >= 6, `source should list the 7-keys envVars map (found ${envVarEntries} key assignments)`);
+});
+
+run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env → keyset matches Set{7}", () => {
+  const fullEnv = {
+    PASAY_QUEUE: makeFakeQueue(),
+    PASAY_CONTAINER: { x: 1 },
+    TELEGRAM_WEBHOOK_SECRET: "wh_sec_v1",
+    PASAY_CONTAINER_INGEST_TOKEN: "ingest_v1",
+    DATABASE_URL: "postgres://u:p@h/d",
+    DATABASE_URL_UNPOOLED: "postgres://u:p@h/d_direct",
+    TELEGRAM_BOT_TOKEN: "123:abc",
+  };
+  const inst = new (PasayContainer as any)({ id: "stub" }, fullEnv);
+  const keys = Object.keys(inst.envVars).sort();
+  const expected = [
+    "CONTAINER_INGEST_TOKEN", "DATABASE_URL", "DATABASE_URL_UNPOOLED",
+    "PASAY_RUNTIME_MODE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
+  ].sort();
+  assert_eq(keys.length, 6, `envVars keys length = 6 (+ PASAY_RUNTIME_MODE static) — got ${keys.length}: ${keys}`);
+  for (const k of expected) {
+    assert(k in inst.envVars, `envVars must contain key ${k}`);
+  }
+  assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
+    "PASAY_RUNTIME_MODE static == cloudflare-container");
+  assert_eq(inst.envVars.DATABASE_URL, fullEnv.DATABASE_URL, "DATABASE_URL == env.DATABASE_URL (no hardcoding)");
+  assert_eq(inst.envVars.DATABASE_URL_UNPOOLED, fullEnv.DATABASE_URL_UNPOOLED,
+    "DATABASE_URL_UNPOOLED == env.DATABASE_URL_UNPOOLED");
+  assert_eq(inst.envVars.TELEGRAM_BOT_TOKEN, fullEnv.TELEGRAM_BOT_TOKEN,
+    "TELEGRAM_BOT_TOKEN == env.TELEGRAM_BOT_TOKEN");
+  assert_eq(inst.envVars.TELEGRAM_WEBHOOK_SECRET, fullEnv.TELEGRAM_WEBHOOK_SECRET,
+    "TELEGRAM_WEBHOOK_SECRET == env.TELEGRAM_WEBHOOK_SECRET");
+  assert_eq(inst.envVars.CONTAINER_INGEST_TOKEN, fullEnv.PASAY_CONTAINER_INGEST_TOKEN,
+    "CONTAINER_INGEST_TOKEN == env.PASAY_CONTAINER_INGEST_TOKEN (name mapping verified)");
+  // Static tag does NOT come from env
+  assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
+    "PASAY_RUNTIME_MODE is STATIC (not from env, never changes)");
+});
+
+run("CLOSEOUT#7c: PasayContainer envVars — partial/missing env → empty strings, no crash, no undefined", () => {
+  const emptyEnv: any = {};
+  const inst = new (PasayContainer as any)(undefined, emptyEnv);
+  for (const [k, v] of Object.entries(inst.envVars)) {
+    assert(typeof v === "string", `${k} must be string (no undefined)`);
+  }
+  assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
+    "static tag still present with empty env");
+});
+
+// ---------------------------------------------------------------------------
 // 7. Execute async tests + report summary
 // ---------------------------------------------------------------------------
 
 (async function main() {
   await flushAllPending();
   console.log(
-    `\nCloudflare Worker FIX2 tests ${passed}/${total} passed`
+    `\nCloudflare Worker FIX2 + RETURN-1 CLOSEOUT tests ${passed}/${total} passed`
     + (process.exitCode ? ` (${total - passed} FAILED — exitCode=1)` : " (OK)")
   );
 })();
