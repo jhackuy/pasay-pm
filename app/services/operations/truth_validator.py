@@ -353,6 +353,17 @@ _PROJECTION_TABLE: dict[tuple[OperationalTaskType | None, str | None], CheckerFn
     (OperationalTaskType.AC_MAINTENANCE, "repair"): _repair_projection_ok,
     (OperationalTaskType.FOLLOWUP, "repair"): _repair_projection_ok,
     (OperationalTaskType.MOVE_OUT_INSPECTION, "move_out_inspection"): _move_out_inspection_ok,
+    # --- Owner PASAY-TASK-012 #7: explicit registration for the provisional
+    # MOVE_OUT_INSPECTION + source_type=lease contract (provisional task
+    # created by generation.py L962-964 before a real inspection row
+    # exists). Truth validation consults the canonical lease row and
+    # determines closed-ness from the real inspection pointed at by
+    # lease.move_out_inspection_id, rather than fail-closed 409-ing this
+    # tuple as an unregistered orphan.
+    #
+    # NOTE: source_id=None tasks NEVER reach this checker — they are still
+    # routed to reconcile fail-closed CANCELLED (per Owner #13 contract).
+    (OperationalTaskType.MOVE_OUT_INSPECTION, "lease"): _move_out_inspection_ok,
     (OperationalTaskType.DEPOSIT_SETTLEMENT, "deposit_settlement"): _deposit_settlement_ok,
 }
 

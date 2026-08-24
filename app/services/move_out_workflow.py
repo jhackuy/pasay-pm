@@ -448,21 +448,25 @@ def _close_projection_tasks_for_inspection(
         actor_id=actor_id, now=now,
         target_status=target_status, reason=reason,
     )
-    # Also dedupe_key route: lease:{id}:MOVE_OUT_INSPECTION (may still have source_id=None at generation time before inspection created)
-    def _patch_provisional(t: OperationalTask) -> None:
-        if t.source_id is None:
-            t.source_id = inspection.id
-            t.source_type = "move_out_inspection"
+    # q2 — ONLY for the explicit provisional-lease contract established by
+    # generation.py L962-964 (before any real inspection exists, the task is
+    # created with source_type='lease' + source_id=lease.id). If it later got
+    # rebound (source_type=move_out_inspection AND source_id != current
+    # inspection.id), this task belongs to a DIFFERENT inspection and MUST
+    # NOT be closed or modified here. Source_id IS NULL is permitted ONLY
+    # by the original Owner #13 fail-closed CANCELLED path (never here in
+    # confirm/cancel).
     q2 = db.query(OperationalTask).filter(
         OperationalTask.task_type == OperationalTaskType.MOVE_OUT_INSPECTION,
         OperationalTask.status == OperationalTaskStatus.PENDING,
         OperationalTask.dedupe_key == f"lease:{inspection.lease_id}:MOVE_OUT_INSPECTION",
+        OperationalTask.source_type == "lease",
+        OperationalTask.source_id == inspection.lease_id,
     )
     _close_tasks_by_query(
         db, q2,
         actor_id=actor_id, now=now,
         target_status=target_status, reason=reason,
-        extra_pre=_patch_provisional,
         exclude_ids=already_closed_ids,
     )
 

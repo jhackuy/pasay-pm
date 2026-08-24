@@ -739,7 +739,12 @@ def decline_renewal(
         raise scope_exception_to_http(exc) from exc
     # --- B5: Capture audit old_value BEFORE any mutation of existing_meta ---
     old = serialize_row(obj)
-    existing_meta = obj.renewal_metadata or {}
+    # --- Owner PASAY-TASK-012 #6: forbid in-place JSONB mutation that relies on
+    # SQLAlchemy implicit dirty tracking; always operate on a COPY and reassign
+    # the whole dict to guarantee change propagation and deterministic
+    # behaviour even if JSONB objects do not expose in-place mutation events
+    # correctly.
+    existing_meta = dict(obj.renewal_metadata or {})
     if existing_meta.get("renewed_lease_id"):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -752,13 +757,15 @@ def decline_renewal(
         )
     if existing_meta.get("not_renewed"):
         return obj
+    now_iso = datetime.now(timezone.utc).isoformat()
     existing_meta["not_renewed"] = True
-    existing_meta["declined_at"] = datetime.now(timezone.utc).isoformat()
+    existing_meta["declined_at"] = now_iso
+    existing_meta["declined_by"] = user.id
     if payload.reason is not None:
         existing_meta["decline_reason"] = payload.reason
     if payload.move_out_date is not None:
         existing_meta["move_out_date"] = payload.move_out_date.isoformat()
-    obj.renewal_metadata = existing_meta
+    obj.renewal_metadata = dict(existing_meta)
     obj.updated_by = user.id
     db.flush()
     record_audit(
