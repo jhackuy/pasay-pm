@@ -1144,6 +1144,127 @@ def test_d7_delete_after_pipeline_success(
     )
 
 
+def test_d7b_concurrent_two_deletes_winner_200_loser_404_no_assertion_error_and_single_audit(
+    db_session, owner_a, unit_id, tenant_id, test_engine
+):
+    """Concurrent DELETE → 1 true winner HTTP 200, 1 loser 404 (not 500/AssertionError)
+    because re-lock WHERE id=? AND deleted_at IS NULL misses for loser → obj is None → 404 HTTPException.
+    Also: exactly 1 real soft_delete audit produced (winner only, not 2 duplicates)."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.database import get_db
+    from sqlalchemy.orm import sessionmaker
+    import threading
+
+    factory = sessionmaker(bind=test_engine, autoflush=False, expire_on_commit=False)
+    prev_override = app.dependency_overrides.get(get_db)
+    tls = threading.local()
+
+    def _per_request_session():
+        sess = getattr(tls, "sess", None)
+        if sess is None:
+            sess = factory()
+            tls.sess = sess
+        try:
+            yield sess
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+            tls.sess = None
+    app.dependency_overrides[get_db] = _per_request_session
+    try:
+        h = _h(owner_a[1])
+        past_end = date.today() - timedelta(days=4)
+        past_start = past_end - timedelta(days=365)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            lr = client.post(
+                f"{API}/leases",
+                json={
+                    "unit_id": unit_id, "tenant_id": tenant_id,
+                    "start_date": past_start.isoformat(),
+                    "end_date": past_end.isoformat(),
+                    "monthly_rent": "12000.00", "deposit": "24000.00",
+                    "status": LeaseStatus.active.value,
+                },
+                headers=h,
+            )
+            assert lr.status_code == 201, (lr.status_code, lr.text)
+            lid = lr.json()["id"]
+            _build_settled_lease(client, db_session, h, expiring_lease_id=lid)
+            pr = client.patch(
+                f"{API}/leases/{lid}",
+                json={"status": LeaseStatus.terminated.value},
+                headers=h,
+            )
+            assert pr.status_code == 200, (pr.status_code, pr.text)
+        db_session.expire_all()
+
+        before_audit = db_session.query(AuditLog).filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == str(lid),
+            AuditLog.action == "soft_delete",
+        ).count()
+
+        statuses = []
+        bodies = []
+        mu = threading.Lock()
+
+        def _worker():
+            with TestClient(app, raise_server_exceptions=False) as wclient:
+                rr = wclient.delete(f"{API}/leases/{lid}", headers=h)
+            with mu:
+                statuses.append(rr.status_code)
+                try:
+                    bodies.append(rr.json())
+                except Exception:
+                    bodies.append(rr.text or "")
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = [ex.submit(_worker), ex.submit(_worker)]
+            wait(futs, timeout=30)
+            [f.result(timeout=15) for f in futs]
+
+        assert sorted(statuses) == [200, 404], (
+            f"Expected exactly 1 winner HTTP 200 + 1 loser HTTP 404 for concurrent DELETE race, "
+            f"got statuses={statuses} bodies={bodies}"
+        )
+        for s, b in zip(statuses, bodies):
+            if s == 404:
+                detail = ""
+                if isinstance(b, dict):
+                    detail = b.get("detail") or ""
+                    if isinstance(detail, str):
+                        detail = detail.lower()
+                    else:
+                        detail = str(detail)
+                else:
+                    detail = str(b).lower()
+                assert "not found" in detail, (
+                    f"Concurrent loser must return 404 via HTTPException (NOT AssertionError/500). "
+                    f"status={s} body={b}"
+                )
+        db_session.expire_all()
+        after_audit = db_session.query(AuditLog).filter(
+            AuditLog.table_name == "leases",
+            AuditLog.record_id == str(lid),
+            AuditLog.action == "soft_delete",
+        ).count()
+        assert (after_audit - before_audit) == 1, (
+            f"Expected exactly 1 real soft_delete audit from winner (not 2 duplicates due to race). "
+            f"before_audit={before_audit} after_audit={after_audit}"
+        )
+        final_lease = db_session.get(Lease, lid)
+        assert final_lease is not None
+        assert final_lease.deleted_at is not None
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+        if prev_override is not None:
+            app.dependency_overrides[get_db] = prev_override
+
+
 def test_d8_patch_to_expired_also_runs_final_state(
     client, db_session, owner_a, unit_id, tenant_id
 ):

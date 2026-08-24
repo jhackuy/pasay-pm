@@ -309,8 +309,11 @@ def delete_lease(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
-    # --- B2: Re-lock after scoped_get ---
-    obj = db.query(Lease).filter(Lease.id == obj.id).with_for_update().populate_existing().first()
+    # --- B2: Re-lock after scoped_get; concurrent soft-delete loses re-lock race → 404 ---
+    obj = db.query(Lease).filter(
+        Lease.id == obj.id,
+        Lease.deleted_at.is_(None),
+    ).with_for_update().populate_existing().first()
     if obj is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
 

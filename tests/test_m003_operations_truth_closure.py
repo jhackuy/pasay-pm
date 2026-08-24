@@ -1264,10 +1264,9 @@ def test_t20_source_bound_inspection_task_not_cancelled_by_sourceless_inactive_l
     db_session.commit()
     after_task = db_session.get(OperationalTask, task_id)
     assert after_task is not None
-    assert after_task.status != OperationalTaskStatus.CANCELLED, (
-        f"Source-bound move_out_inspection task (insp_id={insp_id}) MUST NOT be "
-        f"CANCELLED by sourceless inactive-lease branch because insp exists in "
-        f"SCHEDULED. Got status={after_task.status}"
+    assert after_task.status == OperationalTaskStatus.PENDING, (
+        f"Source-bound move_out_inspection task (insp_id={insp_id}) MUST stay PENDING (true inspection projection) "
+        f"and MUST NOT be CANCELLED by sourceless inactive-lease branch. Got status={after_task.status}"
     )
     after_insp = db_session.get(MoveOutInspection, insp_id)
     assert after_insp is not None
