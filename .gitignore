@@ -30,3 +30,13 @@ pasay-telegram-bot/.pytest_tmp/
 .audit/
 .build/
 .research/
+
+# PASAY-BACKEND-FINAL-CLOSEOUT-001-RETURN-1: IDE agent state, Worker npm artifacts, local scratch
+.agents/
+node_modules/
+**/node_modules/
+*.bak
+*.bak-*
+*.swp
+*.swo
+*~
