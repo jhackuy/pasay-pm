@@ -1216,3 +1216,60 @@ def test_t19_derive_scope_empty_property_but_tenants_via_org_id_still_works(
     assert t19_tenant_b_id not in ts_a, (
         f"owner_a (org_a id={org_a.id}) membership MUST NOT leak org_b tenant {t19_tenant_b_id}"
     )
+
+
+def test_t20_source_bound_inspection_task_not_cancelled_by_sourceless_inactive_lease_branch(
+    db_session, owner_a, org_a, property_id, lease_id, client, tenant_id
+):
+    """FIX is_sourceless_provisional GATE: both branches A/B of
+    is_sourceless_provisional in reconcile MOVE_OUT_INSPECTION path must require
+    task has NO source_type/source_id binding. A source-bound MOVE_OUT_INSPECTION
+    task MUST NOT be CANCELLED by the dedupe-fallback-miss + inactive-lease path
+    when its linked inspection is in SCHEDULED / INSPECTED state (true projection
+    preserved)."""
+    from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
+    headers = _headers(owner_a[1])
+    insp = MoveOutInspection(
+        lease_id=lease_id,
+        scheduled_at=datetime.now(timezone.utc) + timedelta(days=1),
+        unit_id=None,
+        tenant_id=None,
+        status=MoveOutInspectionStatus.SCHEDULED,
+        created_by=owner_a[0].id,
+    )
+    db_session.add(insp)
+    db_session.flush()
+    insp_id = insp.id
+    db_session.commit()
+    task = _insert_task(
+        db_session,
+        task_type=OperationalTaskType.MOVE_OUT_INSPECTION,
+        title="T20: Source-bound inspection task keep SCHEDULED projection",
+        source_type="move_out_inspection",
+        source_id=insp_id,
+        property_id=property_id,
+        lease_id=lease_id,
+        tenant_id=tenant_id,
+        dedupe_key=f"T20:SOURCED_INSPECT_PROJECTION:{lease_id}",
+        status=OperationalTaskStatus.PENDING,
+    )
+    db_session.flush()
+    task_id = task.id
+    lease_row = db_session.get(Lease, lease_id)
+    assert lease_row is not None
+    lease_row.status = LeaseStatus.expired
+    lease_row.renewal_metadata = {"not_renewed": True}
+    db_session.flush()
+    reconcile_tasks(db_session, now=datetime.now(timezone.utc))
+    db_session.commit()
+    after_task = db_session.get(OperationalTask, task_id)
+    assert after_task is not None
+    assert after_task.status != OperationalTaskStatus.CANCELLED, (
+        f"Source-bound move_out_inspection task (insp_id={insp_id}) MUST NOT be "
+        f"CANCELLED by sourceless inactive-lease branch because insp exists in "
+        f"SCHEDULED. Got status={after_task.status}"
+    )
+    after_insp = db_session.get(MoveOutInspection, insp_id)
+    assert after_insp is not None
+    assert after_insp.status == MoveOutInspectionStatus.SCHEDULED
+

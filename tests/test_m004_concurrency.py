@@ -483,24 +483,25 @@ def test_03_non_idempotency_fk_error_not_swallowed(concurrency_engine, c_client,
             raise IntegrityError(statement, parameters, Exception(
                 "insert or update on table \"incomes\" violates foreign key constraint "
                 "\"fk_incomes_bad_leasing_agent\"\nDETAIL:  Key (some_fk)=(99999) is not present in table xxx."
-            ), params=parameters, orig=Exception("FK violation poison"))
+            ))
 
     from app.services.deposit_settlement_service import confirm_settlement as _svc_confirm
     settle_row = concurrency_db.get(DepositSettlement, settle_id)
-    raised_ok = False
+    raised_ie = False
     try:
         try:
-            _svc_confirm(concurrency_db, settle_row, datetime.now(timezone.utc), c_owner[0].id)
+            _svc_confirm(concurrency_db, settle_row, confirmed_at=datetime.now(timezone.utc), confirmed_by=c_owner[0].id)
         except IntegrityError:
-            raised_ok = True
-        except Exception:
-            raised_ok = True
+            raised_ie = True
+        except TypeError:
+            raise AssertionError("TypeError propagated — confirm_settlement kwargs required (positionals banned)")
     finally:
         event.remove(concurrency_engine, "before_cursor_execute", _poison)
-    assert raised_ok, "Expected IntegrityError/exception to propagate, not swallow"
+    assert raised_ie, "Expected only IntegrityError to propagate, not swallow TypeError or nothing"
+    assert poison_fired.is_set() is True, "Expected poison FK violation raised but listener fired"
     concurrency_db.expire_all()
     s2 = concurrency_db.get(DepositSettlement, settle_id)
-    assert s2.status == DepositSettlementStatus.DRAFT
+    assert s2.status == DepositSettlementStatus.DRAFT, f"Expected DRAFT after FK violation, got {s2.status}"
 
 
 # ===== 4. property unresolved refund 409 =====

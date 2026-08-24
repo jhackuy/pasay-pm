@@ -1100,10 +1100,48 @@ def test_d7_delete_after_pipeline_success(
         json={"status": LeaseStatus.terminated.value},
         headers=h,
     )
+    before_lease = db_session.get(Lease, lease_id)
+    assert before_lease is not None
+    assert before_lease.deleted_at is None
+    before_audit_count = db_session.query(AuditLog).filter(
+        AuditLog.table_name == "leases",
+        AuditLog.record_id == str(lease_id),
+        AuditLog.action == "soft_delete",
+    ).count()
     r = client.delete(f"{API}/leases/{lease_id}", headers=h)
     assert r.status_code == 200, r.text
     lease = db_session.get(Lease, lease_id)
     assert lease.deleted_at is not None
+    after_log = db_session.query(AuditLog).filter(
+        AuditLog.table_name == "leases",
+        AuditLog.record_id == str(lease_id),
+        AuditLog.action == "soft_delete",
+    ).order_by(AuditLog.id.desc()).first()
+    assert after_log is not None, "Expected exactly one new soft_delete audit log for delete"
+    assert (db_session.query(AuditLog).filter(
+        AuditLog.table_name == "leases",
+        AuditLog.record_id == str(lease_id),
+        AuditLog.action == "soft_delete",
+    ).count() - before_audit_count) == 1
+    old_value = after_log.old_value
+    new_value = after_log.new_value
+    assert isinstance(old_value, dict), f"old_value must be serialize_row dict, got {type(old_value)}"
+    assert isinstance(new_value, dict), f"new_value must be serialize_row dict, got {type(new_value)}"
+    assert old_value.get("deleted_at") is None, (
+        f"old_value.deleted_at must be None BEFORE mutation, got {old_value.get('deleted_at')!r}. "
+        f"old_row must be serialized before deleted_at/updated_by/apply_settled mutation."
+    )
+    assert new_value.get("deleted_at") is not None, (
+        f"new_value.deleted_at must be non-None AFTER mutation, got {new_value.get('deleted_at')!r}"
+    )
+    assert old_value.get("deleted_at") != new_value.get("deleted_at"), (
+        f"old/new deleted_at must differ (None → set) to prove audit captured real mutation boundary."
+        f" old={old_value.get('deleted_at')!r} new={new_value.get('deleted_at')!r}"
+    )
+    assert old_value != new_value, (
+        "old_value/new_value must differ; otherwise audit is re-snapshotting post-mutation state "
+        "for both sides, losing the exact transition trace required by close gate invariant."
+    )
 
 
 def test_d8_patch_to_expired_also_runs_final_state(

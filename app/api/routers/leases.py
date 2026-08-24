@@ -373,6 +373,8 @@ def delete_lease(
                     },
                 )
 
+        old_row = serialize_row(obj)
+        assert old_row.get("deleted_at") is None, "Precondition: old_row.deleted_at must be None before soft-delete mutation"
         obj.deleted_at = datetime.now(timezone.utc)
         obj.updated_by = user.id
         if obj.moved_out_settled_at is None:
@@ -382,13 +384,18 @@ def delete_lease(
             old_s, new_s = _sync_unit_status(db, unit)
             if getattr(old_s, "value", old_s) != getattr(new_s, "value", new_s):
                 unit.updated_by = user.id
+        new_row = serialize_row(obj)
+        assert new_row.get("deleted_at") is not None, "Postcondition: new_row.deleted_at must be non-None after soft-delete mutation"
+        assert old_row.get("deleted_at") != new_row.get("deleted_at"), "old/new deleted_at must differ (None -> set) for audit trace"
+        assert old_row != new_row, "old_value and new_value must differ for a real soft-delete mutation"
         record_audit(
             db,
             table_name="leases",
             record_id=obj.id,
             action="soft_delete",
             actor_id=user.id,
-            old_value=serialize_row(obj),
+            old_value=old_row,
+            new_value=new_row,
         )
         db.commit()
         return MessageResponse(detail="Lease deleted")

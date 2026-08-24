@@ -243,11 +243,10 @@ def _reconcile_one(db: Session, task: OperationalTask, *, now: datetime) -> str 
                 .first()
                 is not None
             )
-            is_sourceless_provisional = (
-                task.source_id is None and task.source_type is None
-            ) or (
-                not is_business_orphan_safe and not matched_by_dedupe
-            )
+            no_source_binding = task.source_id is None and task.source_type is None
+            branch_a = no_source_binding
+            branch_b = no_source_binding and (not is_business_orphan_safe and not matched_by_dedupe)
+            is_sourceless_provisional = branch_a or branch_b
             if lease_inactive and not pending_insp_exists and is_sourceless_provisional:
                 if task.status != OperationalTaskStatus.CANCELLED:
                     return _transition(
