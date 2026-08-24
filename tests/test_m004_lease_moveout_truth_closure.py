@@ -1802,18 +1802,21 @@ def test_a10_concurrent_predecessor_archive_vs_successor_race_barrier(
         before_succ_audit = db_session.query(AuditLog).filter(
             AuditLog.table_name == "leases",
             AuditLog.record_id == str(succ_id),
-            AuditLog.action.in_(["soft_delete", "update", "patch"]),
+            AuditLog.action == "soft_delete",
         ).count()
 
         pred_results = []
         succ_results = []
         mu = threading.Lock()
         start_barrier = threading.Barrier(2)
+        succ_lock_event = threading.Event()
 
         def _archive_pred_worker():
             try:
                 with TestClient(app, raise_server_exceptions=False) as wc:
                     start_barrier.wait(timeout=20)
+                    if not succ_lock_event.wait(timeout=20):
+                        raise RuntimeError("Timeout waiting for succ lock acquisition")
                     r = wc.delete(f"{API}/leases/{pred_id}", headers=h)
                 parsed = None
                 try:
@@ -1836,6 +1839,7 @@ def test_a10_concurrent_predecessor_archive_vs_successor_race_barrier(
                     Lease.id == succ_id, Lease.deleted_at.is_(None)
                 ).with_for_update().populate_existing().first()
                 assert row is not None
+                succ_lock_event.set()
                 old_s = row.__dict__.copy()
                 old_s.pop("_sa_instance_state", None)
                 clean_old = {}
