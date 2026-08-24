@@ -64,6 +64,18 @@ class Lease(AuditMixin, SoftDeleteMixin, Base):
             ['deposit_settlements.id', 'deposit_settlements.lease_id'],
             name='fk_leases_ds_id_lease',
         ),
+        Index(
+            'uq_leases_id_unit_tenant',
+            'id', 'unit_id', 'tenant_id',
+            unique=True,
+        ),
+        ForeignKeyConstraint(
+            ['superseded_by_lease_id', 'unit_id', 'tenant_id'],
+            ['leases.id', 'leases.unit_id', 'leases.tenant_id'],
+            name='fk_leases_superseded_same_party',
+            ondelete='RESTRICT',
+            use_alter=True,
+        ),
         ForeignKeyConstraint(
             ['superseded_by_lease_id'],
             ['leases.id'],
