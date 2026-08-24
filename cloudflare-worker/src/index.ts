@@ -40,26 +40,12 @@ type BindingQueue = Queue;
 
 interface Env {
   PASAY_QUEUE: BindingQueue;
-  // OFFICIAL Container Durable Object namespace (from [[durable_objects.bindings]]
-  // in wrangler.toml with class_name="PasayContainer" and name="PASAY_CONTAINER").
-  // ND_RETURN FIX2 #1: official single Durable Object namespace for the
-  // PasayContainer class (registered via wrangler.toml + migrations).
-  // FIX11: DurableObjectNamespace<any> — the generic branded constraint
-  // `Rpc.DurableObjectBranded` uses a package-local unique symbol that the
-  // test mock cannot structurally match (only the REAL build, which imports
-  // directly from `@cloudflare/containers`, carries the exact brand symbol
-  // via `Container extends DurableObject<Env>`). Declaring `<any>` here is
-  // safe: the REAL build (tsconfig.json, no mock) still exercises the
-  // runtime-critical contract — Container class + getContainer factory call
-  // — through the actual @cloudflare/containers 0.3.7 types at tsc time.
   PASAY_CONTAINER?: DurableObjectNamespace<any>;
-  // Secret env vars (wrangler secret put). Note: on the Cloudflare 2025
-  // Containers platform, ALL Worker secrets/env vars are automatically
-  // propagated into the spawned Container process environment. We do NOT
-  // repeat them here in Container.envVars anymore — see the envVars
-  // comment on the PasayContainer class below.
   TELEGRAM_WEBHOOK_SECRET?: string;
   PASAY_CONTAINER_INGEST_TOKEN?: string;
+  DATABASE_URL?: string;
+  DATABASE_URL_UNPOOLED?: string;
+  TELEGRAM_BOT_TOKEN?: string;
 }
 
 // ── OFFICIAL Container class declaration ────────────────────────────────
@@ -73,43 +59,58 @@ const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const CONTAINER_INGEST_PATH = "/internal/ingest";
 const INGEST_AUTH_HEADER = "X-Pasay-Ingest-Token";
 
-/**
- * OFFICIAL Cloudflare Containers class — extends Container from
- * @cloudflare/containers. This is the runtime glue: the Cloudflare
- * platform uses the exported class name to match
- * [[durable_objects.bindings]] class_name + [[migrations]] new_sqlite_classes,
- * then wires Dockerfile container processes onto matching DO instances.
- *
- * defaultPort = 8000 must match the Dockerfile CMD uvicorn --port 8000.
- * sleepAfter = 15m lets a cold container stay warm 15 minutes between
- * worker requests (operator-friendly heartbeat cost).
- *
- * envVars (FIX11 REAL-TYPE FIX):
- *   On the 2025 Cloudflare Containers platform, every Worker secret
- *   (`wrangler secret put …`) and every `[vars]` entry in wrangler.toml
- *   is **automatically propagated** into the spawned Container process
- *   as POSIX environment variables. Manual per-key mapping via a
- *   function-table is NOT needed and was NEVER supported by the real
- *   @cloudflare/containers@0.3.7 type system (Container.envVars has
- *   type `Record<string, string>` — no function-valued entries).
- *
- *   Consequently we declare ONLY the static runtime-mode tag here.
- *   CONTAINER_INGEST_TOKEN, DATABASE_URL, DATABASE_URL_UNPOOLED,
- *   TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET all reach the
- *   Dockerfile process automatically via platform propagation.
- */
 export class PasayContainer extends Container {
   defaultPort = 8000;
   sleepAfter = "15m";
-  envVars: Record<string, string> = {
-    PASAY_RUNTIME_MODE: "cloudflare-container",
-  };
+  envVars: Record<string, string>;
+
+  constructor(ctx: any = {}, env: Env = {} as Env, options?: any) {
+    super(ctx, env, options);
+    this.envVars = {
+      DATABASE_URL: env.DATABASE_URL ?? "",
+      DATABASE_URL_UNPOOLED: env.DATABASE_URL_UNPOOLED ?? "",
+      TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN ?? "",
+      TELEGRAM_WEBHOOK_SECRET: env.TELEGRAM_WEBHOOK_SECRET ?? "",
+      CONTAINER_INGEST_TOKEN: env.PASAY_CONTAINER_INGEST_TOKEN ?? "",
+      PASAY_RUNTIME_MODE: "cloudflare-container",
+    };
+  }
 }
 
 type IngestAckResult = "ack" | "retry" | "terminal";
 
 function now_iso(): string {
   return new Date().toISOString();
+}
+
+function mask_sensitive(input: string): string {
+  let s = String(input);
+  s = s.replace(/postgres(?:ql)?:\/\/[^\s"'<>]+/gi, "postgres://***:***@***:***/***");
+  const kvs = [
+    "DATABASE_URL", "DATABASE_URL_UNPOOLED",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
+    "CONTAINER_INGEST_TOKEN", "PASAY_CONTAINER_INGEST_TOKEN",
+    "TOKEN", "SECRET", "KEY",
+  ];
+  for (const k of kvs) {
+    const re = new RegExp(`(${k})\\s*[:=]\\s*[^\s"'&,;]+`, "gi");
+    s = s.replace(re, (_m, key) => `${key}=***`);
+  }
+  s = s.replace(/[a-zA-Z0-9_\-]{20,}/g, (m) => {
+    if (/^[0-9a-fA-F-]{8,}$/.test(m) || m.includes(":")) return m;
+    return `${m.slice(0, 4)}***${m.slice(-4)}`;
+  });
+  return s;
+}
+
+function opaque_req_id(): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
+  let out = "r_";
+  for (let i = 0; i < bytes.length; i++) {
+    out += bytes[i].toString(16).padStart(2, "0");
+  }
+  return out;
 }
 
 function header_eq(a: string | null, b: string): boolean {
@@ -216,9 +217,11 @@ async function handle_telegram_ingress(
   try {
     await env.PASAY_QUEUE.send(envelope as unknown as MessageSendRequest<any>);
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const req_id = opaque_req_id();
+    const raw = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ""}` : String(err);
+    console.error(`[${req_id}] handle_telegram_ingress enqueue_failed: ${mask_sensitive(raw)}`);
     return new Response(
-      JSON.stringify({ ok: false, error: "enqueue_failed", detail: msg }),
+      JSON.stringify({ ok: false, error: "enqueue_failed", req_id }),
       { status: 503, headers: { "Content-Type": "application/json" } },
     );
   }
@@ -242,7 +245,7 @@ async function deliver_envelope_to_container(
     return "retry";
   }
   const token = env.PASAY_CONTAINER_INGEST_TOKEN;
-  if (!token) {
+  if (!token || !token.trim()) {
     return "retry";
   }
 
