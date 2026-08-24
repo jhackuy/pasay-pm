@@ -188,12 +188,11 @@ def schedule_inspection(
     )
     obj.created_by = actor_id
     obj.updated_by = actor_id
-    db.add(obj)
     try:
         with db.begin_nested():
+            db.add(obj)
             db.flush()
     except IntegrityError:
-        db.rollback()
         existing = (
             db.query(MoveOutInspection)
             .filter(
