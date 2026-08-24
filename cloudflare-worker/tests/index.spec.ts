@@ -696,12 +696,12 @@ run("CLOSEOUT#6: Container status codes → EXACT ack/retry/terminal mapping (20
   }
 });
 
-run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL exactly 7 entries (6 dynamic + 1 static)", () => {
+run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL 6 unique keys (5 mapped from env + 1 static PASAY_RUNTIME_MODE)", () => {
   const envVarEntries = [...WORKER_SRC.matchAll(/(?:PASAY_RUNTIME_MODE|DATABASE_URL(?:_UNPOOLED)?|TELEGRAM_BOT_TOKEN|TELEGRAM_WEBHOOK_SECRET|CONTAINER_INGEST_TOKEN)\s*:/g)].length;
-  assert(envVarEntries >= 6, `source should list the 7-keys envVars map (found ${envVarEntries} key assignments)`);
+  assert(envVarEntries >= 6, `source should list the 6-keys envVars map (found ${envVarEntries} key assignments)`);
 });
 
-run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env → keyset matches Set{7}", () => {
+run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env → exact keyset + per-key mapping source verified", () => {
   const fullEnv = {
     PASAY_QUEUE: makeFakeQueue(),
     PASAY_CONTAINER: { x: 1 },
@@ -717,24 +717,33 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     "CONTAINER_INGEST_TOKEN", "DATABASE_URL", "DATABASE_URL_UNPOOLED",
     "PASAY_RUNTIME_MODE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
   ].sort();
-  assert_eq(keys.length, 6, `envVars keys length = 6 (+ PASAY_RUNTIME_MODE static) — got ${keys.length}: ${keys}`);
+  assert_eq(keys.length, expected.length,
+    `envVars keys length = ${expected.length} unique — got ${keys.length}: ${keys}`);
   for (const k of expected) {
     assert(k in inst.envVars, `envVars must contain key ${k}`);
   }
-  assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
-    "PASAY_RUNTIME_MODE static == cloudflare-container");
-  assert_eq(inst.envVars.DATABASE_URL, fullEnv.DATABASE_URL, "DATABASE_URL == env.DATABASE_URL (no hardcoding)");
+  // Per-key exact mapping source:
+  //   4 keys = direct 1:1 from Env → envVars
+  assert_eq(inst.envVars.DATABASE_URL, fullEnv.DATABASE_URL,
+    "DATABASE_URL <-- env.DATABASE_URL (1:1)");
   assert_eq(inst.envVars.DATABASE_URL_UNPOOLED, fullEnv.DATABASE_URL_UNPOOLED,
-    "DATABASE_URL_UNPOOLED == env.DATABASE_URL_UNPOOLED");
+    "DATABASE_URL_UNPOOLED <-- env.DATABASE_URL_UNPOOLED (1:1)");
   assert_eq(inst.envVars.TELEGRAM_BOT_TOKEN, fullEnv.TELEGRAM_BOT_TOKEN,
-    "TELEGRAM_BOT_TOKEN == env.TELEGRAM_BOT_TOKEN");
+    "TELEGRAM_BOT_TOKEN <-- env.TELEGRAM_BOT_TOKEN (1:1)");
   assert_eq(inst.envVars.TELEGRAM_WEBHOOK_SECRET, fullEnv.TELEGRAM_WEBHOOK_SECRET,
-    "TELEGRAM_WEBHOOK_SECRET == env.TELEGRAM_WEBHOOK_SECRET");
+    "TELEGRAM_WEBHOOK_SECRET <-- env.TELEGRAM_WEBHOOK_SECRET (1:1)");
+  //   1 key = NAME MAPPING (PASAY_CONTAINER_INGEST_TOKEN in Env →
+  //     CONTAINER_INGEST_TOKEN in envVars), to match backend snake_case
+  //     "container_ingest_token" Settings key.
   assert_eq(inst.envVars.CONTAINER_INGEST_TOKEN, fullEnv.PASAY_CONTAINER_INGEST_TOKEN,
-    "CONTAINER_INGEST_TOKEN == env.PASAY_CONTAINER_INGEST_TOKEN (name mapping verified)");
-  // Static tag does NOT come from env
+    "CONTAINER_INGEST_TOKEN <-- env.PASAY_CONTAINER_INGEST_TOKEN (NAME MAPPING: PASAY_ prefix stripped)");
+  //   1 key = STATIC (not from env, never changes regardless of env values)
   assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
-    "PASAY_RUNTIME_MODE is STATIC (not from env, never changes)");
+    "PASAY_RUNTIME_MODE is STATIC (NOT from env) == cloudflare-container");
+  // Container constructor passes the original env object through Container base
+  // super() as-is, so DurableObject storage / bindings (PASAY_QUEUE, PASAY_CONTAINER)
+  // remain accessible through Container.env. The extra keys are intentionally
+  // NOT forwarded into envVars because they are platform bindings, not env vars.
 });
 
 run("CLOSEOUT#7c: PasayContainer envVars — partial/missing env → empty strings, no crash, no undefined", () => {

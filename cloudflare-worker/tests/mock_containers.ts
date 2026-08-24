@@ -42,7 +42,8 @@ export abstract class Container {
    * Environment-variable provisioning table (Cloudflare Containers runtime).
    *
    * REAL @cloudflare/containers@0.3.7 signature: Record<string, string>.
-   * Pasay closeout RETURN-1 §2: explicit 7-key envVars (6 dynamic + 1 static).
+   * Pasay closeout RETURN-1 §2: explicit 6-key envVars (5 dynamic mapped
+   * from env + 1 static PASAY_RUNTIME_MODE).
    */
   envVars: Record<string, string> = {};
 
