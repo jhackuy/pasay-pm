@@ -33,6 +33,7 @@ from app.models.operations import (
     OperationalTaskType,
     RecurringRule,
 )
+from app.models.financial import Expense
 from app.models.lease import Lease
 from app.models.membership import Membership, MembershipState, OrganizationRole
 from app.models.property import Property, Unit
@@ -112,30 +113,98 @@ def resolve_org_membership(
     """Depends factory: resolve ACTIVE Membership for the current user+org scope.
 
     Returns Membership object (with .organization_id). Raises HTTP 403 on role
-    mismatch / missing membership. Supports HUMAN (via User) and SYSTEM job
-    readers (via SystemReader) — the SYSTEM reader has global read scope and
-    is bound to the first ACTIVE membership found (org context required for
-    payload filtering; SYSTEM reader never escalates to writes).
+    mismatch / missing membership, or HTTP 409 when a SYSTEM reader presents
+    an ambiguous org scope (multiple ACTIVE memberships, no explicit trusted
+    org context).
+
+    HUMAN path (unchanged contract):
+      * Uses the HUMAN user's ACTIVE memberships via list_active_org_ids_for_user.
+      * No ACTIVE membership -> HTTP 403.
+      * Otherwise picks the caller's first active org_id (HUMANs are expected to
+        belong to a single active org in the frozen topology).
+      * Role mismatch on the resolved membership -> HTTP 403.
+
+    SYSTEM / SystemReader path (fail-closed for ambiguous scope):
+      * A SYSTEM reader must never implicitly fall back to the "first available"
+        ACTIVE membership (no .first() / no ordered select / no memberships[0]).
+      * Decisions (after filtering state=ACTIVE + removed_at=NULL + role match):
+        * 0 qualifying memberships  -> HTTP 403 "Active organization membership
+          required" (fail-closed, no org exposure).
+        * exactly 1 qualifying membership -> use that unique Membership.  The
+          singleton case is unambiguous even without an explicit trusted org
+          context, so legacy single-org deployments keep working.
+        * >= 2 qualifying memberships AND a trusted organization context is
+          available -> query ONLY for that single organization_id and confirm
+          an ACTIVE, role-matching Membership exists.  No fallback to other
+          memberships on mismatch; fail 403 immediately.  The trusted org
+          context currently comes from the request's reader-bound scheduler
+          operation (a SystemReader operation always has a single-org target
+          already proven by the caller), mirrored through the resolved reader.
+        * >= 2 qualifying memberships WITHOUT a trusted explicit organization
+          context -> HTTP 409 "Organization context required" (fail-closed).
+          No DB default ordering / no "pick first" heuristic — ambiguous scope
+          is rejected explicitly.
     """
     role_set: set[OrganizationRole] = set(role) if role else set()
+
+    def _base_membership_query(db: Session):
+        q = db.query(Membership).filter(
+            Membership.state == MembershipState.ACTIVE,
+            Membership.removed_at.is_(None),
+        )
+        if role_set:
+            q = q.filter(Membership.role.in_(role_set))
+        return q
 
     def _dep(
         db: Session = Depends(get_db),
         reader: User | SystemReader = Depends(get_operations_reader),
     ) -> Membership:
         if isinstance(reader, SystemReader):
-            m = (
-                db.query(Membership)
-                .filter(
-                    Membership.state == MembershipState.ACTIVE,
-                    Membership.removed_at.is_(None),
-                )
-                .order_by(Membership.organization_id.asc(), Membership.id.asc())
-                .first()
+            # Explicit trusted organization_id context for the SYSTEM reader is
+            # carried on the reader.credential when an internal caller binds it
+            # to a single target org.  SystemReader uses __slots__ so the
+            # credential SQLAlchemy instance (with __dict__) is used as the
+            # stable attachment surface for internal scope hints.  When absent
+            # (legacy single-org jobs), attribute is None and we fall to the
+            # 0/1/N ambiguity guard below.
+            trusted_org_id: int | None = getattr(
+                reader.credential, "trusted_organization_id", None
             )
-            if m is None:
-                raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
-            return m
+            base_q = _base_membership_query(db)
+
+            if trusted_org_id is not None:
+                # Case: explicit trusted org context.  Only the trusted org
+                # qualifies; never fall back to other memberships even if this
+                # one is missing.
+                picked = (
+                    base_q.filter(Membership.organization_id == trusted_org_id)
+                    .one_or_none()
+                )
+                if picked is None:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Active organization membership required",
+                    )
+                return picked
+
+            # No explicit trusted org context.  Ambiguity guard: read up to 2
+            # rows with an UNORDERED query so DB default ordering can never
+            # choose an org for us.  Exactly 1 is unambiguous; 0 and >=2 are
+            # fail-closed with stable contracts above.
+            small_batch = base_q.limit(2).all()
+            if len(small_batch) == 0:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Active organization membership required",
+                )
+            if len(small_batch) == 1:
+                return small_batch[0]
+            raise HTTPException(
+                status_code=409,
+                detail="Organization context required",
+            )
+
         user = reader
         org_ids = list_active_org_ids_for_user(db, user.id)
         if not org_ids:
@@ -1101,13 +1170,73 @@ def quick_tasks(
     reader: User | SystemReader = Depends(get_operations_reader),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _ = membership.organization_id
+    org_id = membership.organization_id
     if isinstance(reader, SystemReader):
         if scope == "owner":
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "SYSTEM reader cannot use the owner scope"
             )
-        return quick_svc.build_quick_tasks(db, reader, owner_only=False)
+        rows = quick_svc.build_quick_tasks(db, reader, owner_only=False)
+        org_prop_ids = _org_property_ids(db, org_id)
+        org_lease_ids = _org_lease_ids(db, org_id)
+        task_ids = [
+            r["id"] for r in rows
+            if isinstance(r, dict) and isinstance(r.get("id"), int)
+        ]
+        allowed_task_ids: set[int] = set()
+        if task_ids:
+            prop_q = db.execute(
+                select(OperationalTask.id).where(
+                    OperationalTask.id.in_(task_ids),
+                    OperationalTask.property_id.in_(org_prop_ids),
+                )
+            ).all()
+            lease_q = db.execute(
+                select(OperationalTask.id).where(
+                    OperationalTask.id.in_(task_ids),
+                    OperationalTask.lease_id.in_(org_lease_ids),
+                )
+            ).all()
+            orphan_q = db.execute(
+                select(OperationalTask.id).where(
+                    OperationalTask.id.in_(task_ids),
+                    OperationalTask.property_id.is_(None),
+                    OperationalTask.lease_id.is_(None),
+                )
+            ).all()
+            allowed_task_ids = (
+                {r[0] for r in prop_q}
+                | {r[0] for r in lease_q}
+                | {r[0] for r in orphan_q}
+            )
+        payable_expense_ids = [
+            r["expense_id"] for r in rows
+            if isinstance(r, dict)
+            and r.get("kind") == "payable_expense"
+            and isinstance(r.get("expense_id"), int)
+        ]
+        allowed_payable_ids: set[int] = set()
+        if payable_expense_ids:
+            pay_q = db.execute(
+                select(Expense.id).where(
+                    Expense.id.in_(payable_expense_ids),
+                    Expense.property_id.in_(org_prop_ids),
+                )
+            ).all()
+            allowed_payable_ids = {r[0] for r in pay_q}
+        kept: list[dict] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("id")
+            if isinstance(rid, int) and rid in allowed_task_ids:
+                kept.append(r)
+                continue
+            if r.get("kind") == "payable_expense":
+                eid = r.get("expense_id")
+                if isinstance(eid, int) and eid in allowed_payable_ids:
+                    kept.append(r)
+        return kept
     return quick_svc.build_quick_tasks(db, reader, owner_only=(scope == "owner"))
 
 
