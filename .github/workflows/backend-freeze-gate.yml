@@ -43,12 +43,12 @@ jobs:
           --health-retries=5
 
     steps:
-      - name: DOOR-00 Preflight â€?checkout and basic invariants
+      - name: DOOR-00 Preflight â€” checkout and basic invariants
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: DOOR-00 Preflight â€?verify freeze contract files exist
+      - name: DOOR-00 Preflight â€” verify freeze contract files exist
         run: |
           set -euo pipefail
           test -f AGENTS.md
@@ -117,7 +117,7 @@ jobs:
 
       - name: DOOR-04/05/06 Start container with fake secrets, entrypoint alembic re-run, uvicorn health
         env:
-          FREEZE_CONTAINER_NAME: "pasay-freeze-${{ github.run_id }}"
+          FREEZE_CONTAINER_NAME: "pasay-freeze-${GITHUB_RUN_ID}"
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
           FAKE_DB_URL: "postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${{ env.FREEZE_GATE_DB }}"
           FAKE_DB_UNPOOLED_URL: "postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${{ env.FREEZE_GATE_DB }}"
@@ -126,13 +126,21 @@ jobs:
           mkdir -p artifacts/container
           # DOOR-04: Launch with fake secrets (no production values)
           docker rm -f "${FREEZE_CONTAINER_NAME}" 2>/dev/null || true
+          # Create separate unmigrated database for container startup alembic validation
+          EMPTY_STARTUP_DB="pasay_freeze_startup_${GITHUB_RUN_ID}"
+          export PGPASSWORD=postgres
+          psql -h localhost -U postgres -c "DROP DATABASE IF EXISTS \"${EMPTY_STARTUP_DB}\";"
+          psql -h localhost -U postgres -c "CREATE DATABASE \"${EMPTY_STARTUP_DB}\";"
+          STARTUP_DB_URL="postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${EMPTY_STARTUP_DB}"
+          STARTUP_DB_UNPOOLED_URL="postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${EMPTY_STARTUP_DB}"
+          echo "STARTUP_EMPTY_DB=${EMPTY_STARTUP_DB}" >> $GITHUB_ENV
           # Use docker run with add-host so container reaches host postgres (service)
           if ! docker run -d \
               --name "${FREEZE_CONTAINER_NAME}" \
               --add-host=host.docker.internal:host-gateway \
               -p 18000:8000 \
-              -e DATABASE_URL="${FAKE_DB_URL}" \
-              -e DATABASE_URL_UNPOOLED="${FAKE_DB_UNPOOLED_URL}" \
+              -e DATABASE_URL="${STARTUP_DB_URL}" \
+              -e DATABASE_URL_UNPOOLED="${STARTUP_DB_UNPOOLED_URL}" \
               -e TELEGRAM_BOT_TOKEN="fake-bot-token-freeze-gate-${GITHUB_RUN_ID}" \
               -e TELEGRAM_WEBHOOK_SECRET="fake-webhook-secret-freeze-${GITHUB_RUN_ID}" \
               -e CONTAINER_INGEST_TOKEN="fake-ingest-token-freeze-${GITHUB_RUN_ID}" \
@@ -145,23 +153,39 @@ jobs:
           fi
           echo "BACKEND_FREEZE_GATE__DOOR_04_OK=1" >> $GITHUB_ENV
 
-          # DOOR-05: Container entrypoint should already have run alembic; re-verify by exec alembic current inside container (idempotent re-check, no stamp)
-          sleep 8
+          # DOOR-05: Container must auto-run alembic upgrade head against a truly empty database
+          # (FREEZE_GATE_DB was pre-migrated in DOOR-02, so we must NOT reuse it for this proof)
+          sleep 12
           docker logs "${FREEZE_CONTAINER_NAME}" > artifacts/container/startup_logs.txt 2>&1 || true
-          # Check alembic was run or migrations applied (look for any m4d marker in logs, or the health endpoint)
-          # The entrypoint alembic requirement is verified by: the app started without migration failures
           if ! grep -qE "alembic|migration|uvicorn|started" artifacts/container/startup_logs.txt; then
-            # No visible logs; container may not have printed stdout; fallback: just confirm app is listening via DOOR-06 below
-            echo "WARN: no alembic entrypoint logs visible, will rely on health + PG tables presence"
+            echo "WARN: no alembic entrypoint logs visible, will rely on empty DB alembic_version and tables presence"
           fi
-          # Confirm DB tables exist (evidence of migrations applied inside container)
-          PGPASSWORD=postgres psql -h localhost -U postgres -d "${FREEZE_GATE_DB}" \
-            -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" \
-            > artifacts/container/table_count.txt
-          NUM_TABLES=$(grep -oE '[0-9]+' artifacts/container/table_count.txt | tail -n1)
-          echo "Detected tables in freeze gate DB: ${NUM_TABLES}"
+          # (a) Verify alembic_version has advanced to expected head on the EMPTY startup database
+          EXPECTED_HEAD="m4d000000001"
+          STARTUP_HEAD="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${EMPTY_STARTUP_DB}" \
+            -c "SELECT version_num FROM alembic_version LIMIT 1;")"
+          printf '%s\n' "${STARTUP_HEAD}" > artifacts/container/startup_alembic_head.txt
+          echo "Detected alembic head in startup empty DB: ${STARTUP_HEAD}"
+          if [ "${STARTUP_HEAD}" != "${EXPECTED_HEAD}" ]; then
+            echo "FAIL: expected alembic_version=${EXPECTED_HEAD} on empty startup DB after container entrypoint, got ${STARTUP_HEAD}"
+            exit 1
+          fi
+          # (b) Use -At for scalar extraction (no "(1 row)" footer leaked into value)
+          NUM_TABLES="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${EMPTY_STARTUP_DB}" \
+            -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")"
+          printf '%s\n' "${NUM_TABLES}" > artifacts/container/table_count.txt
+          echo "Detected tables in startup empty DB (post-entrypoint): ${NUM_TABLES}"
           if [ "${NUM_TABLES}" -lt 35 ]; then
-            echo "FAIL: expected >= 35 tables after alembic application, got ${NUM_TABLES}"
+            echo "FAIL: expected >= 35 tables after entrypoint alembic application on empty DB, got ${NUM_TABLES}"
+            exit 1
+          fi
+          # (c) Sanity-check that FREEZE_GATE_DB (pre-migrated in DOOR-02) still has >= 35 tables
+          FREEZE_TABLES="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${FREEZE_GATE_DB}" \
+            -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")"
+          printf '%s\n' "${FREEZE_TABLES}" > artifacts/container/door02_freeze_tables_count.txt
+          echo "Detected tables in pre-migrated FREEZE_GATE_DB: ${FREEZE_TABLES}"
+          if [ "${FREEZE_TABLES}" -lt 35 ]; then
+            echo "FAIL: DOOR-02 migrated FREEZE_GATE_DB should have >=35 tables, got ${FREEZE_TABLES}"
             exit 1
           fi
           echo "BACKEND_FREEZE_GATE__DOOR_05_OK=1" >> $GITHUB_ENV
@@ -191,7 +215,7 @@ jobs:
           if [ "$CODE" != "200" ]; then echo "FAIL: expected 200 got $CODE"; cat artifacts/doors/door_07_health.json; exit 1; fi
           echo "BACKEND_FREEZE_GATE__DOOR_07_OK=1" >> $GITHUB_ENV
 
-      - name: DOOR-08 POST /internal/ingest == 401 (no container_ingest_token â†?fail closed)
+      - name: DOOR-08 POST /internal/ingest == 401 (no container_ingest_token â†’ fail closed)
         run: |
           set -euo pipefail
           mkdir -p artifacts/doors
@@ -216,6 +240,8 @@ jobs:
 
       - name: Cleanup container (after DOOR-07/08)
         if: always()
+        env:
+          FREEZE_CONTAINER_NAME: "pasay-freeze-${{ github.run_id }}"
         run: |
           docker rm -f "${FREEZE_CONTAINER_NAME}" 2>/dev/null || true
           # leave image for DOOR-03 artifact upload
@@ -272,10 +298,9 @@ jobs:
             exit 5
           }
           if [ "$EXIT" != "0" ]; then
-            echo "INFO: wrangler deploy --dry-run returned non-zero (EXIT=$EXIT); treating as STOP because runner physical infeasible"
+            echo "FAIL: wrangler deploy --dry-run returned ${EXIT}"
             echo "INFO: artifacts/worker/door_12_wrangler_dry.log for full output"
-            # Phase 2 instruction: "Runner ä¸è¡Œç«‹å³ STOP ä¸é™çº?
-            exit 0
+            exit "${EXIT}"
           fi
           echo "BACKEND_FREEZE_GATE__DOOR_12_OK=1" >> $GITHUB_ENV
 
@@ -301,14 +326,13 @@ jobs:
 
           # Any door missing? Fail closed (all 13 doors must be explicitly 1)
           MISSING=""
-          for d in 00 01 02 03 04 05 06 07 08 09 10 11; do
+          for d in 00 01 02 03 04 05 06 07 08 09 10 11 12; do
             KEY="BACKEND_FREEZE_GATE__DOOR_${d}_OK"
             VAL="${!KEY:-MISSING}"
             if [ "${VAL}" != "1" ]; then
               MISSING="${MISSING} DOOR-${d}"
             fi
           done
-          # DOOR-12 is allowed to be physically infeasible on runner (Phase 2 instruction) â€?check only that it didn't real-deploy
           if [ -n "${MISSING}" ]; then
             echo "FAIL CLOSED: missing doors${MISSING}"
             exit 1
@@ -335,4 +359,4 @@ jobs:
     timeout-minutes: 1
     steps:
       - name: Freeze gate done
-        run: echo "backend-freeze-gate completed â€?see backend-freeze-gate artifacts for 13 doors"
+        run: echo "backend-freeze-gate completed â€” see backend-freeze-gate artifacts for 13 doors"
