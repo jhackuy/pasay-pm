@@ -542,6 +542,7 @@ def tasks_report(
             OperationalTask.tenant_id.in_(org_tenant_ids),
         )
     )
+    today = date.today()
     if status is not None:
         if status == "pending":
             query = query.filter(
@@ -562,7 +563,6 @@ def tasks_report(
                 OperationalTask.due_at.isnot(None),
                 func.date(OperationalTask.due_at) > today,
             )
-    today = date.today()
     if overdue:
         query = query.filter(
             OperationalTask.due_at.isnot(None),

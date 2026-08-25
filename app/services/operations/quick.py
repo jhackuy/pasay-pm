@@ -304,6 +304,10 @@ def _derive_org_scope_sets(db: Session, user_id: int | None = None):
         orgs = list_active_org_ids_for_user(db, user_id)
     if not orgs:
         return set(), set(), set(), set()
+    try:
+        db.flush()
+    except Exception:
+        pass
     org_property_ids = {
         r for (r,) in db.execute(
             select(Property.id).where(
@@ -842,16 +846,74 @@ def build_quick_expense(
     1. If org_property_ids is explicitly provided → use directly (Router path,
        resolves membership for the request org-id, M003 Expense scope hardening).
        Empty org_property_ids (set()==Falsy) → returns fully zeroed result.
+       When explicitly given, the companion lease/tenant scope sets are derived
+       by walking the org's full property → unit → lease → tenant chain so
+       tasks linked ONLY via lease_id or tenant_id (property_id intentionally
+       left NULL) still pass the three-channel visibility gate (M003/M004 joint
+       contract, fail-closed: no channel matches → task not visible).
     2. Else if user_id is provided → derive scope via _derive_org_scope_sets
        (backward-compatible test path; M004 tests call this).
     3. Else both None → system-wide full scope (convenience for test helpers
        that want all rows when no user/org context exists; still fail-closed
        if DB has no orgs, zeroed).
     """
+    from sqlalchemy import or_ as _sa_or
     now = now or datetime.now(timezone.utc)
+    org_lease_ids: set[int] | None = None
+    org_tenant_ids: set[int] | None = None
     if org_property_ids is None:
-        (derived_prop_ids, _, _, _) = _derive_org_scope_sets(db, user_id=user_id)
+        (derived_prop_ids, _unit_ids_d, derived_lease_ids, derived_tenant_ids) = _derive_org_scope_sets(db, user_id=user_id)
         org_property_ids = derived_prop_ids
+        org_lease_ids = derived_lease_ids
+        org_tenant_ids = derived_tenant_ids
+    else:
+        # Expand property_ids explicitly passed to the companion lease & tenant
+        # sets via DB join: same org chain that _derive_org_scope_sets builds
+        # when user_id is None (system-wide enumeration of org's properties).
+        # PLUS direct Tenant.organization_id for orphan tenants that have no
+        # Lease chain (mirrors the direct query in _derive_org_scope_sets so
+        # both enumeration paths produce equivalent tenant scopes).
+        # Enumeration limited to rows actually in scope → deterministic.
+        if org_property_ids:
+            prop_list = list(org_property_ids)
+            lease_rows = (
+                db.query(Lease.id)
+                .join(Unit, Unit.id == Lease.unit_id)
+                .filter(Unit.property_id.in_(prop_list))
+                .all()
+            )
+            org_lease_ids = {r[0] for r in lease_rows} if lease_rows else set()
+            unit_rows = (
+                db.query(Unit.id)
+                .filter(Unit.property_id.in_(prop_list))
+                .all()
+            )
+            unit_ids = {r[0] for r in unit_rows} if unit_rows else set()
+            if org_lease_ids:
+                tenant_rows = (
+                    db.query(Tenant.id)
+                    .join(Lease, Lease.tenant_id == Tenant.id)
+                    .filter(Lease.id.in_(list(org_lease_ids)))
+                    .all()
+                )
+                org_tenant_ids = {r[0] for r in tenant_rows} if tenant_rows else set()
+            else:
+                org_tenant_ids = set()
+            org_ids_from_prop = {
+                r[0] for r in db.query(Property.organization_id)
+                .filter(Property.id.in_(prop_list), Property.deleted_at.is_(None))
+                .all()
+            } or set()
+            if org_ids_from_prop:
+                extra_tenant_rows = db.query(Tenant.id).filter(
+                    Tenant.organization_id.in_(list(org_ids_from_prop)),
+                    Tenant.deleted_at.is_(None),
+                ).all()
+                if extra_tenant_rows:
+                    org_tenant_ids |= {r[0] for r in extra_tenant_rows}
+        else:
+            org_lease_ids = set()
+            org_tenant_ids = set()
     if not org_property_ids:
         return {
             "month_total": Decimal("0.00"),
@@ -891,18 +953,33 @@ def build_quick_expense(
         .all()
     )
     pending_amount = sum((_d2(e.amount) for e in pending_rows), Decimal("0.00"))
-    unresolved_filter = [
-        OperationalTask.task_type.in_(
-            [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
-        ),
-        OperationalTask.status.in_(
-            [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-        ),
-        OperationalTask.property_id.in_(list(org_property_ids)),
-    ]
+    task_type_filter = OperationalTask.task_type.in_(
+        [OperationalTaskType.APPROVAL_PENDING, OperationalTaskType.PAYMENT_PENDING]
+    )
+    task_status_filter = OperationalTask.status.in_(
+        [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+    )
+    # Three-channel OR gate: tasks are visible if linked via ANY of
+    # (property, lease, tenant). M003 requires the scope sets (originating
+    # from org membership) to bound the result; M004 requires that tasks bound
+    # only via lease_id or tenant_id are not silently dropped.
+    from sqlalchemy import false as _sa_false
+    channel_property = OperationalTask.property_id.in_(list(org_property_ids))
+    channel_lease = (
+        OperationalTask.lease_id.in_(list(org_lease_ids))
+        if org_lease_ids else _sa_false()
+    )
+    channel_tenant = (
+        OperationalTask.tenant_id.in_(list(org_tenant_ids))
+        if org_tenant_ids else _sa_false()
+    )
     unresolved = (
         db.query(OperationalTask)
-        .filter(*unresolved_filter)
+        .filter(
+            task_type_filter,
+            task_status_filter,
+            _sa_or(channel_property, channel_lease, channel_tenant),
+        )
         .order_by(OperationalTask.due_at)
         .all()
     )

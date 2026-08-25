@@ -112,15 +112,31 @@ def resolve_org_membership(
     """Depends factory: resolve ACTIVE Membership for the current user+org scope.
 
     Returns Membership object (with .organization_id). Raises HTTP 403 on role
-    mismatch / missing membership. Uses organization_id from query/header via
-    get_current_user context — mirrors reports.py pattern.
+    mismatch / missing membership. Supports HUMAN (via User) and SYSTEM job
+    readers (via SystemReader) — the SYSTEM reader has global read scope and
+    is bound to the first ACTIVE membership found (org context required for
+    payload filtering; SYSTEM reader never escalates to writes).
     """
     role_set: set[OrganizationRole] = set(role) if role else set()
 
     def _dep(
         db: Session = Depends(get_db),
-        user: User = Depends(get_current_user),
+        reader: User | SystemReader = Depends(get_operations_reader),
     ) -> Membership:
+        if isinstance(reader, SystemReader):
+            m = (
+                db.query(Membership)
+                .filter(
+                    Membership.state == MembershipState.ACTIVE,
+                    Membership.removed_at.is_(None),
+                )
+                .order_by(Membership.organization_id.asc(), Membership.id.asc())
+                .first()
+            )
+            if m is None:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
+            return m
+        user = reader
         org_ids = list_active_org_ids_for_user(db, user.id)
         if not org_ids:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
@@ -229,10 +245,24 @@ def _scoped_lock_task_for_update(db: Session, task_id: int, org_id: int) -> Oper
 def _self_filter_required(user: User, membership: Membership) -> bool:
     """True if the caller should only see tasks assigned to themselves.
 
-    OWNER bypasses self-filter (can see all org tasks). SECRETARY maps to the
-    legacy "agent" role behaviour: only their own assigned tasks.
+    OWNER and SECRETARY-manager tiers see every task in the org (bypass).
+    Only SECRETARY-agent tier (UserRole.agent inside a SECRETARY org
+    membership) is restricted to their own assigned tasks (double-checked
+    by :func:`_agent_scope` as a defense-in-depth redundancy).
     """
-    return membership.role != OrganizationRole.OWNER
+    return user.role == UserRole.agent
+
+
+def _forbid_agent_role(user: User) -> None:
+    """UserRole.agent is a worker tier within SECRETARY org membership: it
+    can act on tasks but never CRUD rules, approve expenses or configure the
+    business. Always checked after org-level SECRETARY/OWNER membership gate.
+    """
+    if user.role == UserRole.agent:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Agent role cannot manage rules, approval or financial configuration",
+        )
 
 
 def _agent_scope(query, user: User):
@@ -1341,8 +1371,10 @@ def _scoped_get_rule(db: Session, rule_id: int, org_id: int) -> RecurringRule:
 def list_rules(
     enabled: bool | None = Query(default=None),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
+    _forbid_agent_role(user)
     org_id = membership.organization_id
     org_prop_ids = _org_property_ids(db, org_id)
     query = db.query(RecurringRule).filter(RecurringRule.deleted_at.is_(None))
@@ -1362,6 +1394,7 @@ def create_rule(
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
+    _forbid_agent_role(user)
     org_id = membership.organization_id
     if payload.property_id is not None:
         if payload.property_id not in _org_property_ids(db, org_id):
@@ -1395,6 +1428,7 @@ def update_rule(
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
+    _forbid_agent_role(user)
     org_id = membership.organization_id
     obj = _scoped_get_rule(db, rule_id, org_id)
     updates = payload.model_dump(exclude_unset=True)
@@ -1430,6 +1464,7 @@ def disable_rule(
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
+    _forbid_agent_role(user)
     org_id = membership.organization_id
     obj = _scoped_get_rule(db, rule_id, org_id)
     if not obj.enabled:
