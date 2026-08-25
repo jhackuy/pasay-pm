@@ -260,18 +260,22 @@ class ExecutionDisabledError(RuntimeError):
 # Context builder (read-only; see module docstring)
 # ---------------------------------------------------------------------------
 
-def build_copilot_context(db: Session, user: User, *, now: datetime | None = None) -> dict:
+def build_copilot_context(
+    db: Session, user: User, *, now: datetime | None = None,
+    org_id: int | None = None,
+) -> dict:
     """Build the deterministic, RBAC-scoped context for ``user``.
 
     Agents see only their own tasks and entities reachable through them (plus
-    their own settlements); admins/managers see the full operational picture.
-    Pure reads: the only table this function writes is never written here —
-    the caller writes the ``copilot_runs`` row via ``log_context_run``.
+    their own settlements); admins/managers see the full operational picture
+    bounded to the resolved ``org_id`` scope (fail-closed).  Pure reads:
+    the only table this function writes is never written here — the caller
+    writes the ``copilot_runs`` row via ``log_context_run``.
     """
     now = now or datetime.now(timezone.utc)
     is_agent = user.role == UserRole.agent
 
-    tasks = _pending_tasks(db, user)
+    tasks = _pending_tasks(db, user, org_id=org_id)
     task_ids = [t["id"] for t in tasks]
     lease_ids = _scoped_ids(db, tasks, "lease_id")
     property_ids = _scoped_ids(db, tasks, "property_id")
@@ -285,19 +289,38 @@ def build_copilot_context(db: Session, user: User, *, now: datetime | None = Non
         if t["source_type"] == "commission_settlement" and t["source_id"]
     }
 
-    # Lease scope: for agents, only leases their tasks reference; for
-    # privileged users, every active lease.
-    lease_filter = lease_ids if is_agent else None
+    if not is_agent and org_id is not None:
+        from app.services.operations.summary import (
+            _org_lease_ids as _org_lids,
+            _org_property_ids as _org_pids,
+            _org_tenant_ids as _org_tids,
+        )
+        org_lids = _org_lids(db, org_id)
+        org_pids = _org_pids(db, org_id)
+        org_tids = _org_tids(db, org_id)
+        scoped_lease_ids: set[int] | None = org_lids or None
+        scoped_property_ids: set[int] | None = org_pids or None
+        scoped_tenant_ids: set[int] | None = org_tids or None
+        if not org_lids:
+            scoped_lease_ids = {0}
+        if not org_pids:
+            scoped_property_ids = {0}
+        if not org_tids:
+            scoped_tenant_ids = {0}
+    else:
+        scoped_lease_ids = lease_ids if is_agent else None
+        scoped_property_ids = property_ids if is_agent else None
+        scoped_tenant_ids = tenant_ids if is_agent else None
 
-    overdue_rents = _overdue_rents(db, lease_filter, now=now)
-    leases_expiring = _leases_expiring(db, lease_filter, now=now)
+    overdue_rents = _overdue_rents(db, scoped_lease_ids, now=now)
+    leases_expiring = _leases_expiring(db, scoped_lease_ids, now=now)
     expenses = _pending_expenses(db, expense_ids if is_agent else None)
     settlements = _pending_settlements(db, user, settlement_ids if is_agent else None)
-    maintenance = _maintenance_tasks(db, user)
-    recurring_rules = _recurring_rules(db, user)
-    properties = _properties(db, property_ids if is_agent else None)
-    tenants = _tenants(db, tenant_ids if is_agent else None)
-    income_refs = _income_references(db, lease_filter)
+    maintenance = _maintenance_tasks(db, user, org_id=org_id)
+    recurring_rules = _recurring_rules(db, user, org_id=org_id)
+    properties = _properties(db, scoped_property_ids)
+    tenants = _tenants(db, scoped_tenant_ids)
+    income_refs = _income_references(db, scoped_lease_ids)
 
     references = {
         "properties": [f"property:{p['id']}" for p in properties],
@@ -328,7 +351,7 @@ def build_copilot_context(db: Session, user: User, *, now: datetime | None = Non
         "scoped_to_user": is_agent,
         "free_text_policy": "data_only",
         "free_text_fields": list(FREE_TEXT_FIELDS),
-        "summary": build_operations_summary(db, user, now=now).model_dump(),
+        "summary": build_operations_summary(db, user, now=now, org_id=org_id).model_dump(),
         "pending_tasks": tasks,
         "overdue_rents": overdue_rents,
         "leases_expiring": leases_expiring,
@@ -371,12 +394,15 @@ def log_context_run(
     return run
 
 
-def _pending_tasks(db: Session, user: User) -> list[dict]:
+def _pending_tasks(db: Session, user: User, *, org_id: int | None = None) -> list[dict]:
     query = db.query(OperationalTask).filter(
         OperationalTask.status == OperationalTaskStatus.PENDING
     )
     if user.role == UserRole.agent:
         query = query.filter(OperationalTask.assigned_user_id == user.id)
+    elif org_id is not None:
+        from app.services.operations.summary import _scoped_task_query as _task_scope
+        query = query.filter(_task_scope(db, org_id))
     rows = query.all()
     rows.sort(key=lambda t: (t.due_at, _PRIORITY_WEIGHT.get(t.priority, 9), t.id))
     return [
@@ -544,13 +570,30 @@ def _pending_settlements(
     ]
 
 
-def _maintenance_tasks(db: Session, user: User) -> list[dict]:
+def _maintenance_tasks(
+    db: Session, user: User, *, org_id: int | None = None,
+) -> list[dict]:
     query = db.query(Task).filter(
         Task.deleted_at.is_(None),
         Task.status.in_([TaskStatus.open, TaskStatus.in_progress]),
     )
     if user.role == UserRole.agent:
         query = query.filter(Task.assigned_to == user.id)
+    elif org_id is not None:
+        from app.models.property import Unit, Property
+        from app.services.operations.summary import _org_property_ids as _org_pids
+        pids = _org_pids(db, org_id)
+        sub = (
+            db.query(Unit.id)
+            .join(Property, Property.id == Unit.property_id)
+            .filter(Property.deleted_at.is_(None))
+        )
+        if pids:
+            sub = sub.filter(Property.id.in_(list(pids)))
+        else:
+            sub = sub.filter(Property.id == -1)
+        unit_ids_sq = sub.subquery()
+        query = query.filter(Task.unit_id.in_(unit_ids_sq))
     rows = (
         query.order_by(Task.due_date.is_(None), Task.due_date, Task.id)
         .limit(CONTEXT_CAPS["maintenance_tasks"])
@@ -571,12 +614,21 @@ def _maintenance_tasks(db: Session, user: User) -> list[dict]:
     ]
 
 
-def _recurring_rules(db: Session, user: User) -> list[dict]:
+def _recurring_rules(
+    db: Session, user: User, *, org_id: int | None = None,
+) -> list[dict]:
     query = db.query(RecurringRule).filter(
         RecurringRule.enabled.is_(True), RecurringRule.deleted_at.is_(None)
     )
     if user.role == UserRole.agent:
         query = query.filter(RecurringRule.assigned_user_id == user.id)
+    elif org_id is not None:
+        from app.services.operations.summary import _org_property_ids as _org_pids
+        pids = _org_pids(db, org_id)
+        if pids:
+            query = query.filter(RecurringRule.property_id.in_(list(pids)))
+        else:
+            query = query.filter(RecurringRule.id == -1)
     rows = (
         query.order_by(RecurringRule.next_run_at, RecurringRule.id)
         .limit(CONTEXT_CAPS["recurring_rules"])

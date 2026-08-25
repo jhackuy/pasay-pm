@@ -111,6 +111,7 @@ def check_due_payment_promises(
     db: Session,
     *,
     now: datetime,
+    org_id: int | None = None,
 ) -> dict:
     """§17.2 Auto-check: at the promised date, if the payment arrived the
     promise is auto-fulfilled; if NOT, an actionable follow-up is re-created
@@ -118,7 +119,12 @@ def check_due_payment_promises(
 
     Payment arrived = a confirmed Income that covers the lease period up to
     the promised date (a real ledger check). Returns ``{"fulfilled": n,
-    "refollowed_up": n}``."""
+    "refollowed_up": n}``.
+
+    ``org_id`` fail-closes the active-task scan via the canonical 3-channel OR
+    (property / lease / tenant → organization); None preserves the global
+    standalone-worker behavior.
+    """
     from app.models.financial import Income, IncomeStatus
     from app.models.lease import Lease
     from app.services.operations import scheduler as _sched
@@ -128,15 +134,15 @@ def check_due_payment_promises(
 
     fulfilled = 0
     refollowed_up = 0
-    open_tasks = (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.status.in_(
-                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-            )
+    query = db.query(OperationalTask).filter(
+        OperationalTask.status.in_(
+            [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
         )
-        .all()
     )
+    if org_id is not None:
+        from app.services.operations.summary import _scoped_task_query
+        query = query.filter(_scoped_task_query(db, org_id))
+    open_tasks = query.all()
     for task in open_tasks:
         promise = dict(task_promise(task))
         if promise.get("kind") != "payment" or promise.get("status") not in ("open", "escalated"):
@@ -315,22 +321,27 @@ def escalate_due_promises(
     now: datetime,
     max_misses: int = 2,
     remind_interval_hours: int = 24,
+    org_id: int | None = None,
 ) -> dict:
     """One deterministic pass over active tasks with a due follow-up.
 
     Returns ``{"escalated": n, "reminded": n}``.
+
+    ``org_id`` fail-closes the active-task scan via the canonical 3-channel OR
+    (property / lease / tenant → organization); None preserves the global
+    standalone-worker behavior.
     """
     escalated = 0
     reminded = 0
-    tasks = (
-        db.query(OperationalTask)
-        .filter(
-            OperationalTask.status.in_(
-                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-            )
+    query = db.query(OperationalTask).filter(
+        OperationalTask.status.in_(
+            [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
         )
-        .all()
     )
+    if org_id is not None:
+        from app.services.operations.summary import _scoped_task_query
+        query = query.filter(_scoped_task_query(db, org_id))
+    tasks = query.all()
     for task in tasks:
         promise = dict(task_promise(task))  # copy: never mutate the JSONB in place
         if promise.get("status") != "open":

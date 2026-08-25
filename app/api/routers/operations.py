@@ -533,12 +533,30 @@ def _deliver_rent_followup_outbox_row(
         return "failed", db.get(NotificationOutbox, outbox_id)
 
 
-def _check_assignee(db: Session, user_id: int | None) -> None:
+def _check_assignee(db: Session, user_id: int | None, *, org_id: int | None = None) -> None:
     if user_id is None:
         return
     user = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assigned user not found")
+    if org_id is not None:
+        # Fail-closed: assignee MUST be an ACTIVE member of the caller's organization.
+        # This prevents cross-organization task assignment and accidental DM disclosure.
+        m = (
+            db.query(Membership)
+            .filter(
+                Membership.user_id == user_id,
+                Membership.organization_id == org_id,
+                Membership.state == MembershipState.ACTIVE,
+                Membership.removed_at.is_(None),
+            )
+            .first()
+        )
+        if m is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Assignee is not an active member of the caller's organization",
+            )
 
 
 def _check_property(db: Session, property_id: int | None) -> None:
@@ -1019,7 +1037,7 @@ def deliver_task_followup(
             detail="Follow-up already assigned",
             telegram_message_id=None,
         )
-    _check_assignee(db, payload.assignee_user_id)
+    _check_assignee(db, payload.assignee_user_id, org_id=org_id)
     recipient = resolve_recipient(db, payload.assignee_user_id)
     if not recipient:
         db.rollback()
@@ -1100,12 +1118,12 @@ def create_task(
         if payload.assigned_user_id not in (None, user.id):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
-                "SECRETARY may only assign tasks to themselves",
+                "Agent role may only assign tasks to themselves",
             )
     if payload.property_id is not None:
         if payload.property_id not in _org_property_ids(db, org_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
-    _check_assignee(db, payload.assigned_user_id)
+    _check_assignee(db, payload.assigned_user_id, org_id=org_id)
     _check_property(db, payload.property_id)
     now = datetime.now(timezone.utc)
     fields: dict = {
@@ -1171,73 +1189,23 @@ def quick_tasks(
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     org_id = membership.organization_id
+    from app.services.operations.summary import _scoped_task_query
+    org_prop_ids = _org_property_ids(db, org_id)
+    task_scope = _scoped_task_query(db, org_id)
     if isinstance(reader, SystemReader):
         if scope == "owner":
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "SYSTEM reader cannot use the owner scope"
             )
-        rows = quick_svc.build_quick_tasks(db, reader, owner_only=False)
-        org_prop_ids = _org_property_ids(db, org_id)
-        org_lease_ids = _org_lease_ids(db, org_id)
-        task_ids = [
-            r["id"] for r in rows
-            if isinstance(r, dict) and isinstance(r.get("id"), int)
-        ]
-        allowed_task_ids: set[int] = set()
-        if task_ids:
-            prop_q = db.execute(
-                select(OperationalTask.id).where(
-                    OperationalTask.id.in_(task_ids),
-                    OperationalTask.property_id.in_(org_prop_ids),
-                )
-            ).all()
-            lease_q = db.execute(
-                select(OperationalTask.id).where(
-                    OperationalTask.id.in_(task_ids),
-                    OperationalTask.lease_id.in_(org_lease_ids),
-                )
-            ).all()
-            orphan_q = db.execute(
-                select(OperationalTask.id).where(
-                    OperationalTask.id.in_(task_ids),
-                    OperationalTask.property_id.is_(None),
-                    OperationalTask.lease_id.is_(None),
-                )
-            ).all()
-            allowed_task_ids = (
-                {r[0] for r in prop_q}
-                | {r[0] for r in lease_q}
-                | {r[0] for r in orphan_q}
-            )
-        payable_expense_ids = [
-            r["expense_id"] for r in rows
-            if isinstance(r, dict)
-            and r.get("kind") == "payable_expense"
-            and isinstance(r.get("expense_id"), int)
-        ]
-        allowed_payable_ids: set[int] = set()
-        if payable_expense_ids:
-            pay_q = db.execute(
-                select(Expense.id).where(
-                    Expense.id.in_(payable_expense_ids),
-                    Expense.property_id.in_(org_prop_ids),
-                )
-            ).all()
-            allowed_payable_ids = {r[0] for r in pay_q}
-        kept: list[dict] = []
-        for r in rows:
-            if not isinstance(r, dict):
-                continue
-            rid = r.get("id")
-            if isinstance(rid, int) and rid in allowed_task_ids:
-                kept.append(r)
-                continue
-            if r.get("kind") == "payable_expense":
-                eid = r.get("expense_id")
-                if isinstance(eid, int) and eid in allowed_payable_ids:
-                    kept.append(r)
-        return kept
-    return quick_svc.build_quick_tasks(db, reader, owner_only=(scope == "owner"))
+        rows = quick_svc.build_quick_tasks(
+            db, reader, owner_only=False,
+            task_scope=task_scope, org_property_ids=org_prop_ids,
+        )
+        return rows
+    return quick_svc.build_quick_tasks(
+        db, reader, owner_only=(scope == "owner"),
+        task_scope=task_scope, org_property_ids=org_prop_ids,
+    )
 
 
 @router.get("/quick/properties")
@@ -1461,8 +1429,8 @@ def operations_summary(
     """Operational counts for the current user (agents scoped to their own)."""
     from app.services.operations.summary import build_operations_summary
 
-    _ = membership.organization_id
-    return build_operations_summary(db, user, owner_only=(scope == "owner"))
+    org_id = membership.organization_id
+    return build_operations_summary(db, user, owner_only=(scope == "owner"), org_id=org_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1496,7 @@ def create_rule(
     if payload.property_id is not None:
         if payload.property_id not in _org_property_ids(db, org_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
-    _check_assignee(db, payload.assigned_user_id)
+    _check_assignee(db, payload.assigned_user_id, org_id=org_id)
     _check_property(db, payload.property_id)
     obj = RecurringRule(**payload.model_dump(exclude={"next_run_at"}))
     obj.next_run_at = payload.next_run_at or datetime.now(timezone.utc)
@@ -1566,7 +1534,7 @@ def update_rule(
     if updates.get("property_id") is not None:
         if updates["property_id"] not in _org_property_ids(db, org_id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
-    _check_assignee(db, updates.get("assigned_user_id"))
+    _check_assignee(db, updates.get("assigned_user_id"), org_id=org_id)
     _check_property(db, updates.get("property_id"))
     old = serialize_row(obj)
     for field, value in updates.items():
@@ -1634,9 +1602,24 @@ def trigger_scheduler(
     from app.services.operations.config import DEFAULT_ASSIGNED_USER_ID
     from app.services.operations.assignee import validate_default_assignee
 
-    _ = membership.organization_id
-    validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
-    return run_scheduler_once(db)
+    org_id = membership.organization_id
+    default_user = validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
+    dm = (
+        db.query(Membership)
+        .filter(
+            Membership.user_id == default_user.id,
+            Membership.organization_id == org_id,
+            Membership.state == MembershipState.ACTIVE,
+            Membership.removed_at.is_(None),
+        )
+        .first()
+    )
+    if dm is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Default assignee is not an active member of the caller's organization",
+        )
+    return run_scheduler_once(db, org_id=org_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1656,8 +1639,8 @@ def copilot_context(
     the ``copilot_runs`` audit row for this build. No LLM is involved and
     nothing executes any action in Phase A+B.
     """
-    _ = membership.organization_id
-    context = copilot_svc.build_copilot_context(db, user)
+    org_id = membership.organization_id
+    context = copilot_svc.build_copilot_context(db, user, org_id=org_id)
     copilot_svc.log_context_run(db, actor=user, context=context)
     db.commit()
     return context

@@ -489,6 +489,8 @@ def _payable_expense_rows(
 def build_quick_tasks(
     db: Session, user: User, *, now: datetime | None = None,
     owner_only: bool = False,
+    task_scope: "SQLAlchemyFilterType | None" = None,
+    org_property_ids: set[int] | None = None,
 ) -> list[dict]:
     """Active tasks (PENDING + IN_PROGRESS) for the caller's scope.
 
@@ -499,13 +501,23 @@ def build_quick_tasks(
 
     AI-OPS-FOUNDATION-001 §5: ``owner_only=True`` applies the Owner attention
     filter — the Owner queue holds only approvals, their payments, decisions
-    and escalations; routine operational work stays out."""
+    and escalations; routine operational work stays out.
+
+    Fail-closed organization scope (PASAY-CONSTITUTION §4):
+    - ``task_scope``: a SQLAlchemy WHERE predicate (usually the canonical
+      3-channel OR from _scoped_task_query) applied to OperationalTask rows;
+      when present it NEVER expands the result set beyond the resolved org.
+    - ``org_property_ids``: passed through to ``_payable_expense_rows`` so
+      payable-expense rows never leak another org's approved spending.
+    """
     now = now or datetime.now(timezone.utc)
     query = _agent_scope(db.query(OperationalTask), user).filter(
         OperationalTask.status.in_(
             [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
         )
     )
+    if task_scope is not None:
+        query = query.filter(task_scope)
     tasks = query.order_by(OperationalTask.due_at, OperationalTask.id).all()
     if owner_only:
         from app.services.operations.owner_scope import is_owner_actionable
@@ -534,7 +546,7 @@ def build_quick_tasks(
             row["overdue_days"] = max((now - due_dt).days, 0) if due_dt < now else None
             row["due_in_days"] = (due_dt - now).days if due_dt >= now else None
     if user.role == UserRole.admin:
-        rows.extend(_payable_expense_rows(db, now=now))
+        rows.extend(_payable_expense_rows(db, now=now, org_property_ids=org_property_ids))
     return rows
 
 

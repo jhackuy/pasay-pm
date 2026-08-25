@@ -629,17 +629,31 @@ def _complete_payment_task(db: Session, expense: Expense, *, now: datetime) -> N
         )
 
 
-def generate_business_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
-    """Create tasks from business sources. Returns (tasks_created, notifications_enqueued)."""
+def generate_business_tasks(
+    db: Session, *, now: datetime,
+    org_id: int | None = None,
+) -> tuple[int, int]:
+    """Create tasks from business sources. Returns (tasks_created, notifications_enqueued).
+
+    ``org_id`` fail-closes the lease/unit/tenant scan via canonical
+    property→organization scoping; None preserves the global standalone-worker
+    behavior (daemon owns all tenants).
+    """
     created = 0
     notifications = 0
     today = now.date()
 
-    leases = (
-        db.query(Lease)
-        .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
-        .all()
+    lease_query = db.query(Lease).filter(
+        Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None)
     )
+    if org_id is not None:
+        from app.services.operations.summary import _org_lease_ids
+        lids = _org_lease_ids(db, org_id)
+        if lids:
+            lease_query = lease_query.filter(Lease.id.in_(list(lids)))
+        else:
+            lease_query = lease_query.filter(Lease.id == -1)
+    leases = lease_query.all()
     lease_ids = [lease.id for lease in leases]
     confirmed_by_lease: dict[int, list[Income]] = {}
     if lease_ids:

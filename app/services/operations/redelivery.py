@@ -74,7 +74,8 @@ def is_snooze_redelivery_key(dedupe_key: str | None) -> bool:
 
 
 def redeliver_due_snoozes(
-    db: Session, *, now: datetime | None = None, batch: int = SNOOZE_REDELIVERY_BATCH
+    db: Session, *, now: datetime | None = None, batch: int = SNOOZE_REDELIVERY_BATCH,
+    org_id: int | None = None,
 ) -> int:
     """Enqueue one reminder per due snooze window; returns how many fired.
 
@@ -83,19 +84,27 @@ def redeliver_due_snoozes(
     matching the exact ``snoozed_until`` the scan observed, so concurrent
     passes / instances cannot double-fire a window; the outbox unique index is
     a second, independent guard.
+
+    ``org_id`` fail-closes the candidate scan via the canonical 3-channel OR
+    (property / lease / tenant → organization); None preserves the global
+    standalone-worker behavior.
     """
     now = now or datetime.now(timezone.utc)
-    candidates = (
+    filters = [
+        OperationalTask.status == OperationalTaskStatus.PENDING,
+        OperationalTask.snoozed_until.is_not(None),
+        OperationalTask.snoozed_until <= now,
+    ]
+    if org_id is not None:
+        from app.services.operations.summary import _scoped_task_query
+        filters.append(_scoped_task_query(db, org_id))
+    query = (
         db.query(OperationalTask)
-        .filter(
-            OperationalTask.status == OperationalTaskStatus.PENDING,
-            OperationalTask.snoozed_until.is_not(None),
-            OperationalTask.snoozed_until <= now,
-        )
+        .filter(*filters)
         .order_by(OperationalTask.snoozed_until, OperationalTask.id)
         .limit(batch)
-        .all()
     )
+    candidates = query.all()
     redelivered = 0
     for task in candidates:
         window = task.snoozed_until
