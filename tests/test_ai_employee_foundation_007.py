@@ -21,6 +21,7 @@ from app.models.lease import Lease, LeaseStatus
 from app.models.property import Property, Unit, UnitStatus
 from app.models.tenant import Tenant, TenantContactStatus
 from app.models.user import User, UserRole
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
@@ -37,9 +38,7 @@ def _seed_unit_lease(
     tenant_id=None,
     lease_status=LeaseStatus.active,
 ):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(
         property_id=prop.id, unit_number=unit_number, floor="16", size_sqm="32.50",
         monthly_rent=monthly_rent, status=unit_status,
@@ -49,8 +48,7 @@ def _seed_unit_lease(
     else:
         tenant = db.get(Tenant, tenant_id)
     if tenant is None:
-        tenant = Tenant(full_name="Lena Cruz", phone=phone)
-        db.add(tenant)
+        tenant = seed_tenant(db, full_name="Lena Cruz", phone=phone)
         db.flush()
     db.add(unit)
     db.flush()
@@ -408,9 +406,7 @@ def test_action_router_unrouted_fails_closed(client, admin_headers):
 # ---------------------------------------------------------------------------
 
 def test_property_management_contact_structured(client, admin_headers, db_session):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db_session.add(prop)
-    db_session.commit()
+    prop = seed_property(db_session, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     prop_id = prop.id
     resp = client.patch(
         f"{API}/properties/{prop_id}",

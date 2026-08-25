@@ -1,3 +1,4 @@
+import re
 import secrets
 import os
 
@@ -16,7 +17,12 @@ from app.main import app
 from app.models.user import User, UserRole
 from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.membership import Organization, Membership, OrganizationRole, MembershipState
+from app.models.property import Property, Unit
+from app.models.tenant import Tenant
+from app.models.financial import Expense, ExpenseStatus
 from app.services.audit import audit_context
+from decimal import Decimal
+from datetime import date as _date
 
 TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 
@@ -30,22 +36,38 @@ TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 _CONFIGURED_DB = make_url(settings.database_url).database
 _FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test"}
 
+# Strict pasay_pm_* / pasay_*_gate_* / pasay_freeze_* / pasay_closeout_* prefix
+# are the only allowed isolated test-database name families. Any other name
+# (including the bare legacy "pasay_pm_test" default fallback when not otherwise
+# overridden) is refused unless it matches one of the approved patterns.
+_ALLOWED_TEST_DB_PREFIX_RE = re.compile(
+    r"^pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_"
+)
+
 
 def _test_db_allowed(name: str, configured_db: str) -> bool:
     """True only when the requested test DB is a real, isolated test database
-    (never the configured live DB and never a production/live-named DB)."""
+    (never the configured live DB and never a production/live-named DB).
+
+    Strict prefix whitelist (§四·原则6): only names matching
+    ``pasay_(pm|gate*|freeze|closeout|return|fresh|alembic)_*`` are accepted.
+    Any other name including the historical bare ``pasay_pm_test" pattern without
+    underscore prefix-family is refused; forbidden literal names are also refused."""
     if not name:
         return False
     if name == configured_db:
         return False
-    return name not in _FORBIDDEN_TEST_DBS
+    if name in _FORBIDDEN_TEST_DBS:
+        return False
+    return bool(_ALLOWED_TEST_DB_PREFIX_RE.match(name))
 
 
 if not _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB):
     raise SystemExit(
         "REFUSED: PASAY_TEST_DB_NAME=%r would run tests against the "
         "live/production database (configured DATABASE_URL db=%r). "
-        "Set PASAY_TEST_DB_NAME to an isolated test database (e.g. pasay_pm_test)."
+        "Set PASAY_TEST_DB_NAME to an isolated test database "
+        "(e.g. pasay_pm_r1_20260101_001 or pasay_freeze_gate_001)."
         % (TEST_DB_NAME, _CONFIGURED_DB)
     )
 
@@ -180,17 +202,65 @@ def make_user(db, username, role, active=True):
 
 @pytest.fixture()
 def admin(db_session):
-    return make_user(db_session, "admin", UserRole.admin)
+    user, _key = make_user(db_session, "admin", UserRole.admin)
+    ensure_default_org(db_session)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from app.models.membership import Organization
+    org = db_session.query(Organization).order_by(Organization.id.asc()).first()
+    if org:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            m = Membership(user_id=user.id, organization_id=org.id,
+                           role=OrganizationRole.OWNER, state=MembershipState.ACTIVE)
+            db_session.add(m)
+            db_session.commit()
+    return user, _key
 
 
 @pytest.fixture()
 def manager(db_session):
-    return make_user(db_session, "manager", UserRole.manager)
+    user, _key = make_user(db_session, "manager", UserRole.manager)
+    ensure_default_org(db_session)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from app.models.membership import Organization
+    org = db_session.query(Organization).order_by(Organization.id.asc()).first()
+    if org:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            m = Membership(user_id=user.id, organization_id=org.id,
+                           role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE)
+            db_session.add(m)
+            db_session.commit()
+    return user, _key
 
 
 @pytest.fixture()
 def agent(db_session):
-    return make_user(db_session, "agent", UserRole.agent)
+    user, _key = make_user(db_session, "agent", UserRole.agent)
+    ensure_default_org(db_session)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from app.models.membership import Organization
+    org = db_session.query(Organization).order_by(Organization.id.asc()).first()
+    if org:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            m = Membership(user_id=user.id, organization_id=org.id,
+                           role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE)
+            db_session.add(m)
+            db_session.commit()
+    return user, _key
 
 
 def _headers(user_key):
@@ -300,6 +370,123 @@ def owner_b(db_session, org_b):
     db_session.commit()
     db_session.refresh(membership)
     return user, api_key, membership
+
+
+# --- shared factory helpers (for tests that directly build ORM objects) --------
+
+def ensure_default_org(db, *, name: str = "Org-A", display_name: str = "Pasay Org A"):
+    """Lazily create (or return the existing) named Organization with a deterministic
+    admin/manager/agent membership chain.
+
+    Used by tests that directly construct Property/Tenant/ExpenseClaim ORM objects
+    instead of going through the API fixtures. Always builds a real
+    ``org → (membership → User.role) → Property → Unit/Tenant → Lease → Expense``
+    chain when combined with :func:`seed_property` / :func:`seed_tenant` below.
+
+    Idempotent per session/database: returns the same Organization when an org
+    with the same ``name`` already exists (no duplicate org creation)."""
+    existing = db.query(Organization).filter(Organization.name == name).first()
+    if existing is not None:
+        return existing
+    org = Organization(name=name, display_name=display_name)
+    db.add(org)
+    db.flush()
+    role_mapping = {
+        UserRole.admin: OrganizationRole.OWNER,
+        UserRole.manager: OrganizationRole.SECRETARY,
+        UserRole.agent: OrganizationRole.SECRETARY,
+    }
+    for (username, user_role) in (
+        ("admin", UserRole.admin),
+        ("manager", UserRole.manager),
+        ("agent", UserRole.agent),
+    ):
+        user = db.query(User).filter(User.username == username).first()
+        if user is None:
+            continue
+        db.add(Membership(
+            organization_id=org.id,
+            user_id=user.id,
+            role=role_mapping[user_role],
+            state=MembershipState.ACTIVE,
+        ))
+    db.flush()
+    return org
+
+
+def seed_property(db, *, org=None, **kw):
+    """Construct and flush a Property with a real organization_id.
+
+    When ``org`` is explicitly None the property is attached to the deterministic
+    default organization produced by :func:`ensure_default_org`. Any extra keyword
+    arguments override defaults (name/address/city/total_units)."""
+    if org is None:
+        org = ensure_default_org(db)
+    data = {
+        "name": "Sunset Tower",
+        "address": "1 Roxas Blvd",
+        "city": "Pasay",
+        "total_units": 4,
+    }
+    data.update(kw)
+    data["organization_id"] = org.id
+    prop = Property(**data)
+    db.add(prop)
+    db.flush()
+    return prop
+
+
+def seed_unit(db, *, prop=None, **kw):
+    if prop is None:
+        prop = seed_property(db)
+    data = {
+        "property_id": prop.id,
+        "unit_number": "101",
+        "floor": "1",
+        "size_sqm": Decimal("32.50"),
+        "monthly_rent": Decimal("12000.00"),
+        "status": "vacant",
+    }
+    data.update(kw)
+    unit = Unit(**data)
+    db.add(unit)
+    db.flush()
+    return unit
+
+
+def seed_tenant(db, *, org=None, **kw):
+    if org is None:
+        org = ensure_default_org(db)
+    data = {
+        "full_name": "Juan Dela Cruz",
+        "phone": "+639170000000",
+        "email": "juan@example.com",
+        "organization_id": org.id,
+    }
+    data.update(kw)
+    tenant = Tenant(**data)
+    db.add(tenant)
+    db.flush()
+    return tenant
+
+
+def seed_expense(db, *, prop=None, **kw):
+    if prop is None:
+        prop = seed_property(db)
+    data = {
+        "property_id": prop.id,
+        "expense_date": _date.today(),
+        "category": "maintenance",
+        "description": "Plumbing fix",
+        "amount": Decimal("2500.00"),
+        "payee": "Local Vendor Co",
+        "status": ExpenseStatus.pending,
+    }
+    data.update(kw)
+    exp = Expense(**data)
+    db.add(exp)
+    db.flush()
+    return exp
 
 
 # --- shared data fixtures (created through the API as Org Owner) ---

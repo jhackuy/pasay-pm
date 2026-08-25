@@ -16,6 +16,7 @@ from app.models.financial import Expense, ExpenseStatus
 from app.models.property import Property, Unit, UnitStatus
 from app.models.user import UserRole
 from app.services.operations import quick as quick_svc
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 TODAY = date(2026, 8, 15)
@@ -30,9 +31,7 @@ def _make_user(db, username, role):
 
 
 def _seed_unit(db):
-    prop = Property(name="DEV Modern", address="8 Roxas Blvd", city="Pasay", total_units=2)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="DEV Modern", address="8 Roxas Blvd", city="Pasay", total_units=2)
     u1680 = Unit(property_id=prop.id, unit_number="1680", floor="16", size_sqm="40.00",
                  monthly_rent="55000.00", status=UnitStatus.occupied)
     u1608 = Unit(property_id=prop.id, unit_number="1608", floor="16", size_sqm="35.00",
@@ -44,9 +43,11 @@ def _seed_unit(db):
 
 def _add_expense(db, *, unit_id, category, amount, status, expense_date=TODAY,
                  exp_id=None):
+    _pid_row = db.query(Unit.property_id).filter(Unit.id == unit_id).first()
+    _pid = _pid_row[0] if _pid_row else db.query(Property.id).order_by(Property.id.asc()).first()[0]
     exp = Expense(
         expense_date=expense_date, category=category, amount=amount,
-        payee="Fix-It Co", unit_id=unit_id, status=status,
+        payee="Fix-It Co", unit_id=unit_id, status=status, property_id=_pid,
     )
     if exp_id is not None:
         exp.id = exp_id

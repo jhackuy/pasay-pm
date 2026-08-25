@@ -30,18 +30,17 @@ from app.models.operations import (
 from app.models.property import Property, Unit, UnitStatus
 from app.models.tenant import Tenant
 from app.services.operations.quick import build_digest
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 NOW = datetime(2026, 8, 20, 9, 30, 0, tzinfo=timezone.utc)
 
 
 def _seed_property_unit_tenant(db, unit_number="1680"):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number=unit_number, floor="16",
                 size_sqm="32.50", monthly_rent="12000.00", status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Ana P.", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Ana P.", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     return unit, tenant
 
@@ -235,7 +234,7 @@ def test_human_owner_payment_completed_visible(db_session):
     user = _seed_user(db_session)
     expense = Expense(expense_date=date(2026, 8, 1), category="repair",
                       amount="7000.00", payee="Repair Co", status=ExpenseStatus.approved,
-                      approved_at=NOW)
+                      approved_at=NOW, property_id=unit.property_id, unit_id=unit.id)
     db_session.add(expense)
     db_session.flush()
     _completed_task(
@@ -339,7 +338,8 @@ def test_payable_expense_carries_pay_action_fields(db_session):
     user = _seed_user(db_session)
     expense = Expense(expense_date=date(2026, 8, 15), category="repair",
                       amount="7000.00", payee="Repair Co", unit_id=unit.id,
-                      status=ExpenseStatus.approved, approved_at=NOW)
+                      status=ExpenseStatus.approved, approved_at=NOW,
+                      property_id=unit.property_id)
     db_session.add(expense)
     db_session.commit()
     digest = build_digest(db_session, user, now=NOW)

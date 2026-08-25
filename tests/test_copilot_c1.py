@@ -44,6 +44,7 @@ from app.services.copilot import llm, prompts, ranking, today
 from app.services.copilot.llm import LLMClient, LLMProviderError, ProviderConfig, UnknownProviderError
 from app.services.operations.copilot import CONTEXT_SCHEMA_VERSION, build_copilot_context
 from app.services.operations.timeclock import MANILA_TZ, clock
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW_MANILA = datetime(2026, 8, 11, 12, 0, 0, tzinfo=MANILA_TZ)
@@ -92,9 +93,7 @@ def _headers(key):
 
 
 def _seed_property(db, name="Sunset Tower"):
-    prop = Property(name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
     return prop
 
 
@@ -107,8 +106,8 @@ def _seed_lease(db, *, prop=None, unit_no="101", monthly_rent="12000.00",
                 size_sqm="32.50", monthly_rent=monthly_rent,
                 status=UnitStatus.occupied)
     if tenant is None:
-        tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
-    db.add_all([unit, tenant])
+        tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=start,
                   end_date=end, monthly_rent=monthly_rent, deposit="24000.00",
@@ -668,6 +667,22 @@ def test_copilot_today_endpoint_provider_selection_and_rbac(db_session, client, 
 
     manager, manager_key = _user_with_key(db_session, "mgr-c1-rbac", UserRole.manager)
     agent, agent_key = _user_with_key(db_session, "ag-c1-rbac", UserRole.agent)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from tests.conftest import ensure_default_org
+    org = ensure_default_org(db_session)
+    # Agent: explicitly NO ACTIVE org membership -> 403 fail-closed (copilot requires SECRETARY/OWNER)
+    for u, role in [(manager, OrganizationRole.SECRETARY)]:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == u.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            db_session.add(Membership(
+                user_id=u.id, organization_id=org.id,
+                role=role, state=MembershipState.ACTIVE,
+            ))
+    db_session.commit()
 
     resp = client.post(f"{API}/operations/copilot/today",
                        headers=_headers(agent_key), json={})

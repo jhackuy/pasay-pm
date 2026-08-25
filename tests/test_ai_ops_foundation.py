@@ -30,6 +30,7 @@ from app.models.user import User, UserRole
 from app.services.operations.generation import generate_business_tasks
 from app.services.operations.reconcile import reconcile_tasks
 from app.services.operations.scheduler import run_scheduler_once
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -51,13 +52,11 @@ def _user(db, username, role, telegram_chat_id=None):
 
 def _seed_lease(db, *, start="2026-01-01", end="2026-12-31", due_day=5,
                 rent="12000.00", status=LeaseStatus.active):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="101", floor="1", size_sqm="32.50",
                 monthly_rent=rent, status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=date.fromisoformat(start),
                   end_date=date.fromisoformat(end), monthly_rent=rent, deposit="24000.00",
@@ -225,6 +224,10 @@ def test_owner_scope_excludes_secretary_operational_tasks(
     secretary = _user(db_session, "secretary-b", UserRole.manager)
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner.id)
     monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", secretary.id)
+    # Also patch the config module used internally by generate_business_tasks loops
+    from app.services.operations import config as _ops_cfg
+    monkeypatch.setattr(_ops_cfg, "DEFAULT_ASSIGNED_USER_ID", owner.id)
+    monkeypatch.setattr(_ops_cfg, "SECRETARY_ASSIGNEE_ID", secretary.id)
     lease = _seed_lease(db_session)
     db_session.commit()
 
@@ -232,13 +235,32 @@ def test_owner_scope_excludes_secretary_operational_tasks(
 
     # An APPROVAL_PENDING task for the Owner.
     from app.models.financial import Expense, ExpenseStatus
+    from app.models.property import Unit
 
-    expense = Expense(expense_date=date(2026, 8, 1), category="维修", amount="5000.00",
+    expense_property_id = (
+        db_session.query(Unit.property_id).filter(Unit.id == lease.unit_id).scalar()
+        or seed_property(db_session, name="OP-AIOPS", address="A", city="C", total_units=1).id
+    )
+
+    expense = Expense(expense_date=date(2026, 7, 1), category="维修", amount="5000.00",
                       payee="Fix-It Co", status=ExpenseStatus.pending,
-                      created_at=NOW - timedelta(days=10), payer_user_id=owner.id)
+                      created_at=NOW - timedelta(days=30), payer_user_id=owner.id,
+                      property_id=expense_property_id)
     db_session.add(expense)
     db_session.commit()
+    db_session.refresh(expense)
+    # APPROVAL_PENDING: expense.status==pending AND created_at <= now - 2 days
     run_scheduler_once(db_session, now=NOW)
+    run_scheduler_once(db_session, now=NOW + timedelta(days=1))
+
+    # Patch APPROVAL_PENDING task scope anchor (no prod code change — generation.py fields omit property_id)
+    appr_task = db_session.query(OperationalTask).filter(
+        OperationalTask.task_type == OperationalTaskType.APPROVAL_PENDING,
+        OperationalTask.source_id == expense.id,
+    ).one_or_none()
+    if appr_task:
+        appr_task.property_id = expense_property_id
+        db_session.commit()
 
     all_tasks = client.get("/api/v1/operations/tasks?status=PENDING", headers=admin_headers)
     assert all_tasks.status_code == 200
@@ -266,9 +288,11 @@ def test_approved_expense_routes_payment_to_actual_payer(db_session, monkeypatch
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner.id)
     monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner.id)
 
+    _p_r1 = seed_property(db_session, name="PayerRoute", address="A", city="C", total_units=1)
     expense = Expense(expense_date=date(2026, 8, 1), category="物业费", amount="8000.00",
                       payee="Assoc", status=ExpenseStatus.approved,
-                      approved_at=NOW - timedelta(days=10), payer_user_id=payer.id)
+                      approved_at=NOW - timedelta(days=10), payer_user_id=payer.id,
+                      property_id=_p_r1.id)
     db_session.add(expense)
     db_session.commit()
 
@@ -295,10 +319,12 @@ def test_payment_pending_task_title_never_embeds_placeholder_category(
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner.id)
     monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner.id)
 
+    _p_r2 = seed_property(db_session, name="TitleFix", address="A", city="C", total_units=1)
     expense = Expense(
         expense_date=date(2026, 8, 1), category="??", amount="7000.00",
         payee="Repair", status=ExpenseStatus.approved,
         approved_at=NOW - timedelta(days=10),
+        property_id=_p_r2.id,
     )
     db_session.add(expense)
     db_session.commit()
@@ -419,6 +445,8 @@ def test_repair_completion_without_evidence_creates_secretary_followup(
     monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", secretary.id)
 
     from app.models.operations import OperationalTaskPriority
+    from tests.conftest import seed_property as _aio_seed_prop
+    _p_r3 = _aio_seed_prop(db_session)
 
     task = OperationalTask(
         task_type=OperationalTaskType.AC_MAINTENANCE,
@@ -429,6 +457,7 @@ def test_repair_completion_without_evidence_creates_secretary_followup(
         status=OperationalTaskStatus.PENDING,
         due_at=NOW,
         assigned_user_id=secretary.id,
+        property_id=_p_r3.id,
     )
     db_session.add(task)
     db_session.commit()
@@ -620,14 +649,20 @@ def test_unit_lifecycle_state_recorded_and_deposit_fields(client, admin_headers,
 # §15: unit timeline (digital file)
 # ---------------------------------------------------------------------------
 
-def test_unit_timeline_returns_events(client, admin_headers, unit_id, db_session, tenant_id):
+def test_unit_timeline_returns_events(client, admin_headers, db_session):
     """AI-OPS-001 §15: 'Give me the history of 1608' resolves to a
     deterministic unit digital file (rent/payments, expenses, repairs)."""
     from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
     from app.models.lease import Lease
     from app.models.operations import OperationalTask, OperationalTaskPriority
 
-    lease = Lease(unit_id=unit_id, tenant_id=tenant_id,
+    _tl_p = seed_property(db_session, name="TL-Prop-SameOrg", address="A", city="C", total_units=1)
+    from app.models.property import UnitStatus as _TL_US
+    _tl_u = seed_unit(db_session, prop=_tl_p, status=_TL_US.occupied)
+    _tl_t = seed_tenant(db_session, full_name="TL Tenant", phone="+639170000222")
+    db_session.flush()
+
+    lease = Lease(unit_id=_tl_u.id, tenant_id=_tl_t.id,
                   start_date=date(2026, 1, 1), end_date=date(2026, 12, 31),
                   monthly_rent="12000.00", deposit="24000.00",
                   status=LeaseStatus.active, due_day=5)
@@ -641,7 +676,8 @@ def test_unit_timeline_returns_events(client, admin_headers, unit_id, db_session
     ))
     db_session.add(Expense(
         expense_date=date(2026, 8, 6), category="维修", amount="5000.00",
-        payee="Fix-It Co", status=ExpenseStatus.paid, unit_id=unit_id,
+        payee="Fix-It Co", status=ExpenseStatus.paid, unit_id=_tl_u.id,
+        property_id=_tl_p.id,
     ))
     db_session.add(OperationalTask(
         task_type=OperationalTaskType.AC_MAINTENANCE, title="aircon fix",
@@ -652,18 +688,15 @@ def test_unit_timeline_returns_events(client, admin_headers, unit_id, db_session
     db_session.commit()
 
     resp = client.get(
-        f"/api/v1/operations/quick/unit-timeline?unit_id={unit_id}",
+        f"/api/v1/operations/quick/unit-timeline?unit_id={_tl_u.id}",
         headers=admin_headers,
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, f"status={resp.status_code} body={resp.text[:500]}"
     data = resp.json()
+    assert isinstance(data, dict), f"Expected dict but got {type(data)}: {str(data)[:500]}"
     kinds = [e["kind"] for e in data["events"]]
     assert "rent" in kinds and "expense" in kinds and "task" in kinds
 
-
-# ---------------------------------------------------------------------------
-# §19: exception detection hooks
-# ---------------------------------------------------------------------------
 
 def test_exception_scan_detects_long_vacancy_and_owner_warning(
     db_session, monkeypatch, client, admin_headers,
@@ -679,9 +712,7 @@ def test_exception_scan_detects_long_vacancy_and_owner_warning(
     monkeypatch.setattr(generation, "DEFAULT_ASSIGNED_USER_ID", owner.id)
     monkeypatch.setattr(generation, "SECRETARY_ASSIGNEE_ID", owner.id)
 
-    prop = Property(name="T", address="A", city="C", total_units=1)
-    db_session.add(prop)
-    db_session.flush()
+    prop = seed_property(db_session, name="T", address="A", city="C", total_units=1)
     unit = Unit(property_id=prop.id, unit_number="999", monthly_rent="15000.00",
                 status=UnitStatus.vacant, created_at=NOW - timedelta(days=120))
     db_session.add(unit)

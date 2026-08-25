@@ -372,12 +372,19 @@ def test_period_hint_picks_month():
 # --- API integration (needs the PostgreSQL test DB like the rest of the suite)
 
 
-def _seed_payment_match_data(client, admin_headers):
+def _seed_payment_match_data(client, db_session, admin_headers):
+    from tests.conftest import ensure_default_org
+
+    _org = ensure_default_org(db_session)
+    org_id = _org.id
+    db_session.flush()
     prop = client.post(
         "/api/v1/properties",
-        json={"name": "Bayshore", "address": "1 Roxas Blvd", "city": "Pasay", "total_units": 1},
+        json={"name": "Bayshore", "address": "1 Roxas Blvd", "city": "Pasay", "total_units": 1, "organization_id": org_id},
         headers=admin_headers,
-    ).json()
+    )
+    assert prop.status_code in {200, 201}, prop.text
+    prop = prop.json()
     unit = client.post(
         "/api/v1/units",
         json={
@@ -385,12 +392,16 @@ def _seed_payment_match_data(client, admin_headers):
             "size_sqm": "40.00", "monthly_rent": "70000.00", "status": "vacant",
         },
         headers=admin_headers,
-    ).json()
+    )
+    assert unit.status_code in {200, 201}, unit.text
+    unit = unit.json()
     tenant = client.post(
         "/api/v1/tenants",
-        json={"full_name": "John Dela Cruz", "phone": "+639170000000"},
+        json={"full_name": "John Dela Cruz", "phone": "+639170000000", "organization_id": org_id},
         headers=admin_headers,
-    ).json()
+    )
+    assert tenant.status_code in {200, 201}, tenant.text
+    tenant = tenant.json()
     lease = client.post(
         "/api/v1/leases",
         json={
@@ -399,9 +410,11 @@ def _seed_payment_match_data(client, admin_headers):
             "monthly_rent": "70000.00", "deposit": "140000.00", "status": "active",
         },
         headers=admin_headers,
-    ).json()
+    )
+    assert lease.status_code in {200, 201}, lease.text
+    lease = lease.json()
     for m in range(1, 8):
-        client.post(
+        r = client.post(
             "/api/v1/incomes",
             json={
                 "lease_id": lease["id"], "amount": "70000.00",
@@ -411,11 +424,12 @@ def _seed_payment_match_data(client, admin_headers):
             },
             headers=admin_headers,
         )
+        assert r.status_code in {200, 201}, r.text
     return lease
 
 
-def test_match_endpoint_exact_high(client, admin_headers, manager_headers, agent_headers):
-    lease = _seed_payment_match_data(client, admin_headers)
+def test_match_endpoint_exact_high(client, db_session, admin_headers, manager_headers, agent_headers):
+    lease = _seed_payment_match_data(client, db_session, admin_headers)
     resp = client.post(
         "/api/v1/payments/match",
         json={"text": "1608租金收到了"},
@@ -440,8 +454,8 @@ def test_match_endpoint_exact_high(client, admin_headers, manager_headers, agent
     assert resp.status_code == 403
 
 
-def test_match_endpoint_duplicate(client, admin_headers):
-    lease = _seed_payment_match_data(client, admin_headers)
+def test_match_endpoint_duplicate(client, db_session, admin_headers):
+    lease = _seed_payment_match_data(client, db_session, admin_headers)
     client.post(
         "/api/v1/incomes",
         json={

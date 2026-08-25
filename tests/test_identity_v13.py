@@ -459,12 +459,28 @@ def test_audit_provenance_preserves_canonical_human_actor(db_session):
 def test_native_bot_mutation_audit_keeps_human_and_caller_provenance(
     client, db_session
 ):
+    from app.models.membership import Membership, MembershipState, OrganizationRole
+    from tests.conftest import ensure_default_org
     user, subject, _ = human(db_session, "telegram-audit-human")
     bind(db_session, subject, 515151)
     caller, caller_credential, bot_key = native_bot(
         db_session, "telegram-audit-bot-key"
     )
     db_session.commit()
+    _org = ensure_default_org(db_session)
+    _existing_ms = db_session.query(Membership.id).filter(
+        Membership.user_id == user.id,
+        Membership.organization_id == _org.id,
+        Membership.state == MembershipState.ACTIVE,
+    ).first()
+    if _existing_ms is None:
+        db_session.add(Membership(
+            user_id=user.id,
+            organization_id=_org.id,
+            role=OrganizationRole.OWNER,
+            state=MembershipState.ACTIVE,
+        ))
+        db_session.commit()
 
     response = client.post(
         f"{API}/properties",
@@ -477,6 +493,7 @@ def test_native_bot_mutation_audit_keeps_human_and_caller_provenance(
             "address": "Gate A",
             "city": "Pasay",
             "total_units": 1,
+            "organization_id": _org.id,
         },
     )
     assert response.status_code == 201, response.text

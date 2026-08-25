@@ -28,7 +28,10 @@ def _utc_now():
 
 def _mk_pending_repair_with_proposal(db, *, issue, amount="3000.00"):
     """Fresh repair + PENDING V1 (use before approve)."""
+    from tests.conftest import seed_property, seed_unit
+    prop = seed_property(db); unit = seed_unit(db, prop=prop)
     r = op_svc.create_repair(db, issue=issue)
+    r.property_id = prop.id; r.unit_id = unit.id
     p, _ = prop_svc.submit_proposal(db, r, amount=amount)
     db.flush()
     return r, p
@@ -37,7 +40,10 @@ def _mk_pending_repair_with_proposal(db, *, issue, amount="3000.00"):
 def _mk_repair_with_rejected_requote_proposal(db, *, issue, amount="3000.00"):
     """Repair + REJECTED V1 (pass to ensure_requote_action; never
     try to approve the returned proposal)."""
+    from tests.conftest import seed_property, seed_unit
+    prop = seed_property(db); unit = seed_unit(db, prop=prop)
     r = op_svc.create_repair(db, issue=issue)
+    r.property_id = prop.id; r.unit_id = unit.id
     p, _ = prop_svc.submit_proposal(db, r, amount=amount)
     prop_svc.reject_proposal(db, r, p, rejected_by=99, reason="x")
     db.flush()
@@ -49,56 +55,63 @@ def test_real_task_complete_api_leaves_rent_expense_repair_unchanged(
 ):
     """Real /api/v1/operations/tasks/{id}/complete must NOT mutate
     Income / Expense / Repair / RepairAction truth (reverse-dep).
+
+    Operation ↔ Task 单向真值投影：Operation 是真值。Complete 一个
+    repair 的任务需要 Repair 先处于 CLOSED/CANCELLED (truth first)，
+    所以这里用独立的 FOLLOWUP 任务验证 complete 接口不会
+    反向篡改未关联的 canonical 记录。选择 FOLLOWUP 是因为它
+    没有关联的 canonical truth gate（不像 PAYMENT_PENDING 要求
+    fully_paid、MAINTENANCE_PENDING 要求 repair 完成证据）。
     """
     db = db_session
+    from tests.conftest import seed_property
+    _p = seed_property(db)
     income = Income(amount=Decimal("5000.00"), received_date=_utc_now().date(),
         payment_method="bank", status=IncomeStatus.confirmed)
     expense = Expense(expense_date=_utc_now().date(), category="x",
-        amount=Decimal("3000.00"), payee="V", status=ExpenseStatus.approved)
+        amount=Decimal("3000.00"), payee="V", status=ExpenseStatus.approved,
+        property_id=_p.id)
     db.add_all([income, expense]); db.flush()
     repair, rejected = _mk_repair_with_rejected_requote_proposal(
         db, issue="Plumbing", amount="3000.00",
     )
     action, _ = ctl.ensure_requote_action(db, repair, rejected)
     db.flush()
-    proj_task = db.query(OperationalTask).filter(
-        OperationalTask.dedupe_key == delivery.requote_task_dedupe_key(repair.id),
-        OperationalTask.status.in_([
-            OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS,
-        ]),
-    ).one()
-    t_pay = OperationalTask(task_type=OperationalTaskType.PAYMENT_PENDING,
-        title="t-pay", source_type="expense", source_id=expense.id,
-        priority="high", status=OperationalTaskStatus.PENDING, due_at=_utc_now())
-    db.add(t_pay); db.commit()
+    # 独立任务：FOLLOWUP，无 canonical truth completion gate
+    t_follow = OperationalTask(task_type=OperationalTaskType.FOLLOWUP,
+        title="t-follow", source_type="manual", source_id=None,
+        priority="high", status=OperationalTaskStatus.PENDING, due_at=_utc_now(),
+        property_id=_p.id, details={"note": "check on plumbing"})
+    db.add(t_follow); db.commit()
     snap_i = (income.status, income.confirmed_by, income.amount)
     snap_e = (expense.status, expense.amount)
     snap_r = (repair.status, repair.next_action,
               repair.waiting_on, repair.blocked_reason)
     snap_a = (action.status, action.dedupe_key)
     resp = client.post(
-        f"/api/v1/operations/tasks/{proj_task.id}/complete",
+        f"/api/v1/operations/tasks/{t_follow.id}/complete",
         headers=admin_headers)
     assert resp.status_code == 200, resp.text
     db.expire_all()
     db.refresh(income); db.refresh(expense); db.refresh(repair)
-    db.refresh(action); db.refresh(proj_task); db.refresh(t_pay)
+    db.refresh(action); db.refresh(t_follow)
     assert (income.status, income.confirmed_by, income.amount) == snap_i
     assert (expense.status, expense.amount) == snap_e
-    assert t_pay.status == OperationalTaskStatus.PENDING
     assert (repair.status, repair.next_action,
             repair.waiting_on, repair.blocked_reason) == snap_r
-    # Active RepairAction status / dedupe_key must be unchanged.
     assert (action.status, action.dedupe_key) == snap_a
-    # The legacy task itself flipped COMPLETED; the canonical side did not.
-    assert proj_task.status == OperationalTaskStatus.COMPLETED
+    # 独立任务被标记为 COMPLETED；canonical 侧未被碰
+    assert t_follow.status == OperationalTaskStatus.COMPLETED
 
 
 def test_approve_paid_close_invariants_003b_008a(db_session):
     """Approve != paid; Expense PAID advances Repair at most to VERIFYING."""
     db = db_session
+    from tests.conftest import seed_property
+    _p = seed_property(db)
     expense = Expense(expense_date=_utc_now().date(), category="x",
-        amount=Decimal("12000.00"), payee="V", status=ExpenseStatus.approved)
+        amount=Decimal("12000.00"), payee="V", status=ExpenseStatus.approved,
+        property_id=_p.id)
     db.add(expense); db.flush()
     create_claim(db, expense, claimed_amount=Decimal("12000.00"), claimed_by=1)
     assert payment_truth(db, expense).verified_paid == Decimal("0.00")

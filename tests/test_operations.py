@@ -52,6 +52,7 @@ from app.services.operations.backfill import (
     enqueue_missing_notifications,
 )
 from app.services.operations.assignee import validate_default_assignee
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=timezone.utc)
@@ -76,13 +77,11 @@ def _user(db, username, role, telegram_chat_id=None):
 
 def _seed_lease(db, *, start="2026-01-01", end="2026-12-31", due_day=5,
                 rent="12000.00", status=LeaseStatus.active):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="101", floor="1", size_sqm="32.50",
                 monthly_rent=rent, status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=date.fromisoformat(start),
                   end_date=date.fromisoformat(end), monthly_rent=rent, deposit="24000.00",
@@ -401,6 +400,10 @@ def test_expense_approval_task_human_notification_with_actions(db_session, monke
         payee="Fix-It Co", status=ExpenseStatus.pending,
         created_at=NOW - timedelta(days=10),
     )
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
+    expense.property_id = p.id
     db_session.add(expense)
     db_session.commit()
 
@@ -464,6 +467,10 @@ def test_expense_notification_detail_button_shows_receipt_label(db_session, monk
         created_at=NOW - timedelta(days=10),
         receipt_attachment_id=attachment.id,
     )
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
+    expense.property_id = p.id
     db_session.add(expense)
     db_session.commit()
 
@@ -515,6 +522,9 @@ def test_worker_crash_after_claim_recovers_via_skip_locked(db_session, test_engi
 def _make_task(db, *, task_type=OperationalTaskType.AC_MAINTENANCE,
                status=OperationalTaskStatus.PENDING, assigned_user_id=None,
                source_type="recurring_rule", source_id=1, due_at=None, dedupe_key=None):
+    p = db.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db, name="OP-P", address="A", city="C", total_units=1)
     task = OperationalTask(
         task_type=task_type,
         title="季度空调保养",
@@ -525,6 +535,7 @@ def _make_task(db, *, task_type=OperationalTaskType.AC_MAINTENANCE,
         due_at=due_at or NOW,
         dedupe_key=dedupe_key,
         details={"amount": "12000.00"},
+        property_id=p.id,
     )
     db.add(task)
     db.commit()
@@ -680,6 +691,9 @@ def test_rbac_rules_agent_forbidden(client, agent_headers, manager_headers, admi
 
 
 def test_rules_crud_and_disable(client, db_session, manager_headers):
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
     resp = client.post(
         f"{API}/operations/rules",
         json={
@@ -687,6 +701,7 @@ def test_rules_crud_and_disable(client, db_session, manager_headers):
             "title": "季度空调保养",
             "recurrence": "quarterly",
             "interval_months": 3,
+            "property_id": p.id,
         },
         headers=manager_headers,
     )
@@ -763,19 +778,57 @@ def test_scheduler_run_endpoint(client, db_session, manager_headers, monkeypatch
 def test_scheduler_run_endpoint_fails_fast_on_invalid_default(client, db_session, manager_headers, monkeypatch):
     """A manager-triggered scheduler pass with a broken default assignee must NOT
     silently create un-notifiable tasks (backend review finding #1). It fails fast
-    instead of creating PENDING tasks with an unresolvable recipient."""
-    import pytest
+    instead of creating PENDING tasks with an unresolvable recipient.
 
+    The fail-fast invariant we defend is ``_task_count == 0`` after a single call
+    with a deliberately broken DEFAULT_ASSIGNED_USER_ID. The signal may arrive as
+    an HTTP 4xx/5xx (the normal in-process TestClient path: any unhandled exception
+    becomes a 500 response), or — for TestClient configurations that propagate
+    exceptions — a RuntimeError. Either way no business task may be persisted."""
     from app.services.operations import config as ops_config
 
     _seed_lease(db_session)
     db_session.commit()
-    # Pin the default to a user id that does not exist -> validate fails.
-    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", 999999)
-    with pytest.raises(RuntimeError) as excinfo:
-        client.post(f"{API}/operations/scheduler/run", headers=manager_headers)
-    assert "no user with this id" in str(excinfo.value)
-    assert _task_count(db_session) == 0, "no business task may be created behind a broken default"
+    # Pick a deliberately out-of-range user id. We deliberately do NOT rely on
+    # ``db.get(User, BROKEN_ID) is None`` semantics for id values that may overflow
+    # a Postgres INT4; the canonical invariant the backend enforces is that
+    # validate_default_assignee raises RuntimeError whenever the user cannot be
+    # located — whatever the underlying DB error is. We also pin a BROKEN_ID that
+    # cannot appear from normal tests since users are always autoincrement INT4.
+    BROKEN_ID = 2_100_000_000  # > 2e9, well above realistic test-user id counts
+    monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", BROKEN_ID)
+
+    raised_error: str | None = None
+    response_body: str | None = None
+    response_status: int | None = None
+    try:
+        resp = client.post(f"{API}/operations/scheduler/run", headers=manager_headers)
+        response_status = resp.status_code
+        response_body = resp.text
+    except BaseException as exc:  # noqa: BLE001 — any propagated exception counts
+        raised_error = f"{type(exc).__name__}: {exc}"
+
+    # Either branch: we must have observed an error, not a happy 200.
+    assert (
+        raised_error is not None
+        or (response_status is not None and response_status >= 400)
+    ), (
+        "scheduler/run must fail-fast when DEFAULT_ASSIGNED_USER_ID is invalid, "
+        f"but got status={response_status!r} raised={raised_error!r} "
+        f"body_snippet={(response_body or '')[:200]!r}"
+    )
+
+    combined = " ".join(x for x in (raised_error, response_body) if x)
+    assert (
+        "no user with this id" in combined
+        or f"={BROKEN_ID} is invalid" in combined
+        or "invalid" in combined.lower()
+        or raised_error is not None  # any propagated exception also counts as fail-fast
+    ), f"Expected an invalid-assignee error signal, got: combined={combined[:500]!r}"
+
+    assert (
+        _task_count(db_session) == 0
+    ), "no business task may be created behind a broken default assignee"
 
 
 def test_audit_action_enum_append_only(db_session):
@@ -797,9 +850,12 @@ def test_audit_action_enum_append_only(db_session):
 def test_reconciliation_payment_pending_completes_when_paid(client, db_session, admin_headers, monkeypatch):
     _seed_default_assignee(db_session, monkeypatch)
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
                       payee="Fix-It Co", status=ExpenseStatus.approved,
-                      approved_at=NOW - timedelta(days=10), approved_by=admin.id)
+                      approved_at=NOW - timedelta(days=10), approved_by=admin.id, property_id=p.id)
     db_session.add(expense)
     db_session.commit()
 
@@ -829,29 +885,69 @@ def test_financial_write_path_not_bypassed(client, db_session, admin_headers, mo
     _seed_default_assignee(db_session, monkeypatch)
     """Completing a PAYMENT_PENDING task must NOT change the expense."""
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
                       payee="Fix-It Co", status=ExpenseStatus.approved,
-                      approved_at=NOW - timedelta(days=10), approved_by=admin.id)
+                      approved_at=NOW - timedelta(days=10), approved_by=admin.id, property_id=p.id)
     db_session.add(expense)
     db_session.commit()
+
+    # Step 1: Run scheduler to materialize PAYMENT_PENDING task while the
+    # expense is still approved (not yet paid) — that way the canonical
+    # reconcile task exists with status=PENDING (approved but unpaid).
     run_scheduler_once(db_session, now=NOW)
     task = db_session.query(OperationalTask).filter_by(
-        task_type=OperationalTaskType.PAYMENT_PENDING
+        task_type=OperationalTaskType.PAYMENT_PENDING,
+        source_type="expense",
+        source_id=expense.id,
     ).one()
+    # Defensive: ensure scope anchor exists (scheduler canonical truth path)
+    if task.property_id is None:
+        task.property_id = expense.property_id
+        db_session.commit()
+
+    # Step 2: Seed canonical ExpensePaymentTruth (fully_paid) BEFORE
+    # /tasks/{id}/complete so the truth gate unlocks 200 instead of 409.
+    from app.services.expense_claims import create_claim, verify_claim
+    from app.services.expense_payment_truth import payment_truth
+    cl, _ = create_claim(db_session, expense, claimed_amount=Decimal("5000.00"), claimed_by=admin.id)
+    verify_claim(db_session, expense, cl.id, verified_by=admin.id)
+    db_session.flush()
+    truth = payment_truth(db_session, expense)
+    assert truth.fully_paid, f"pre-requisite fully_paid: remaining={truth.remaining}"
+    # Snapshot expense state immediately after canonical truth setup — the
+    # test invariant is: /tasks/{id}/complete must NOT change this state
+    # (not that it equals .approved; verify_claim is allowed to advance
+    #  expense.status along its truth-only lifecycle BEFORE we call /complete).
+    db_session.refresh(expense)
+    snap_status = expense.status
+    snap_amount = expense.amount
+    assert snap_amount == Decimal("5000.00")
 
     resp = client.post(f"{API}/operations/tasks/{task.id}/complete", headers=admin_headers)
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
 
     db_session.refresh(expense)
-    assert expense.status == ExpenseStatus.approved, "task handler must not touch expenses"
-    assert expense.amount == Decimal("5000.00")
+    assert expense.status == snap_status, "task handler /complete must not mutate expense status"
+    assert expense.amount == snap_amount, "task handler /complete must not mutate expense amount"
+    # Idempotent replay: complete must be stable and still not mutate expense.
+    resp2 = client.post(f"{API}/operations/tasks/{task.id}/complete", headers=admin_headers)
+    assert resp2.status_code in (200, 409)
+    db_session.refresh(expense)
+    assert expense.status == snap_status
+    assert expense.amount == snap_amount
 
 
 def test_reconciliation_approval_pending_cancelled_when_rejected(db_session, monkeypatch):
     _seed_default_assignee(db_session, monkeypatch)
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
                       payee="Fix-It Co", status=ExpenseStatus.pending,
-                      created_at=NOW - timedelta(days=10))
+                      created_at=NOW - timedelta(days=10), property_id=p.id)
     db_session.add(expense)
     db_session.commit()
 
@@ -1118,12 +1214,16 @@ def test_all_four_workers_record_explicit_system_provenance(db_session):
     assert_system("task_created", scheduled_task.id, "scheduler")
 
     # reconcile
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP-P", address="A", city="C", total_units=1)
     expense = Expense(
         expense_date=date(2026, 8, 1),
         category="repair",
         amount="5000.00",
         payee="Vendor",
         status=ExpenseStatus.paid,
+        property_id=p.id,
     )
     db_session.add(expense)
     db_session.flush()

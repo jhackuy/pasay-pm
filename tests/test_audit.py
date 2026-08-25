@@ -1,16 +1,19 @@
 API = "/api/v1"
 
 
-def _create_property(client, headers):
+def _create_property(client, headers, db_session):
+    from tests.conftest import ensure_default_org
+    org = ensure_default_org(db_session)
     return client.post(
         f"{API}/properties",
-        json={"name": "Audited", "address": "1 St", "city": "Pasay"},
+        json={"name": "Audited", "address": "1 St", "city": "Pasay",
+              "total_units": 1, "organization_id": org.id},
         headers=headers,
     )
 
 
-def test_create_is_audited(client, admin_headers):
-    resp = _create_property(client, admin_headers)
+def test_create_is_audited(client, admin_headers, db_session):
+    resp = _create_property(client, admin_headers, db_session)
     assert resp.status_code == 201
 
     logs = client.get(f"{API}/audit-logs", headers=admin_headers).json()
@@ -51,8 +54,8 @@ def test_audit_logs_admin_only(client, manager_headers):
     assert resp.status_code == 403
 
 
-def test_audit_logs_filter(client, admin_headers):
-    _create_property(client, admin_headers)
+def test_audit_logs_filter(client, admin_headers, db_session):
+    _create_property(client, admin_headers, db_session)
     client.post(
         f"{API}/incomes",
         json={"amount": "500.00", "received_date": "2026-04-01", "status": "pending"},

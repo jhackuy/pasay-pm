@@ -41,6 +41,7 @@ from app.services.copilot import ask, llm, ranking, shared, today_fast, why
 from app.services.copilot.llm import LLMProviderError
 from app.services.operations.copilot import build_copilot_context
 from app.services.operations.timeclock import MANILA_TZ, clock
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW_MANILA = datetime(2026, 8, 11, 12, 0, 0, tzinfo=MANILA_TZ)
@@ -92,9 +93,7 @@ def _headers(key):
 
 
 def _seed_property(db, name="Sunset Tower"):
-    prop = Property(name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
     return prop
 
 
@@ -105,8 +104,8 @@ def _seed_lease(db, *, prop=None, unit_no="101", monthly_rent="12000.00",
     unit = Unit(property_id=prop.id, unit_number=unit_no, floor="1",
                 size_sqm="32.50", monthly_rent=monthly_rent,
                 status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=start,
                   end_date=end, monthly_rent=monthly_rent, deposit="24000.00",
@@ -434,6 +433,15 @@ def test_why_strips_ungrounded_amounts_and_refs(db_session, client, manager_head
 def test_why_not_grounded_404_and_rbac_and_bad_provider(db_session, client, monkeypatch):
     admin, admin_key = _user_with_key(db_session, "admin-c11-why404", UserRole.admin)
     agent, agent_key = _user_with_key(db_session, "ag-c11-why403", UserRole.agent)
+    from tests.conftest import ensure_default_org
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=org.id,
+        user_id=admin.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    ))
     _seed_mandated_scenario(db_session)
     db_session.commit()
     clock.set_override(NOW_MANILA)
@@ -443,7 +451,7 @@ def test_why_not_grounded_404_and_rbac_and_bad_provider(db_session, client, monk
                        json={"item_ref": "lease:999999"})
     assert resp.status_code == 404
 
-    # agent -> 403
+    # agent -> 403 (no active org membership => permission denied)
     resp = client.post(f"{API}/operations/copilot/why", headers=_headers(agent_key),
                        json={"item_ref": "lease:1"})
     assert resp.status_code == 403
@@ -539,9 +547,18 @@ def test_ask_refuses_ungrounded_amounts(db_session, client, manager_headers, mon
 def test_ask_validation_and_rbac(db_session, client, monkeypatch):
     admin, admin_key = _user_with_key(db_session, "admin-c11-askv", UserRole.admin)
     agent, agent_key = _user_with_key(db_session, "ag-c11-ask403", UserRole.agent)
+    from tests.conftest import ensure_default_org
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=org.id,
+        user_id=admin.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    ))
     db_session.commit()
 
-    # agent -> 403
+    # agent -> 403 (no active org membership => permission denied)
     resp = client.post(f"{API}/operations/copilot/ask", headers=_headers(agent_key),
                        json={"question": "hi"})
     assert resp.status_code == 403

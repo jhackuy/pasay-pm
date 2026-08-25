@@ -51,6 +51,7 @@ from app.models.user import User, UserRole
 from app.services.copilot import llm, prompts, ranking
 from app.services.operations.copilot import build_copilot_context
 from app.services.operations.timeclock import MANILA_TZ
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 TEST_DB_NAME = "pasay_pm_test"
 NOW = datetime(2026, 8, 11, 12, 0, 0, tzinfo=MANILA_TZ)
@@ -97,9 +98,7 @@ def _user(db, username, role=UserRole.admin):
 
 
 def _seed_property(db, name="Sunset Tower"):
-    prop = Property(name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
     return prop
 
 
@@ -112,8 +111,8 @@ def _seed_lease(db, *, prop=None, unit_no="101", monthly_rent="12000.00",
                 size_sqm="32.50", monthly_rent=monthly_rent,
                 status=UnitStatus.occupied)
     if tenant is None:
-        tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
-    db.add_all([unit, tenant])
+        tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=start,
                   end_date=end, monthly_rent=monthly_rent, deposit="24000.00",

@@ -30,7 +30,27 @@ def _headers(raw_key: str, telegram_user_id: int | None = None) -> dict[str, str
 
 
 def _income(db, status: IncomeStatus) -> Income:
+    from app.models.lease import Lease, LeaseStatus
+    from tests.conftest import seed_property, seed_tenant, seed_unit
+
+    _p = seed_property(db)
+    _u = seed_unit(db, prop=_p)
+    _t = seed_tenant(db)
+    db.flush()
+    _lease = Lease(
+        unit_id=_u.id,
+        tenant_id=_t.id,
+        status=LeaseStatus.active,
+        start_date=date(2026, 1, 1),
+        end_date=date(2026, 12, 31),
+        monthly_rent=Decimal("12000.00"),
+        deposit=Decimal("0.00"),
+        due_day=1,
+    )
+    db.add(_lease)
+    db.flush()
     row = Income(
+        lease_id=_lease.id,
         amount=Decimal("12000.00"),
         received_date=date(2026, 8, 12),
         payment_method="Bank",
@@ -324,6 +344,9 @@ def test_human_credential_cannot_forge_telegram_subject(
 def test_exact_legacy_human_owner_key_remains_compatible(
     transition, client, db_session
 ):
+    from app.models.membership import Membership, MembershipState, OrganizationRole
+    from tests.conftest import ensure_default_org
+
     initial, expected = _transition(transition)
     raw_key = f"legacy-owner-{transition}"
     owner = User(
@@ -334,6 +357,20 @@ def test_exact_legacy_human_owner_key_remains_compatible(
     )
     db_session.add(owner)
     db_session.flush()
+    _org = ensure_default_org(db_session)
+    _exists = db_session.query(Membership.id).filter(
+        Membership.user_id == owner.id,
+        Membership.organization_id == _org.id,
+        Membership.state == MembershipState.ACTIVE,
+    ).first()
+    if _exists is None:
+        db_session.add(Membership(
+            user_id=owner.id,
+            organization_id=_org.id,
+            role=OrganizationRole.OWNER,
+            state=MembershipState.ACTIVE,
+        ))
+        db_session.flush()
     subject = Principal(
         name=f"legacy-owner-{transition}",
         principal_type=PrincipalType.HUMAN,
