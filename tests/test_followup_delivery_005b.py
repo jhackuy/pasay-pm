@@ -71,6 +71,16 @@ class _FailOnceSender:
 def test_followup_delivery_concurrent_single_send(db_session, test_engine, monkeypatch, admin):
     actor = db_session.get(User, admin[0].id)
     assignee = _user(db_session, "sec-005b", UserRole.agent, telegram_chat_id="tg-sec-005b")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     payload = TaskFollowupDeliveryIn(
         assignee_user_id=assignee.id,
@@ -123,6 +133,16 @@ def test_followup_delivery_failure_then_retry(db_session, monkeypatch, admin):
         Membership.removed_at.is_(None),
     ).first()
     assignee = _user(db_session, "sec-005b-fail", UserRole.agent, telegram_chat_id="tg-sec-005b-fail")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     payload = TaskFollowupDeliveryIn(assignee_user_id=assignee.id, message="Retry me", reply_markup=None)
     sender = _FailOnceSender()
@@ -152,6 +172,16 @@ def test_followup_delivery_sequential_duplicate_no_resend(db_session, monkeypatc
         Membership.removed_at.is_(None),
     ).first()
     assignee = _user(db_session, "sec-005b-seq", UserRole.agent, telegram_chat_id="tg-sec-005b-seq")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     payload = TaskFollowupDeliveryIn(assignee_user_id=assignee.id, message="Only once", reply_markup=None)
     sent: list[tuple] = []
@@ -174,6 +204,16 @@ def test_followup_delivery_retry_refreshes_render_payload(db_session, monkeypatc
         Membership.removed_at.is_(None),
     ).first()
     assignee = _user(db_session, "sec-005c-render", UserRole.agent, telegram_chat_id="tg-sec-005c")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     first_payload = TaskFollowupDeliveryIn(
         assignee_user_id=assignee.id,

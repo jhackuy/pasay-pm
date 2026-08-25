@@ -82,7 +82,11 @@ def _reconcile_credential(db):
     return principal, credential
 
 
-def _seed_task(db, *, status=OperationalTaskStatus.PENDING):
+def _seed_task(db, *, status=OperationalTaskStatus.PENDING, property_id=None):
+    if property_id is None:
+        from tests.conftest import seed_property
+        _p = seed_property(db)
+        property_id = _p.id
     task = OperationalTask(
         task_type=OperationalTaskType.AC_MAINTENANCE,
         title="SYSTEM job test task",
@@ -91,6 +95,7 @@ def _seed_task(db, *, status=OperationalTaskStatus.PENDING):
         status=status,
         due_at=NOW,
         dedupe_key="job-service-auth-002",
+        property_id=property_id,
     )
     db.add(task)
     db.commit()
