@@ -41,7 +41,7 @@ _FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test"}
 # (including the bare legacy "pasay_pm_test" default fallback when not otherwise
 # overridden) is refused unless it matches one of the approved patterns.
 _ALLOWED_TEST_DB_PREFIX_RE = re.compile(
-    r"^pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_[a-zA-Z0-9_]+$"
+    r"^(?:pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_[a-zA-Z0-9_]+|test_pasay_[a-zA-Z0-9_]+)$"
 )
 
 
@@ -52,14 +52,18 @@ def _test_db_allowed(name: str, configured_db: str) -> bool:
     Strict prefix whitelist (§四·原则6): only names matching
     ``pasay_(pm|gate*|freeze|closeout|return|fresh|alembic)_*`` are accepted.
     Any other name including the historical bare ``pasay_pm_test" pattern without
-    underscore prefix-family is refused; forbidden literal names are also refused."""
+    underscore prefix-family is refused; forbidden literal names are also refused.
+
+    Uses fullmatch (NOT substring / partial match) so a name like
+    ``production_pasay`` — which merely *contains* an allowed token as a
+    substring — is deterministically refused (fail-closed)."""
     if not name:
         return False
     if name == configured_db:
         return False
     if name in _FORBIDDEN_TEST_DBS:
         return False
-    return bool(_ALLOWED_TEST_DB_PREFIX_RE.match(name))
+    return bool(_ALLOWED_TEST_DB_PREFIX_RE.fullmatch(name))
 
 
 if not _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB):
@@ -243,13 +247,29 @@ def manager(db_session):
 
 
 @pytest.fixture()
-def agent(db_session):
+def agent(db_session, request):
+    """Generic agent fixture — SECRETARY membership granted by default so
+    existing tests that exercise real secretary flows continue to work.
+
+    For FAIL-CLOSED security verification (negative tests) use marker
+    ``@pytest.mark.agent_no_secretary`` to explicitly request NO membership.
+    The companion RET3 tests exercise this opt-out path to prove endpoints
+    reject requests when the agent lacks a SECRETARY role (403 / empty set).
+    """
+    want_secretary = True
+    mark_no = request.node.get_closest_marker("agent_no_secretary")
+    if mark_no is not None:
+        want_secretary = False
+    param = getattr(request, "param", None)
+    if isinstance(param, dict) and "secretary" in param:
+        want_secretary = bool(param["secretary"])
+
     user, _key = make_user(db_session, "agent", UserRole.agent)
     ensure_default_org(db_session)
     from app.models.membership import Membership, OrganizationRole, MembershipState
     from app.models.membership import Organization
     org = db_session.query(Organization).order_by(Organization.id.asc()).first()
-    if org:
+    if org and want_secretary:
         exists = db_session.query(Membership.id).filter(
             Membership.user_id == user.id,
             Membership.organization_id == org.id,
@@ -286,6 +306,50 @@ def agent_headers(agent):
 
 @pytest.fixture()
 def org_a(db_session):
+    existing = db_session.query(Organization).filter(Organization.name == "Org-A").first()
+    if existing is not None:
+        admin_user = db_session.query(User).filter(User.username == "admin").first()
+        if admin_user is not None:
+            has_owner = db_session.query(Membership.id).filter(
+                Membership.organization_id == existing.id,
+                Membership.user_id == admin_user.id,
+                Membership.role == OrganizationRole.OWNER,
+                Membership.state == MembershipState.ACTIVE,
+            ).first()
+            if has_owner is None:
+                db_session.add(Membership(
+                    organization_id=existing.id, user_id=admin_user.id,
+                    role=OrganizationRole.OWNER, state=MembershipState.ACTIVE,
+                ))
+        manager_user = db_session.query(User).filter(User.username == "manager").first()
+        if manager_user is not None:
+            has_sec = db_session.query(Membership.id).filter(
+                Membership.organization_id == existing.id,
+                Membership.user_id == manager_user.id,
+                Membership.role == OrganizationRole.SECRETARY,
+                Membership.state == MembershipState.ACTIVE,
+            ).first()
+            if has_sec is None:
+                db_session.add(Membership(
+                    organization_id=existing.id, user_id=manager_user.id,
+                    role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE,
+                ))
+        agent_user = db_session.query(User).filter(User.username == "agent").first()
+        if agent_user is not None:
+            has_agent = db_session.query(Membership.id).filter(
+                Membership.organization_id == existing.id,
+                Membership.user_id == agent_user.id,
+                Membership.role == OrganizationRole.SECRETARY,
+                Membership.state == MembershipState.ACTIVE,
+            ).first()
+            if has_agent is None:
+                db_session.add(Membership(
+                    organization_id=existing.id, user_id=agent_user.id,
+                    role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE,
+                ))
+        db_session.commit()
+        db_session.refresh(existing)
+        return existing
     org = Organization(name="Org-A", display_name="Pasay Org A")
     db_session.add(org)
     db_session.flush()
@@ -320,6 +384,10 @@ def org_a(db_session):
 
 @pytest.fixture()
 def org_b(db_session):
+    existing = db_session.query(Organization).filter(Organization.name == "Org-B").first()
+    if existing is not None:
+        db_session.refresh(existing)
+        return existing
     org = Organization(name="Org-B", display_name="Pasay Org B")
     db_session.add(org)
     db_session.commit()
@@ -382,6 +450,13 @@ def ensure_default_org(db, *, name: str = "Org-A", display_name: str = "Pasay Or
     instead of going through the API fixtures. Always builds a real
     ``org → (membership → User.role) → Property → Unit/Tenant → Lease → Expense``
     chain when combined with :func:`seed_property` / :func:`seed_tenant` below.
+
+    For FAIL-CLOSED security verification (negative tests) callers can use the
+    ``@pytest.mark.agent_no_secretary`` marker on the agent fixture to opt out
+    of the SECRETARY grant specifically for the fixture-backed user; the helper
+    membership grant via :func:`ensure_default_org` remains deterministic for
+    the direct-ORM construction path but tests may delete the membership to
+    exercise the no-access path if truly needed.
 
     Idempotent per session/database: returns the same Organization when an org
     with the same ``name`` already exists (no duplicate org creation)."""
