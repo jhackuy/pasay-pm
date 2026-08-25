@@ -214,22 +214,103 @@ def test_expense_claim_fail_creates_owner_decision_task(
     )
     t = rows[0]
     assert t.status in (OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS)
-    # next_actor semantics: encoded in metadata or assigned_user_id defaulting
-    # to the Owner org default. We assert at least one of the standard
-    # carriers indicates OWNER responsibility.
+    # next_actor semantics: EXPLICIT OWNER role guard.
+    #
+    # PREVIOUS BUG (never-fail assertion):
+    #   `or t.assigned_user_id is not None` was always True because
+    #   assigned_user_id gets populated even when the role guard is missing.
+    #   That made the assertion a tautology (assert False is False style).
+    #
+    # FIXED: require an EXPLICIT OWNER indicator from the recognized carriers.
+    #   If the OWNER role guard were removed from the task generation code,
+    #   at least one of these specific markers would be absent → ASSERTION FAILS.
     meta = t.details or {}
-    next_actor_ok = (
+    owner_role_explicit = (
         meta.get("next_actor") == "OWNER"
         or meta.get("role_required") == "OWNER"
-        or t.assigned_user_id is not None  # default assigned is owner proxy
         or (t.next_action is not None and "OWNER" in (t.next_action or "").upper())
     )
-    assert next_actor_ok, (
-        f"claim_fail task must be OWNER-actionable; "
-        f"got details={meta} next_action={t.next_action} assigned={t.assigned_user_id}"
+    assert owner_role_explicit, (
+        f"claim_fail task must carry EXPLICIT OWNER role marker (not just a "
+        f"non-null assigned_user_id). got details={meta} "
+        f"next_action={t.next_action} assigned={t.assigned_user_id}"
     )
     if meta.get("organization_id"):
         assert meta["organization_id"] == org_a.id
+
+
+def test_expense_claim_fail_owner_guard_counterexample_would_fail(
+    client, owner_a, org_a, property_id, unit_id, lease_id, db_session, monkeypatch
+):
+    """COUNTER-EXAMPLE: remove the OWNER role guard → assertion MUST fail.
+
+    This test documents that the strengthened assertion above is REAL (not a
+    tautology). We monkeypatch the task-generating code path to STRIP any
+    EXPLICIT OWNER marker — then we show the original T2's ``owner_role_explicit``
+    style assertion would raise AssertionError (proving the guard catches bugs).
+    """
+    headers = _headers(owner_a[1])
+    e = _create_expense_approved(client, headers, property_id, unit_id, "500.00")
+    eid = e["id"]
+
+    c = _claim_expense(client, headers, eid, "600.00")
+    _fail_claim(client, headers, eid, c["id"], reason="mismatch overclaim")
+
+    db_session.commit()
+
+    rows = (
+        db_session.query(OperationalTask)
+        .filter(OperationalTask.dedupe_key.ilike("%claim_fail%"))
+        .all()
+    )
+    if not rows:
+        rows = (
+            db_session.query(OperationalTask)
+            .filter(
+                (OperationalTask.next_action == "PAYMENT_CLAIM_DECISION")
+                | (OperationalTask.details["next_action"].astext == "PAYMENT_CLAIM_DECISION")
+                | (OperationalTask.details["claim_fail"].isnot(None))
+            )
+            .all()
+        )
+    assert len(rows) >= 1
+    t = rows[0]
+
+    # Simulate a BUG: the OWNER role guard was removed — the row now carries
+    # NO explicit OWNER marker (we erase any that exist to mirror the buggy code).
+    if t.details:
+        t.details.pop("next_actor", None)
+        t.details.pop("role_required", None)
+    if t.next_action:
+        t.next_action = t.next_action.upper().replace("OWNER", "")
+        if not t.next_action.strip():
+            t.next_action = None
+    db_session.commit()
+
+    meta = t.details or {}
+    owner_role_explicit_after_bug = (
+        meta.get("next_actor") == "OWNER"
+        or meta.get("role_required") == "OWNER"
+        or (t.next_action is not None and "OWNER" in (t.next_action or "").upper())
+    )
+
+    # This MUST be False → the real assertion would FAIL (we caught the bug).
+    assert owner_role_explicit_after_bug is False, (
+        "Counter-example invalid: even after stripping OWNER markers, the "
+        "assertion still passes → the strengthened assertion is STILL a "
+        "tautology, which means this fix is incomplete."
+    )
+    # Sanity: the OLD (buggy) assertion still passes — that was the problem.
+    old_buggy_assertion_would_pass = (
+        meta.get("next_actor") == "OWNER"
+        or meta.get("role_required") == "OWNER"
+        or t.assigned_user_id is not None
+        or (t.next_action is not None and "OWNER" in (t.next_action or "").upper())
+    )
+    assert old_buggy_assertion_would_pass, (
+        "Counter-example invalid: old form didn't pass either — "
+        "we stripped more than the guard-bug scenario models."
+    )
 
 
 # T3

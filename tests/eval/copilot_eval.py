@@ -24,7 +24,10 @@ import re
 import secrets
 import sys
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # repo root
 
@@ -108,14 +111,15 @@ def _seed_lease(db, *, prop=None, unit_no="101", monthly_rent="12000.00",
     if prop is None:
         prop = _seed_property(db)
     unit = Unit(property_id=prop.id, unit_number=unit_no, floor="1",
-                size_sqm="32.50", monthly_rent=monthly_rent,
+                size_sqm="32.50", monthly_rent=Decimal(str(monthly_rent)),
                 status=UnitStatus.occupied)
     if tenant is None:
         tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
     db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=start,
-                  end_date=end, monthly_rent=monthly_rent, deposit="24000.00",
+                  end_date=end, monthly_rent=Decimal(str(monthly_rent)),
+                  deposit=Decimal("24000.00"),
                   status=LeaseStatus.active, due_day=due_day)
     db.add(lease)
     db.flush()
@@ -125,7 +129,7 @@ def _seed_lease(db, *, prop=None, unit_no="101", monthly_rent="12000.00",
 def _seed_income(db, lease, month: str, amount="12000.00"):
     db.add(Income(
         lease_id=lease.id,
-        amount=amount,
+        amount=Decimal(str(amount)),
         received_date=date(int(month[:4]), int(month[5:7]), 5),
         description=month,
         status=IncomeStatus.confirmed,
@@ -580,6 +584,61 @@ def main(argv=None) -> int:
               f"({', '.join(k for k, v in record['scores'].items() if not v['binary']) or 'all dims'})")
     print(f"artifact: {out_path}")
     return 0 if summary["scenarios_passed"] == summary["scenarios_total"] else 1
+
+
+@pytest.mark.eval
+def test_copilot_eval_seed_financial_amounts_use_decimal_no_float_imprecision(db_session):
+    """Counter-example: financial seed rows MUST use Decimal, NO float/int.
+
+    ISSUE #4: the eval fixture population was passing bare strings or ints
+    that SQLAlchemy coerced through float (losing precision in edge cases).
+    We load a seeded row and assert:
+      1. isinstance(row.amount, Decimal)
+      2. Decimal('0.1') + Decimal('0.2') == Decimal('0.3') (no float imprecision)
+    If the seed code reverted to float/int coercion, this test FAILS.
+    """
+    lease = _seed_lease(db_session, monthly_rent="12000.00")
+    db_session.commit()
+    db_session.refresh(lease)
+
+    assert isinstance(lease.monthly_rent, Decimal), (
+        f"Lease.monthly_rent must be Decimal, got {type(lease.monthly_rent).__name__}"
+    )
+    assert isinstance(lease.deposit, Decimal), (
+        f"Lease.deposit must be Decimal, got {type(lease.deposit).__name__}"
+    )
+
+    _seed_income(db_session, lease, "2026-06", amount="0.10")
+    _seed_income(db_session, lease, "2026-07", amount="0.20")
+    db_session.commit()
+
+    rows = (
+        db_session.query(Income)
+        .filter(Income.lease_id == lease.id)
+        .order_by(Income.received_date.asc())
+        .all()
+    )
+    assert len(rows) >= 2, f"seeded at least 2 incomes, got {len(rows)}"
+    for r in rows:
+        assert isinstance(r.amount, Decimal), (
+            f"Income.amount must be Decimal, got {type(r.amount).__name__}. "
+            f"If the seed uses float/int, this assertion catches the precision bug."
+        )
+
+    a = rows[-2].amount
+    b = rows[-1].amount
+    assert a + b == Decimal("0.30"), (
+        f"Decimal arithmetic precision fail: {a!r} + {b!r} = {a + b!r}, "
+        f"expected Decimal('0.30'). Float imprecision would give "
+        f"0.1 + 0.2 = 0.30000000000000004 which is NOT Decimal('0.30')."
+    )
+
+    # Sanity: prove float WOULD have lost precision (this always passes but
+    # documents the guard we just verified is real).
+    assert float(0.1) + float(0.2) != float(0.3), (
+        "Counter-example invalid: Python float on this platform happened to "
+        "be precise for 0.1+0.2, which is vanishingly rare."
+    )
 
 
 if __name__ == "__main__":

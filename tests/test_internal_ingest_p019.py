@@ -197,11 +197,12 @@ def _is_first_accept(body: dict[str, Any]) -> bool:
     if body.get("replay") is True:
         return False
     state = body.get("state")
-    # Accepted terminal outcome — could be "done" / "failed" (permanent) /
-    # "claimed_elsewhere" (HTTP 200, replay:false). All count as first accept
-    # because they represent a request that drove the claim branch (not a
-    # later replay short-circuit that never claimed).
-    return state in {"done", "failed", "claimed_elsewhere"} or state is not None
+    # Accepted terminal outcome — ONLY "done" counts as first accept because
+    # it actually drove the claim branch and wrote state transition.
+    # "claimed_elsewhere" is excluded: it means concurrent claim lost
+    # (short-circuit, no DB write, idempotent duplicate behavior).
+    # "failed" with ok=False already returned False above.
+    return state == "done"
 
 
 def _is_replay_shortcircuit(body: dict[str, Any]) -> bool:

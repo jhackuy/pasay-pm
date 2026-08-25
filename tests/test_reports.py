@@ -1,6 +1,28 @@
-﻿from datetime import date, timedelta
+from datetime import date, timedelta
+from decimal import Decimal
 
 import pytest
+
+from app.services.dates import add_months, month_range
+
+
+def _patch_reports_date_today(monkeypatch, target: date):
+    """Override ``date.today`` inside app.api.routers.reports module.
+
+    The router uses ``from datetime import date`` then ``date.today()``.
+    We replace its module-level ``date`` object with a subclass whose
+    ``today()`` returns *target*. All other ``date`` behavior falls through
+    to the real ``datetime.date`` because we subclass it.
+    """
+    import app.api.routers.reports as _reports_mod
+    import datetime as _std_dt
+
+    class _FixedDate(_std_dt.date):
+        @classmethod
+        def today(cls):
+            return target
+
+    monkeypatch.setattr(_reports_mod, "date", _FixedDate)
 
 
 @pytest.fixture()
@@ -642,26 +664,145 @@ def test_overdue_rents_income_after_accounting_start_covers_period(
     ]
 
 
+def _expected_overdue_months(start_month: date, end_month: date) -> tuple[int, set[str], list[str]]:
+    """Compute reference overdue months using REAL calendar math (add_months).
+
+    Returns (count, year_set, ordered_month_keys)."""
+    months: list[str] = []
+    cursor = start_month.replace(day=1)
+    end_norm = end_month.replace(day=1)
+    while cursor <= end_norm:
+        months.append(_month_key(cursor))
+        cursor = add_months(cursor, 1)
+    year_set = {m.split("-")[0] for m in months}
+    return len(months), year_set, months
+
+
 def test_overdue_rents_accounting_start_cross_year(
     client, owner_a_headers, unit_id, tenant_id
 ):
     # 跨年租约：accounting 起点在上一年，应收周期跨两个年份
+    # FIXED (was May-Aug only): compute reference data with actual calendar
+    # math using app.services.dates.add_months so the assertions are correct
+    # in EVERY month of the year — including Jan/Feb vs Nov/Dec boundaries.
     today = date.today()
     start = _shift_month(today, -14)
     accounting_start = _shift_month(today, -8)
+    end_date = add_months(today, 12).replace(month=12, day=31)
     lease_id = _create_rent_lease(
         client, owner_a_headers, unit_id, tenant_id,
         start_date=start,
-        end_date=date(today.year + 1, 12, 31),
+        end_date=end_date,
         due_day=1,
         accounting_start_date=accounting_start,
     )
     row = _overdue_row(client, owner_a_headers, lease_id)
-    assert row["overdue_months"] == 9
-    assert row["overdue_periods"][0]["month"] == _month_key(accounting_start)
-    assert row["overdue_periods"][-1]["month"] == _month_key(today)
-    years = {p["month"].split("-")[0] for p in row["overdue_periods"]}
-    assert years == {str(today.year - 1), str(today.year)}
+
+    # Reference computed via app.services.dates.add_months calendar math
+    expected_count, expected_years, expected_month_keys = _expected_overdue_months(
+        accounting_start, today
+    )
+
+    assert row["overdue_months"] == expected_count, (
+        f"overdue_months={row['overdue_months']} expected={expected_count} "
+        f"today={today.isoformat()} accounting_start={accounting_start.isoformat()}"
+    )
+    assert row["overdue_periods"][0]["month"] == expected_month_keys[0]
+    assert row["overdue_periods"][-1]["month"] == expected_month_keys[-1]
+    actual_years = {p["month"].split("-")[0] for p in row["overdue_periods"]}
+    assert actual_years == expected_years, (
+        f"year set mismatch: actual={actual_years} expected={expected_years} "
+        f"months={[p['month'] for p in row['overdue_periods']]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "report_month_date,current_date,months_back,expected_cross_year",
+    [
+        # Dedicated boundary case: report=December Y, current=January 1st Y+1
+        (
+            date(2025, 12, 15),
+            date(2026, 1, 1),
+            8,
+            True,
+        ),
+        # Another boundary: report=November Y, current=February Y+1
+        (
+            date(2025, 11, 10),
+            date(2026, 2, 1),
+            8,
+            True,
+        ),
+        # Same-year case: report=February, current=September (no cross)
+        (
+            date(2026, 2, 1),
+            date(2026, 9, 1),
+            8,
+            False,
+        ),
+    ],
+    ids=["Dec→Jan_boundary", "Nov→Feb_boundary", "Feb→Sep_same_year"],
+)
+def test_overdue_rents_accounting_start_cross_year_dedicated_cases(
+    client, owner_a_headers, unit_id, tenant_id, monkeypatch,
+    report_month_date, current_date, months_back, expected_cross_year,
+):
+    """Dedicated parametrize cases with fixed dates + calendar math reference.
+
+    The critical case here is month=December / current_date=January 1st next
+    year: the old today.year-1 style reference was off-by-one and incorrectly
+    asserted a cross-year where none existed (or vice versa depending on what
+    month the test was run in). We use add_months for the golden reference.
+
+    CRITICAL: we patch ``app.api.routers.reports.date.today`` so the endpoint
+    computes overdue against *current_date* fixture (not real today) — this
+    is what makes the fixed-date assertions deterministic regardless of when
+    CI runs. Without this, Dec→Jan case would compute overdue from real today
+    (e.g. Aug 2026) and produce ~16 months instead of the expected 9.
+    """
+    _patch_reports_date_today(monkeypatch, current_date)
+    today = current_date
+    start = add_months(today, -14)
+    accounting_start = add_months(today, -months_back)
+    end_date = add_months(today, 12).replace(month=12, day=31)
+
+    lease_id = _create_rent_lease(
+        client, owner_a_headers, unit_id, tenant_id,
+        start_date=start,
+        end_date=end_date,
+        due_day=1,
+        accounting_start_date=accounting_start,
+    )
+    row = _overdue_row(client, owner_a_headers, lease_id)
+
+    expected_count, expected_years, expected_month_keys = _expected_overdue_months(
+        accounting_start, today
+    )
+
+    assert row["overdue_months"] == expected_count
+    assert row["overdue_periods"][0]["month"] == expected_month_keys[0]
+    assert row["overdue_periods"][-1]["month"] == expected_month_keys[-1]
+
+    actual_years = {p["month"].split("-")[0] for p in row["overdue_periods"]}
+    assert actual_years == expected_years
+
+    # Explicitly validate the cross-year property we care about
+    if expected_cross_year:
+        assert len(expected_years) >= 2, (
+            f"parametrize case expected cross-year but add_months gave "
+            f"only one year: {expected_years}"
+        )
+    else:
+        assert len(expected_years) == 1, (
+            f"parametrize case expected same-year but add_months gave "
+            f"cross-year: {expected_years}"
+        )
+    # month_range from app/services/dates.py produces same calendar boundaries
+    for mkey in expected_month_keys:
+        first, last = month_range(mkey)
+        assert first.isoformat().startswith(mkey)
+        assert last.isoformat().startswith(mkey)
+        assert first <= last
 
 
 def test_overdue_rents_future_accounting_start_no_overdue(

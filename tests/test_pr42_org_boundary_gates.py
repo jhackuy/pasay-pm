@@ -336,7 +336,8 @@ def test_scheduler_run_does_not_claim_or_mutate_other_org_rules(
     resp = client.post(f"{API}/operations/scheduler/run", headers=_h(owner_a[1]))
     assert resp.status_code == 200, resp.text
 
-    db_session.expire_all(); db_session.refresh(rule_b)
+    db_session.expire_all()
+    db_session.refresh(rule_b)
     assert rule_b.next_run_at == b_next_run_before, (
         "org B rule next_run_at must NOT advance when org A runs scheduler"
     )
