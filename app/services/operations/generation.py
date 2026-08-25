@@ -17,7 +17,7 @@ import time as _time
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 
-from sqlalchemy import cast, text
+from sqlalchemy import cast, or_, text
 from sqlalchemy.dialects.postgresql import JSONB, insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -664,8 +664,22 @@ def generate_business_tasks(
         ):
             confirmed_by_lease.setdefault(income.lease_id, []).append(income)
 
-    units = {u.id: u for u in db.query(Unit).all()}
-    tenants = {t.id: t for t in db.query(Tenant).all()}
+    unit_query = db.query(Unit).filter(Unit.deleted_at.is_(None))
+    tenant_query = db.query(Tenant).filter(Tenant.deleted_at.is_(None))
+    if org_id is not None:
+        from app.services.organization_scope import org_property_ids, org_tenant_ids
+        pids = org_property_ids(db, org_id)
+        tids = org_tenant_ids(db, org_id)
+        if pids:
+            unit_query = unit_query.filter(Unit.property_id.in_(list(pids)))
+        else:
+            unit_query = unit_query.filter(Unit.id == -1)
+        if tids:
+            tenant_query = tenant_query.filter(Tenant.id.in_(list(tids)))
+        else:
+            tenant_query = tenant_query.filter(Tenant.id == -1)
+    units = {u.id: u for u in unit_query.all()}
+    tenants = {t.id: t for t in tenant_query.all()}
 
     # --- RENT_DUE / RENT_OVERDUE -------------------------------------------------
     for lease in leases:
@@ -794,11 +808,28 @@ def generate_business_tasks(
 
     # --- APPROVAL_PENDING / PAYMENT_PENDING (expenses, read-only) ----------------
     approval_cutoff = now - timedelta(days=APPROVAL_PENDING_AFTER_DAYS)
-    pending_expenses = (
+    pending_expense_q = (
         db.query(Expense)
         .filter(Expense.status == ExpenseStatus.pending, Expense.created_at <= approval_cutoff)
-        .all()
     )
+    if org_id is not None:
+        from app.services.organization_scope import org_property_ids
+        pids = org_property_ids(db, org_id)
+        if pids:
+            prop_unit_subq = (
+                db.query(Unit.id)
+                .filter(Unit.property_id.in_(list(pids)))
+                .subquery()
+            )
+            pending_expense_q = pending_expense_q.filter(
+                or_(
+                    Expense.property_id.in_(list(pids)),
+                    Expense.unit_id.in_(prop_unit_subq),
+                )
+            )
+        else:
+            pending_expense_q = pending_expense_q.filter(Expense.id == -1)
+    pending_expenses = pending_expense_q.all()
     for expense in pending_expenses:
         task, enqueued, is_new = _register_task(
             db,
@@ -839,7 +870,7 @@ def generate_business_tasks(
     # §4). Fully-paid expenses are skipped; partial expenses refresh the task
     # amount to the REMAINING balance. The dedupe boundary guarantees at most
     # one active payment task per expense (§13 / E11).
-    payable_expenses = (
+    payable_expense_q = (
         db.query(Expense)
         .filter(
             Expense.status.in_([
@@ -849,8 +880,25 @@ def generate_business_tasks(
             ]),
             (Expense.approved_at.isnot(None)) & (Expense.approved_at <= payment_cutoff),
         )
-        .all()
     )
+    if org_id is not None:
+        from app.services.organization_scope import org_property_ids
+        pids = org_property_ids(db, org_id)
+        if pids:
+            prop_unit_subq = (
+                db.query(Unit.id)
+                .filter(Unit.property_id.in_(list(pids)))
+                .subquery()
+            )
+            payable_expense_q = payable_expense_q.filter(
+                or_(
+                    Expense.property_id.in_(list(pids)),
+                    Expense.unit_id.in_(prop_unit_subq),
+                )
+            )
+        else:
+            payable_expense_q = payable_expense_q.filter(Expense.id == -1)
+    payable_expenses = payable_expense_q.all()
     from app.services.expense_payment_truth import payment_truth
 
     for expense in payable_expenses:
@@ -903,14 +951,21 @@ def generate_business_tasks(
 
     # --- SETTLEMENT_PENDING -------------------------------------------------------
     settlement_cutoff = now - timedelta(days=SETTLEMENT_PENDING_AFTER_DAYS)
-    pending_settlements = (
+    commission_q = (
         db.query(CommissionSettlement)
         .filter(
             CommissionSettlement.status == CommissionSettlementStatus.pending,
             CommissionSettlement.created_at <= settlement_cutoff,
         )
-        .all()
     )
+    if org_id is not None:
+        from app.services.organization_scope import org_lease_ids
+        lids = org_lease_ids(db, org_id)
+        if lids:
+            commission_q = commission_q.filter(CommissionSettlement.lease_id.in_(list(lids)))
+        else:
+            commission_q = commission_q.filter(CommissionSettlement.id == -1)
+    pending_settlements = commission_q.all()
     for settlement in pending_settlements:
         task, enqueued, is_new = _register_task(
             db,
@@ -938,15 +993,22 @@ def generate_business_tasks(
             notifications += 1 if enqueued else 0
 
     # --- MOVE_OUT_INSPECTION -------------------------------------------------------
-    declined_leases = (
+    declined_leases_q = (
         db.query(Lease)
         .filter(
             Lease.deleted_at.is_(None),
             Lease.status == LeaseStatus.active,
             Lease.renewal_metadata.op("@>")(cast({"not_renewed": True}, JSONB)),
         )
-        .all()
     )
+    if org_id is not None:
+        from app.services.organization_scope import org_lease_ids
+        lids = org_lease_ids(db, org_id)
+        if lids:
+            declined_leases_q = declined_leases_q.filter(Lease.id.in_(list(lids)))
+        else:
+            declined_leases_q = declined_leases_q.filter(Lease.id == -1)
+    declined_leases = declined_leases_q.all()
     for lease in declined_leases:
         existing_insp = (
             db.query(MoveOutInspection)
@@ -1013,7 +1075,7 @@ def generate_business_tasks(
             notifications += 1 if enqueued else 0
 
     # --- DEPOSIT_SETTLEMENT --------------------------------------------------------
-    pending_settlements = (
+    deposit_q = (
         db.query(DepositSettlement, MoveOutInspection)
         .join(
             MoveOutInspection,
@@ -1025,8 +1087,15 @@ def generate_business_tasks(
                 [DepositSettlementStatus.CONFIRMED, DepositSettlementStatus.RECONCILED]
             ),
         )
-        .all()
     )
+    if org_id is not None:
+        from app.services.organization_scope import org_lease_ids
+        lids = org_lease_ids(db, org_id)
+        if lids:
+            deposit_q = deposit_q.filter(MoveOutInspection.lease_id.in_(list(lids)))
+        else:
+            deposit_q = deposit_q.filter(DepositSettlement.id == -1)
+    pending_settlements = deposit_q.all()
     for existing_settlement, insp in pending_settlements:
         lease = db.get(Lease, insp.lease_id)
         unit = units.get(lease.unit_id) if lease else None

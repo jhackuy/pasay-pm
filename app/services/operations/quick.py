@@ -12,6 +12,7 @@ import calendar
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -307,7 +308,7 @@ def _derive_org_scope_sets(db: Session, user_id: int | None = None):
     try:
         db.flush()
     except Exception:
-        pass
+        raise
     org_property_ids = {
         r for (r,) in db.execute(
             select(Property.id).where(
@@ -489,7 +490,7 @@ def _payable_expense_rows(
 def build_quick_tasks(
     db: Session, user: User, *, now: datetime | None = None,
     owner_only: bool = False,
-    task_scope: "SQLAlchemyFilterType | None" = None,
+    task_scope: "Any | None" = None,
     org_property_ids: set[int] | None = None,
 ) -> list[dict]:
     """Active tasks (PENDING + IN_PROGRESS) for the caller's scope.
@@ -1247,9 +1248,53 @@ def _human_done_digest_rows(
     if org_property_ids is not None:
         if not org_property_ids:
             return []
-        commits_filter.append(
-            OperationalTask.property_id.in_(list(org_property_ids))
+        prop_list = list(org_property_ids)
+        unit_rows = (
+            db.query(Unit.id)
+            .filter(Unit.property_id.in_(prop_list), Unit.deleted_at.is_(None))
+            .all()
         )
+        org_unit_ids = {r[0] for r in unit_rows} if unit_rows else set()
+        org_lease_ids: set[int] = set()
+        if org_unit_ids:
+            lease_rows = (
+                db.query(Lease.id)
+                .filter(Lease.unit_id.in_(list(org_unit_ids)), Lease.deleted_at.is_(None))
+                .all()
+            )
+            org_lease_ids = {r[0] for r in lease_rows} if lease_rows else set()
+        org_tenant_ids: set[int] = set()
+        if org_lease_ids:
+            tenant_rows = (
+                db.query(Tenant.id)
+                .join(Lease, Lease.tenant_id == Tenant.id)
+                .filter(Lease.id.in_(list(org_lease_ids)), Tenant.deleted_at.is_(None))
+                .all()
+            )
+            org_tenant_ids = {r[0] for r in tenant_rows} if tenant_rows else set()
+        org_ids_from_prop = {
+            r[0] for r in db.query(Property.organization_id)
+            .filter(Property.id.in_(prop_list), Property.deleted_at.is_(None))
+            .all()
+        } or set()
+        if org_ids_from_prop:
+            extra_tenant_rows = db.query(Tenant.id).filter(
+                Tenant.organization_id.in_(list(org_ids_from_prop)),
+                Tenant.deleted_at.is_(None),
+            ).all()
+            if extra_tenant_rows:
+                org_tenant_ids |= {r[0] for r in extra_tenant_rows}
+        or_terms = []
+        if org_property_ids:
+            or_terms.append(OperationalTask.property_id.in_(prop_list))
+        if org_lease_ids:
+            or_terms.append(OperationalTask.lease_id.in_(list(org_lease_ids)))
+        if org_tenant_ids:
+            or_terms.append(OperationalTask.tenant_id.in_(list(org_tenant_ids)))
+        if or_terms:
+            commits_filter.append(or_(*or_terms))
+        else:
+            return []
     commits = (
         db.query(OperationalTask)
         .filter(*commits_filter)

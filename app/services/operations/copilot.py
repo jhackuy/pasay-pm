@@ -314,8 +314,17 @@ def build_copilot_context(
 
     overdue_rents = _overdue_rents(db, scoped_lease_ids, now=now)
     leases_expiring = _leases_expiring(db, scoped_lease_ids, now=now)
-    expenses = _pending_expenses(db, expense_ids if is_agent else None)
-    settlements = _pending_settlements(db, user, settlement_ids if is_agent else None)
+    expenses = _pending_expenses(
+        db,
+        expense_ids if is_agent else None,
+        org_id=None if is_agent else org_id,
+    )
+    settlements = _pending_settlements(
+        db,
+        user,
+        settlement_ids if is_agent else None,
+        org_id=None if is_agent else org_id,
+    )
     maintenance = _maintenance_tasks(db, user, org_id=org_id)
     recurring_rules = _recurring_rules(db, user, org_id=org_id)
     properties = _properties(db, scoped_property_ids)
@@ -515,8 +524,25 @@ def _leases_expiring(db: Session, lease_ids: set[int] | None, *, now: datetime) 
     ]
 
 
-def _pending_expenses(db: Session, expense_ids: set[int] | None) -> list[dict]:
+def _pending_expenses(db: Session, expense_ids: set[int] | None, *, org_id: int | None = None) -> list[dict]:
     query = db.query(Expense).filter(Expense.status == ExpenseStatus.pending)
+    if org_id is not None:
+        from app.services.organization_scope import org_property_ids
+        pids = org_property_ids(db, org_id)
+        if pids:
+            subq = (
+                db.query(Unit.id)
+                .filter(Unit.property_id.in_(list(pids)))
+                .subquery()
+            )
+            query = query.filter(
+                or_(
+                    Expense.property_id.in_(list(pids)),
+                    Expense.unit_id.in_(subq),
+                )
+            )
+        else:
+            query = query.filter(Expense.id == -1)
     if expense_ids is not None:
         query = query.filter(Expense.id.in_(expense_ids or [0]))
     rows = (
@@ -540,11 +566,18 @@ def _pending_expenses(db: Session, expense_ids: set[int] | None) -> list[dict]:
 
 
 def _pending_settlements(
-    db: Session, user: User, settlement_ids: set[int] | None
+    db: Session, user: User, settlement_ids: set[int] | None, *, org_id: int | None = None
 ) -> list[dict]:
     query = db.query(CommissionSettlement).filter(
         CommissionSettlement.status == CommissionSettlementStatus.pending
     )
+    if org_id is not None:
+        from app.services.organization_scope import org_lease_ids
+        lids = org_lease_ids(db, org_id)
+        if lids:
+            query = query.filter(CommissionSettlement.lease_id.in_(list(lids)))
+        else:
+            query = query.filter(CommissionSettlement.id == -1)
     if user.role == UserRole.agent:
         query = query.filter(
             or_(

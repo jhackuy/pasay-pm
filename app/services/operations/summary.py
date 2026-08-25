@@ -58,11 +58,10 @@ def _org_tenant_ids(db: Session, org_id: int) -> set[int]:
 
 
 def _scoped_task_query(db: Session, org_id: int):
+    from sqlalchemy import Integer
     pids = _org_property_ids(db, org_id)
     lids = _org_lease_ids(db, org_id)
     tids = _org_tenant_ids(db, org_id)
-    if not pids and not lids and not tids:
-        return OperationalTask.id == -1
     or_terms = []
     if pids:
         or_terms.append(OperationalTask.property_id.in_(list(pids)))
@@ -70,6 +69,11 @@ def _scoped_task_query(db: Session, org_id: int):
         or_terms.append(OperationalTask.lease_id.in_(list(lids)))
     if tids:
         or_terms.append(OperationalTask.tenant_id.in_(list(tids)))
+    or_terms.append(
+        OperationalTask.details.op("->>")("organization_id").cast(Integer) == org_id
+    )
+    if not or_terms:
+        return OperationalTask.id == -1
     return or_(*or_terms)
 
 

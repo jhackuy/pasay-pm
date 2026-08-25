@@ -774,3 +774,41 @@ def scoped_get_deposit_settlement(
     if obj is None:
         raise LookupError(f"deposit_settlement {settlement_id} not found")
     return obj, membership
+
+
+# ---------------------------------------------------------------------------
+# Canonical org scope ID set helpers (shared by routers, services, quick view)
+# ---------------------------------------------------------------------------
+
+
+def org_property_ids(db: Session, org_id: int) -> set[int]:
+    rows = db.execute(
+        select(Property.id).where(
+            Property.organization_id == org_id,
+            Property.deleted_at.is_(None),
+        )
+    ).all()
+    return {r[0] for r in rows}
+
+
+def org_lease_ids(db: Session, org_id: int) -> set[int]:
+    rows = db.execute(
+        select(Lease.id)
+        .join(Unit, Unit.id == Lease.unit_id)
+        .join(Property, Property.id == Unit.property_id)
+        .where(
+            Property.organization_id == org_id,
+            Lease.deleted_at.is_(None),
+        )
+    ).all()
+    return {r[0] for r in rows}
+
+
+def org_tenant_ids(db: Session, org_id: int) -> set[int]:
+    rows = db.execute(
+        select(Tenant.id).where(
+            Tenant.organization_id == org_id,
+            Tenant.deleted_at.is_(None),
+        )
+    ).all()
+    return {r[0] for r in rows}

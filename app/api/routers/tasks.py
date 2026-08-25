@@ -48,11 +48,17 @@ def list_tasks(
     _deprecation_headers(response)
     try:
         org_ids = list_active_org_ids_for_user(db, user.id)
-        if org_ids:
-            resolve_org_membership(
-                db, user.id, org_ids[0],
-                role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        if not org_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active organization membership",
             )
+        resolve_org_membership(
+            db, user.id, org_ids[0],
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
     return db.query(Task).filter(False).all()
@@ -78,11 +84,17 @@ def get_task(
     _deprecation_headers(response)
     try:
         org_ids = list_active_org_ids_for_user(db, user.id)
-        if org_ids:
-            resolve_org_membership(
-                db, user.id, org_ids[0],
-                role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        if not org_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active organization membership",
             )
+        resolve_org_membership(
+            db, user.id, org_ids[0],
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
     raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")

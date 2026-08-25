@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_
+from sqlalchemy import Integer, func, or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -50,13 +50,18 @@ def resolve_org_membership(
         if role is not None:
             roles = list(role) if not isinstance(role, OrganizationRole) else [role]
             query = query.filter(Membership.role.in_(roles))
-        membership = query.first()
-        if membership is None:
+        small_batch = query.limit(2).all()
+        if len(small_batch) == 0:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Insufficient permissions",
             )
-        return membership
+        if len(small_batch) == 1:
+            return small_batch[0]
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Organization context required",
+        )
     return _dep
 
 MONTH_PATTERN = r"^\d{4}-\d{2}$"
@@ -535,11 +540,13 @@ def tasks_report(
     org_tenant_ids = (
         db.query(Tenant.id).filter(Tenant.organization_id == org_id, Tenant.deleted_at.is_(None))
     )
+    from sqlalchemy.dialects.postgresql import JSONB
     query = db.query(OperationalTask).filter(
         or_(
             OperationalTask.property_id.in_(org_property_ids),
             OperationalTask.lease_id.in_(org_lease_ids),
             OperationalTask.tenant_id.in_(org_tenant_ids),
+            OperationalTask.details.op("->>")("organization_id").cast(Integer) == org_id,
         )
     )
     today = date.today()

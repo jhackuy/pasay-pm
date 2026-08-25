@@ -39,7 +39,12 @@ from app.models.membership import Membership, MembershipState, OrganizationRole
 from app.models.property import Property, Unit
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
-from app.services.organization_scope import list_active_org_ids_for_user
+from app.services.organization_scope import (
+    list_active_org_ids_for_user,
+    org_property_ids as _org_property_ids,
+    org_lease_ids as _org_lease_ids,
+    org_tenant_ids as _org_tenant_ids,
+)
 from app.schemas.operations import (
     OperationsSummary,
     OperationalTaskRead,
@@ -206,60 +211,18 @@ def resolve_org_membership(
             )
 
         user = reader
-        org_ids = list_active_org_ids_for_user(db, user.id)
-        if not org_ids:
+        base_q = _base_membership_query(db).filter(Membership.user_id == user.id)
+        small_batch = base_q.limit(2).all()
+        if len(small_batch) == 0:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
-        org_id = org_ids[0]
-        q = (
-            db.query(Membership)
-            .filter(
-                Membership.user_id == user.id,
-                Membership.organization_id == org_id,
-                Membership.state == MembershipState.ACTIVE,
-                Membership.removed_at.is_(None),
-            )
+        if len(small_batch) == 1:
+            return small_batch[0]
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Organization context required",
         )
-        if role_set:
-            q = q.filter(Membership.role.in_(role_set))
-        membership = q.first()
-        if membership is None:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient organization role")
-        return membership
 
     return _dep
-
-
-def _org_property_ids(db: Session, org_id: int) -> set[int]:
-    rows = db.execute(
-        select(Property.id).where(
-            Property.organization_id == org_id,
-            Property.deleted_at.is_(None),
-        )
-    ).all()
-    return {r[0] for r in rows}
-
-
-def _org_lease_ids(db: Session, org_id: int) -> set[int]:
-    rows = db.execute(
-        select(Lease.id)
-        .join(Unit, Unit.id == Lease.unit_id)
-        .join(Property, Property.id == Unit.property_id)
-        .where(
-            Property.organization_id == org_id,
-            Lease.deleted_at.is_(None),
-        )
-    ).all()
-    return {r[0] for r in rows}
-
-
-def _org_tenant_ids(db: Session, org_id: int) -> set[int]:
-    rows = db.execute(
-        select(Tenant.id).where(
-            Tenant.organization_id == org_id,
-            Tenant.deleted_at.is_(None),
-        )
-    ).all()
-    return {r[0] for r in rows}
 
 
 def _scoped_task_query(db: Session, org_id: int):

@@ -188,11 +188,12 @@ def schedule_inspection(
     )
     obj.created_by = actor_id
     obj.updated_by = actor_id
+    savepoint = db.begin_nested()
     try:
-        with db.begin_nested():
-            db.add(obj)
-            db.flush()
+        db.add(obj)
+        db.flush()
     except IntegrityError:
+        savepoint.rollback()
         existing = (
             db.query(MoveOutInspection)
             .filter(
@@ -204,6 +205,8 @@ def schedule_inspection(
         if existing is not None:
             return existing, False
         raise
+    else:
+        savepoint.commit()
     lease = db.get(Lease, lease_id)
     if lease is not None and lease.move_out_inspection_id is None:
         lease.move_out_inspection_id = obj.id
