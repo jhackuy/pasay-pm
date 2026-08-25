@@ -41,7 +41,7 @@ _FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test"}
 # (including the bare legacy "pasay_pm_test" default fallback when not otherwise
 # overridden) is refused unless it matches one of the approved patterns.
 _ALLOWED_TEST_DB_PREFIX_RE = re.compile(
-    r"^pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_"
+    r"^pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_[a-zA-Z0-9_]+$"
 )
 
 

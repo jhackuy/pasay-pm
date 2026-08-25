@@ -296,8 +296,9 @@ def test_1680_outstanding_is_true_total_arrears(db_session):
     item = red[0]
     # Only 3 periods overdue under the lease (Jun/Aug due day 1 <= Aug 20).
     assert item["unpaid_periods"] == 3
-    # True outstanding = 3 periods x 25,000 = 75,000 �?never the bare monthly.
-    assert float(item["amount"]) == 75000.0
+    # True outstanding = 3 periods x 25,000 = 75,000 – never the bare monthly.
+    from decimal import Decimal
+    assert Decimal(str(item["amount"])) == Decimal("75000.00")
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +347,8 @@ def test_payable_expense_carries_pay_action_fields(db_session):
     pay = [r for r in digest["act_now"] if r["kind"] == "payable_expense"]
     assert len(pay) == 1
     assert pay[0]["expense_id"] == expense.id
-    assert float(pay[0]["amount"]) == 7000.0
+    from decimal import Decimal
+    assert Decimal(str(pay[0]["amount"])) == Decimal("7000.00")
     assert pay[0].get("purpose")  # the actionable purpose, not a bare category
 
 

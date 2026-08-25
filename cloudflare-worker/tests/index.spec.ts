@@ -485,19 +485,18 @@ run("CLOSEOUT#1b: worker.fetch — empty TELEGRAM_WEBHOOK_SECRET → 401 webhook
   assert_eq(body.error, "webhook_not_configured", "whitespace secret → webhook_not_configured");
 });
 
-run("CLOSEOUT#2a: worker.fetch — non-JSON body → 400 invalid_json / bad_content_type", async () => {
+run("CLOSEOUT#2a: worker.fetch — non-JSON body → 400 bad_content_type", async () => {
   beforeEachPerTestCleanup();
   const env = makeEnv();
-  const req = makeWorkerRequest("/telegram/webhook", {
+  const req = new Request("http://x/telegram/webhook", {
     method: "POST",
     headers: { "content-type": "text/plain", "X-Telegram-Bot-Api-Secret-Token": "correct-secret" },
     body: "not json content",
   });
-  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  const resp = await worker.fetch(req, env as any, undefined as any);
   assert(resp.status === 400, `non-json → 400 (got ${resp.status})`);
   const body = await resp.json() as any;
-  assert(body.error === "bad_content_type" || body.error === "invalid_json",
-    `bad_content_type or invalid_json, got ${body.error}`);
+  assert_eq(body.error, "bad_content_type", `bad_content_type exact, got ${body.error}`);
 });
 
 run("CLOSEOUT#2b: worker.fetch — update_id missing / 0 / negative / non-number → 400", async () => {

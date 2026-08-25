@@ -574,6 +574,7 @@ def tasks_report(
         horizon = today + timedelta(days=within_days)
         query = query.filter(
             OperationalTask.due_at.isnot(None),
+            func.date(OperationalTask.due_at) >= today,
             func.date(OperationalTask.due_at) <= horizon,
         )
     tasks = (
@@ -618,6 +619,8 @@ def tasks_report(
             return "in_progress"
         if s == OperationalTaskStatus.COMPLETED:
             return "completed"
+        if s == OperationalTaskStatus.CANCELLED:
+            return "cancelled"
         return "scheduled"
 
     def _map_priority(p: OperationalTaskPriority) -> str:

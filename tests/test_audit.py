@@ -26,7 +26,7 @@ def test_create_is_audited(client, admin_headers, db_session):
 def test_update_is_audited_with_changes(client, admin_headers, property_id):
     client.patch(f"{API}/properties/{property_id}", json={"city": "Taguig"}, headers=admin_headers)
     logs = client.get(f"{API}/audit-logs", headers=admin_headers).json()
-    update_log = next(l for l in logs if l["action"] == "update")
+    update_log = next(log for log in logs if log["action"] == "update")
     assert update_log["changed_fields"] == {"city": ["Pasay", "Taguig"]}
 
 
@@ -46,7 +46,7 @@ def test_confirm_action_is_audited(client, admin_headers, lease_id):
     logs = client.get(
         f"{API}/audit-logs?table_name=incomes&record_id={income_id}", headers=admin_headers
     ).json()
-    assert [l["action"] for l in logs] == ["confirm", "create"]
+    assert [log["action"] for log in logs] == ["confirm", "create"]
 
 
 def test_audit_logs_admin_only(client, manager_headers):
@@ -63,4 +63,4 @@ def test_audit_logs_filter(client, admin_headers, db_session):
     )
     logs = client.get(f"{API}/audit-logs?table_name=properties", headers=admin_headers).json()
     assert len(logs) == 1
-    assert all(l["table_name"] == "properties" for l in logs)
+    assert all(log["table_name"] == "properties" for log in logs)

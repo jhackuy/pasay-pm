@@ -764,6 +764,27 @@ def test_scheduler_run_endpoint(client, db_session, manager_headers, monkeypatch
     from app.services.operations import generation
 
     admin = _seed_valid_default_admin(db_session, "tg-sched")  # valid notifiable default
+    # Ensure the default assignee has ACTIVE membership in the same org as the
+    # caller (manager_headers user's default org) — PR #42 scheduler org scope.
+    from tests.conftest import ensure_default_org
+    from app.models.membership import Membership, MembershipState, OrganizationRole
+    default_org = ensure_default_org(db_session)
+    existing = (
+        db_session.query(Membership)
+        .filter(
+            Membership.user_id == admin.id,
+            Membership.organization_id == default_org.id,
+            Membership.removed_at.is_(None),
+        )
+        .first()
+    )
+    if existing is None:
+        db_session.add(Membership(
+            user_id=admin.id,
+            organization_id=default_org.id,
+            role=OrganizationRole.OWNER,
+            state=MembershipState.ACTIVE,
+        ))
     # endpoint validates against config DEFAULT_ASSIGNED_USER_ID; pin it to the
     # seeded valid admin so the manager-triggered pass is allowed.
     monkeypatch.setattr(ops_config, "DEFAULT_ASSIGNED_USER_ID", admin.id)

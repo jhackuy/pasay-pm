@@ -294,7 +294,7 @@ def test_payment_promise_recorded(client, admin_headers, db_session):
     promised = (NOW + timedelta(days=3)).isoformat()
     resp = client.post(
         f"{API}/operations/promise",
-        json={"lease_id": lease.id, "amount": 30000.0, "promised_date": promised},
+        json={"lease_id": lease.id, "amount": "30000.00", "promised_date": promised},
         headers=admin_headers,
     )
     assert resp.status_code == 201, resp.text

@@ -106,7 +106,7 @@ def test_test_db_guard_allows_isolated_name_and_blocks_live():
 
     # The active test DB must be an isolated name (strict pasay_*_ prefix whitelist).
     assert _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB) is True
-    assert bool(_ALLOWED_TEST_DB_PREFIX_RE.match(TEST_DB_NAME)), (
+    assert bool(_ALLOWED_TEST_DB_PREFIX_RE.fullmatch(TEST_DB_NAME)), (
         "TEST_DB_NAME=%r must match strict prefix whitelist pattern %s"
         % (TEST_DB_NAME, _ALLOWED_TEST_DB_PREFIX_RE.pattern)
     )
@@ -133,5 +133,6 @@ def test_test_db_guard_allows_isolated_name_and_blocks_live():
         "production",
         "defaultdb",
         "pasaytest",
+        "pasay_pm_r1_20260101_001!prod",
     ):
         assert _test_db_allowed(disallowed, _CONFIGURED_DB) is False, disallowed

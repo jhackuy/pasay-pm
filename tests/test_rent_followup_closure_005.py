@@ -54,10 +54,11 @@ def _seed_fixture(db, *, rent="25000.00", due_day=20):
     return owner, unit, lease
 
 
-def test_secretary_target_resolves_configured_secretary(client, db_session, admin_headers):
+def test_secretary_target_resolves_configured_secretary(client, db_session, admin_headers, monkeypatch):
     """The 催租 assign-to-Secretary DM needs the canonical Secretary target."""
     from tests.conftest import make_user
     from app.models.membership import Organization, Membership, MembershipState, OrganizationRole
+    from app.services.operations import config as ops_config
 
     sec, _ = make_user(db_session, "closure-secretary", UserRole.manager)
     db_session.query(User).filter_by(id=sec.id).update({"telegram_chat_id": "1083657401"})
@@ -76,6 +77,7 @@ def test_secretary_target_resolves_configured_secretary(client, db_session, admi
             state=MembershipState.ACTIVE,
         ))
     db_session.commit()
+    monkeypatch.setattr(ops_config, "SECRETARY_ASSIGNEE_ID", sec.id)
     resp = client.get(f"{API}/operations/secretary-target", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["telegram_chat_id"].strip() == "1083657401"

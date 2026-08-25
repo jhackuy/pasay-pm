@@ -29,9 +29,11 @@ def _utc_now():
 def _mk_pending_repair_with_proposal(db, *, issue, amount="3000.00"):
     """Fresh repair + PENDING V1 (use before approve)."""
     from tests.conftest import seed_property, seed_unit
-    prop = seed_property(db); unit = seed_unit(db, prop=prop)
+    prop = seed_property(db)
+    unit = seed_unit(db, prop=prop)
     r = op_svc.create_repair(db, issue=issue)
-    r.property_id = prop.id; r.unit_id = unit.id
+    r.property_id = prop.id
+    r.unit_id = unit.id
     p, _ = prop_svc.submit_proposal(db, r, amount=amount)
     db.flush()
     return r, p
@@ -41,9 +43,11 @@ def _mk_repair_with_rejected_requote_proposal(db, *, issue, amount="3000.00"):
     """Repair + REJECTED V1 (pass to ensure_requote_action; never
     try to approve the returned proposal)."""
     from tests.conftest import seed_property, seed_unit
-    prop = seed_property(db); unit = seed_unit(db, prop=prop)
+    prop = seed_property(db)
+    unit = seed_unit(db, prop=prop)
     r = op_svc.create_repair(db, issue=issue)
-    r.property_id = prop.id; r.unit_id = unit.id
+    r.property_id = prop.id
+    r.unit_id = unit.id
     p, _ = prop_svc.submit_proposal(db, r, amount=amount)
     prop_svc.reject_proposal(db, r, p, rejected_by=99, reason="x")
     db.flush()
@@ -71,7 +75,8 @@ def test_real_task_complete_api_leaves_rent_expense_repair_unchanged(
     expense = Expense(expense_date=_utc_now().date(), category="x",
         amount=Decimal("3000.00"), payee="V", status=ExpenseStatus.approved,
         property_id=_p.id)
-    db.add_all([income, expense]); db.flush()
+    db.add_all([income, expense])
+    db.flush()
     repair, rejected = _mk_repair_with_rejected_requote_proposal(
         db, issue="Plumbing", amount="3000.00",
     )
@@ -82,7 +87,8 @@ def test_real_task_complete_api_leaves_rent_expense_repair_unchanged(
         title="t-follow", source_type="manual", source_id=None,
         priority="high", status=OperationalTaskStatus.PENDING, due_at=_utc_now(),
         property_id=_p.id, details={"note": "check on plumbing"})
-    db.add(t_follow); db.commit()
+    db.add(t_follow)
+    db.commit()
     snap_i = (income.status, income.confirmed_by, income.amount)
     snap_e = (expense.status, expense.amount)
     snap_r = (repair.status, repair.next_action,
@@ -93,8 +99,11 @@ def test_real_task_complete_api_leaves_rent_expense_repair_unchanged(
         headers=admin_headers)
     assert resp.status_code == 200, resp.text
     db.expire_all()
-    db.refresh(income); db.refresh(expense); db.refresh(repair)
-    db.refresh(action); db.refresh(t_follow)
+    db.refresh(income)
+    db.refresh(expense)
+    db.refresh(repair)
+    db.refresh(action)
+    db.refresh(t_follow)
     assert (income.status, income.confirmed_by, income.amount) == snap_i
     assert (expense.status, expense.amount) == snap_e
     assert (repair.status, repair.next_action,
