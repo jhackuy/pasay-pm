@@ -92,12 +92,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/doors
-          python _fresh_alembic_gate_001.py 2>&1 | tee artifacts/doors/door_02_alembic.log || exit_code=$?
-          if [ "${exit_code:-0}" != "0" ]; then
-            echo "FAIL: alembic upgrade head"
-            exit ${exit_code}
-          fi
-          # Verify single linear head m4d000000001
+          alembic upgrade head 2>&1 | tee artifacts/doors/door_02_alembic.log || { exit_code=$?; echo "FAIL: alembic upgrade head"; exit ${exit_code}; }
           alembic current 2>&1 | tee artifacts/doors/door_02_current.log | grep -q "m4d000000001" || {
             echo "FAIL: expected single linear head m4d000000001"; exit 1;
           }
