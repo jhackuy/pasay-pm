@@ -936,7 +936,7 @@ def _schedule_repair_verification_followup(
                     "source_id": repair_id,
                     "property_id": repair_property_id,
                     "assigned_user_id": actor_id,
-                    "priority": OperationalTaskPriority.high if _evidence_present_for_repair_close(repair) else OperationalTaskPriority.normal,
+                    "priority": OperationalTaskPriority.high if _evidence_present_for_repair_close(repair) else OperationalTaskPriority.medium,
                     "status": OperationalTaskStatus.PENDING,
                     "due_at": now + timedelta(days=3),
                     "remind_at": now,
