@@ -36,7 +36,7 @@ const WRANGLER_TOML = fs.readFileSync(
 //    The REAL index.ts default export methods are what we call.
 // ---------------------------------------------------------------------------
 
-import worker, { PasayContainer } from "../src/index";
+import worker, { PasayContainer, mask_sensitive } from "../src/index";
 import {
   ENVELOPE_VERSION,
   make_scheduled_event_id,
@@ -569,10 +569,12 @@ run("CLOSEOUT#3b: enqueue_failed → fixed body {ok:false, error:'enqueue_failed
   assert(typeof body.req_id === "string" && body.req_id.startsWith("r_"),
     `req_id must be opaque r_ prefixed, got ${body.req_id}`);
   assert(!("detail" in body), "enqueue_failed resp MUST NOT include raw detail field");
-  assert(!/"leakme"/.test(text), "resp must NOT contain internal leakme substring");
-  assert(!/"postgres:\/\/"/.test(text), "resp must NOT expose postgres:// URL");
-  assert(!/"xxyyzz112233445566778899"/.test(text), "resp must NOT expose secret token value");
-  assert(!/"TELEGRAM_BOT_TOKEN=/.test(text), "resp must NOT include raw k=v secret pair");
+  assert(!/leakme/.test(text), "resp must NOT contain internal leakme substring");
+  assert(!/postgres:\/\//.test(text), "resp must NOT expose postgres:// URL");
+  assert(!/xxyyzz112233445566778899/.test(text), "resp must NOT expose secret token value");
+  assert(!/TELEGRAM_BOT_TOKEN=/.test(text), "resp must NOT include raw k=v secret pair");
+  assert(!text.includes("leakme"), "raw secret value leakme must NOT appear in output text");
+  assert(!text.includes("xxyyzz112233445566778899"), "raw secret token value must NOT appear in output text");
 });
 
 run("CLOSEOUT#3c: mask_sensitive — fabricated secret injection NEVER appears in enqueue_failed response", async () => {
@@ -607,6 +609,53 @@ run("CLOSEOUT#3c: mask_sensitive — fabricated secret injection NEVER appears i
     assert(!text.includes(d), `Response MUST NOT leak fabricated secret: '${d.slice(0, 20)}…'`);
   }
   assert(!text.includes("detail"), "response must NOT have raw detail key");
+});
+
+run("MASK_SENSITIVE#1: unquoted KEY=value style masked correctly", () => {
+  const SECRET_VAL = "secret1234567890abcdef";
+  const input = `TOKEN=${SECRET_VAL}; KEY=otherpass; SECRET=xyz123abc`;
+  const result = mask_sensitive(input);
+  assert(result.includes("TOKEN=***"), `unquoted TOKEN should mask to TOKEN=***, got: ${result}`);
+  assert(result.includes("KEY=***"), `unquoted KEY should mask to KEY=***, got: ${result}`);
+  assert(result.includes("SECRET=***"), `unquoted SECRET should mask to SECRET=***, got: ${result}`);
+  assert(!result.includes(SECRET_VAL), `raw secret value '${SECRET_VAL}' MUST NOT appear in masked output`);
+  assert(!result.includes("otherpass"), "raw secret 'otherpass' MUST NOT appear in masked output");
+  assert(!result.includes("xyz123abc"), "raw secret 'xyz123abc' MUST NOT appear in masked output");
+});
+
+run("MASK_SENSITIVE#2: double-quoted JSON \"KEY\":\"value\" style masked correctly", () => {
+  const SECRET_VAL = "secret1234567890abcdef";
+  const input = `{"TOKEN":"${SECRET_VAL}", "TELEGRAM_BOT_TOKEN":"bot-abc-123-xyz", "DATABASE_URL":"postgres://u:p@h/db"}`;
+  const result = mask_sensitive(input);
+  assert(result.includes('"TOKEN":"***"'), `double-quoted TOKEN should mask to "TOKEN":"***", got: ${result}`);
+  assert(result.includes('"TELEGRAM_BOT_TOKEN":"***"'), `double-quoted TELEGRAM_BOT_TOKEN masked, got: ${result}`);
+  assert(!result.includes(SECRET_VAL), `raw secret value '${SECRET_VAL}' MUST NOT appear in masked output`);
+  assert(!result.includes("bot-abc-123-xyz"), "raw TELEGRAM_BOT_TOKEN value MUST NOT appear in output");
+  assert(!result.includes("postgres://u:p@h/db"), "raw DATABASE_URL value MUST NOT appear in output");
+});
+
+run("MASK_SENSITIVE#3: single-quoted 'KEY':'value' style masked correctly", () => {
+  const SECRET_VAL = "secret1234567890abcdef";
+  const input = `{'TOKEN':'${SECRET_VAL}', 'SECRET':'my-single-quote-secret-98765'}`;
+  const result = mask_sensitive(input);
+  assert(result.includes("'TOKEN':'***'"), `single-quoted TOKEN should mask to 'TOKEN':'***', got: ${result}`);
+  assert(result.includes("'SECRET':'***'"), `single-quoted SECRET should mask to 'SECRET':'***', got: ${result}`);
+  assert(!result.includes(SECRET_VAL), `raw secret value '${SECRET_VAL}' MUST NOT appear in masked output`);
+  assert(!result.includes("my-single-quote-secret-98765"), "raw single-quoted secret MUST NOT appear in output");
+});
+
+run("MASK_SENSITIVE#4: mixed styles in same string all masked", () => {
+  const raw1 = "unquoted_secret_val_12345";
+  const raw2 = "double_quoted_secret_val_67890";
+  const raw3 = "single_quoted_secret_val_abcde";
+  const input = `config: KEY=${raw1}, JSON: "DATABASE_URL_UNPOOLED":"${raw2}", shell: 'CONTAINER_INGEST_TOKEN':'${raw3}'`;
+  const result = mask_sensitive(input);
+  assert(!result.includes(raw1), `raw1 '${raw1}' MUST be masked away`);
+  assert(!result.includes(raw2), `raw2 '${raw2}' MUST be masked away`);
+  assert(!result.includes(raw3), `raw3 '${raw3}' MUST be masked away`);
+  assert(result.includes("KEY=***"), "unquoted KEY=*** present");
+  assert(result.includes('"DATABASE_URL_UNPOOLED":"***"'), 'double-quoted DATABASE_URL_UNPOOLED="***" present');
+  assert(result.includes("'CONTAINER_INGEST_TOKEN':'***'"), "single-quoted CONTAINER_INGEST_TOKEN='***' present");
 });
 
 run("CLOSEOUT#4: make_telegram_event_id deterministic format + 5-min bucket floored", () => {

@@ -83,20 +83,29 @@ function now_iso(): string {
   return new Date().toISOString();
 }
 
-function mask_sensitive(input: string): string {
+export function mask_sensitive(input: string): string {
   let s = String(input);
   s = s.replace(/postgres(?:ql)?:\/\/[^\s"'<>]+/gi, "postgres://***:***@***:***/***");
-  const kvs = [
+  const kvs: Array<string> = [
     "DATABASE_URL", "DATABASE_URL_UNPOOLED",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
     "CONTAINER_INGEST_TOKEN", "PASAY_CONTAINER_INGEST_TOKEN",
     "TOKEN", "SECRET", "KEY",
-  ];
+  ].sort((a, b) => b.length - a.length);
+  const kvUpper = new Set(kvs.map((k) => k.toUpperCase()));
   for (const k of kvs) {
-    const re = new RegExp(`(${k})\\s*[:=]\\s*[^\s"'&,;]+`, "gi");
-    s = s.replace(re, (_m, key) => `${key}=***`);
+    const re = new RegExp(
+      `(${k})(["']?)\\s*[:=]\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'&,;]+))`,
+      "gi",
+    );
+    s = s.replace(re, (_m, key, qKey, dqVal, sqVal, uqVal) => {
+      if (dqVal !== undefined) return `${key}${qKey}:"***"`;
+      if (sqVal !== undefined) return `${key}${qKey}:'***'`;
+      return `${key}${qKey}=***`;
+    });
   }
   s = s.replace(/[a-zA-Z0-9_\-]{20,}/g, (m) => {
+    if (kvUpper.has(m.toUpperCase())) return m;
     if (/^[0-9a-fA-F-]{8,}$/.test(m) || m.includes(":")) return m;
     return `${m.slice(0, 4)}***${m.slice(-4)}`;
   });

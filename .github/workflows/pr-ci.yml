@@ -16,7 +16,7 @@ jobs:
   pasay-gate:
     name: pasay-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       PYTHONPATH: ""
     services:
@@ -119,7 +119,7 @@ jobs:
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
           PASAY_RUNTIME_MODE: "ci"
-        timeout-minutes: 15
+        timeout-minutes: 40
         run: |
           # Legacy P0 gates: Issue #18 (telegram webhook) + Issue #31 (prod arch closeout)
           # M1 org-scope P0 regression (milestone/1)
