@@ -6,8 +6,9 @@ context builder so both always use the same counting semantics.
 - Snoozed tasks count toward ``pending_total`` but are skipped from the
   overdue / due buckets while ``snoozed_until`` is in the future.
 - Organization scope (``org_id``): non-agent callers only see tasks linked
-  to the caller's organization via property / lease / tenant 3-channel OR,
-  following the canonical ``_scoped_task_query`` pattern in operations.py.
+  to the caller's organization via property / lease / tenant / org-details
+  4-channel OR, following the canonical ``_scoped_task_query`` pattern in
+  operations.py.
 """
 from __future__ import annotations
 
@@ -22,39 +23,23 @@ from app.models.property import Property, Unit
 from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.schemas.operations import OperationsSummary
+from app.services.organization_scope import (
+    org_lease_ids as _canonical_org_lease_ids,
+    org_property_ids as _canonical_org_property_ids,
+    org_tenant_ids as _canonical_org_tenant_ids,
+)
 
 
 def _org_property_ids(db: Session, org_id: int) -> set[int]:
-    rows = db.execute(
-        select(Property.id).where(
-            Property.organization_id == org_id,
-            Property.deleted_at.is_(None),
-        )
-    ).all()
-    return {r[0] for r in rows}
+    return _canonical_org_property_ids(db, org_id)
 
 
 def _org_lease_ids(db: Session, org_id: int) -> set[int]:
-    rows = db.execute(
-        select(Lease.id)
-        .join(Unit, Unit.id == Lease.unit_id)
-        .join(Property, Property.id == Unit.property_id)
-        .where(
-            Property.organization_id == org_id,
-            Lease.deleted_at.is_(None),
-        )
-    ).all()
-    return {r[0] for r in rows}
+    return _canonical_org_lease_ids(db, org_id)
 
 
 def _org_tenant_ids(db: Session, org_id: int) -> set[int]:
-    rows = db.execute(
-        select(Tenant.id).where(
-            Tenant.organization_id == org_id,
-            Tenant.deleted_at.is_(None),
-        )
-    ).all()
-    return {r[0] for r in rows}
+    return _canonical_org_tenant_ids(db, org_id)
 
 
 def _scoped_task_query(db: Session, org_id: int):
@@ -72,8 +57,6 @@ def _scoped_task_query(db: Session, org_id: int):
     or_terms.append(
         OperationalTask.details.op("->>")("organization_id").cast(Integer) == org_id
     )
-    if not or_terms:
-        return OperationalTask.id == -1
     return or_(*or_terms)
 
 
@@ -95,6 +78,8 @@ def build_operations_summary(
     )
     if user.role == UserRole.agent:
         query = query.filter(OperationalTask.assigned_user_id == user.id)
+        if org_id is not None:
+            query = query.filter(_scoped_task_query(db, org_id))
     elif org_id is not None:
         query = query.filter(_scoped_task_query(db, org_id))
     tasks = query.all()

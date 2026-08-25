@@ -136,7 +136,22 @@ def test_summary_excludes_other_organization_tasks(
     resp_a = client.get(f"{API}/operations/summary", headers=_h(owner_a[1]))
     assert resp_a.status_code == 200, resp_a.text
     summary_a = resp_a.json()
-    assert summary_a["overdue"] >= 1, (summary_a, "org-a own overdue task must be counted")
+    assert summary_a["overdue"] == 1, (
+        summary_a,
+        "exactly 1 org-a overdue task must be counted; a count>1 would indicate "
+        "cross-organization leak of org-B's RENT_OVERDUE task",
+    )
+    assert summary_a["pending_total"] == 1, (
+        summary_a, "total pending must be exactly the single org-A task (fail-closed: prevent leak)"
+    )
+    assert summary_a["due_today"] == 0
+    assert summary_a["due_7_days"] == 0
+
+    resp_b = client.get(f"{API}/operations/summary", headers=_h(owner_b[1]))
+    assert resp_b.status_code == 200, resp_b.text
+    summary_b = resp_b.json()
+    assert summary_b["overdue"] == 1, (summary_b, "org-B must see exactly its own 1 overdue task")
+    assert summary_b["pending_total"] == 1, (summary_b, "org-B total pending must be exactly 1 (no org-A leak)")
 
     raw_resp = client.get(
         f"{API}/reports/tasks?overdue=true",

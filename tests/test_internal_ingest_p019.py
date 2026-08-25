@@ -377,6 +377,7 @@ def test_internal_ingest_concurrent_update_id_still_1_row(db_session, test_engin
 
     try:
         db_url = str(test_engine.url)
+        tc = TestClient(app, raise_server_exceptions=False)
 
         def _worker() -> tuple[int, dict[str, Any] | None, str | None]:
             t_engine = create_engine(db_url, poolclass=NullPool)
@@ -392,24 +393,23 @@ def test_internal_ingest_concurrent_update_id_still_1_row(db_session, test_engin
                 )
                 _tls.db_session = t_sess
                 try:
-                    with TestClient(app, raise_server_exceptions=False) as tc:
-                        envl = _telegram_envelope(update_id, chat_id=chat_id, text=text)
-                        start_barrier.wait(timeout=20)
-                        resp = tc.post(INGEST_PATH, json=envl, headers=headers)
-                        status = resp.status_code
-                        body: dict[str, Any] | None = None
-                        err_text: str | None = None
-                        ct = resp.headers.get("content-type", "")
-                        if ct.lower().startswith("application/json"):
-                            try:
-                                body = resp.json()
-                            except Exception as exc:  # noqa: BLE001
-                                err_text = f"json_parse_error:{type(exc).__name__}: {resp.text[:200]}"
-                        else:
-                            err_text = resp.text[:300]
-                        with mu:
-                            responses.append((status, body, err_text))
-                        return status, body, err_text
+                    envl = _telegram_envelope(update_id, chat_id=chat_id, text=text)
+                    start_barrier.wait(timeout=20)
+                    resp = tc.post(INGEST_PATH, json=envl, headers=headers)
+                    status = resp.status_code
+                    body: dict[str, Any] | None = None
+                    err_text: str | None = None
+                    ct = resp.headers.get("content-type", "")
+                    if ct.lower().startswith("application/json"):
+                        try:
+                            body = resp.json()
+                        except Exception as exc:  # noqa: BLE001
+                            err_text = f"json_parse_error:{type(exc).__name__}: {resp.text[:200]}"
+                    else:
+                        err_text = resp.text[:300]
+                    with mu:
+                        responses.append((status, body, err_text))
+                    return status, body, err_text
                 finally:
                     try:
                         delattr(_tls, "db_session")
@@ -432,6 +432,10 @@ def test_internal_ingest_concurrent_update_id_still_1_row(db_session, test_engin
             _ = f1.result(timeout=10)
             _ = f2.result(timeout=10)
     finally:
+        try:
+            tc.close()
+        except Exception:
+            pass
         if prev_override is None:
             app.dependency_overrides.pop(_orig_get_db, None)
         else:

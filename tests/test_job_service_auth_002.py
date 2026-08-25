@@ -497,11 +497,11 @@ def _system_reader_trusted_override(trusted_org_id: int | None):
             )
             .one()
         )
+        if trusted_org_id is not None:
+            scheduler_credential.trusted_organization_id = trusted_org_id
         reader = SystemReader(
             principal=scheduler_principal, credential=scheduler_credential
         )
-        if trusted_org_id is not None:
-            scheduler_credential.trusted_organization_id = trusted_org_id
         return reader
 
     return _override
@@ -552,16 +552,29 @@ def test_system_reader_single_active_membership_exposes_only_that_org(
     resp = client.get(f"{API}/operations/digest", headers=headers)
     assert resp.status_code == 200, resp.text
     digest = resp.json()
-    visible_names = " ".join(
-        (r.get("name") or r.get("property_code") or r.get("title") or "")
-        for section in ("act_now", "upcoming", "done_today")
-        if section in digest and isinstance(digest[section], list)
-        for r in digest[section]
-        if isinstance(r, dict)
+    raw_resp = resp.text or ""
+
+    assert "BANNED" not in raw_resp, (raw_resp[:2000], "Banned org property code must never appear in SYSTEM reader digest")
+    assert "Banned org task must not leak" not in raw_resp, (raw_resp[:2000], "Banned task title must not leak in digest")
+    assert "Banned-Org" not in raw_resp, (raw_resp[:2000], "Banned org name must not leak")
+
+    for key in ("act_now", "upcoming", "done_today", "counts", "hidden", "pending", "recently_completed", "in_progress"):
+        assert key in digest, (key, digest.keys(), "SYSTEM digest schema must expose the standard 8 keys")
+
+    counts = digest.get("counts") or {}
+    hidden = digest.get("hidden") or {}
+    assert isinstance(counts, dict) and set(counts.keys()) >= {"act_now", "upcoming", "done_today"}, (
+        f"counts sub-object must cover act_now/upcoming/done_today; got {counts!r}"
     )
-    assert "SOLE" in visible_names or "Sole org task" in visible_names or visible_names == "" or True, visible_names
-    assert "BANNED" not in visible_names, (visible_names, "Banned org data must never appear for SYSTEM reader scoped to Sole-Org")
-    assert "Banned org task" not in visible_names, (visible_names, "Banned task title must not leak")
+    assert isinstance(hidden, dict) and set(hidden.keys()) >= {"act_now", "upcoming", "done_today"}, (
+        f"hidden sub-object must cover act_now/upcoming/done_today; got {hidden!r}"
+    )
+
+    assert all(isinstance(digest[k], list) for k in ("act_now", "upcoming", "done_today")), digest
+    for row in digest["act_now"] + digest["upcoming"] + digest["done_today"]:
+        assert isinstance(row, dict), (row, "digest rows must be dicts")
+        bad = [k for k in ("Banned", "BANNED", "ban_") if any(str(v).find(k) != -1 for v in row.values() if isinstance(v, str))]
+        assert not bad, (bad, row, "Banned-* string leaked into a digest row")
 
 
 @pytest.mark.parametrize("insert_b_first", [False, True])
@@ -626,11 +639,6 @@ def test_system_reader_two_active_memberships_with_trusted_context_sees_only_tar
     other_org_id = org_b.id if target_is_a else org_a.id
     override = _system_reader_trusted_override(target_org_id)
     try:
-        app.dependency_overrides[
-            "app.api.deps.get_operations_reader"
-        ] = override
-        # FastAPI overrides are keyed by the original callable; the key above is
-        # only a hint; we MUST also override via get_operations_reader symbol.
         from app.api import deps as _deps_mod
 
         app.dependency_overrides[_deps_mod.get_operations_reader] = override
@@ -688,6 +696,3 @@ def test_system_reader_two_active_memberships_with_trusted_context_sees_only_tar
         from app.api import deps as _deps_mod
 
         app.dependency_overrides.pop(_deps_mod.get_operations_reader, None)
-        app.dependency_overrides.pop(
-            "app.api.deps.get_operations_reader", None
-        )

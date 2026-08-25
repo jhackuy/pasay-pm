@@ -32,24 +32,36 @@ def _run_conftest_guard_env(env_overrides: dict) -> tuple[int, str, str]:
     env.pop("PASAY_TEST_DB_NAME", None)
     env.pop("DATABASE_URL", None)
     env.update(env_overrides)
+    src_text = CONFTEST_PATH.read_text(encoding="utf-8")
+    marker = '@pytest.fixture(scope="session")'
+    try:
+        cut = src_text.index(marker)
+    except ValueError as exc:
+        raise AssertionError(
+            f"Cannot locate source cut marker {marker!r} in conftest.py; "
+            "harness must be updated to match conftest structure."
+        ) from exc
+    conftest_path_escaped = str(CONFTEST_PATH).replace("\\", "\\\\")
+    guard_src_repr = repr(src_text[:cut])
     code = (
         "import importlib.util, sys, os\n"
-        "spec = importlib.util.spec_from_file_location("
-        "'_conftest_guard', r'%s')\n"
+        "GUARD_EXIT_MARKER = 'RETP_TEST_GUARD_RAN_TO_END'\n"
+        "spec = importlib.util.spec_from_file_location(\n"
+        f"    '_conftest_guard', r'{conftest_path_escaped}')\n"
         "mod = importlib.util.module_from_spec(spec)\n"
-        # We cannot exec the *entire* conftest.py unconditionally because it
-        # pulls in app.main / SQLA / etc. which need a real DB driver. Instead
-        # we execute ONLY the guard prefix (lines 1..~75) — the portion that
-        # defines _ALLOWED_TEST_DB_PREFIX_RE / _test_db_allowed() and raises
-        # SystemExit. We read the source and exec until right before
-        # test_engine() is defined.
-        "src = open(spec.origin, encoding='utf-8').read()\n"
-        "cut = src.index('@pytest.fixture(scope=\"session\")')\n"
-        "exec(compile(src[:cut], spec.origin, 'exec'), mod.__dict__)\n"
-        "print('GUARD_OK', mod._test_db_allowed("
-        "os.getenv('PASAY_TEST_DB_NAME', ''), "
-        "os.getenv('_CFG_DB', 'postgres_live')))\n"
-    ) % str(CONFTEST_PATH).replace("\\", "\\\\")
+        f"src = {guard_src_repr}\n"
+        "exec(compile(src, spec.origin, 'exec'), mod.__dict__)\n"
+        "try:\n"
+        "    result = mod._test_db_allowed(\n"
+        "        os.getenv('PASAY_TEST_DB_NAME', ''),\n"
+        "        os.getenv('_CFG_DB', 'postgres_live'))\n"
+        "    print('GUARD_OK', result)\n"
+        "except SystemExit as exc:\n"
+        "    msg = exc.code if isinstance(exc.code, str) else str(exc.code)\n"
+        "    print('GUARD_SYSEXIT', msg, file=sys.stderr)\n"
+        "    raise\n"
+        "print(GUARD_EXIT_MARKER)\n"
+    )
     proc = subprocess.run(
         [sys.executable, "-c", code],
         env=env,
@@ -60,7 +72,35 @@ def _run_conftest_guard_env(env_overrides: dict) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+_CUT_NOT_FOUND_EXIT = 97
+
+
 class TestDbGuardFullMatch:
+    def _assert_refusal(self, rc: int, out: str, err: str, *, name_hint: str):
+        combined = out + "\n" + err
+        assert rc != 0 and rc != _CUT_NOT_FOUND_EXIT, (
+            f"Expected guard to REFUSE {name_hint!r} with a real non-zero exit, "
+            f"got rc={rc}. Harness bug if rc={_CUT_NOT_FOUND_EXIT}.\n"
+            f"STDOUT={out!r}\nSTDERR={err!r}"
+        )
+        assert "GUARD_OK" not in out, (
+            f"Guard must NOT print GUARD_OK when {name_hint!r} is refused "
+            "(i.e. SystemExit or ValueError must fire before the result print)."
+        )
+        has_refusal_text = (
+            "REFUSED" in combined
+            or "SystemExit" in combined
+            or "GUARD_SYSEXIT" in err
+            or "not in allowed" in combined
+            or "fail-closed guard" in combined
+            or "ValueError" in combined
+        )
+        assert has_refusal_text, (
+            f"Refusal for {name_hint!r} must produce diagnostic text mentioning "
+            f"REFUSED / SystemExit / GUARD_SYSEXIT / the guard error. "
+            f"rc={rc}, output={combined!r}"
+        )
+
     def test_production_pasay_refused(self):
         """'production_pasay' only *contains* the token 'pasay' as a substring
         — it is not an approved test-database full name. The guard MUST raise
@@ -71,19 +111,7 @@ class TestDbGuardFullMatch:
             "DATABASE_URL": "postgresql+psycopg2://u:p@h:5432/postgres_live",
             "_CFG_DB": "postgres_live",
         })
-        assert rc != 0, (
-            f"Expected guard to REFUSE 'production_pasay' and exit non-zero, "
-            f"got rc=0.\nSTDOUT={out!r}\nSTDERR={err!r}"
-        )
-        combined = out + "\n" + err
-        assert "REFUSED" in combined or "SystemExit" in combined or rc == 1, (
-            f"Guard refusal for 'production_pasay' must mention REFUSED or "
-            f"exit via SystemExit. Got rc={rc}, output={combined!r}"
-        )
-        assert "GUARD_OK" not in out, (
-            "Guard must NOT print GUARD_OK when name is refused "
-            "(i.e. SystemExit fires before the print)."
-        )
+        self._assert_refusal(rc, out, err, name_hint="production_pasay")
 
     def test_test_pasay_xyz_allowed(self):
         """'test_pasay_xyz' matches the approved full pattern
@@ -98,9 +126,14 @@ class TestDbGuardFullMatch:
             f"Expected guard to ALLOW 'test_pasay_xyz' (rc=0), got rc={rc}.\n"
             f"STDOUT={out!r}\nSTDERR={err!r}"
         )
+        assert rc != _CUT_NOT_FOUND_EXIT, f"Harness bug: cut marker missing, rc={_CUT_NOT_FOUND_EXIT}"
         assert "GUARD_OK True" in out, (
             f"_test_db_allowed('test_pasay_xyz', …) must return True. "
             f"STDOUT={out!r}"
+        )
+        assert "RETP_TEST_GUARD_RAN_TO_END" in out, (
+            "Harness must reach the end-of-code sentinel so we know the result "
+            f"wasn't produced by a broken harness. STDOUT={out!r}"
         )
 
     def test_pasay_pm_without_family_suffix_refused(self):
@@ -113,10 +146,7 @@ class TestDbGuardFullMatch:
             "DATABASE_URL": "postgresql+psycopg2://u:p@h:5432/postgres_live",
             "_CFG_DB": "postgres_live",
         })
-        assert rc != 0, (
-            f"Expected guard to REFUSE literal 'pasay_pm' (forbidden list), "
-            f"got rc=0.\nSTDERR={err!r}"
-        )
+        self._assert_refusal(rc, out, err, name_hint="pasay_pm")
 
     def test_approved_pasay_pm_style_allowed(self):
         """Names matching 'pasay_pm_<family-suffix>_<tail>' (the original
@@ -131,7 +161,9 @@ class TestDbGuardFullMatch:
             f"Expected guard to ALLOW 'pasay_pm_test_xyz' (rc=0), "
             f"got rc={rc}.\nSTDERR={err!r}"
         )
+        assert rc != _CUT_NOT_FOUND_EXIT
         assert "GUARD_OK True" in out
+        assert "RETP_TEST_GUARD_RAN_TO_END" in out
 
     def test_same_as_configured_live_db_refused(self):
         """Even if the name *would* match the test pattern, when it equals
@@ -143,8 +175,4 @@ class TestDbGuardFullMatch:
             "DATABASE_URL": "postgresql+psycopg2://u:p@h:5432/test_pasay_xyz",
             "_CFG_DB": "test_pasay_xyz",
         })
-        assert rc != 0, (
-            "Expected guard to REFUSE when PASAY_TEST_DB_NAME equals the "
-            "configured live DB name, even if it looks like a test pattern. "
-            f"Got rc=0.\nSTDERR={err!r}"
-        )
+        self._assert_refusal(rc, out, err, name_hint="same-as-live test_pasay_xyz")

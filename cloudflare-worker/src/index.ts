@@ -106,8 +106,9 @@ export function mask_sensitive(input: string): string {
   }
   s = s.replace(/[a-zA-Z0-9_\-]{20,}/g, (m) => {
     if (kvUpper.has(m.toUpperCase())) return m;
-    if (/^[0-9a-fA-F-]{8,}$/.test(m) || m.includes(":")) return m;
-    return `${m.slice(0, 4)}***${m.slice(-4)}`;
+    if (m.includes(":")) return m;
+    if (/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(m)) return m;
+    return "***";
   });
   return s;
 }

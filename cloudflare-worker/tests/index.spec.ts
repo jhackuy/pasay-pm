@@ -658,6 +658,33 @@ run("MASK_SENSITIVE#4: mixed styles in same string all masked", () => {
   assert(result.includes("'CONTAINER_INGEST_TOKEN':'***'"), "single-quoted CONTAINER_INGEST_TOKEN='***' present");
 });
 
+run("MASK_SENSITIVE#5: bare hex tokens (20+ chars, no label, non-UUID shape) masked to *** while canonical UUIDs stay intact", () => {
+  const HEX32 = "0123456789abcdef0123456789abcdef";          // 32 chars – bare hex API key
+  const HEX40 = "deadbeefcafebabec0ffeef00dfeedc0cdeadd0d";    // 40 chars – SHA-1-like token
+  const HEX64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  const LEGAL_UUID = "123e4567-e89b-12d3-a456-426614174000";
+  const ANOTHER_UUID = "F47AC10B-58CC-4372-A567-0E02B2C3D479"; // uppercase is also a legal UUID shape
+  const LEGAL_TIMESTAMP = "2026-08-17T12:34:56.789Z";           // contains ":" so kept per the "timestamp/ratio" guard
+  const SHORT_HEX = "abcd1234ef";                              // 10 chars, below 20 threshold kept unchanged
+  const input = [
+    `token=${HEX32}`,
+    `trace=${LEGAL_UUID}`,
+    `sig=${HEX40}`,
+    `req=${ANOTHER_UUID}`,
+    `longkey=${HEX64}`,
+    `created:${LEGAL_TIMESTAMP}`,
+    `short=${SHORT_HEX}`,
+  ].join(" | ");
+  const out = mask_sensitive(input);
+  assert(!out.includes(HEX32), `bare 32-char hex token must be masked: ${HEX32.slice(0, 8)}… in:\n${out}`);
+  assert(!out.includes(HEX40), `bare 40-char hex token must be masked: ${HEX40.slice(0, 8)}… in:\n${out}`);
+  assert(!out.includes(HEX64), `bare 64-char hex token must be masked: ${HEX64.slice(0, 8)}… in:\n${out}`);
+  assert(out.includes(LEGAL_UUID), `canonical hyphenated UUID ${LEGAL_UUID} must NOT be masked (trace IDs must survive)\n${out}`);
+  assert(out.includes(ANOTHER_UUID), `uppercase canonical UUID ${ANOTHER_UUID} must NOT be masked\n${out}`);
+  assert(out.includes(LEGAL_TIMESTAMP), `colon-including timestamp ${LEGAL_TIMESTAMP} must NOT be masked (kept via includes-colon guard)\n${out}`);
+  assert(out.includes(SHORT_HEX), `sub-20-char hex fragment ${SHORT_HEX} must NOT be masked\n${out}`);
+});
+
 run("CLOSEOUT#4: make_telegram_event_id deterministic format + 5-min bucket floored", () => {
   assert_eq(make_telegram_event_id(123), "tg:123", "make_telegram_event_id(123) == tg:123");
   assert_eq(make_telegram_event_id(0), "tg:0", "make_telegram_event_id(0) still formats (0 is invalid but helper is pure)");

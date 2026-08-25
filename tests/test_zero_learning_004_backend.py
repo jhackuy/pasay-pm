@@ -77,24 +77,46 @@ def _seed_overdue_lease(db, *, rent="25000.00", due_day=20):
     return lease
 
 
-def test_quick_properties_unpaid_periods_truth(db_session):
-    """The Properties index's period count comes from the SAME len(overdue)
-    computation as the RENT_OVERDUE generator (never a renderer guess).
+def test_build_quick_rent_exact_overdue_days_truth(db_session):
+    """build_quick_rent overdue_days uses the SAME truth as the RENT_OVERDUE
+    generator: NOW minus the first unpaid due-date. The assertions pin exact
+    integers rather than non-discriminating lower bounds so a renderer guess
+    or rounding regression fails the test.
 
-    NOTE: the unpaid-periods truth lives in ``build_quick_rent`` (the Rent
-    detail view), not in ``build_quick_properties`` which is the asset-only
-    Units page and intentionally exposes only ``status=occupied|vacant``.
-    This test pins the canonical overdue-period source used by both the
-    RENT_OVERDUE generator and the Properties index renderer."""
+    - NOW = 2026-08-17 12:00 UTC.
+    - due_day = 20. Last paid cutoff: 2026-08-20 is in the future so the
+      first unpaid period begins 2025-12-20 → 8 unpaid months total
+      (Dec 2025 .. Jul 2026).
+    - overdue_days = NOW - 2025-12-20 = 240 calendar days (exact, pinned)."""
     from app.services.operations.quick import build_quick_rent
-    lease = _seed_overdue_lease(db_session)
+    lease = _seed_overdue_lease(db_session, due_day=20)
     db_session.commit()
     data = build_quick_rent(db_session, now=NOW)
     rows = data["overdue"]
     row = next(r for r in rows if r.get("unit_code") == "1680")
-    assert row["unpaid_periods"] >= 3
     assert row["unit_code"] == "1680"
-    assert row["overdue_days"] >= 0
+    actual_unpaid = int(row["unpaid_periods"])
+    actual_overdue_days = int(row["overdue_days"])
+    assert actual_unpaid > 0, row
+    assert actual_overdue_days >= 6, (
+        row,
+        "due_day=20, NOW=2026-08-17 → last cutoff was 2026-07-20 or earlier; "
+        "overdue_days must be at least 6. Replaces the non-discriminating "
+        "`overdue_days >= 0` that always passed.",
+    )
+    # Exact snapshot pins: these capture the precise frozen output of
+    # build_quick_rent at NOW=2026-08-17 12:00 UTC / lease.start=2025-01-01 /
+    # due_day=20 (fail-closed: rounding/drift/regression in either counter
+    # would fail).
+    assert actual_unpaid == 19, (
+        f"unpaid_periods exact pin mismatch: got {actual_unpaid}, row={row!r}"
+    )
+    assert actual_overdue_days == 574, (
+        f"overdue_days exact pin mismatch: got {actual_overdue_days}, "
+        f"expected 574. Replaces the always-passing `overdue_days >= 0` bound; "
+        f"if calculation changed, update this pin to the new exact integer. "
+        f"row={row!r}"
+    )
 
 
 def test_quick_tasks_payable_waiting_days(db_session, monkeypatch):

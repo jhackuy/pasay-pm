@@ -262,7 +262,10 @@ def test_quick_properties_open_maintenance_chip(client, db_session, admin_header
     asset_keys = {"unit_code", "property_name", "status", "tenant_name"}
     assert asset_keys.issubset(set(row.keys())), row.keys()
     assert row["status"] == "occupied"
-    # open_maintenance is intentionally absent from the asset grid.
+    assert "open_maintenance" not in row, (
+        "open_maintenance workload chip must be absent from the identity-only asset grid "
+        "(it is driven by /operations/summary, not duplicated on this endpoint)"
+    )
 
 
 def test_quick_rent_and_expense_shapes(client, db_session, admin_headers):

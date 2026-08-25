@@ -43,7 +43,7 @@ node_modules/
 
 # PASAY-BACKEND-FINAL-CLOSEOUT-001-PHASE-2: local diagnostic / apply scripts + artifacts are
 # local execution evidence, never part of the authoritative repository.
-_*.py
+/_*.py
 artifacts_*/
 artifacts_*.log
 artifacts_*.xml
