@@ -43,12 +43,12 @@ jobs:
           --health-retries=5
 
     steps:
-      - name: DOOR-00 Preflight — checkout and basic invariants
+      - name: DOOR-00 Preflight �?checkout and basic invariants
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: DOOR-00 Preflight — verify freeze contract files exist
+      - name: DOOR-00 Preflight �?verify freeze contract files exist
         run: |
           set -euo pipefail
           test -f AGENTS.md
@@ -117,7 +117,7 @@ jobs:
 
       - name: DOOR-04/05/06 Start container with fake secrets, entrypoint alembic re-run, uvicorn health
         env:
-          FREEZE_CONTAINER_NAME: "pasay-freeze-${GITHUB_RUN_ID}"
+          FREEZE_CONTAINER_NAME: "pasay-freeze-${{ github.run_id }}"
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
           FAKE_DB_URL: "postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${{ env.FREEZE_GATE_DB }}"
           FAKE_DB_UNPOOLED_URL: "postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${{ env.FREEZE_GATE_DB }}"
@@ -191,7 +191,7 @@ jobs:
           if [ "$CODE" != "200" ]; then echo "FAIL: expected 200 got $CODE"; cat artifacts/doors/door_07_health.json; exit 1; fi
           echo "BACKEND_FREEZE_GATE__DOOR_07_OK=1" >> $GITHUB_ENV
 
-      - name: DOOR-08 POST /internal/ingest == 401 (no container_ingest_token → fail closed)
+      - name: DOOR-08 POST /internal/ingest == 401 (no container_ingest_token �?fail closed)
         run: |
           set -euo pipefail
           mkdir -p artifacts/doors
@@ -217,7 +217,7 @@ jobs:
       - name: Cleanup container (after DOOR-07/08)
         if: always()
         run: |
-          docker rm -f "pasay-freeze-${GITHUB_RUN_ID}" 2>/dev/null || true
+          docker rm -f "${FREEZE_CONTAINER_NAME}" 2>/dev/null || true
           # leave image for DOOR-03 artifact upload
 
       - name: Set up Node.js 22 (Cloudflare Worker TS gate)
@@ -274,7 +274,7 @@ jobs:
           if [ "$EXIT" != "0" ]; then
             echo "INFO: wrangler deploy --dry-run returned non-zero (EXIT=$EXIT); treating as STOP because runner physical infeasible"
             echo "INFO: artifacts/worker/door_12_wrangler_dry.log for full output"
-            # Phase 2 instruction: "Runner 不行立即 STOP 不降级"
+            # Phase 2 instruction: "Runner 不行立即 STOP 不降�?
             exit 0
           fi
           echo "BACKEND_FREEZE_GATE__DOOR_12_OK=1" >> $GITHUB_ENV
@@ -308,7 +308,7 @@ jobs:
               MISSING="${MISSING} DOOR-${d}"
             fi
           done
-          # DOOR-12 is allowed to be physically infeasible on runner (Phase 2 instruction) — check only that it didn't real-deploy
+          # DOOR-12 is allowed to be physically infeasible on runner (Phase 2 instruction) �?check only that it didn't real-deploy
           if [ -n "${MISSING}" ]; then
             echo "FAIL CLOSED: missing doors${MISSING}"
             exit 1
@@ -335,4 +335,4 @@ jobs:
     timeout-minutes: 1
     steps:
       - name: Freeze gate done
-        run: echo "backend-freeze-gate completed — see backend-freeze-gate artifacts for 13 doors"
+        run: echo "backend-freeze-gate completed �?see backend-freeze-gate artifacts for 13 doors"
