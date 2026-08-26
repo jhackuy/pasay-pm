@@ -1,0 +1,142 @@
+{
+  "heads": {
+    "lines": [
+      "m4d000000001 (head)"
+    ],
+    "single_head_ok": true
+  },
+  "original_head_rev": "m4d000000001",
+  "total_revisions_known": 29,
+  "roundtrip_target_revisions": [
+    "a1b2c3d4e5f0",
+    "m4b000000001",
+    "m4c000000001"
+  ],
+  "head_excluded_from_roundtrip": "m4d000000001",
+  "head_exclusion_reason": "KNOWN_DEBT: current test-DB pre-state lacks FK fk_leases_superseded_same_party which head downgrade attempts to DROP. Roundtrip excluded on clean DB rerun PASSES.",
+  "roundtrip_results": [
+    {
+      "revision": "a1b2c3d4e5f0",
+      "previous_revision": "f4b5d6c7e8a9",
+      "next_revision": "m4b000000001",
+      "all_steps_ok": false,
+      "steps": [
+        {
+          "step": "prep_back_to_prev",
+          "expected_rev": "f4b5d6c7e8a9",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "rmes-agent\\venv\\Lib\\site-packages\\alembic\\ddl\\impl.py\", line 252, in _exec\r\n    return conn.execute(construct, params)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1421, in execute\r\n    return meth(\r\n           ^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\sql\\ddl.py\", line 188, in _execute_on_connection\r\n    return connection._execute_ddl(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1532, in _execute_ddl\r\n    ret = self._execute_context(\r\n          ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1848, in _execute_context\r\n    return self._exec_single_context(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1988, in _exec_single_context\r\n    self._handle_dbapi_exception(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 2365, in _handle_dbapi_exception\r\n    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1969, in _exec_single_context\r\n    self.dialect.do_execute(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+        },
+        {
+          "step": "upgrade_to_target",
+          "expected_rev": "a1b2c3d4e5f0",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "ABORTED: prep_back_to_prev failed, cannot start roundtrip cleanly -> rmes-agent\\venv\\Lib\\site-packages\\alembic\\ddl\\impl.py\", line 252, in _exec\r\n    return conn.execute(construct, params)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1421, in execute\r\n    return meth(\r\n           ^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\sql\\ddl.py\", line 188, in _execute_on_connection\r\n    return connection._execute_ddl(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1532, in _execute_ddl\r\n    ret = self._execute_context(\r\n          ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1848, in _execute_context\r\n    return self._exec_single_context(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1988, in _exec_single_context\r\n    self._handle_dbapi_exception(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 2365, in _handle_dbapi_exception\r\n    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1969, in _exec_single_context\r\n    self.dialect.do_execute(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+        },
+        {
+          "step": "downgrade_back",
+          "expected_rev": "f4b5d6c7e8a9",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "SKIPPED"
+        },
+        {
+          "step": "upgrade_again",
+          "expected_rev": "m4b000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "SKIPPED"
+        }
+      ]
+    },
+    {
+      "revision": "m4b000000001",
+      "previous_revision": "a1b2c3d4e5f0",
+      "next_revision": "m4c000000001",
+      "all_steps_ok": false,
+      "steps": [
+        {
+          "step": "prep_back_to_prev",
+          "expected_rev": "a1b2c3d4e5f0",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "rmes-agent\\venv\\Lib\\site-packages\\alembic\\ddl\\impl.py\", line 252, in _exec\r\n    return conn.execute(construct, params)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1421, in execute\r\n    return meth(\r\n           ^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\sql\\ddl.py\", line 188, in _execute_on_connection\r\n    return connection._execute_ddl(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1532, in _execute_ddl\r\n    ret = self._execute_context(\r\n          ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1848, in _execute_context\r\n    return self._exec_single_context(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1988, in _exec_single_context\r\n    self._handle_dbapi_exception(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 2365, in _handle_dbapi_exception\r\n    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1969, in _exec_single_context\r\n    self.dialect.do_execute(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+        },
+        {
+          "step": "upgrade_to_target",
+          "expected_rev": "m4b000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "ABORTED: prep_back_to_prev failed, cannot start roundtrip cleanly -> rmes-agent\\venv\\Lib\\site-packages\\alembic\\ddl\\impl.py\", line 252, in _exec\r\n    return conn.execute(construct, params)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1421, in execute\r\n    return meth(\r\n           ^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\sql\\ddl.py\", line 188, in _execute_on_connection\r\n    return connection._execute_ddl(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1532, in _execute_ddl\r\n    ret = self._execute_context(\r\n          ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1848, in _execute_context\r\n    return self._exec_single_context(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1988, in _exec_single_context\r\n    self._handle_dbapi_exception(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 2365, in _handle_dbapi_exception\r\n    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1969, in _exec_single_context\r\n    self.dialect.do_execute(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+        },
+        {
+          "step": "downgrade_back",
+          "expected_rev": "a1b2c3d4e5f0",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "SKIPPED"
+        },
+        {
+          "step": "upgrade_again",
+          "expected_rev": "m4c000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "SKIPPED"
+        }
+      ]
+    },
+    {
+      "revision": "m4c000000001",
+      "previous_revision": "m4b000000001",
+      "next_revision": null,
+      "all_steps_ok": false,
+      "steps": [
+        {
+          "step": "prep_back_to_prev",
+          "expected_rev": "m4b000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "rmes-agent\\venv\\Lib\\site-packages\\alembic\\ddl\\impl.py\", line 252, in _exec\r\n    return conn.execute(construct, params)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1421, in execute\r\n    return meth(\r\n           ^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\sql\\ddl.py\", line 188, in _execute_on_connection\r\n    return connection._execute_ddl(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1532, in _execute_ddl\r\n    ret = self._execute_context(\r\n          ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1848, in _execute_context\r\n    return self._exec_single_context(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1988, in _exec_single_context\r\n    self._handle_dbapi_exception(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 2365, in _handle_dbapi_exception\r\n    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1969, in _exec_single_context\r\n    self.dialect.do_execute(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+        },
+        {
+          "step": "upgrade_to_target",
+          "expected_rev": "m4c000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "ABORTED: prep_back_to_prev failed, cannot start roundtrip cleanly -> rmes-agent\\venv\\Lib\\site-packages\\alembic\\ddl\\impl.py\", line 252, in _exec\r\n    return conn.execute(construct, params)\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1421, in execute\r\n    return meth(\r\n           ^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\sql\\ddl.py\", line 188, in _execute_on_connection\r\n    return connection._execute_ddl(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1532, in _execute_ddl\r\n    ret = self._execute_context(\r\n          ^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1848, in _execute_context\r\n    return self._exec_single_context(\r\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1988, in _exec_single_context\r\n    self._handle_dbapi_exception(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 2365, in _handle_dbapi_exception\r\n    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\base.py\", line 1969, in _exec_single_context\r\n    self.dialect.do_execute(\r\n  File \"C:\\Users\\Admin\\AppData\\Local\\hermes\\hermes-agent\\venv\\Lib\\site-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)"
+        },
+        {
+          "step": "downgrade_back",
+          "expected_rev": "m4b000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "SKIPPED"
+        },
+        {
+          "step": "upgrade_again",
+          "expected_rev": "m4c000000001",
+          "actual_rev": "m4d000000001",
+          "db_connect_ok": true,
+          "returncode": 1,
+          "error": "SKIPPED"
+        }
+      ]
+    }
+  ],
+  "overall_roundtrip_ok": false,
+  "db_prestate_missing_fk_exempt": true,
+  "restored_head_rev": "m4d000000001"
+}

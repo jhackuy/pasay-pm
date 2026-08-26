@@ -1,0 +1,121 @@
+{
+  "scan_root": "D:\\AI-Review\\pasay-pm",
+  "excluded_dirs": [
+    ".ai-control",
+    ".git",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".runtime",
+    ".tox",
+    ".trae",
+    ".venv",
+    ".vscode",
+    "__pycache__",
+    "_m005_artifacts",
+    "build",
+    "dist",
+    "env",
+    "node_modules",
+    "venv",
+    "worktrees"
+  ],
+  "target_tokens": [
+    "redis",
+    "kafka",
+    "celery",
+    "temporal",
+    "queue2",
+    "bot2"
+  ],
+  "hit_count": 13,
+  "files_count": 2,
+  "files": [
+    {
+      "path": "scripts/m005_handoff_template.py",
+      "hit_count": 12,
+      "matches": [
+        {
+          "line": 342,
+          "token": "redis",
+          "snippet": "\"  目标 tokens：Redis / Kafka / Celery / Temporal / Queue2 / Bot2）_\\n\""
+        },
+        {
+          "line": 342,
+          "token": "kafka",
+          "snippet": "\"  目标 tokens：Redis / Kafka / Celery / Temporal / Queue2 / Bot2）_\\n\""
+        },
+        {
+          "line": 342,
+          "token": "celery",
+          "snippet": "\"  目标 tokens：Redis / Kafka / Celery / Temporal / Queue2 / Bot2）_\\n\""
+        },
+        {
+          "line": 342,
+          "token": "temporal",
+          "snippet": "\"  目标 tokens：Redis / Kafka / Celery / Temporal / Queue2 / Bot2）_\\n\""
+        },
+        {
+          "line": 342,
+          "token": "queue2",
+          "snippet": "\"  目标 tokens：Redis / Kafka / Celery / Temporal / Queue2 / Bot2）_\\n\""
+        },
+        {
+          "line": 342,
+          "token": "bot2",
+          "snippet": "\"  目标 tokens：Redis / Kafka / Celery / Temporal / Queue2 / Bot2）_\\n\""
+        },
+        {
+          "line": 386,
+          "token": "redis",
+          "snippet": "\"- [ ] 依赖残留扫描：Redis/Kafka/Celery/Temporal/Queue2/Bot2 命中数 = 0\\n\""
+        },
+        {
+          "line": 386,
+          "token": "kafka",
+          "snippet": "\"- [ ] 依赖残留扫描：Redis/Kafka/Celery/Temporal/Queue2/Bot2 命中数 = 0\\n\""
+        },
+        {
+          "line": 386,
+          "token": "celery",
+          "snippet": "\"- [ ] 依赖残留扫描：Redis/Kafka/Celery/Temporal/Queue2/Bot2 命中数 = 0\\n\""
+        },
+        {
+          "line": 386,
+          "token": "temporal",
+          "snippet": "\"- [ ] 依赖残留扫描：Redis/Kafka/Celery/Temporal/Queue2/Bot2 命中数 = 0\\n\""
+        },
+        {
+          "line": 386,
+          "token": "queue2",
+          "snippet": "\"- [ ] 依赖残留扫描：Redis/Kafka/Celery/Temporal/Queue2/Bot2 命中数 = 0\\n\""
+        },
+        {
+          "line": 386,
+          "token": "bot2",
+          "snippet": "\"- [ ] 依赖残留扫描：Redis/Kafka/Celery/Temporal/Queue2/Bot2 命中数 = 0\\n\""
+        }
+      ]
+    },
+    {
+      "path": "app/services/onboarding.py",
+      "hit_count": 1,
+      "matches": [
+        {
+          "line": 26,
+          "token": "redis",
+          "snippet": "- NO Redis / queue / extra services."
+        }
+      ]
+    }
+  ],
+  "summary_per_token": {
+    "redis": 3,
+    "kafka": 2,
+    "celery": 2,
+    "temporal": 2,
+    "queue2": 2,
+    "bot2": 2
+  }
+}

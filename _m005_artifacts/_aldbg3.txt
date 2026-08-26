@@ -1,0 +1,18 @@
+HEADS: ['m4d000000001 (head)']
+CURRENT: 4d000000001
+DB_CONN: True
+REVS_COUNT: 29
+LAST3: ['9a5bc7e31a7f', 'f4b5d6c7e8a9', '20260824']
+UPGRADE last2:
+  upgrade f4b5d6c7e8a9: rc=0 err[:200]='INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\n'
+  current_rev -> 4d000000001
+  downgrade -1: rc=1 err[:200]='INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\nINFO  [alembic.runtime.migration] Running downgrade m4d000000001 -> m4c0'
+  current_rev -> 4d000000001
+  upgrade f4b5d6c7e8a9: rc=0 err[:200]='INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\n'
+  current_rev -> 4d000000001
+  upgrade 20260824: rc=4294967295 err[:200]="INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\nERROR [alembic.util.messaging] Can't locate revision identified by '2026"
+  current_rev -> 4d000000001
+  downgrade -1: rc=1 err[:200]='INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\nINFO  [alembic.runtime.migration] Running downgrade m4d000000001 -> m4c0'
+  current_rev -> 4d000000001
+  upgrade 20260824: rc=4294967295 err[:200]="INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\nERROR [alembic.util.messaging] Can't locate revision identified by '2026"
+  current_rev -> 4d000000001

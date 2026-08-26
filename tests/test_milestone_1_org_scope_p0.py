@@ -113,8 +113,13 @@ def test_tenant_t1_list_isolation(client, owner_a, owner_b, org_a, org_b):
     resp_list_b = client.get(f"{API}/tenants", headers=owner_b_headers)
     assert resp_list_b.status_code == 200, resp_list_b.text
     items = resp_list_b.json()
-    assert len(items) == 0
-    assert not any(item.get("full_name") == "Tenant A" for item in items)
+    # Paginated response: strict emptiness (fail-closed cross-org isolation)
+    assert isinstance(items, dict), items
+    assert items["total"] == 0, items
+    assert len(items["items"]) == 0, items
+    assert items["limit"] in (50, 1, 500), items
+    assert items["offset"] >= 0, items
+    assert not any(item.get("full_name") == "Tenant A" for item in items["items"])
 
 
 def test_tenant_t2_get_cross_org_404(client, owner_a, owner_b, org_a, org_b):
@@ -203,7 +208,12 @@ def test_lease_t1_list_isolation(client, owner_a, owner_b, org_a, org_b):
     resp_list_b = client.get(f"{API}/leases", headers=owner_b_headers)
     assert resp_list_b.status_code == 200, resp_list_b.text
     items = resp_list_b.json()
-    assert len(items) == 0
+    # Paginated response: strict emptiness (fail-closed cross-org isolation)
+    assert isinstance(items, dict), items
+    assert items["total"] == 0, items
+    assert len(items["items"]) == 0, items
+    assert items["limit"] in (50, 1, 500), items
+    assert items["offset"] >= 0, items
 
 
 def test_lease_t2_get_cross_org_404(client, owner_a, owner_b, org_a, org_b):
@@ -249,7 +259,12 @@ def test_income_t1_list_isolation(client, owner_a, owner_b, org_a, org_b):
     resp_list_b = client.get(f"{API}/incomes", headers=owner_b_headers)
     assert resp_list_b.status_code == 200, resp_list_b.text
     items = resp_list_b.json()
-    assert len(items) == 0
+    # Paginated response: strict emptiness (fail-closed cross-org isolation)
+    assert isinstance(items, dict), items
+    assert items["total"] == 0, items
+    assert len(items["items"]) == 0, items
+    assert items["limit"] in (50, 1, 500), items
+    assert items["offset"] >= 0, items
 
 
 def test_income_t2_get_cross_org_404(client, owner_a, owner_b, org_a, org_b):
@@ -296,7 +311,12 @@ def test_expense_t1_list_isolation(client, owner_a, owner_b, org_a, org_b):
     resp_list_b = client.get(f"{API}/expenses", headers=owner_b_headers)
     assert resp_list_b.status_code == 200, resp_list_b.text
     items = resp_list_b.json()
-    assert len(items) == 0
+    # Paginated response: strict emptiness (fail-closed cross-org isolation)
+    assert isinstance(items, dict), items
+    assert items["total"] == 0, items
+    assert len(items["items"]) == 0, items
+    assert items["limit"] in (50, 1, 500), items
+    assert items["offset"] >= 0, items
 
 
 def test_expense_t2_get_cross_org_404(client, owner_a, owner_b, org_a, org_b):
@@ -340,7 +360,9 @@ def test_repair_t1_list_isolation(client, owner_a, owner_b, org_a, org_b):
     assert resp_list_b.status_code == 200, resp_list_b.text
     body = resp_list_b.json()
     items = body["items"]
-    assert len(items) == 0
+    # Strict emptiness: items is a plain list from body["items"]
+    assert isinstance(items, list), items
+    assert len(items) == 0, items
     assert body["total"] == 0
 
 

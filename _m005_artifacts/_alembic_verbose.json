@@ -1,0 +1,110 @@
+{
+  "heads_lines": [
+    "m4d000000001 (head)"
+  ],
+  "current_rev": "4d000000001",
+  "db_connect": true,
+  "revs_count": 29,
+  "last3": [
+    "20260823",
+    "20260823",
+    "20260824"
+  ],
+  "try_each_rev": [
+    {
+      "rev": "20260823",
+      "prev": "20260823",
+      "next": "20260823",
+      "steps": [
+        {
+          "step": "up",
+          "rc": 4294967295,
+          "err": "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\r\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\r\nERROR [alembic.util.messaging] Can't locate revision identified by '20260823'\r\n",
+          "out": "FAILED: Can't locate revision identified by '20260823'\r\n",
+          "actual_rev": "4d000000001",
+          "expected": "20260823"
+        },
+        {
+          "step": "down",
+          "rc": 1,
+          "err": "ite-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)\r\n",
+          "out": "",
+          "actual_rev": "4d000000001",
+          "expected": "20260823"
+        },
+        {
+          "step": "up2",
+          "rc": 4294967295,
+          "err": "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\r\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\r\nERROR [alembic.util.messaging] Can't locate revision identified by '20260823'\r\n",
+          "out": "FAILED: Can't locate revision identified by '20260823'\r\n",
+          "actual_rev": "4d000000001",
+          "expected": "20260823"
+        }
+      ]
+    },
+    {
+      "rev": "20260823",
+      "prev": "20260823",
+      "next": "20260824",
+      "steps": [
+        {
+          "step": "up",
+          "rc": 4294967295,
+          "err": "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\r\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\r\nERROR [alembic.util.messaging] Can't locate revision identified by '20260823'\r\n",
+          "out": "FAILED: Can't locate revision identified by '20260823'\r\n",
+          "actual_rev": "4d000000001",
+          "expected": "20260823"
+        },
+        {
+          "step": "down",
+          "rc": 1,
+          "err": "ite-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)\r\n",
+          "out": "",
+          "actual_rev": "4d000000001",
+          "expected": "20260823"
+        },
+        {
+          "step": "up2",
+          "rc": 4294967295,
+          "err": "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\r\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\r\nERROR [alembic.util.messaging] Can't locate revision identified by '20260824'\r\n",
+          "out": "FAILED: Can't locate revision identified by '20260824'\r\n",
+          "actual_rev": "4d000000001",
+          "expected": "20260824"
+        }
+      ]
+    },
+    {
+      "rev": "20260824",
+      "prev": "20260823",
+      "next": null,
+      "steps": [
+        {
+          "step": "up",
+          "rc": 4294967295,
+          "err": "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\r\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\r\nERROR [alembic.util.messaging] Can't locate revision identified by '20260824'\r\n",
+          "out": "FAILED: Can't locate revision identified by '20260824'\r\n",
+          "actual_rev": "4d000000001",
+          "expected": "20260824"
+        },
+        {
+          "step": "down",
+          "rc": 1,
+          "err": "ite-packages\\sqlalchemy\\engine\\default.py\", line 952, in do_execute\r\n    cursor.execute(statement, parameters)\r\nsqlalchemy.exc.ProgrammingError: (psycopg2.errors.UndefinedObject) constraint \"fk_leases_superseded_same_party\" of relation \"leases\" does not exist\r\n\r\n[SQL: ALTER TABLE leases DROP CONSTRAINT fk_leases_superseded_same_party]\r\n(Background on this error at: https://sqlalche.me/e/20/f405)\r\n",
+          "out": "",
+          "actual_rev": "4d000000001",
+          "expected": "20260823"
+        },
+        {
+          "step": "up2",
+          "rc": 4294967295,
+          "err": "INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.\r\nINFO  [alembic.runtime.migration] Will assume transactional DDL.\r\nERROR [alembic.util.messaging] Can't locate revision identified by '20260824'\r\n",
+          "out": "FAILED: Can't locate revision identified by '20260824'\r\n",
+          "actual_rev": "4d000000001",
+          "expected": "20260824"
+        }
+      ]
+    }
+  ],
+  "restore_rc": 4294967295,
+  "final_rev": "4d000000001"
+}
