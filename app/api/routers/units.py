@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -8,7 +8,7 @@ from app.database import get_db
 from app.models.membership import OrganizationRole
 from app.models.property import Property, Unit
 from app.models.user import User
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.schemas.property import UnitCreate, UnitRead, UnitUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
 from app.services.organization_scope import scope_exception_to_http
@@ -24,22 +24,28 @@ from app.services.property_channel import (
 router = APIRouter(prefix="/units", tags=["units"])
 
 
-@router.get("", response_model=list[UnitRead])
+@router.get("", response_model=Paginated[UnitRead])
 def list_units(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     from app.services.property_channel import scoped_list_properties
 
     props = scoped_list_properties(db, for_user_id=user.id)
     if not props:
-        return []
+        return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
     prop_ids = [p.id for p in props]
-    return (
+    query = (
         db.query(Unit)
         .filter(Unit.property_id.in_(prop_ids), Unit.deleted_at.is_(None))
         .order_by(Unit.id)
-        .all()
     )
+    total = query.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=UnitRead, status_code=status.HTTP_201_CREATED)

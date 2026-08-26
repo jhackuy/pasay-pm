@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import or_, select, update
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
@@ -23,6 +24,7 @@ from app.api.deps import (
     get_operations_reader,
 )
 from app.config import settings
+from app.core.i18n import resolve_locale as _resolve_locale, t as _t
 from app.database import get_db
 from app.models.copilot import CopilotActionProposal, CopilotActionStatus
 from app.models.operations import (
@@ -46,6 +48,9 @@ from app.services.organization_scope import (
     org_tenant_ids as _org_tenant_ids,
 )
 from app.schemas.operations import (
+    GodViewCounts,
+    GodViewOut,
+    GodViewTopIssue,
     OperationsSummary,
     OperationalTaskRead,
     PaymentPromiseIn,
@@ -63,6 +68,7 @@ from app.schemas.operations import (
     TaskSnoozeIn,
     TaskUpdateIn,
 )
+from app.schemas.common import Paginated
 from app.schemas.copilot import (
     CopilotAskIn,
     CopilotAskOut,
@@ -164,6 +170,7 @@ def resolve_org_membership(
     def _dep(
         db: Session = Depends(get_db),
         reader: User | SystemReader = Depends(get_operations_reader),
+        accept_language: str | None = Header(default=None, include_in_schema=False),
     ) -> Membership:
         if isinstance(reader, SystemReader):
             # Explicit trusted organization_id context for the SYSTEM reader is
@@ -187,9 +194,10 @@ def resolve_org_membership(
                     .one_or_none()
                 )
                 if picked is None:
+                    _loc = _resolve_locale(accept_language_header=accept_language)
                     raise HTTPException(
                         status_code=403,
-                        detail="Active organization membership required",
+                        detail=_t("org_required", _loc),
                     )
                 return picked
 
@@ -199,27 +207,39 @@ def resolve_org_membership(
             # fail-closed with stable contracts above.
             small_batch = base_q.limit(2).all()
             if len(small_batch) == 0:
+                _loc = _resolve_locale(accept_language_header=accept_language)
                 raise HTTPException(
                     status_code=403,
-                    detail="Active organization membership required",
+                    detail=_t("org_required", _loc),
                 )
             if len(small_batch) == 1:
                 return small_batch[0]
+            _loc = _resolve_locale(accept_language_header=accept_language)
             raise HTTPException(
                 status_code=409,
-                detail="Organization context required",
+                detail=_t("org_required", _loc),
             )
 
         user = reader
         base_q = _base_membership_query(db).filter(Membership.user_id == user.id)
         small_batch = base_q.limit(2).all()
         if len(small_batch) == 0:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
+            _loc = _resolve_locale(
+                membership_role=None,
+                user_role_tier=str(getattr(user, "role", None) or ""),
+                accept_language_header=accept_language,
+            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, _t("org_required", _loc))
         if len(small_batch) == 1:
             return small_batch[0]
+        _loc = _resolve_locale(
+            membership_role=small_batch[0].role,
+            user_role_tier=str(getattr(user, "role", None) or ""),
+            accept_language_header=accept_language,
+        )
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Organization context required",
+            detail=_t("org_required", _loc),
         )
 
     return _dep
@@ -246,7 +266,7 @@ def _scoped_task_query(db: Session, org_id: int):
     return or_(*or_terms)
 
 
-def _scoped_get_task(db: Session, task_id: int, org_id: int) -> OperationalTask:
+def _scoped_get_task(db: Session, task_id: int, org_id: int, *, locale: str = "en") -> OperationalTask:
     """scoped_get for OperationalTask: LookupError semantics → HTTP 404 if cross-org or missing."""
     where_scope = _scoped_task_query(db, org_id)
     task = (
@@ -255,11 +275,11 @@ def _scoped_get_task(db: Session, task_id: int, org_id: int) -> OperationalTask:
         .first()
     )
     if task is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operational task not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _t("404_not_found", locale))
     return task
 
 
-def _scoped_lock_task_for_update(db: Session, task_id: int, org_id: int) -> OperationalTask:
+def _scoped_lock_task_for_update(db: Session, task_id: int, org_id: int, *, locale: str = "en") -> OperationalTask:
     where_scope = _scoped_task_query(db, org_id)
     task = (
         db.execute(
@@ -270,7 +290,7 @@ def _scoped_lock_task_for_update(db: Session, task_id: int, org_id: int) -> Oper
         .scalar_one_or_none()
     )
     if task is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operational task not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _t("404_not_found", locale))
     return task
 
 
@@ -285,7 +305,7 @@ def _self_filter_required(user: User, membership: Membership) -> bool:
     return user.role == UserRole.agent
 
 
-def _forbid_agent_role(user: User) -> None:
+def _forbid_agent_role(user: User, *, locale: str = "en") -> None:
     """UserRole.agent is a worker tier within SECRETARY org membership: it
     can act on tasks but never CRUD rules, approve expenses or configure the
     business. Always checked after org-level SECRETARY/OWNER membership gate.
@@ -293,7 +313,7 @@ def _forbid_agent_role(user: User) -> None:
     if user.role == UserRole.agent:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "Agent role cannot manage rules, approval or financial configuration",
+            _t("403_no_permission", locale),
         )
 
 
@@ -304,17 +324,17 @@ def _agent_scope(query, user: User):
     return query
 
 
-def _get_task_or_404(db: Session, task_id: int) -> OperationalTask:
+def _get_task_or_404(db: Session, task_id: int, *, locale: str = "en") -> OperationalTask:
     task = db.query(OperationalTask).filter(OperationalTask.id == task_id).first()
     if task is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operational task not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _t("404_not_found", locale))
     return task
 
 
-def _require_access(task: OperationalTask, user: User) -> None:
+def _require_access(task: OperationalTask, user: User, *, locale: str = "en") -> None:
     if user.role == UserRole.agent and task.assigned_user_id != user.id:
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+            status.HTTP_403_FORBIDDEN, _t("403_no_permission", locale)
         )
 
 
@@ -567,13 +587,15 @@ def _replay_or_conflict(db: Session, task_id: int, want_status, conflict_detail:
 # tasks
 # ---------------------------------------------------------------------------
 
-@router.get("/tasks", response_model=list[OperationalTaskRead])
+@router.get("/tasks", response_model=Paginated[OperationalTaskRead])
 def list_tasks(
     property_id: int | None = Query(default=None),
     assignee: int | None = Query(default=None),
     task_type: OperationalTaskType | None = Query(default=None),
     status: OperationalTaskStatus | None = Query(default=None),
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
@@ -586,30 +608,58 @@ def list_tasks(
         query = query.filter(OperationalTask.assigned_user_id == assignee)
     if property_id is not None:
         if property_id not in _org_property_ids(db, org_id):
-            return []
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
         query = query.filter(OperationalTask.property_id == property_id)
     if task_type is not None:
         query = query.filter(OperationalTask.task_type == task_type)
     if status is not None:
         query = query.filter(OperationalTask.status == status)
-    rows = query.order_by(OperationalTask.due_at, OperationalTask.id).all()
+    ordered = query.order_by(OperationalTask.due_at, OperationalTask.id)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
     if scope == "owner":
-        rows = [t for t in rows if is_owner_actionable(t, user)]
-    return rows
+        candidate_tasks = ordered.with_entities(
+            OperationalTask.id,
+            OperationalTask.details,
+            OperationalTask.task_type,
+            OperationalTask.assigned_user_id,
+        ).all()
+        scoped_task_ids = []
+        for t in candidate_tasks:
+            full_task = OperationalTask()
+            full_task.id = t.id
+            full_task.details = t.details
+            full_task.task_type = t.task_type
+            full_task.assigned_user_id = t.assigned_user_id
+            if is_owner_actionable(full_task, user):
+                scoped_task_ids.append(t.id)
+        scoped_query = ordered.filter(OperationalTask.id.in_(scoped_task_ids))
+        total = scoped_query.count()
+        rows = scoped_query.offset(offset).limit(limit).all()
+    else:
+        total = ordered.count()
+        rows = ordered.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/tasks/{task_id}", response_model=OperationalTaskRead)
 def get_task(
     task_id: int,
+    accept_language: str | None = Header(default=None, include_in_schema=False),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     org_id = membership.organization_id
-    task = _scoped_get_task(db, task_id, org_id)
+    locale = _resolve_locale(
+        membership_role=membership.role,
+        user_role_tier=str(getattr(user, "role", "") or ""),
+        accept_language_header=accept_language,
+    )
+    task = _scoped_get_task(db, task_id, org_id, locale=locale)
     if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
         raise HTTPException(
-            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+            status.HTTP_403_FORBIDDEN, _t("403_no_permission", locale)
         )
     return task
 
@@ -1147,6 +1197,8 @@ def create_task(
 @router.get("/quick/tasks")
 def quick_tasks(
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     reader: User | SystemReader = Depends(get_operations_reader),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
@@ -1164,44 +1216,68 @@ def quick_tasks(
             db, reader, owner_only=False,
             task_scope=task_scope, org_property_ids=org_prop_ids,
         )
-        return rows
-    return quick_svc.build_quick_tasks(
-        db, reader, owner_only=(scope == "owner"),
-        task_scope=task_scope, org_property_ids=org_prop_ids,
-    )
+    else:
+        rows = quick_svc.build_quick_tasks(
+            db, reader, owner_only=(scope == "owner"),
+            task_scope=task_scope, org_property_ids=org_prop_ids,
+        )
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.get("/quick/properties")
 def quick_properties(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     org_id = membership.organization_id
     org_prop_ids = _org_property_ids(db, org_id)
-    return quick_svc.build_quick_properties(db, org_property_ids=org_prop_ids)
+    rows = quick_svc.build_quick_properties(db, org_property_ids=org_prop_ids)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.get("/quick/rent")
 def quick_rent(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     org_id = membership.organization_id
     org_prop_ids = _org_property_ids(db, org_id)
-    return quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
+    summary = quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    items = [summary] if offset == 0 else []
+    return Paginated(items=items, total=1, limit=limit, offset=offset)
 
 
 @router.get("/quick/expense")
 def quick_expense(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     org_id = membership.organization_id
     org_prop_ids = _org_property_ids(db, org_id)
-    return quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
+    summary = quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    items = [summary] if offset == 0 else []
+    return Paginated(items=items, total=1, limit=limit, offset=offset)
 
 
 @router.get("/quick/expense-duplicates")
@@ -1394,6 +1470,228 @@ def operations_summary(
 
     org_id = membership.organization_id
     return build_operations_summary(db, user, owner_only=(scope == "owner"), org_id=org_id)
+
+
+@router.get("/god-view", response_model=GodViewOut)
+def god_view(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER])),
+):
+    """OWNER-only aggregate dashboard: org-wide counts + top 5 issues.
+
+    Strict ORG isolation via canonical scope helpers. All monetary totals use
+    Decimal (NUMERIC 14,2). SECRETARY / agent callers are rejected with 403
+    by the ``resolve_org_membership(role=[OWNER])`` gate above.
+    """
+    from app.models.financial import ExpenseStatus
+    from app.models.lease import LeaseStatus
+    from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
+    from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
+
+    org_id = membership.organization_id
+    now_utc = datetime.now(timezone.utc)
+    today_start = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    org_prop_ids = _org_property_ids(db, org_id)
+    org_lease_ids = _org_lease_ids(db, org_id)
+    org_tenant_ids = _org_tenant_ids(db, org_id)
+    task_scope = _scoped_task_query(db, org_id)
+
+    prop_list = list(org_prop_ids) if org_prop_ids else [-1]
+    lease_list = list(org_lease_ids) if org_lease_ids else [-1]
+    tenant_list = list(org_tenant_ids) if org_tenant_ids else [-1]
+
+    counts = GodViewCounts()
+
+    counts.properties = (
+        db.query(func.count(Property.id))
+        .filter(Property.id.in_(prop_list), Property.deleted_at.is_(None))
+        .scalar() or 0
+    )
+
+    counts.units = (
+        db.query(func.count(Unit.id))
+        .filter(Unit.property_id.in_(prop_list), Unit.deleted_at.is_(None))
+        .scalar() or 0
+    )
+
+    counts.active_tenants = (
+        db.query(func.count(Tenant.id))
+        .filter(Tenant.id.in_(tenant_list), Tenant.deleted_at.is_(None), Tenant.is_active.is_(True))
+        .scalar() or 0
+    )
+
+    counts.active_leases = (
+        db.query(func.count(Lease.id))
+        .filter(Lease.id.in_(lease_list), Lease.deleted_at.is_(None), Lease.status == LeaseStatus.active)
+        .scalar() or 0
+    )
+
+    counts.pending_tasks = (
+        db.query(func.count(OperationalTask.id))
+        .filter(task_scope, OperationalTask.status == OperationalTaskStatus.PENDING)
+        .scalar() or 0
+    )
+
+    counts.in_progress_tasks = (
+        db.query(func.count(OperationalTask.id))
+        .filter(task_scope, OperationalTask.status == OperationalTaskStatus.IN_PROGRESS)
+        .scalar() or 0
+    )
+
+    counts.overdue_tasks = (
+        db.query(func.count(OperationalTask.id))
+        .filter(
+            task_scope,
+            OperationalTask.status.in_([OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]),
+            OperationalTask.due_at < now_utc,
+        )
+        .scalar() or 0
+    )
+
+    counts.completed_today = (
+        db.query(func.count(OperationalTask.id))
+        .filter(
+            task_scope,
+            OperationalTask.status == OperationalTaskStatus.COMPLETED,
+            OperationalTask.completed_at >= today_start,
+        )
+        .scalar() or 0
+    )
+
+    pending_expense_row = (
+        db.query(
+            func.count(Expense.id),
+            func.coalesce(func.sum(Expense.amount), Decimal("0.00")),
+        )
+        .filter(
+            Expense.property_id.in_(prop_list),
+            Expense.status.in_([ExpenseStatus.pending, ExpenseStatus.approved, ExpenseStatus.payment_claimed, ExpenseStatus.partially_paid]),
+        )
+        .first()
+    )
+    counts.pending_expenses_count = int(pending_expense_row[0] or 0)
+    counts.pending_expenses_total_decimal = Decimal(str(pending_expense_row[1] or Decimal("0.00")))
+
+    rent_summary = quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
+    counts.rent_overdue_count = len(rent_summary.get("overdue", []))
+    counts.rent_overdue_total_decimal = Decimal(str(rent_summary.get("outstanding_total", Decimal("0.00")))).quantize(Decimal("0.01"))
+
+    counts.move_out_pending_count = (
+        db.query(func.count(MoveOutInspection.id))
+        .filter(
+            MoveOutInspection.lease_id.in_(lease_list),
+            MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
+        )
+        .scalar() or 0
+    )
+
+    counts.deposit_settlement_pending_count = (
+        db.query(func.count(DepositSettlement.id))
+        .filter(
+            DepositSettlement.lease_id.in_(lease_list),
+            DepositSettlement.status.in_([DepositSettlementStatus.DRAFT, DepositSettlementStatus.CONFIRMED]),
+        )
+        .scalar() or 0
+    )
+
+    top_issues: list[GodViewTopIssue] = []
+    seen_ids: set[tuple[str, int]] = set()
+
+    overdue_tasks_top = (
+        db.query(OperationalTask)
+        .filter(
+            task_scope,
+            OperationalTask.status.in_([OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]),
+            OperationalTask.due_at < now_utc,
+        )
+        .order_by(OperationalTask.due_at.asc(), OperationalTask.id.asc())
+        .limit(5)
+        .all()
+    )
+    for t in overdue_tasks_top:
+        key = ("task", t.id)
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+        sev = "critical" if (now_utc - t.due_at).days >= 7 else "major"
+        top_issues.append(GodViewTopIssue(
+            id=len(top_issues) + 1,
+            kind="overdue_task",
+            title=t.title,
+            severity=sev,
+            task_id=t.id,
+            property_id=t.property_id,
+            lease_id=t.lease_id,
+            tenant_id=t.tenant_id,
+        ))
+        if len(top_issues) >= 5:
+            break
+
+    if len(top_issues) < 5:
+        pending_exp_top = (
+            db.query(Expense)
+            .filter(
+                Expense.property_id.in_(prop_list),
+                Expense.status.in_([ExpenseStatus.pending, ExpenseStatus.approved]),
+            )
+            .order_by(Expense.amount.desc(), Expense.id.asc())
+            .limit(5)
+            .all()
+        )
+        for e in pending_exp_top:
+            if len(top_issues) >= 5:
+                break
+            key = ("expense", e.id)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            top_issues.append(GodViewTopIssue(
+                id=len(top_issues) + 1,
+                kind="pending_expense",
+                title=f"{e.category}: {e.payee}",
+                severity="major" if e.status == ExpenseStatus.approved else "minor",
+                expense_id=e.id,
+                property_id=e.property_id,
+                unit_id=e.unit_id,
+            ))
+
+    if len(top_issues) < 5:
+        move_out_top = (
+            db.query(MoveOutInspection)
+            .filter(
+                MoveOutInspection.lease_id.in_(lease_list),
+                MoveOutInspection.status.in_([MoveOutInspectionStatus.SCHEDULED, MoveOutInspectionStatus.INSPECTED]),
+            )
+            .order_by(MoveOutInspection.scheduled_at.asc(), MoveOutInspection.id.asc())
+            .limit(5)
+            .all()
+        )
+        for m in move_out_top:
+            if len(top_issues) >= 5:
+                break
+            key = ("moveout", m.id)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            top_issues.append(GodViewTopIssue(
+                id=len(top_issues) + 1,
+                kind="move_out_pending",
+                title=f"Move-out inspection: lease #{m.lease_id}",
+                severity="major" if m.status == MoveOutInspectionStatus.INSPECTED else "minor",
+                lease_id=m.lease_id,
+                unit_id=m.unit_id,
+                tenant_id=m.tenant_id,
+            ))
+
+    return GodViewOut(
+        org_id=org_id,
+        as_of_utc=now_utc.isoformat(),
+        counts=counts,
+        currency="VND",
+        top_issues=top_issues,
+    )
 
 
 # ---------------------------------------------------------------------------

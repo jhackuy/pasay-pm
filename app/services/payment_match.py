@@ -587,13 +587,28 @@ class _Row:
         self.ctx, self.period, self.due = triple
 
 
-def load_contexts(db: Session) -> list[LeaseCtx]:
-    """Load active leases + related rows + their incomes (read-only)."""
-    leases = (
+def load_contexts(db: Session, org_ids: list[int] | None = None) -> list[LeaseCtx]:
+    """Load active leases + related rows + their incomes (read-only).
+
+    Caller-org scoping (fail-closed): when ``org_ids`` is an empty list
+    (zero active memberships) this function returns ``[]`` WITHOUT any DB
+    load.  When ``org_ids`` is a non-empty list, leases are restricted to
+    ``Unit.property_id -> Property.organization_id IN (org_ids)`` so no
+    cross-organization lease / income / tenant / property data ever leaks
+    into the matcher.  ``None`` preserves pre-existing all-org behaviour
+    for internal admin callers that deliberately want the full table (the
+    payments router NEVER passes ``None``)."""
+    if org_ids is not None and len(org_ids) == 0:
+        return []
+    leases_q = (
         db.query(Lease)
         .filter(Lease.status == LeaseStatus.active, Lease.deleted_at.is_(None))
-        .all()
     )
+    if org_ids:
+        leases_q = leases_q.join(Unit, Unit.id == Lease.unit_id).join(
+            Property, Property.id == Unit.property_id
+        ).filter(Property.organization_id.in_(org_ids))
+    leases = leases_q.all()
     if not leases:
         return []
     lease_ids = [lease.id for lease in leases]
@@ -649,6 +664,14 @@ def match_payment(
     text: str,
     amount: Optional[Decimal] = None,
     today: Optional[date] = None,
+    org_ids: list[int] | None = None,
 ) -> MatchResult:
-    """Public entry: load contexts and match (read-only, never writes)."""
-    return match_from_leases(load_contexts(db), text, today=today, amount=amount)
+    """Public entry: load contexts and match (read-only, never writes).
+
+    The optional ``org_ids`` fail-closed argument is mandatory for the HTTP
+    ``/payments/match`` router (caller active memberships) so cross-organization
+    lease/tenant/unit/income data never leaks.  Internal admin callers may
+    pass ``None`` to load every active lease."""
+    return match_from_leases(
+        load_contexts(db, org_ids=org_ids), text, today=today, amount=amount
+    )

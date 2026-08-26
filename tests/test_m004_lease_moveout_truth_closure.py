@@ -2447,8 +2447,10 @@ def test_g12_confirm_inspection_auto_creates_draft_settlement(
         headers=h,
     )
     assert list_r.status_code == 200, list_r.text
-    settlements = list_r.json()
-    assert len(settlements) == 1
+    settlements_payload = list_r.json()
+    assert isinstance(settlements_payload, dict) and "items" in settlements_payload, settlements_payload
+    settlements = settlements_payload["items"]
+    assert isinstance(settlements, list) and len(settlements) == 1, settlements_payload
     linked = [s for s in settlements if s.get("move_out_inspection_id") == insp["id"]]
     assert len(linked) == 1
     assert linked[0]["status"] == DepositSettlementStatus.DRAFT.value

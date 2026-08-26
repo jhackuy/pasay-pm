@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -9,7 +9,7 @@ from app.models.lease import Lease, LeaseStatus
 from app.models.property import Unit, UnitStatus
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.schemas.lease import (
     LeaseAutoExpireResponse,
     LeaseCreate,
@@ -42,14 +42,36 @@ from app.services.organization_scope import (
 router = APIRouter(prefix="/leases", tags=["leases"])
 
 
-@router.get("", response_model=list[LeaseRead])
+@router.get("", response_model=Paginated[LeaseRead])
 def list_leases(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     try:
-        return scoped_list_leases(db, for_user_id=user.id)
+        from app.services.organization_scope import list_active_org_ids_for_user
+        from app.models.property import Property
+        from app.models.property import Unit
+        orgs = list_active_org_ids_for_user(db, user.id)
+        if not orgs:
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
+        query = (
+            db.query(Lease)
+            .join(Unit, Unit.id == Lease.unit_id)
+            .join(Property, Property.id == Unit.property_id)
+            .filter(
+                Property.organization_id.in_(orgs),
+                Lease.deleted_at.is_(None),
+            )
+            .order_by(Lease.id)
+        )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    total = query.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=LeaseRead, status_code=status.HTTP_201_CREATED)

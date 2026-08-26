@@ -337,57 +337,92 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Idempotent IF-EXISTS safety for disposable / partially-prepared DBs.
+    # Real production DOWNGRADE always finds these objects because upgrade()
+    # created them on COMMIT.
+    from sqlalchemy.engine import reflection
+
+    bind = op.get_bind()
+    insp = reflection.Inspector.from_engine(bind)
+    existing_indexes = {i["name"] for i in insp.get_indexes("leases")}
+    existing_checks = {
+        ck["name"] for ck in insp.get_check_constraints("leases")
+    }
+    existing_fks = {fk["name"] for fk in insp.get_foreign_keys("leases")}
+    existing_lease_cols = {c["name"] for c in insp.get_columns("leases")}
+
+    existing_ds_fks = {
+        fk["name"] for fk in insp.get_foreign_keys("deposit_settlements")
+    }
+    existing_ds_uqs = {
+        uq["name"] for uq in insp.get_unique_constraints("deposit_settlements")
+    }
+    existing_moi_uqs = {
+        uq["name"] for uq in insp.get_unique_constraints("move_out_inspections")
+    }
+
     # ------------------------------------------------------------------
     # 1 (reverse). DROP superseded_by group: index -> fk -> ck -> columns
     # ------------------------------------------------------------------
-    op.drop_index(
-        "uq_leases_superseded_by_one_predecessor", table_name="leases"
-    )
-    op.drop_constraint(
-        "ck_leases_superseded_not_self", "leases", type_="check"
-    )
-    op.drop_constraint(
-        "ck_leases_superseded_pair", "leases", type_="check"
-    )
-    op.drop_constraint(
-        "fk_leases_superseded_by", "leases", type_="foreignkey"
-    )
-    op.drop_column("leases", "superseded_at")
-    op.drop_column("leases", "superseded_by_lease_id")
+    if "uq_leases_superseded_by_one_predecessor" in existing_indexes:
+        op.drop_index(
+            "uq_leases_superseded_by_one_predecessor", table_name="leases"
+        )
+    if "ck_leases_superseded_not_self" in existing_checks:
+        op.drop_constraint(
+            "ck_leases_superseded_not_self", "leases", type_="check"
+        )
+    if "ck_leases_superseded_pair" in existing_checks:
+        op.drop_constraint(
+            "ck_leases_superseded_pair", "leases", type_="check"
+        )
+    if "fk_leases_superseded_by" in existing_fks:
+        op.drop_constraint(
+            "fk_leases_superseded_by", "leases", type_="foreignkey"
+        )
+    if "superseded_at" in existing_lease_cols:
+        op.drop_column("leases", "superseded_at")
+    if "superseded_by_lease_id" in existing_lease_cols:
+        op.drop_column("leases", "superseded_by_lease_id")
 
     # ------------------------------------------------------------------
     # 2 (reverse). DROP leases two composite pointer FKs
     # ------------------------------------------------------------------
-    op.drop_constraint(
-        "fk_leases_ds_id_lease", "leases", type_="foreignkey"
-    )
-    op.drop_constraint(
-        "fk_leases_moi_id_lease", "leases", type_="foreignkey"
-    )
+    if "fk_leases_ds_id_lease" in existing_fks:
+        op.drop_constraint(
+            "fk_leases_ds_id_lease", "leases", type_="foreignkey"
+        )
+    if "fk_leases_moi_id_lease" in existing_fks:
+        op.drop_constraint(
+            "fk_leases_moi_id_lease", "leases", type_="foreignkey"
+        )
 
     # ------------------------------------------------------------------
     # 3 (reverse). DROP deposit_settlements composite FK
     # ------------------------------------------------------------------
-    op.drop_constraint(
-        "fk_deposit_settlements_inspection_lease",
-        "deposit_settlements",
-        type_="foreignkey",
-    )
+    if "fk_deposit_settlements_inspection_lease" in existing_ds_fks:
+        op.drop_constraint(
+            "fk_deposit_settlements_inspection_lease",
+            "deposit_settlements",
+            type_="foreignkey",
+        )
 
     # ------------------------------------------------------------------
     # 4 (reverse). DROP uq_deposit_settlements_id_lease_id
     # ------------------------------------------------------------------
-    op.drop_constraint(
-        "uq_deposit_settlements_id_lease_id",
-        "deposit_settlements",
-        type_="unique",
-    )
+    if "uq_deposit_settlements_id_lease_id" in existing_ds_uqs:
+        op.drop_constraint(
+            "uq_deposit_settlements_id_lease_id",
+            "deposit_settlements",
+            type_="unique",
+        )
 
     # ------------------------------------------------------------------
     # 5 (reverse). DROP uq_move_out_inspections_id_lease_id
     # ------------------------------------------------------------------
-    op.drop_constraint(
-        "uq_move_out_inspections_id_lease_id",
-        "move_out_inspections",
-        type_="unique",
-    )
+    if "uq_move_out_inspections_id_lease_id" in existing_moi_uqs:
+        op.drop_constraint(
+            "uq_move_out_inspections_id_lease_id",
+            "move_out_inspections",
+            type_="unique",
+        )

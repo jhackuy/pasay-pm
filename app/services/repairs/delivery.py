@@ -32,6 +32,7 @@ from the work queue and its pending reminders are dropped; the Repair moves to
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -57,6 +58,8 @@ from app.services.operations.generation import secretary_assignee_id
 
 _REPAIR_PROJECTION_DOMAIN = "repairs.delivery"
 
+_TWO = Decimal("0.01")
+
 
 # The projection task's dedupe key (stable business identity for the work entry).
 def requote_task_dedupe_key(repair_id: int) -> str:
@@ -79,7 +82,7 @@ def _unit_label(db: Session, repair: RepairOperation) -> str | None:
 
 def _money(value) -> str:
     try:
-        d = round(float(value or 0), 2)
+        d = Decimal(str(value or 0)).quantize(_TWO)
         return f"₱{d:,.2f}"
     except (TypeError, ValueError):
         return ""

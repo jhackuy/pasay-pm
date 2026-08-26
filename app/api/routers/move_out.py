@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -15,7 +15,7 @@ from app.schemas.move_out import (
     MoveOutInspectionRead,
     MoveOutInspectionUpdate,
 )
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.services.audit import serialize_row
 from app.services.organization_scope import (
     OrganizationRole,
@@ -35,9 +35,11 @@ from app.services.move_out_workflow import (
 router = APIRouter(prefix="/move-out-inspections", tags=["move_out_inspections"])
 
 
-@router.get("", response_model=list[MoveOutInspectionRead])
+@router.get("", response_model=Paginated[MoveOutInspectionRead])
 def list_inspections(
     lease_id: int | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -48,7 +50,7 @@ def list_inspections(
 
     orgs = list_active_org_ids_for_user(db, user.id)
     if not orgs:
-        return []
+        return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
     org_property_ids = (
         select(Property.id).where(Property.organization_id.in_(orgs), Property.deleted_at.is_(None)).scalar_subquery()
     )
@@ -57,7 +59,12 @@ def list_inspections(
     q = db.query(MoveOutInspection).filter(MoveOutInspection.lease_id.in_(org_lease_ids))
     if lease_id is not None:
         q = q.filter(MoveOutInspection.lease_id == lease_id)
-    return q.order_by(MoveOutInspection.id.desc()).all()
+    ordered = q.order_by(MoveOutInspection.id.desc())
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=MoveOutInspectionRead, status_code=status.HTTP_201_CREATED)

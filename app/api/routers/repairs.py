@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import admin_only, get_current_user, manager_or_admin
@@ -24,6 +24,7 @@ from app.schemas.repair import (
     RepairRecordResultIn,
     RepairVerifyIn,
 )
+from app.schemas.common import Paginated
 from app.services.audit import record_audit, serialize_row
 from app.services.organization_scope import (
     CrossOrgReference,
@@ -130,8 +131,10 @@ def _resolve_proposal(db, repair, payload: RepairDecisionIn) -> RepairProposal:
 # Reads
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=RepairListOut)
+@router.get("", response_model=Paginated[RepairDetailOut])
 def list_repairs(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -141,7 +144,11 @@ def list_repairs(
         raise scope_exception_to_http(exc) from exc
     if user.role == UserRole.agent:
         items = [r for r in items if r.assignee_user_id == user.id]
-    return RepairListOut(items=items, total=len(items))
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(items)
+    paged = items[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{repair_id}", response_model=RepairDetailOut)

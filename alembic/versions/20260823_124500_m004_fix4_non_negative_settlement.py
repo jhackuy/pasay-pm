@@ -45,18 +45,26 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint(
-        "ck_deposit_settlements_refund_amount_non_negative",
-        "deposit_settlements",
-        type_="check",
-    )
-    op.drop_constraint(
-        "ck_deposit_settlements_total_deductions_non_negative",
-        "deposit_settlements",
-        type_="check",
-    )
-    op.drop_constraint(
-        "ck_deposit_settlements_deposit_received_non_negative",
-        "deposit_settlements",
-        type_="check",
-    )
+    from sqlalchemy.engine import reflection
+
+    bind = op.get_bind()
+    insp = reflection.Inspector.from_engine(bind)
+    existing = {ck["name"] for ck in insp.get_check_constraints("deposit_settlements")}
+    if "ck_deposit_settlements_refund_amount_non_negative" in existing:
+        op.drop_constraint(
+            "ck_deposit_settlements_refund_amount_non_negative",
+            "deposit_settlements",
+            type_="check",
+        )
+    if "ck_deposit_settlements_total_deductions_non_negative" in existing:
+        op.drop_constraint(
+            "ck_deposit_settlements_total_deductions_non_negative",
+            "deposit_settlements",
+            type_="check",
+        )
+    if "ck_deposit_settlements_deposit_received_non_negative" in existing:
+        op.drop_constraint(
+            "ck_deposit_settlements_deposit_received_non_negative",
+            "deposit_settlements",
+            type_="check",
+        )

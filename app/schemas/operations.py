@@ -1,6 +1,7 @@
 """Pydantic schemas for the /operations router (V1.2 + V2 Foundation)."""
 from datetime import datetime
-from typing import Any
+from decimal import Decimal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -179,7 +180,7 @@ class PaymentPromiseIn(BaseModel):
     promised date (§17.2)."""
 
     lease_id: int | None = None
-    amount: float | None = Field(default=None, gt=0)
+    amount: Decimal | None = Field(default=None, gt=0, max_digits=14, decimal_places=2)
     promised_date: datetime
     note: str | None = None
 
@@ -212,3 +213,41 @@ class ResumeActionOut(BaseModel):
     resolved: bool
     blocked_action: str | None = None
     message: str = ""
+
+
+class GodViewCounts(BaseModel):
+    properties: int = 0
+    units: int = 0
+    active_tenants: int = 0
+    active_leases: int = 0
+    pending_tasks: int = 0
+    in_progress_tasks: int = 0
+    overdue_tasks: int = 0
+    completed_today: int = 0
+    pending_expenses_count: int = 0
+    pending_expenses_total_decimal: Decimal = Decimal("0.00")
+    rent_overdue_count: int = 0
+    rent_overdue_total_decimal: Decimal = Decimal("0.00")
+    move_out_pending_count: int = 0
+    deposit_settlement_pending_count: int = 0
+
+
+class GodViewTopIssue(BaseModel):
+    id: int
+    kind: str
+    title: str
+    severity: str
+    task_id: int | None = None
+    lease_id: int | None = None
+    expense_id: int | None = None
+    property_id: int | None = None
+    unit_id: int | None = None
+    tenant_id: int | None = None
+
+
+class GodViewOut(BaseModel):
+    org_id: int
+    as_of_utc: str
+    counts: GodViewCounts
+    currency: Literal["VND"] = "VND"
+    top_issues: list[GodViewTopIssue]

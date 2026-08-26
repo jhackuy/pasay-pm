@@ -20,11 +20,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user
+from app.api.deps import manager_or_admin
 from app.database import get_db
 from app.models.evidence import Evidence, EvidenceCategory
+from app.models.membership import Membership, MembershipState
 from app.models.property import Property, Unit
 from app.models.user import User
+from app.schemas.common import Paginated
 from app.services.audit import record_audit, serialize_row
 
 router = APIRouter(prefix="/evidence", tags=["evidence"])
@@ -34,6 +36,50 @@ _EVIDENCE_KEYS = (
     "mime_type", "filename", "size_bytes", "checksum", "category",
     "property_id", "unit_id", "entity_type", "entity_id",
 )
+
+
+def _scoped_evidence_ids(db: Session, for_user_id: int) -> set[int] | None:
+    """Compute evidence ids visible to `for_user_id` via org-membership scoping.
+
+    Rule: user owns evidence iff evidence.property_id -> Property.organization_id
+    is in the user's active memberships OR evidence.unit_id -> Unit.property
+    -> organization_id is; OR evidence was uploaded by the user directly
+    (cross-org owned upload fallback — fail-closed).
+
+    Returns set of visible ids, or None if caller has no active memberships
+    and no self-upload (nothing to see)."""
+    org_ids = [
+        m.organization_id
+        for m in db.query(Membership).filter(
+            Membership.user_id == for_user_id,
+            Membership.state == MembershipState.ACTIVE,
+        ).all()
+    ]
+    clauses: list = []
+    if org_ids:
+        clauses.append(
+            Evidence.id.in_(
+                db.query(Evidence.id).join(
+                    Property, Property.id == Evidence.property_id
+                ).filter(Property.organization_id.in_(org_ids))
+            )
+        )
+        clauses.append(
+            Evidence.id.in_(
+                db.query(Evidence.id)
+                .join(Unit, Unit.id == Evidence.unit_id)
+                .join(Property, Property.id == Unit.property_id)
+                .filter(Property.organization_id.in_(org_ids))
+            )
+        )
+    clauses.append(Evidence.uploaded_by == for_user_id)
+    from sqlalchemy import or_ as _sa_or
+    visible = (
+        db.query(Evidence.id)
+        .filter(_sa_or(*clauses))
+        .all()
+    )
+    return {v.id for v in visible} if visible else set()
 
 
 class EvidenceCreate(BaseModel):
@@ -123,7 +169,7 @@ def _repair_evidence_key(category: str | None) -> str | None:
 def create_evidence(
     payload: EvidenceCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(manager_or_admin),
 ):
     _check_links(db, payload)
     obj = Evidence(
@@ -175,17 +221,26 @@ def create_evidence(
     return _serialize(obj)
 
 
-@router.get("", response_model=list[EvidenceRead])
+@router.get("", response_model=Paginated[EvidenceRead])
 def list_evidence(
     property_id: Optional[int] = Query(default=None),
     unit_id: Optional[int] = Query(default=None),
     entity_type: Optional[str] = Query(default=None),
     entity_id: Optional[int] = Query(default=None),
     category: Optional[str] = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(manager_or_admin),
 ):
-    query = db.query(Evidence)
+    visible_ids = _scoped_evidence_ids(db, user.id)
+    if not visible_ids:
+        return Paginated(
+            items=[], total=0,
+            limit=max(1, min(limit, 500)),
+            offset=max(0, offset),
+        )
+    query = db.query(Evidence).filter(Evidence.id.in_(visible_ids))
     if property_id is not None:
         query = query.filter(Evidence.property_id == property_id)
     if unit_id is not None:
@@ -196,17 +251,27 @@ def list_evidence(
         query = query.filter(Evidence.entity_id == entity_id)
     if category is not None:
         query = query.filter(Evidence.category == category)
-    rows = query.order_by(Evidence.created_at.desc(), Evidence.id.desc()).all()
-    return [_serialize(ev) for ev in rows]
+    ordered = query.order_by(Evidence.created_at.desc(), Evidence.id.desc())
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    items = [_serialize(ev) for ev in rows]
+    return Paginated(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{evidence_id}", response_model=EvidenceRead)
 def get_evidence(
     evidence_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(manager_or_admin),
 ):
-    obj = db.get(Evidence, evidence_id)
+    visible_ids = _scoped_evidence_ids(db, user.id)
+    obj = (
+        db.query(Evidence)
+        .filter(Evidence.id == evidence_id, Evidence.id.in_(visible_ids))
+        .first()
+    ) if visible_ids else None
     if obj is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Evidence not found")
     return _serialize(obj)
