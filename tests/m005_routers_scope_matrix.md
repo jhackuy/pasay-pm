@@ -5,7 +5,7 @@
 > **Issue #43 explicitly scopes 22 routers.** Internal-only helper `internal_ingest.py` is **not part of the 22**, because it exposes container-internal Worker/Container RPC (trusted network, shared secret auth) rather than any Owner/Secretary/Tenant public API surface.  This explains the 22-vs-23 discrepancy in the original matrix.
 > Total Issue-43 routers (non internal_ingest) = 22.
 > Total endpoints captured = 163.
-> Endpoints with explicit `has_cross_org_test=true` = 38.
+> Endpoints with explicit `has_cross_org_test=true` = 17.
 
 ## 22 vs 23 discrepancy — explicit rationale
 
@@ -104,9 +104,9 @@
 | `leases` | `/api/v1/leases/{lease_id}` | DELETE | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
 | `leases` | `/api/v1/leases/{lease_id}` | GET | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
 | `leases` | `/api/v1/leases/{lease_id}` | PATCH | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases/{lease_id}/auto-expire` | POST | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases/{lease_id}/decline-renewal` | POST | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases/{lease_id}/renew` | POST | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
+| `leases` | `/api/v1/leases/{lease_id}/auto-expire` | POST | true | false | `` |  |
+| `leases` | `/api/v1/leases/{lease_id}/decline-renewal` | POST | true | false | `` |  |
+| `leases` | `/api/v1/leases/{lease_id}/renew` | POST | true | false | `` |  |
 | `income` | `/api/v1/incomes` | GET | true | false | `` |  |
 | `income` | `/api/v1/incomes` | POST | true | false | `` |  |
 | `income` | `/api/v1/incomes/claims` | GET | true | false | `` |  |
@@ -121,7 +121,7 @@
 | `income` | `/api/v1/incomes/{income_id}` | PATCH | true | false | `` |  |
 | `income` | `/api/v1/incomes/{income_id}/confirm` | POST | true | false | `` |  |
 | `income` | `/api/v1/incomes/{income_id}/reverse` | POST | true | false | `` |  |
-| `payments` | `/api/v1/payments/match` | POST | true | true | `tests/test_financial.py::cross-org financial endpoint 403` |  |
+| `payments` | `/api/v1/payments/match` | POST | true | false | `` |  |
 | `expense` | `/api/v1/expenses` | GET | true | false | `` |  |
 | `expense` | `/api/v1/expenses` | POST | true | false | `` |  |
 | `expense` | `/api/v1/expenses/{expense_id}` | GET | true | false | `` |  |
@@ -139,25 +139,25 @@
 | `expense` | `/api/v1/expenses/{expense_id}/reverse` | POST | true | false | `` |  |
 | `commission` | `/api/v1/commission/rules` | GET | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
 | `commission` | `/api/v1/commission/rules` | POST | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/rules/{rule_id}` | DELETE | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/rules/{rule_id}` | GET | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/rules/{rule_id}` | PATCH | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/settlements` | GET | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/settlements` | POST | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/settlements/{settlement_id}` | GET | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/settlements/{settlement_id}/confirm` | POST | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
+| `commission` | `/api/v1/commission/rules/{rule_id}` | DELETE | true | false | `` |  |
+| `commission` | `/api/v1/commission/rules/{rule_id}` | GET | true | false | `` |  |
+| `commission` | `/api/v1/commission/rules/{rule_id}` | PATCH | true | false | `` |  |
+| `commission` | `/api/v1/commission/settlements` | GET | true | false | `` |  |
+| `commission` | `/api/v1/commission/settlements` | POST | true | false | `` |  |
+| `commission` | `/api/v1/commission/settlements/{settlement_id}` | GET | true | false | `` |  |
+| `commission` | `/api/v1/commission/settlements/{settlement_id}/confirm` | POST | true | false | `` |  |
 | `tasks` | `/api/v1/tasks` | GET | true | false | `` |  |
 | `tasks` | `/api/v1/tasks` | POST | true | false | `` |  |
 | `tasks` | `/api/v1/tasks/{task_id}` | DELETE | true | false | `` |  |
 | `tasks` | `/api/v1/tasks/{task_id}` | GET | true | false | `` |  |
 | `tasks` | `/api/v1/tasks/{task_id}` | PATCH | true | false | `` |  |
 | `tasks` | `/api/v1/tasks/{task_id}/complete` | POST | true | false | `` |  |
-| `reports` | `/api/v1/reports/commission` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` |  |
-| `reports` | `/api/v1/reports/expenses` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` |  |
+| `reports` | `/api/v1/reports/commission` | GET | true | false | `` |  |
+| `reports` | `/api/v1/reports/expenses` | GET | true | false | `` |  |
 | `reports` | `/api/v1/reports/financial-summary` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` |  |
-| `reports` | `/api/v1/reports/monthly` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` |  |
-| `reports` | `/api/v1/reports/overdue-rents` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` |  |
-| `reports` | `/api/v1/reports/tasks` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` |  |
+| `reports` | `/api/v1/reports/monthly` | GET | true | false | `` |  |
+| `reports` | `/api/v1/reports/overdue-rents` | GET | true | false | `` |  |
+| `reports` | `/api/v1/reports/tasks` | GET | true | false | `` |  |
 | `repairs` | `/api/v1/repairs` | GET | true | false | `` |  |
 | `repairs` | `/api/v1/repairs` | POST | true | false | `` |  |
 | `repairs` | `/api/v1/repairs/{repair_id}` | GET | true | false | `` |  |
@@ -209,11 +209,11 @@
 | `operations` | `/api/v1/operations/tasks` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
 | `operations` | `/api/v1/operations/tasks/{task_id}` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
 | `operations` | `/api/v1/operations/tasks/{task_id}` | PATCH | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks/{task_id}/acknowledge` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks/{task_id}/cancel` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks/{task_id}/complete` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks/{task_id}/followup-delivery` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks/{task_id}/snooze` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
+| `operations` | `/api/v1/operations/tasks/{task_id}/acknowledge` | POST | true | false | `` |  |
+| `operations` | `/api/v1/operations/tasks/{task_id}/cancel` | POST | true | false | `` |  |
+| `operations` | `/api/v1/operations/tasks/{task_id}/complete` | POST | true | false | `` |  |
+| `operations` | `/api/v1/operations/tasks/{task_id}/followup-delivery` | POST | true | false | `` |  |
+| `operations` | `/api/v1/operations/tasks/{task_id}/snooze` | POST | true | false | `` |  |
 | `evidence` | `/api/v1/evidence` | GET | true | false | `` |  |
 | `evidence` | `/api/v1/evidence` | POST | true | false | `` |  |
 | `evidence` | `/api/v1/evidence/{evidence_id}` | GET | true | false | `` |  |
@@ -304,6 +304,7 @@
       "org_scoped": false,
       "non_org_rationale": "Anonymous public session endpoints (login/register/me); organization scope is established POST login.",
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -314,6 +315,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -324,6 +326,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -334,6 +337,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -344,6 +348,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -354,6 +359,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
       "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
     },
@@ -364,6 +370,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
       "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
       "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
     },
@@ -374,6 +381,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "DELETE",
       "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
       "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
     },
@@ -384,6 +392,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
       "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
     },
@@ -394,6 +403,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "PATCH",
       "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
       "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
     },
@@ -404,6 +414,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -414,6 +425,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -424,6 +436,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -434,6 +447,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -444,6 +458,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -454,6 +469,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -464,6 +480,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -474,6 +491,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -484,6 +502,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -494,6 +513,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -504,6 +524,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -514,6 +535,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -524,6 +546,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -534,6 +557,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -544,6 +568,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -554,6 +579,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
       "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
     },
@@ -564,6 +590,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
       "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
       "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
     },
@@ -574,6 +601,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "DELETE",
       "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
       "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
     },
@@ -584,6 +612,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
       "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
     },
@@ -594,6 +623,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "PATCH",
       "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
       "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
     },
@@ -603,9 +633,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "leases",
@@ -613,9 +644,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "leases",
@@ -623,9 +655,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "income",
@@ -634,6 +667,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -644,6 +678,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -654,6 +689,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -664,6 +700,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -674,6 +711,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -684,6 +722,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -694,6 +733,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -704,6 +744,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -714,6 +755,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -724,6 +766,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -734,6 +777,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -744,6 +788,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -754,6 +799,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -764,6 +810,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -773,9 +820,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org financial endpoint 403",
-      "cross_org_proof": "Non-member HTTP call to payments endpoints -> 403."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "expense",
@@ -784,6 +832,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -794,6 +843,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -804,6 +854,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -814,6 +865,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -824,6 +876,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -834,6 +887,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -844,6 +898,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -854,6 +909,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -864,6 +920,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -874,6 +931,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -884,6 +942,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -894,6 +953,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -904,6 +964,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -914,6 +975,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -924,6 +986,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -934,6 +997,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
       "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
     },
@@ -944,6 +1008,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
       "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
       "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
     },
@@ -953,9 +1018,10 @@
       "methods": "DELETE",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -963,9 +1029,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -973,9 +1040,10 @@
       "methods": "PATCH",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -983,9 +1051,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -993,9 +1062,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -1003,9 +1073,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -1013,9 +1084,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "tasks",
@@ -1024,6 +1096,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1034,6 +1107,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1044,6 +1118,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1054,6 +1129,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1064,6 +1140,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1074,6 +1151,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1083,9 +1161,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
-      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "reports",
@@ -1093,9 +1172,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
-      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "reports",
@@ -1104,6 +1184,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
       "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
     },
@@ -1113,9 +1194,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
-      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "reports",
@@ -1123,9 +1205,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
-      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "reports",
@@ -1133,9 +1216,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
-      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "repairs",
@@ -1144,6 +1228,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1154,6 +1239,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1164,6 +1250,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1174,6 +1261,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1184,6 +1272,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1194,6 +1283,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1204,6 +1294,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1214,6 +1305,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1224,6 +1316,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1234,6 +1327,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1244,6 +1338,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1254,6 +1349,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1264,6 +1360,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1274,6 +1371,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1284,6 +1382,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1294,6 +1393,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1304,6 +1404,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1314,6 +1415,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1324,6 +1426,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1334,6 +1437,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1344,6 +1448,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1354,6 +1459,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1364,6 +1470,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1374,6 +1481,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1384,6 +1492,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1394,6 +1503,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1404,6 +1514,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1414,6 +1525,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1424,6 +1536,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1434,6 +1547,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1444,6 +1558,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1454,6 +1569,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1464,6 +1580,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1474,6 +1591,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1484,6 +1602,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1494,6 +1613,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1504,6 +1624,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1514,6 +1635,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1524,6 +1646,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1534,6 +1657,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1544,6 +1668,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1554,6 +1679,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1564,6 +1690,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1574,6 +1701,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1584,6 +1712,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1594,6 +1723,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1604,6 +1734,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1614,6 +1745,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
       "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
     },
@@ -1624,6 +1756,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
       "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
     },
@@ -1634,6 +1767,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
       "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
     },
@@ -1644,6 +1778,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": true,
+      "cross_org_test_methods": "PATCH",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
       "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
     },
@@ -1653,9 +1788,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1663,9 +1799,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1673,9 +1810,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1683,9 +1821,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1693,9 +1832,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "evidence",
@@ -1704,6 +1844,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1714,6 +1855,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1724,6 +1866,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1734,6 +1877,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1744,6 +1888,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1754,6 +1899,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1764,6 +1910,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1774,6 +1921,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1784,6 +1932,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1794,6 +1943,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1804,6 +1954,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1814,6 +1965,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1824,6 +1976,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1834,6 +1987,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1844,6 +1998,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1854,6 +2009,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1864,6 +2020,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1874,6 +2031,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1884,6 +2042,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1894,6 +2053,7 @@
       "org_scoped": true,
       "non_org_rationale": null,
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1904,6 +2064,7 @@
       "org_scoped": false,
       "non_org_rationale": "Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary.",
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1914,6 +2075,7 @@
       "org_scoped": false,
       "non_org_rationale": "Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership.",
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     },
@@ -1924,6 +2086,7 @@
       "org_scoped": false,
       "non_org_rationale": "Endpoint name indicates no org membership gate (login/register/health/webhook).",
       "has_cross_org_test": false,
+      "cross_org_test_methods": null,
       "cross_org_test": null,
       "cross_org_proof": null
     }

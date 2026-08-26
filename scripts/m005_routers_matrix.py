@@ -72,16 +72,16 @@ NON_ORG_RATIONALE = {
     "internal_ingest": "Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership.",
 }
 
-# Concrete cross-org test -> endpoint path pattern / router mapping.
-# Each entry maps one real test (file::name) to the router module and a
-# list of concrete endpoint path prefixes it exercises.  The generator
-# will mark has_cross_org_test=True on rows matching
-# (router_module, endpoint_path startswith one of paths).
 CROSS_ORG_TEST_REFS: list[dict] = [
     {
         "test_file": "tests/test_m003_expense_scope_hardening.py",
         "test_name": "test_reports_cross_org_fail_closed",
         "router_module": "reports",
+        "endpoint_methods": [
+            ("/api/v1/reports/financial-summary", "GET"),
+            ("/api/v1/reports/tenant-arrears", "GET"),
+            ("/api/v1/reports/delinquency", "GET"),
+        ],
         "paths": ["/api/v1/reports/financial-summary", "/api/v1/reports/"],
         "proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak).",
     },
@@ -89,6 +89,12 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_m003_expense_scope_hardening.py",
         "test_name": "test_operations_tasks_cross_org_404",
         "router_module": "operations",
+        "endpoint_methods": [
+            ("/api/v1/operations/tasks", "GET"),
+            ("/api/v1/operations/tasks/{task_id}", "GET"),
+            ("/api/v1/operations/tasks", "POST"),
+            ("/api/v1/operations/tasks/{task_id}", "PATCH"),
+        ],
         "paths": ["/api/v1/operations/tasks"],
         "proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks.",
     },
@@ -96,6 +102,13 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_auth.py",
         "test_name": "cross-org property forbidden",
         "router_module": "properties",
+        "endpoint_methods": [
+            ("/api/v1/properties", "GET"),
+            ("/api/v1/properties", "POST"),
+            ("/api/v1/properties/{property_id}", "GET"),
+            ("/api/v1/properties/{property_id}", "PATCH"),
+            ("/api/v1/properties/{property_id}", "DELETE"),
+        ],
         "paths": ["/api/v1/properties"],
         "proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403.",
     },
@@ -103,6 +116,12 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_financial.py",
         "test_name": "cross-org commission/financial 403",
         "router_module": "commission",
+        "endpoint_methods": [
+            ("/api/v1/commission", "GET"),
+            ("/api/v1/commission/rules", "GET"),
+            ("/api/v1/commission/rules", "POST"),
+            ("/api/v1/commission/statements", "GET"),
+        ],
         "paths": ["/api/v1/commission"],
         "proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership).",
     },
@@ -110,6 +129,12 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_financial.py",
         "test_name": "cross-org financial endpoint 403",
         "router_module": "payments",
+        "endpoint_methods": [
+            ("/api/v1/payments", "GET"),
+            ("/api/v1/payments/{payment_id}", "GET"),
+            ("/api/v1/payments", "POST"),
+            ("/api/v1/payments/{payment_id}/match", "POST"),
+        ],
         "paths": ["/api/v1/payments"],
         "proof": "Non-member HTTP call to payments endpoints -> 403.",
     },
@@ -117,6 +142,10 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_audit.py",
         "test_name": "audit non-member 403",
         "router_module": "audit",
+        "endpoint_methods": [
+            ("/api/v1/audit", "GET"),
+            ("/api/v1/audit/{audit_id}", "GET"),
+        ],
         "paths": ["/api/v1/audit"],
         "proof": "Non-member attempt on audit log -> 403.",
     },
@@ -124,6 +153,12 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_fix3_blockers_m2.py",
         "test_name": "rent/payment claims non-member 403",
         "router_module": "income",
+        "endpoint_methods": [
+            ("/api/v1/income/claims", "GET"),
+            ("/api/v1/income/claims", "POST"),
+            ("/api/v1/income/claims/{claim_id}", "GET"),
+            ("/api/v1/income/claims/{claim_id}/reverse", "POST"),
+        ],
         "paths": ["/api/v1/income/claims", "/api/v1/income/"],
         "proof": "Non-member user attempts rent claim reversal / payment claim endpoints -> 403/404 fail-closed.",
     },
@@ -131,6 +166,13 @@ CROSS_ORG_TEST_REFS: list[dict] = [
         "test_file": "tests/test_fix3_blockers_m2.py",
         "test_name": "cross-org reference 409/403",
         "router_module": "leases",
+        "endpoint_methods": [
+            ("/api/v1/leases", "GET"),
+            ("/api/v1/leases", "POST"),
+            ("/api/v1/leases/{lease_id}", "GET"),
+            ("/api/v1/leases/{lease_id}", "PATCH"),
+            ("/api/v1/leases/{lease_id}", "DELETE"),
+        ],
         "paths": ["/api/v1/leases"],
         "proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment.",
     },
@@ -204,14 +246,13 @@ def _is_org_scoped(router_module: str, route: Any) -> bool:
     return True
 
 
-def _match_cross_org_test(router_module: str, endpoint_path: str) -> dict | None:
+def _match_cross_org_test(router_module: str, endpoint_path: str, method: str) -> dict | None:
     for ref in CROSS_ORG_TEST_REFS:
         if ref["router_module"] != router_module:
             continue
-        for p in ref["paths"]:
-            if endpoint_path == p or endpoint_path.startswith(p.rstrip("/") + "/"):
-                return ref
-            if p.endswith("/") and endpoint_path.startswith(p):
+        endpoint_methods = ref.get("endpoint_methods", [])
+        for (ref_path, ref_method) in endpoint_methods:
+            if ref_path == endpoint_path and ref_method.upper() == method.upper():
                 return ref
     return None
 
@@ -228,7 +269,15 @@ def collect_rows() -> list[dict[str, Any]]:
             continue
         router_module = _router_module_from_route(route)
         methods_clean = sorted({m for m in methods if m not in {"HEAD", "OPTIONS"}})
-        cross_ref = _match_cross_org_test(router_module, path)
+        cross_ref_for_methods: set[str] = set()
+        cross_ref_map: dict[str, dict] = {}
+        for m in methods_clean:
+            ref = _match_cross_org_test(router_module, path, m)
+            if ref is not None:
+                cross_ref_for_methods.add(m)
+                cross_ref_map[m] = ref
+        has_cross = len(cross_ref_for_methods) > 0
+        any_cross_ref = next(iter(cross_ref_map.values())) if cross_ref_map else None
         non_org_rationale = None
         org_scoped = _is_org_scoped(router_module, route)
         if not org_scoped:
@@ -236,6 +285,7 @@ def collect_rows() -> list[dict[str, Any]]:
                 router_module,
                 "Endpoint name indicates no org membership gate (login/register/health/webhook).",
             )
+        cross_methods_str = ",".join(sorted(cross_ref_for_methods)) if cross_ref_for_methods else None
         rows.append(
             {
                 "router_module": router_module,
@@ -243,12 +293,13 @@ def collect_rows() -> list[dict[str, Any]]:
                 "methods": ",".join(methods_clean),
                 "org_scoped": org_scoped,
                 "non_org_rationale": non_org_rationale,
-                "has_cross_org_test": cross_ref is not None,
+                "has_cross_org_test": has_cross,
+                "cross_org_test_methods": cross_methods_str,
                 "cross_org_test": (
-                    f"{ref_test(router_module, path)}"
-                    if cross_ref else None
+                    f"{ref_test(router_module, path, list(cross_ref_map.keys())[0])}"
+                    if any_cross_ref else None
                 ),
-                "cross_org_proof": cross_ref["proof"] if cross_ref else None,
+                "cross_org_proof": any_cross_ref["proof"] if any_cross_ref else None,
             }
         )
     rows.sort(key=lambda r: (
@@ -259,8 +310,14 @@ def collect_rows() -> list[dict[str, Any]]:
     return rows
 
 
-def ref_test(router_module: str, path: str) -> str:
-    ref = _match_cross_org_test(router_module, path)
+def ref_test(router_module: str, path: str, method: str | None = None) -> str:
+    if method is None:
+        for m in ("GET", "POST", "PATCH", "DELETE", "PUT"):
+            ref = _match_cross_org_test(router_module, path, m)
+            if ref:
+                return f"{ref['test_file']}::{ref['test_name']}"
+        return ""
+    ref = _match_cross_org_test(router_module, path, method)
     if not ref:
         return ""
     return f"{ref['test_file']}::{ref['test_name']}"

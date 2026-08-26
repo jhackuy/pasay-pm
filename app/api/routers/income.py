@@ -91,14 +91,28 @@ def list_incomes(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     try:
-        rows = scoped_list_incomes(db, for_user_id=user.id)
+        from app.services.organization_scope import list_active_org_ids_for_user
+        from app.models.property import Property
+        from app.models.lease import Lease
+        from app.models.property import Unit
+        orgs = list_active_org_ids_for_user(db, user.id)
+        if not orgs:
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
+        query = (
+            db.query(Income)
+            .join(Lease, Lease.id == Income.lease_id)
+            .join(Unit, Unit.id == Lease.unit_id)
+            .join(Property, Property.id == Unit.property_id)
+            .filter(Property.organization_id.in_(orgs))
+            .order_by(Income.id)
+        )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    total = query.count()
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    total = len(rows)
-    paged = rows[offset:offset + limit]
-    return Paginated(items=paged, total=total, limit=limit, offset=offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=IncomeRead, status_code=status.HTTP_201_CREATED)

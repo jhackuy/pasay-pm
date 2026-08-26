@@ -119,17 +119,23 @@ def _run_one(suite: SuiteDef, _report_json: Path) -> dict[str, Any]:
     stdout_text = (result.stdout or b"").decode("utf-8", errors="replace")
     stderr_text = (result.stderr or b"").decode("utf-8", errors="replace")
     counts = _extract_counts(stdout_text, stderr_text)
+    parse_false_green_prevented = False
+    rc = result.returncode
+    if rc != 0 and counts["failed"] == 0 and counts["errors"] == 0:
+        counts["errors"] = max(counts["errors"], 1)
+        parse_false_green_prevented = True
     return {
         "key": suite.key,
         "title": suite.title,
         "k_expr": suite.k_expr,
         "command": real_cmd,
-        "returncode": result.returncode,
+        "returncode": rc,
         "collected": counts["collected"],
         "passed": counts["passed"],
         "failed": counts["failed"],
         "skipped": counts["skipped"],
         "errors": counts["errors"],
+        "parse_false_green_prevented": parse_false_green_prevented,
         "total_tests": counts["passed"] + counts["failed"] + counts["skipped"] + counts["errors"],
         "stdout_tail": stdout_text[-4000:],
         "stderr_tail": stderr_text[-2000:],
@@ -148,16 +154,20 @@ def print_plan() -> dict[str, Any]:
 def run_all() -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     overall = {"collected": 0, "passed": 0, "failed": 0, "skipped": 0, "errors": 0}
+    any_parse_false_green_prevented = False
     with tempfile.TemporaryDirectory() as tmp:
         tmpdir = Path(tmp)
         for s in SUITES:
             report = tmpdir / f"{s.key}.json"
             row = _run_one(s, report)
             results.append(row)
+            if row.get("parse_false_green_prevented"):
+                any_parse_false_green_prevented = True
             for k in overall:
                 overall[k] += int(row.get(k, 0) or 0)
     return {
         "overall": overall,
+        "parse_false_green_prevented_overall": any_parse_false_green_prevented,
         "suites": results,
     }
 

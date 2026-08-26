@@ -615,13 +615,15 @@ def list_tasks(
     if status is not None:
         query = query.filter(OperationalTask.status == status)
     ordered = query.order_by(OperationalTask.due_at, OperationalTask.id)
-    total = ordered.count()
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    rows = ordered.offset(offset).limit(limit).all()
     if scope == "owner":
-        rows = [t for t in rows if is_owner_actionable(t, user)]
-        total = len([t for t in ordered.all() if is_owner_actionable(t, user)])
+        all_filtered = [t for t in ordered.all() if is_owner_actionable(t, user)]
+        total = len(all_filtered)
+        rows = all_filtered[offset:offset + limit]
+    else:
+        total = ordered.count()
+        rows = ordered.offset(offset).limit(limit).all()
     return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
@@ -1239,12 +1241,10 @@ def quick_rent(
 ):
     org_id = membership.organization_id
     org_prop_ids = _org_property_ids(db, org_id)
-    rows = quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
+    summary = quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    total = len(rows)
-    paged = rows[offset:offset + limit]
-    return Paginated(items=paged, total=total, limit=limit, offset=offset)
+    return Paginated(items=[summary], total=1, limit=limit, offset=offset)
 
 
 @router.get("/quick/expense")
@@ -1257,12 +1257,10 @@ def quick_expense(
 ):
     org_id = membership.organization_id
     org_prop_ids = _org_property_ids(db, org_id)
-    rows = quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
+    summary = quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    total = len(rows)
-    paged = rows[offset:offset + limit]
-    return Paginated(items=paged, total=total, limit=limit, offset=offset)
+    return Paginated(items=[summary], total=1, limit=limit, offset=offset)
 
 
 @router.get("/quick/expense-duplicates")
@@ -1559,54 +1557,9 @@ def god_view(
     counts.pending_expenses_count = int(pending_expense_row[0] or 0)
     counts.pending_expenses_total_decimal = Decimal(str(pending_expense_row[1] or Decimal("0.00")))
 
-    rent_overdue_q = (
-        db.query(Lease)
-        .filter(
-            Lease.id.in_(lease_list),
-            Lease.deleted_at.is_(None),
-            Lease.status == LeaseStatus.active,
-        )
-    )
-    rent_overdue_count = 0
-    rent_overdue_total = Decimal("0.00")
-    from app.models.financial import Income
-    for lease in rent_overdue_q.all():
-        if lease.due_day is None:
-            continue
-        from datetime import date as _date
-        today_d = now_utc.date()
-        cursor_year = today_d.year
-        cursor_month = today_d.month
-        expected_periods = []
-        for _ in range(3):
-            try:
-                due_d = _date(cursor_year, cursor_month, min(lease.due_day, 28))
-            except ValueError:
-                due_d = _date(cursor_year, cursor_month, 28)
-            if due_d <= today_d:
-                expected_periods.append(due_d)
-            cursor_month -= 1
-            if cursor_month < 1:
-                cursor_month = 12
-                cursor_year -= 1
-        if not expected_periods:
-            continue
-        paid_total = (
-            db.query(func.coalesce(func.sum(Income.amount), Decimal("0.00")))
-            .filter(
-                Income.lease_id == lease.id,
-                Income.status.in_(["confirmed", "pending"]),
-            )
-            .scalar() or Decimal("0.00")
-        )
-        expected_total = lease.monthly_rent * Decimal(len(expected_periods))
-        if expected_total > paid_total:
-            shortfall = expected_total - paid_total
-            if shortfall > Decimal("0"):
-                rent_overdue_count += 1
-                rent_overdue_total += shortfall
-    counts.rent_overdue_count = rent_overdue_count
-    counts.rent_overdue_total_decimal = rent_overdue_total.quantize(Decimal("0.01"))
+    rent_summary = quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
+    counts.rent_overdue_count = len(rent_summary.get("overdue", []))
+    counts.rent_overdue_total_decimal = Decimal(str(rent_summary.get("outstanding_total", Decimal("0.00")))).quantize(Decimal("0.01"))
 
     counts.move_out_pending_count = (
         db.query(func.count(MoveOutInspection.id))

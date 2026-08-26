@@ -55,11 +55,10 @@ def test_m005_god_view_owner_only_happy(client, db_session, owner_a, org_a):
     assert counts["units"] >= 1
     assert counts["active_leases"] >= 1
     assert counts["active_tenants"] >= 1
-    assert counts.get("overdue_rents", 0) >= 0
-    assert counts.get("pending_expenses", 0) >= 0
-    # Money fields must use int-like or Decimal string, never float with weird mantissa
-    assert isinstance(counts.get("total_monthly_rent", 0), (int, str))
-    assert isinstance(counts.get("total_pending_expenses", 0), (int, str))
+    assert isinstance(counts.get("rent_overdue_count", 0), int)
+    assert isinstance(counts.get("pending_expenses_count", 0), int)
+    assert isinstance(counts["rent_overdue_total_decimal"], str)
+    assert isinstance(counts["pending_expenses_total_decimal"], str)
     assert "top_issues" in body
     assert "as_of_utc" in body
 
@@ -241,47 +240,40 @@ def test_m005_float_safety_script_exit_0_on_clean_codebase():
 
 
 def test_m005_float_safety_fail_closed_on_real_float_ctor_in_blacklist(tmp_path, db_session):
-    """REAL-BLACKLIST injection: append float() to app/api/routers/expense.py,
-    run scanner against the REAL repository root, prove exit=1, then restore
-    the file (fail-closed on ANY failure to restore).
-
-    We do NOT use tmp_path tree; we use the actual repo blacklist file
-    basename=expense.py (appears in FINANCIAL_BLACKLIST).  Under no
-    circumstances may the file stay modified after the test returns.
+    """ISOLATED-BLACKLIST injection: copy blacklist target into tmp_path,
+    inject float() there, run scanner against tmp_path root, prove exit=1.
+    Never touches the tracked worktree; after pytest, git diff on
+    app/api/routers/expense.py must be clean (empty).
     """
     import os
-    target = REPO_ROOT / "app" / "api" / "routers" / "expense.py"
-    assert target.exists() and target.name in {"expense.py"}
+    import shutil
+    target_orig = REPO_ROOT / "app" / "api" / "routers" / "expense.py"
+    assert target_orig.exists() and target_orig.name in {"expense.py"}
     sc = REPO_ROOT / "scripts" / "pasay_gate_float_safety.py"
     assert sc.exists()
 
-    original_bytes = target.read_bytes()
-    needle_line = "\n# injected float by M005 float-safety counterexample test\n_pasay_m005_unused = float(0.333)\n"
-    restored = False
-    try:
-        with target.open("a", encoding="utf-8") as f:
-            f.write(needle_line)
-        # Confirm the injection actually took effect on the target file.
-        assert needle_line in target.read_text(encoding="utf-8")
+    scan_root = tmp_path
+    scan_routers_dir = scan_root / "app" / "api" / "routers"
+    scan_routers_dir.mkdir(parents=True, exist_ok=True)
+    target_copy = scan_routers_dir / "expense.py"
+    shutil.copyfile(target_orig, target_copy)
 
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        proc = subprocess.run(
-            [_py(), str(sc), str(REPO_ROOT)],
-            capture_output=True, cwd=str(REPO_ROOT), timeout=120, env=env,
-        )
-        stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
-        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
-        assert proc.returncode == 1, (
-            "Float gate must fail-closed after real blacklist injection; "
-            f"got exit 0. stdout:\n{stdout_text}\n\nstderr:\n{stderr_text}"
-        )
-        assert "FAIL" in stdout_text or "BLACKLIST-FAIL" in stdout_text, stdout_text
-        assert "expense.py" in stdout_text, stdout_text
-    finally:
-        target.write_bytes(original_bytes)
-        restored = target.read_bytes() == original_bytes
-    assert restored, (
-        "SAFETY FAILURE: app/api/routers/expense.py was NOT restored after "
-        "float-safety injection subtest.  The file must be recovered from git."
+    needle_line = "\n# injected float by M005 float-safety counterexample test\n_pasay_m005_unused = float(0.333)\n"
+    with target_copy.open("a", encoding="utf-8") as f:
+        f.write(needle_line)
+    assert needle_line in target_copy.read_text(encoding="utf-8")
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(
+        [_py(), str(sc), str(scan_root)],
+        capture_output=True, cwd=str(REPO_ROOT), timeout=120, env=env,
     )
+    stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
+    stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
+    assert proc.returncode == 1, (
+        "Float gate must fail-closed after isolated blacklist injection; "
+        f"got exit 0. stdout:\n{stdout_text}\n\nstderr:\n{stderr_text}"
+    )
+    assert "FAIL" in stdout_text or "BLACKLIST-FAIL" in stdout_text, stdout_text
+    assert "expense.py" in stdout_text, stdout_text

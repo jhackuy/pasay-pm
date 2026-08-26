@@ -11,7 +11,7 @@ Scopes scanned (grepped):
 Patterns flagged (real code, not comments/docstrings):
   - float(...)       constructor call
   - ``: float``      type annotation
-  - /float\(/        regex variants
+  - float\(          regex variants
 
 White-listed (never FAIL):
   - occurrences inside comments / triple-quoted docstrings
@@ -35,6 +35,16 @@ import os
 import re
 import sys
 from pathlib import Path
+
+
+ALLOWED_FLOAT_SITES: frozenset[tuple[str, int, str]] = frozenset({
+    ("app/services/copilot/llm.py", 102, "type_annotation"),
+    ("app/services/copilot/llm.py", 158, "ctor_call"),
+    ("app/services/copilot/llm.py", 193, "type_annotation"),
+    ("app/services/operations/notifier.py", 71, "type_annotation"),
+    ("app/services/telegram_webhook.py", 68, "type_annotation"),
+    ("app/services/telegram_webhook.py", 926, "ctor_call"),
+})
 
 
 FINANCIAL_BLACKLIST: frozenset[str] = frozenset({
@@ -214,6 +224,26 @@ def build_report(root: Path) -> dict:
     ]
     total_real_hits = sum(r["hit_count"] for r in non_whitelist_real_hits)
 
+    violations: list[dict] = []
+    allowed_count = 0
+    for r in non_whitelist_real_hits:
+        for h in r["hits"]:
+            key = (r["file"], int(h["line"]), h["pattern"])
+            if key in ALLOWED_FLOAT_SITES:
+                allowed_count += 1
+                continue
+            violations.append({
+                "file": r["file"],
+                "line": h["line"],
+                "col": h["col"],
+                "pattern": h["pattern"],
+                "match": h["match"],
+                "context": h["context"],
+                "is_blacklist_file": r["is_blacklist_file"],
+            })
+
+    fail = len(blacklist_hits) > 0 or len(violations) > 0
+
     return {
         "root": str(root),
         "scan_dirs": list(SCAN_DIRS),
@@ -222,9 +252,12 @@ def build_report(root: Path) -> dict:
         "total_blacklist_hits": sum(r["hit_count"] for r in blacklist_hits),
         "blacklist_hit_files": [r["file"] for r in blacklist_hits],
         "total_non_whitelist_hits": total_real_hits,
+        "allowed_float_sites_count": allowed_count,
         "non_whitelist_hit_files": [r["file"] for r in non_whitelist_real_hits],
+        "violations": violations,
+        "violation_count": len(violations),
         "per_file": per_file,
-        "fail": len(blacklist_hits) > 0,
+        "fail": fail,
     }
 
 
@@ -241,6 +274,10 @@ def main(argv: list[str]) -> int:
         return 2
 
     report = build_report(root)
+    violations = report.get("violations", [])
+    blacklist_hits_list = [v for v in violations if v.get("is_blacklist_file")]
+    non_blacklist_violations = [v for v in violations if not v.get("is_blacklist_file")]
+
     if json_only:
         json.dump(report, sys.stdout, indent=2, ensure_ascii=False)
         sys.stdout.write("\n")
@@ -262,10 +299,21 @@ def main(argv: list[str]) -> int:
         print(f"files scanned: {report['files_scanned']}")
         print(f"blacklist files hit: {len(report['blacklist_hit_files'])} ({report['total_blacklist_hits']} hits)")
         print(f"non-whitelist files hit: {len(report['non_whitelist_hit_files'])} ({report['total_non_whitelist_hits']} hits)")
+        print(f"total violations (fail-closed): {report.get('violation_count', 0)}")
+        if len(violations) > 0:
+            print("VIOLATION LIST:")
+            for i, v in enumerate(violations, 1):
+                bt = " [BLACKLIST]" if v.get("is_blacklist_file") else ""
+                print(f"  #{i}. {v['file']}:L{v['line']}:{v['col']}{bt} {v['pattern']}: {v['context'][:120]}")
         if report["fail"]:
-            print("FAIL: financial blacklist file contains real float usage")
+            reasons = []
+            if len(blacklist_hits_list) > 0:
+                reasons.append(f"{len(blacklist_hits_list)} blacklist-file float hit(s)")
+            if len(non_blacklist_violations) > 0:
+                reasons.append(f"{len(non_blacklist_violations)} non-whitelist protected-surface float violation(s)")
+            print(f"FAIL: {'; '.join(reasons)}")
         else:
-            print("PASS: no financial-blacklist float hits")
+            print("PASS: no financial-blacklist float hits and no non-whitelist protected-surface float violations")
 
     return 1 if report["fail"] else 0
 

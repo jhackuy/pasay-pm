@@ -43,16 +43,20 @@ def _current_url():
     return settings.database_url
 
 
-def _superuser_create_db(super_engine, new_db_name: str) -> bool:
-    """Try CREATE DATABASE via superuser; return True if succeeded."""
+def _superuser_create_db(super_engine, new_db_name: str) -> tuple[bool, str | None]:
+    """Try CREATE DATABASE via superuser; return (ok, failure_reason_masked)."""
     try:
         with super_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
             safe = new_db_name.replace('"', '')
             conn.execute(text(f'DROP DATABASE IF EXISTS "{safe}"'))
             conn.execute(text(f'CREATE DATABASE "{safe}"'))
-        return True
-    except Exception:
-        return False
+        return True, None
+    except Exception as e:
+        raw = f"{type(e).__name__}: {e}"
+        import re
+        masked = re.sub(r"(password|passwd|pwd)\s*[=:]\s*[^\s&,;'\")]+", r"\1=***", raw, flags=re.IGNORECASE)
+        masked = re.sub(r"://([^:/\s]+):([^@\s]+)@", r"://\1:***@", masked)
+        return False, masked
 
 
 def _replace_db_in_url(url: str, new_db: str) -> str:
@@ -148,37 +152,63 @@ def _step(name: str, target: str, direction: str, expected_rev: str | None,
 
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--allow-destructive-schema-clean", action="store_true",
+                    help="Allow fallback to DROP SCHEMA public CASCADE on configured dev DB if CREATE DATABASE fails.")
+    args = ap.parse_args()
+
     out: dict = {}
     BASE_URL = _current_url()
     out["base_url_masked"] = BASE_URL.split("@")[-1] if "@" in BASE_URL else BASE_URL
+    out["allow_destructive_schema_clean"] = args.allow_destructive_schema_clean
 
     disposable_db_name = f"pasay_m005_rt_{os.getpid()}_{int(__import__('time').time() * 1000)}"
 
-    # 1) Try to create a true throwaway DB. Fallback: reuse existing DB but
-    # DROP SCHEMA public CASCADE for a clean slate (also disposable proof).
     disposable_mode = "createdb"
     super_engine = None
     run_url: str | None = None
+    createdb_failure_reason: str | None = None
     try:
-        # Try with a superuser-style URL that might exist on dev machines;
-        # fall back to constructing a new DB name on the existing server.
         from sqlalchemy.engine import make_url
         base_u = make_url(BASE_URL)
-        # Try to use the same user/pass to create a new database.
         su_url = base_u.set(database="postgres")
         super_engine = create_engine(su_url.render_as_string(hide_password=False), pool_pre_ping=True)
-        ok = _superuser_create_db(super_engine, disposable_db_name)
+        ok, fail_reason = _superuser_create_db(super_engine, disposable_db_name)
         if ok:
             run_url_obj = base_u.set(database=disposable_db_name)
             run_url = run_url_obj.render_as_string(hide_password=False)
             disposable_mode = "createdb"
-    except Exception:
-        pass
+        else:
+            createdb_failure_reason = fail_reason
+    except Exception as e:
+        import re
+        raw = f"{type(e).__name__}: {e}"
+        masked = re.sub(r"(password|passwd|pwd)\s*[=:]\s*[^\s&,;'\")]+", r"\1=***", raw, flags=re.IGNORECASE)
+        masked = re.sub(r"://([^:/\s]+):([^@\s]+)@", r"://\1:***@", masked)
+        createdb_failure_reason = f"setup_exception: {masked}"
+
+    out["createdb_failure_reason"] = createdb_failure_reason
 
     if run_url is None:
+        if not args.allow_destructive_schema_clean:
+            out["fatal"] = (
+                "CREATE DATABASE failed and --allow-destructive-schema-clean not set. "
+                "Abort fail-closed to avoid destructive DROP SCHEMA public CASCADE on configured dev DB. "
+                "Set --allow-destructive-schema-clean explicitly to permit the destructive fallback."
+            )
+            if super_engine:
+                try:
+                    super_engine.dispose()
+                except Exception:
+                    pass
+            sys.stdout.buffer.write((json.dumps(out, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+            sys.stderr.buffer.write((
+                f"FAIL-CLOSED: CREATE DATABASE failed. Reason: {createdb_failure_reason or 'unknown'}\n"
+            ).encode("utf-8"))
+            return 1
         disposable_mode = "drop_schema_public"
         run_url = BASE_URL
-        # Ensure schema public is clean for an equivalent fresh DB.
         try:
             base_engine = create_engine(BASE_URL, pool_pre_ping=True)
             _clean_schema_public(base_engine)

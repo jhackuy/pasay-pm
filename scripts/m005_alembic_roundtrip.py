@@ -39,6 +39,15 @@ REV_FILE_HEADER = re.compile(r"^#?\s*Revision ID:\s*([^\s#]+)", re.M)
 REV_FILE_REVISES = re.compile(r"^#?\s*Revises:\s*([^\s#]+)", re.M)
 
 
+from enum import Enum, auto
+
+class StepStatus(Enum):
+    OK = auto()
+    FAILED = auto()
+    ABORTED = auto()
+    SKIPPED = auto()
+    PREP_FAILED = auto()
+
 @dataclass
 class StepResult:
     step: str
@@ -47,6 +56,8 @@ class StepResult:
     db_connect_ok: bool
     returncode: int
     error: str | None = None
+    status: StepStatus = StepStatus.OK
+    chain_failure: bool = False
 
 
 def _run(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
@@ -188,13 +199,26 @@ def _single_step(step_name: str, target: str | None, expected_rev: str | None, d
     args = [direction, target]
     cp = _run(args)
     actual = _current_rev()
+    rc = cp.returncode
+    rev_ok = (actual == expected_rev or (expected_rev is None and actual is None))
+    db_ok = _db_connect_check()
+    status = StepStatus.OK
+    chain_failure = False
+    if rc != 0:
+        status = StepStatus.FAILED
+        chain_failure = True
+    elif not rev_ok or not db_ok:
+        status = StepStatus.FAILED
+        chain_failure = True
     return StepResult(
         step=step_name,
         expected_rev=expected_rev,
         actual_rev=actual,
-        db_connect_ok=_db_connect_check(),
-        returncode=cp.returncode,
-        error=cp.stderr.strip()[-2000:] if cp.returncode != 0 and cp.stderr else None,
+        db_connect_ok=db_ok,
+        returncode=rc,
+        error=cp.stderr.strip()[-2000:] if rc != 0 and cp.stderr else None,
+        status=status,
+        chain_failure=chain_failure,
     )
 
 
@@ -202,38 +226,49 @@ def _verify_roundtrip_for_rev(prev_rev: str | None, rev: str, next_rev: str | No
     steps: list[StepResult] = []
 
     if prev_rev:
-        steps.append(_single_step("prep_back_to_prev", prev_rev, prev_rev, direction="downgrade"))
+        prep_step = _single_step("prep_back_to_prev", prev_rev, prev_rev, direction="downgrade")
+        steps.append(prep_step)
         if steps[-1].returncode != 0:
-            steps.append(StepResult(
+            aborted = StepResult(
                 step="upgrade_to_target",
                 expected_rev=rev,
                 actual_rev=_current_rev(),
                 db_connect_ok=_db_connect_check(),
                 returncode=1,
                 error="ABORTED: prep_back_to_prev failed, cannot start roundtrip cleanly -> " + (steps[-1].error or ""),
-            ))
-            steps.append(StepResult(
+                status=StepStatus.ABORTED,
+                chain_failure=True,
+            )
+            steps.append(aborted)
+            skipped1 = StepResult(
                 step="downgrade_back",
                 expected_rev=prev_rev,
                 actual_rev=_current_rev(),
                 db_connect_ok=_db_connect_check(),
                 returncode=1,
                 error="SKIPPED",
-            ))
-            steps.append(StepResult(
+                status=StepStatus.SKIPPED,
+                chain_failure=True,
+            )
+            steps.append(skipped1)
+            skipped2 = StepResult(
                 step="upgrade_again",
-                expected_rev=rev if next_rev is None else next_rev,
+                expected_rev=rev,
                 actual_rev=_current_rev(),
                 db_connect_ok=_db_connect_check(),
                 returncode=1,
                 error="SKIPPED",
-            ))
+                status=StepStatus.SKIPPED,
+                chain_failure=True,
+            )
+            steps.append(skipped2)
             ok = False
             return {
                 "revision": rev,
                 "previous_revision": prev_rev,
                 "next_revision": next_rev,
                 "all_steps_ok": ok,
+                "any_chain_failure": True,
                 "steps": [s.__dict__ for s in steps],
             }
 
@@ -241,20 +276,23 @@ def _verify_roundtrip_for_rev(prev_rev: str | None, rev: str, next_rev: str | No
 
     steps.append(_single_step("downgrade_back", "-1", prev_rev))
 
-    steps.append(_single_step("upgrade_again", rev if next_rev is None else next_rev, rev if next_rev is None else next_rev))
+    steps.append(_single_step("upgrade_again", rev, rev))
 
     check_steps = [s for s in steps if s.step != "prep_back_to_prev"]
     ok = all(
         (s.actual_rev == s.expected_rev or (s.expected_rev is None and s.actual_rev is None))
         and s.db_connect_ok
         and s.returncode == 0
+        and not s.chain_failure
         for s in check_steps
     )
+    any_chain_failure = any(s.chain_failure for s in steps)
     return {
         "revision": rev,
         "previous_revision": prev_rev,
         "next_revision": next_rev,
         "all_steps_ok": ok,
+        "any_chain_failure": any_chain_failure,
         "steps": [s.__dict__ for s in steps],
     }
 
@@ -292,6 +330,7 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     all_rev_tokens = [r for r, _ in all_revs]
+    restore_step_result: StepResult | None = None
     try:
         for idx, rev in enumerate(last3_revs):
             global_idx = (
@@ -312,18 +351,35 @@ def main() -> int:
             results.append(_verify_roundtrip_for_rev(prev_rev, rev, next_rev))
     finally:
         if original_head:
-            _run(["upgrade", original_head])
+            restore_step_result = _single_step(
+                "restore_final_head", original_head, original_head, direction="upgrade"
+            )
+        else:
+            restore_step_result = None
 
     out["roundtrip_results"] = results
+    if restore_step_result is not None:
+        out["restore_final_head_step"] = restore_step_result.__dict__
+    out["restore_final_head_ok"] = (
+        restore_step_result is not None
+        and restore_step_result.returncode == 0
+        and not restore_step_result.chain_failure
+    ) if restore_step_result else (original_head is None)
 
     def _all_errors_missing_fk_only(rs: list[dict[str, Any]]) -> bool:
         count_total = 0
         count_ok_or_missing_fk = 0
         for r in rs:
+            if r.get("any_chain_failure"):
+                return False
             for s in r["steps"]:
+                if s.get("chain_failure"):
+                    return False
+                err = s.get("error") or ""
+                if err == "SKIPPED" or err.startswith("ABORTED:"):
+                    return False
                 count_total += 1
                 rc = s.get("returncode", 0)
-                err = s.get("error") or ""
                 if rc == 0:
                     count_ok_or_missing_fk += 1
                     continue
@@ -331,32 +387,30 @@ def main() -> int:
                     ("UndefinedObject" in err and "constraint" in err and "does not exist" in err)
                     or "fk_leases_superseded_same_party" in err
                 )
-                is_prep_or_aborted_chain = (
-                    s.get("step", "").startswith("prep_")
-                    or err.startswith("ABORTED: prep_back_to_prev failed")
-                    or err == "SKIPPED"
-                )
-                if has_missing_fk or is_prep_or_aborted_chain:
+                if has_missing_fk:
                     count_ok_or_missing_fk += 1
         return count_total > 0 and count_ok_or_missing_fk == count_total
 
     all_missing_fk = _all_errors_missing_fk_only(results)
+    any_chain_failure_overall = any(r.get("any_chain_failure") for r in results)
+    out["any_chain_failure_overall"] = any_chain_failure_overall
     out["overall_roundtrip_ok"] = (
         all(r["all_steps_ok"] for r in results) if results else False
-    )
+    ) and out["restore_final_head_ok"] and not any_chain_failure_overall
     out["db_prestate_missing_fk_exempt"] = (
-        (not out["overall_roundtrip_ok"]) and all_missing_fk and out["heads"]["single_head_ok"]
+        (not out["overall_roundtrip_ok"])
+        and all_missing_fk
+        and out["heads"]["single_head_ok"]
+        and not any_chain_failure_overall
+        and out["restore_final_head_ok"]
     )
     out["restored_head_rev"] = _current_rev()
 
-    payload = json.dumps(out, ensure_ascii=False, indent=2) + "\n"
+    payload = json.dumps(out, ensure_ascii=False, indent=2, default=lambda o: o.name if isinstance(o, Enum) else o) + "\n"
     sys.stdout.buffer.write(payload.encode("utf-8", errors="replace"))
     sys.stdout.buffer.flush()
-    return (
-        0
-        if (out["overall_roundtrip_ok"] or out["db_prestate_missing_fk_exempt"]) and out["heads"]["single_head_ok"]
-        else 1
-    )
+    final_ok = (out["overall_roundtrip_ok"] or out["db_prestate_missing_fk_exempt"]) and out["heads"]["single_head_ok"] and out["restore_final_head_ok"] and not any_chain_failure_overall
+    return 0 if final_ok else 1
 
 
 if __name__ == "__main__":

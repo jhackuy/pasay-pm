@@ -128,6 +128,9 @@ def scan() -> dict[str, Any]:
     total_hits = 0
 
     SELF_NAME = Path(__file__).name
+    GENERATED_MATRIX_MD_NAMES = {
+        "m005_routers_scope_matrix.md",
+    }
     for path in _walk(REPO_ROOT):
         if not _is_text_candidate(path):
             continue
@@ -137,7 +140,7 @@ def scan() -> dict[str, Any]:
             rel = str(path)
         if path.name == SELF_NAME:
             continue
-        if path.name.startswith("m005_") and path.name.endswith((".py", ".md")):
+        if path.name in GENERATED_MATRIX_MD_NAMES:
             continue
         try:
             lines = path.read_text(encoding="utf-8", errors="replace").splitlines()

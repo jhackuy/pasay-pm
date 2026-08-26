@@ -53,15 +53,27 @@ def list_tenants(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    rows = [
-        _to_public(obj)
-        for obj in scoped_list_tenants(db, for_user_id=user.id)
-    ]
+    try:
+        from app.services.organization_scope import list_active_org_ids_for_user
+        orgs = list_active_org_ids_for_user(db, user.id)
+        if not orgs:
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
+        query = (
+            db.query(Tenant)
+            .filter(
+                Tenant.organization_id.in_(orgs),
+                Tenant.deleted_at.is_(None),
+            )
+            .order_by(Tenant.id)
+        )
+    except Exception as exc:
+        from app.services.organization_scope import scope_exception_to_http
+        raise scope_exception_to_http(exc) from exc
+    total = query.count()
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    total = len(rows)
-    paged = rows[offset:offset + limit]
-    return Paginated(items=paged, total=total, limit=limit, offset=offset)
+    rows = [_to_public(obj) for obj in query.offset(offset).limit(limit).all()]
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=TenantPublic, status_code=status.HTTP_201_CREATED)

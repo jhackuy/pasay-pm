@@ -299,14 +299,29 @@ def list_expenses(
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     try:
-        rows = scoped_list_expenses(db, for_user_id=user.id)
+        from app.services.organization_scope import list_active_org_ids_for_user
+        from app.models.property import Property
+        orgs = list_active_org_ids_for_user(db, user.id)
+        if not orgs:
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
+        org_property_ids = (
+            db.query(Property.id)
+            .filter(Property.organization_id.in_(orgs), Property.deleted_at.is_(None))
+            .subquery()
+        )
+        query = (
+            db.query(Expense)
+            .join(Property, Property.id == Expense.property_id)
+            .filter(Property.organization_id.in_(orgs))
+            .order_by(Expense.id)
+        )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    total = query.count()
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    total = len(rows)
-    paged = rows[offset:offset + limit]
-    return Paginated(items=paged, total=total, limit=limit, offset=offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{expense_id}", response_model=ExpenseRead)
