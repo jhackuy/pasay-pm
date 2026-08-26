@@ -14,13 +14,13 @@ permissions:
 
 concurrency:
   group: deploy-agentteams-gx10
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   deploy:
     name: gx10-deploy
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 44
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: [self-hosted]
     timeout-minutes: 60
     env:
       GX10_HOST: 192.168.50.42
