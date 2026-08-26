@@ -38,3 +38,9 @@ def test_stall_count_resets_on_real_progress():
 def test_project_list_accepts_nested_connector_shape():
     payload = {"result": {"projects": [{"project_id": "p1"}]}}
     assert watchdog.project_list(payload) == [{"project_id": "p1"}]
+
+
+def test_hard_brake_targets_only_pasay_workers():
+    assert len(watchdog.TEAM_WORKERS) == 6
+    assert all(name.startswith("pasay-") for name in watchdog.TEAM_WORKERS)
+    assert "manager" not in watchdog.TEAM_WORKERS
