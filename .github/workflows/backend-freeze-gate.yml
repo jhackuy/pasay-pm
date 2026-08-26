@@ -391,16 +391,24 @@ jobs:
           # deterministically instead of relying on exit.
           pytest tests app \
             --ignore=worktrees --ignore=_m005_artifacts --ignore=pasay-telegram-bot \
-            --co --no-header -q \
+            --co -q \
             > artifacts/doors/door_15_collect_backend.log 2>&1 || true
+          echo "--- first 3 lines of door_15_collect_backend.log ---"
+          head -n 3 artifacts/doors/door_15_collect_backend.log || true
+          echo "--- last 15 lines of door_15_collect_backend.log ---"
+          tail -n 15 artifacts/doors/door_15_collect_backend.log || true
+          echo "--- end door_15_collect_backend.log snippet ---"
           # Parse strategy: first try `N tests`, then fall back to `N items collected`,
           # then fall back to `N/M tests collected (d deselected)` last line format.
           BACKEND_COLLECTED=$(python - <<'PYEOF'
           import re
           text = open("artifacts/doors/door_15_collect_backend.log", encoding="utf-8", errors="replace").read()
-          tail = text.splitlines()[-12:]
+          # Scan LAST 30 lines for any of the 3 priority patterns, not just tail 12.
+          # This makes the parser robust to longer pytest tails (progress,
+          # deselected, warnings, extra banners).
+          scan_lines = text.splitlines()[-30:]
           candidates = []
-          for line in tail:
+          for line in scan_lines:
               # Priority 1: literal "N tests collected" (with optional deselect suffix)
               m = re.search(r'(\d+)\s*tests\s*collected', line)
               if m:
@@ -450,6 +458,12 @@ jobs:
           echo "TOTAL_COLLECTED=${TOTAL_COLLECTED}"      >> "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null || true
           if [ "${TOTAL_COLLECTED}" -lt 250 ] && [ "${BACKEND_COLLECTED}" -lt 250 ]; then
             echo "FAIL: DOOR-15 test count total=${TOTAL_COLLECTED} backend=${BACKEND_COLLECTED} both < 250"
+            echo "--- debug door_15_collect_backend.log (full) ---"
+            cat artifacts/doors/door_15_collect_backend.log || true
+            echo "--- end debug door_15_collect_backend.log (full) ---"
+            echo "--- debug door_15_collect_bot.log (full) ---"
+            cat artifacts/doors/door_15_collect_bot.log 2>/dev/null || true
+            echo "--- end debug door_15_collect_bot.log (full) ---"
             exit 1
           fi
           echo "DOOR-15 Part A mass gate OK (backend=${BACKEND_COLLECTED} >= 250 OR total=${TOTAL_COLLECTED} >= 250)"
