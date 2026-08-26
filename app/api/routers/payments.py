@@ -13,6 +13,7 @@ from app.database import get_db
 from app.models.user import User
 from app.schemas.payment_match import PaymentMatchRequest, PaymentMatchResponse
 from app.services import payment_match as payment_match_service
+from app.services.organization_scope import list_active_org_ids_for_user
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
@@ -21,9 +22,14 @@ router = APIRouter(prefix="/payments", tags=["payments"])
 def match_rent_payment(
     payload: PaymentMatchRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(manager_or_admin),
+    user: User = Depends(manager_or_admin),
 ):
-    result = payment_match_service.match_payment(db, payload.text, amount=payload.amount)
+    # Fail-closed: caller active memberships only. Empty membership -> no
+    # leases are loaded (no cross-org candidate is ever reachable).
+    org_ids = list_active_org_ids_for_user(db, user.id)
+    result = payment_match_service.match_payment(
+        db, payload.text, amount=payload.amount, org_ids=org_ids
+    )
     return {
         "received_date": result.received_date,
         "candidates": [
