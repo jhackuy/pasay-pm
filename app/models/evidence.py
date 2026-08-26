@@ -18,7 +18,7 @@ from enum import Enum
 from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import AuditMixin, Base, pg_enum
+from app.models.base import AuditMixin, Base, SoftDeleteMixin, pg_enum
 
 
 class EvidenceCategory(str, Enum):
@@ -48,7 +48,7 @@ class EvidenceCategory(str, Enum):
     repair = "REPAIR"
 
 
-class Evidence(AuditMixin, Base):
+class Evidence(AuditMixin, SoftDeleteMixin, Base):
     """One indexed media/document record (portable storage metadata)."""
 
     __tablename__ = "evidence"

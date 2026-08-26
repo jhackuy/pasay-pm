@@ -47,11 +47,51 @@ def _user(db, username, role):
     return u
 
 
+def _seed_anchor_property(db, actor_id=1):
+    """Ensure the actor user + org + ACTIVE membership + property exist.
+    Returns the first property.id so DB-direct expenses satisfy expenses.property_id
+    NOT NULL (M001 constraint)."""
+    from app.models.membership import (
+        Organization, Membership, OrganizationRole, MembershipState,
+    )
+    from app.models.property import Property
+    from app.models.user import User
+
+    user = db.query(User).filter(User.id == actor_id).one_or_none()
+    if user is None:
+        user = User(id=actor_id, username=f"anchor_user_{actor_id}", role="admin",
+                    api_key_hash=__import__("secrets").token_urlsafe(24), is_active=True)
+        db.add(user)
+        db.flush()
+    org = (db.query(Organization)
+           .join(Membership, Membership.organization_id == Organization.id)
+           .filter(Membership.user_id == user.id,
+                   Membership.state == MembershipState.ACTIVE)
+           .first())
+    if org is None:
+        org = Organization(name=f"AnchorOrg_{actor_id}")
+        db.add(org)
+        db.flush()
+        m = Membership(organization_id=org.id, user_id=user.id,
+                       role=OrganizationRole.OWNER, state=MembershipState.ACTIVE)
+        db.add(m)
+        db.flush()
+    prop = db.query(Property).filter(Property.organization_id == org.id).first()
+    if prop is None:
+        prop = Property(organization_id=org.id, name=f"AnchorProp_{actor_id}",
+                        address="123 Anchor St", city="Manila")
+        db.add(prop)
+        db.flush()
+    return prop.id
+
+
 def _approved_expense(db, *, amount="28000.00", approved_days_ago=10, actor_id=1):
+    property_id = _seed_anchor_property(db, actor_id=actor_id)
     e = Expense(expense_date=date(2026, 8, 1), category="维修", amount=amount,
                 payee="Fix-It Co", description="aircon", status=ExpenseStatus.approved,
                 approved_by=actor_id,
-                approved_at=NOW - timedelta(days=approved_days_ago))
+                approved_at=NOW - timedelta(days=approved_days_ago),
+                property_id=property_id)
     db.add(e)
     db.flush()
     return e
@@ -176,14 +216,17 @@ def test_e12b_partial_keeps_single_followup(assignee, db_session):
 
 # E14 — Repair-linked Expense PAID does not close the Repair
 def test_e14_repair_not_closed_by_expense_paid(db_session):
+    property_id = _seed_anchor_property(db_session, actor_id=1)
     repair = RepairOperation(issue="aircon broken", status=RepairOperationStatus.WAITING_PAYMENT,
-                             next_action="awaiting payment", created_by=1)
+                             next_action="awaiting payment", created_by=1,
+                             property_id=property_id)
     db_session.add(repair)
     db_session.flush()
 
     expense = Expense(expense_date=date(2026, 8, 1), category="维修", amount="28000.00",
                       payee="Fix-It Co", status=ExpenseStatus.approved,
-                      approved_by=1, approved_at=NOW - timedelta(days=2))
+                      approved_by=1, approved_at=NOW - timedelta(days=2),
+                      property_id=property_id)
     db_session.add(expense)
     db_session.flush()
 

@@ -33,6 +33,8 @@ Owner Product Direction / GitHub Issues / OpenDesign
                  Owner 最终验收 → merge（Owner 执行）
 ```
 
+> **并行证据获取（CI Contract）：CodeRabbit and `pasay-gate` run in parallel**。TRAE SOLO 提交后自行触发 @coderabbitai 与 pasay-gate workflow，两者结果都是独立验收证据，不能互替、不能自证。
+
 ## GitHub Issue / Label 说明
 
 | 元数据 | 说明 |

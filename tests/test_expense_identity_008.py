@@ -95,18 +95,44 @@ def test_purpose_none_when_everything_placeholder():
 # --- B1: test-DB isolation guard fails closed --------------------------------
 
 def test_test_db_guard_allows_isolated_name_and_blocks_live():
+    import re as _re
     from tests.conftest import (
         _CONFIGURED_DB,
         _FORBIDDEN_TEST_DBS,
+        _ALLOWED_TEST_DB_PREFIX_RE,
         TEST_DB_NAME,
         _test_db_allowed,
     )
 
-    # The active test DB must be an isolated name.
+    # The active test DB must be an isolated name (strict pasay_*_ prefix whitelist).
     assert _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB) is True
-    assert TEST_DB_NAME == "pasay_pm_test"
+    assert bool(_ALLOWED_TEST_DB_PREFIX_RE.fullmatch(TEST_DB_NAME)), (
+        "TEST_DB_NAME=%r must match strict prefix whitelist pattern %s"
+        % (TEST_DB_NAME, _ALLOWED_TEST_DB_PREFIX_RE.pattern)
+    )
+    # Explicitly allowed well-known families.
+    for family_name in (
+        "pasay_pm_r1_20260101_001",
+        "pasay_gate_m004_01",
+        "pasay_freeze_candidate_003",
+        "pasay_closeout_20260801",
+        "pasay_return2_r4_20260824_01",
+        "pasay_fresh_alembic_002",
+        "pasay_alembic_head_check",
+    ):
+        assert _test_db_allowed(family_name, _CONFIGURED_DB) is True, family_name
     # Live/production names are refused deterministically.
     for name in _FORBIDDEN_TEST_DBS:
         assert _test_db_allowed(name, _CONFIGURED_DB) is False
     assert _test_db_allowed(_CONFIGURED_DB, _CONFIGURED_DB) is False
     assert _test_db_allowed("", _CONFIGURED_DB) is False
+    # Anything not matching the strict prefix whitelist must also fail closed.
+    for disallowed in (
+        "my_custom_db",
+        "pasayprod",
+        "production",
+        "defaultdb",
+        "pasaytest",
+        "pasay_pm_r1_20260101_001!prod",
+    ):
+        assert _test_db_allowed(disallowed, _CONFIGURED_DB) is False, disallowed

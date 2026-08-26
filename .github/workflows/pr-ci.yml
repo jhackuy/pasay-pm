@@ -16,7 +16,7 @@ jobs:
   pasay-gate:
     name: pasay-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       PYTHONPATH: ""
     services:
@@ -88,7 +88,7 @@ jobs:
           grep -q "route:dev" GITHUB_DEV_WORKFLOW.md
           grep -q "ready-for-owner" GITHUB_DEV_WORKFLOW.md
           grep -q "CodeRabbit and \`pasay-gate\` run in parallel" GITHUB_DEV_WORKFLOW.md
-          grep -q "Long-Term Engineering Rules" AGENTS.md
+          grep -q "Permanent Engineering Truths" AGENTS.md
           grep -q "GitHub Issue 是唯一任务 ID" README.md
           grep -q "pasay-gate" README.md
 
@@ -109,21 +109,35 @@ jobs:
         run: |
           python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
-      - name: Run backend targeted pytest (Issue #18 + Issue #31)
+      - name: Run backend targeted pytest (Issue #18 + Issue #31 + M1 + M002 + M003 + M005 RET3 cross-org)
         if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.cloudflare == 'true'
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
-          PASAY_TEST_DB_NAME: "pasay_pm_test"
+          PASAY_TEST_DB_NAME: "pasay_pm_ci_${{ github.run_id }}_001"
           TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
           PASAY_RUNTIME_MODE: "ci"
-        timeout-minutes: 8
+        timeout-minutes: 40
         run: |
+          # Legacy P0 gates: Issue #18 (telegram webhook) + Issue #31 (prod arch closeout)
+          # M1 org-scope P0 regression (milestone/1)
+          # M002: Rent closure + Repair closure + Expense payment truth + Repair AI employee
+          # M003: Expense Truth Closure + Reports/Operations/Legacy Scope Unified Hardening
+          # M005: RETURN-3 SEC-ADDENDUM — payments matcher + commission settlement cross-org
+          #       strong counterexamples (real PG16 CI execution)
           python -m pytest \
-            tests/test_prod_arch_closeout_p0_031.py \
             tests/test_telegram_webhook_p018.py \
+            tests/test_prod_arch_closeout_p0_031.py \
+            tests/test_milestone_1_org_scope_p0.py \
+            tests/test_expense_003b_payment_truth.py \
+            tests/test_repair_ai_employee_008.py \
+            tests/test_rent_closure_m2.py \
+            tests/test_repair_closure_m2.py \
+            tests/test_fix3_blockers_m2.py \
+            tests/test_m003_expense_scope_hardening.py \
+            tests/test_m005_ret3_cross_org_coverage.py \
             -v --tb=short -q
 
       - name: Install bot dependencies
@@ -183,3 +197,88 @@ jobs:
           # real package cannot be loaded in Node.js because it imports
           # the Cloudflare-only virtual module "cloudflare:workers").
           npx tsx --tsconfig tsconfig.tests.json tests/index.spec.ts
+
+  m004-gate:
+    name: m004-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ""
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files (backend scope)
+        id: changed
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$base" ] || [ -z "$head" ]; then
+            backend=true
+          else
+            files="$(git diff --name-only "$base" "$head")"
+            backend=false
+            while IFS= read -r f; do
+              case "$f" in
+                .github/workflows/*|app/*|alembic/*|tests/*|requirements*.txt|pyproject.toml|setup.py|conftest.py)
+                  backend=true
+                  ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "backend=$backend" >> $GITHUB_OUTPUT
+
+      - name: Set up Python 3.11
+        if: steps.changed.outputs.backend == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        if: steps.changed.outputs.backend == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: M004 Gate — exact 6 tests (0 FAIL / 0 ERROR contract)
+        if: steps.changed.outputs.backend == 'true'
+        timeout-minutes: 28
+        env:
+          DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          PASAY_TEST_DB_NAME: "pasay_pm_test_m004"
+          PASAY_RT_DB_NAME: "pasay_pm_test_rt"
+          PASAY_RT_DB_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          PASAY_RT_ADMIN_DB_OVERRIDE: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
+          TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
+          PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
+          PASAY_RUNTIME_MODE: "ci"
+          OPERATIONS_DEFAULT_ASSIGNEE: "1"
+        run: |
+          python -m pytest \
+            tests/test_m004_lease_moveout_truth_closure.py \
+            tests/test_m004_db_invariants.py \
+            tests/test_m004_db_invariants_renewal_lifecycle.py \
+            tests/test_m004_concurrency.py \
+            tests/test_leases.py \
+            tests/test_m003_operations_truth_closure.py \
+            -q -p no:cacheprovider --tb=short \
+            --ignore=eval

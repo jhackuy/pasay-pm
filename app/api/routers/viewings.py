@@ -27,6 +27,12 @@ from app.models.user import User
 from app.services.audit import record_audit, serialize_row
 from app.services.operations.config import SECRETARY_ASSIGNEE_ID
 from app.services.operations.generation import create_operational_task
+from app.services.organization_scope import (
+    list_active_org_ids_for_user,
+    scope_exception_to_http,
+    unit_org_id,
+)
+from app.schemas.common import Paginated
 
 router = APIRouter(prefix="/viewings", tags=["viewings"])
 
@@ -103,6 +109,33 @@ def _schedule_viewing_reminder(db: Session, viewing: Viewing) -> None:
     create_operational_task(db, fields=fields, now=datetime.now(timezone.utc))
 
 
+def _org_unit_ids_query(db: Session, for_user_id: int):
+    orgs = list_active_org_ids_for_user(db, for_user_id)
+    if not orgs:
+        return db.query(Unit.id).filter(Unit.id == -1).subquery()
+    return (
+        db.query(Unit.id)
+        .join(Property, Property.id == Unit.property_id)
+        .filter(
+            Property.organization_id.in_(orgs),
+            Unit.deleted_at.is_(None),
+        )
+        .subquery()
+    )
+
+
+def _scoped_get_viewing(db: Session, viewing_id: int, for_user_id: int) -> Viewing:
+    org_unit_ids = _org_unit_ids_query(db, for_user_id)
+    obj = (
+        db.query(Viewing)
+        .filter(Viewing.id == viewing_id, Viewing.unit_id.in_(org_unit_ids))
+        .first()
+    )
+    if obj is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Viewing not found")
+    return obj
+
+
 @router.post("", response_model=ViewingRead, status_code=status.HTTP_201_CREATED)
 def create_viewing(
     payload: ViewingCreate,
@@ -112,6 +145,15 @@ def create_viewing(
     unit = db.query(Unit).filter(Unit.id == payload.unit_id, Unit.deleted_at.is_(None)).first()
     if unit is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
+    try:
+        object_org_id = unit_org_id(db, payload.unit_id)
+        if object_org_id is None:
+            raise LookupError("Unit not found")
+        user_orgs = list_active_org_ids_for_user(db, user.id)
+        if object_org_id not in user_orgs:
+            raise LookupError("Unit not found")
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
     obj = Viewing(
         unit_id=payload.unit_id,
         property_id=unit.property_id,
@@ -137,14 +179,17 @@ def create_viewing(
     return _serialize(obj)
 
 
-@router.get("", response_model=list[ViewingRead])
+@router.get("", response_model=Paginated[ViewingRead])
 def list_viewings(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     unit_id: Optional[int] = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
-    query = db.query(Viewing)
+    org_unit_ids = _org_unit_ids_query(db, user.id)
+    query = db.query(Viewing).filter(Viewing.unit_id.in_(org_unit_ids))
     if status_filter:
         try:
             query = query.filter(Viewing.status == ViewingStatus(status_filter))
@@ -152,7 +197,13 @@ def list_viewings(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown viewing status")
     if unit_id is not None:
         query = query.filter(Viewing.unit_id == unit_id)
-    return [_serialize(v) for v in query.order_by(Viewing.scheduled_at, Viewing.id).all()]
+    ordered = query.order_by(Viewing.scheduled_at, Viewing.id)
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    items = [_serialize(v) for v in rows]
+    return Paginated(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.post("/{viewing_id}/outcome", response_model=ViewingRead)
@@ -166,9 +217,7 @@ def record_outcome(
     outcome (+ rejection reason where applicable) — real data for future
     vacancy/pricing analysis. Completing the outcome closes the viewing and
     its Secretary reminder."""
-    obj = db.get(Viewing, viewing_id)
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Viewing not found")
+    obj = _scoped_get_viewing(db, viewing_id, for_user_id=user.id)
     if obj.status == ViewingStatus.cancelled:
         raise HTTPException(status.HTTP_409_CONFLICT, "Viewing was cancelled")
     obj.status = ViewingStatus.done
@@ -198,9 +247,7 @@ def cancel_viewing(
     db: Session = Depends(get_db),
     user: User = Depends(manager_or_admin),
 ):
-    obj = db.get(Viewing, viewing_id)
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Viewing not found")
+    obj = _scoped_get_viewing(db, viewing_id, for_user_id=user.id)
     if obj.status == ViewingStatus.done:
         raise HTTPException(status.HTTP_409_CONFLICT, "Viewing already done")
     obj.status = ViewingStatus.cancelled

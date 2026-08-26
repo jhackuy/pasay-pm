@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from fastapi import HTTPException, status
-from sqlalchemy import and_, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.financial import Expense, Income
@@ -41,8 +41,11 @@ from app.models.membership import (
     OrganizationRole,
 )
 from app.models.property import Property, Unit
+from app.models.rent_payment_claim import RentPaymentClaim
 from app.models.repair import RepairOperation
 from app.models.tenant import Tenant
+from app.models.move_out import MoveOutInspection
+from app.models.deposit_settlement import DepositSettlement
 from app.services.membership import has_active_membership
 
 # ---------------------------------------------------------------------------
@@ -613,3 +616,199 @@ def scoped_get_repair(
     if obj is None:
         raise LookupError(f"repair {repair_id} not found")
     return obj, membership
+
+
+# ---------------------------------------------------------------------------
+# Rent Payment Claim scope (PASAY-MILESTONE-002)
+# ---------------------------------------------------------------------------
+
+
+def rent_payment_claim_org_id(db: Session, claim_id: int) -> int | None:
+    row = (
+        db.query(Property.organization_id)
+        .select_from(RentPaymentClaim)
+        .join(Lease, Lease.id == RentPaymentClaim.lease_id)
+        .join(Unit, Unit.id == Lease.unit_id)
+        .join(Property, Property.id == Unit.property_id)
+        .filter(RentPaymentClaim.id == claim_id)
+        .one_or_none()
+    )
+    return row[0] if row else None
+
+
+def scoped_get_rent_payment_claim(
+    db: Session,
+    claim_id: int,
+    *,
+    for_user_id: int,
+    role: OrganizationRole | Iterable[OrganizationRole] | None = None,
+) -> tuple[RentPaymentClaim, Membership]:
+    org_id = rent_payment_claim_org_id(db, claim_id)
+    if org_id is None:
+        raise LookupError(
+            f"rent_payment_claim {claim_id} not found or has no organization"
+        )
+    membership = _resolve_scoped_membership(
+        db,
+        for_user_id=for_user_id,
+        object_org_id=org_id,
+        role=role,
+        object_kind="rent_payment_claim",
+    )
+    obj = (
+        db.query(RentPaymentClaim).filter(RentPaymentClaim.id == claim_id).first()
+    )
+    if obj is None:
+        raise LookupError(f"rent_payment_claim {claim_id} not found")
+    return obj, membership
+
+
+def scoped_list_rent_payment_claims(
+    db: Session, *, for_user_id: int, lease_id: int | None = None
+) -> list[RentPaymentClaim]:
+    orgs = list_active_org_ids_for_user(db, for_user_id)
+    if not orgs:
+        return []
+    org_property_ids = (
+        select(Property.id)
+        .where(
+            Property.organization_id.in_(orgs),
+            Property.deleted_at.is_(None),
+        )
+        .scalar_subquery()
+    )
+    org_unit_ids = (
+        select(Unit.id)
+        .where(
+            Unit.property_id.in_(org_property_ids),
+            Unit.deleted_at.is_(None),
+        )
+        .scalar_subquery()
+    )
+    org_lease_ids = (
+        select(Lease.id)
+        .where(
+            Lease.unit_id.in_(org_unit_ids),
+            Lease.deleted_at.is_(None),
+        )
+        .scalar_subquery()
+    )
+    q = db.query(RentPaymentClaim).filter(
+        RentPaymentClaim.lease_id.in_(org_lease_ids)
+    )
+    if lease_id is not None:
+        q = q.filter(RentPaymentClaim.lease_id == lease_id)
+    return q.order_by(RentPaymentClaim.id.desc()).all()
+
+
+# ---------------------------------------------------------------------------
+# Move-Out Inspection + Deposit Settlement scope (PASAY-MILESTONE-004)
+# ---------------------------------------------------------------------------
+
+
+def move_out_inspection_org_id(db: Session, inspection_id: int) -> int | None:
+    row = (
+        db.query(Lease.id)
+        .select_from(MoveOutInspection)
+        .join(Lease, Lease.id == MoveOutInspection.lease_id)
+        .filter(MoveOutInspection.id == inspection_id)
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    return lease_org_id(db, row[0])
+
+
+def deposit_settlement_org_id(db: Session, settlement_id: int) -> int | None:
+    row = (
+        db.query(DepositSettlement.lease_id)
+        .filter(DepositSettlement.id == settlement_id)
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    return lease_org_id(db, row[0])
+
+
+def scoped_get_move_out_inspection(
+    db: Session,
+    inspection_id: int,
+    *,
+    for_user_id: int,
+    role: OrganizationRole | Iterable[OrganizationRole] | None = None,
+) -> tuple[MoveOutInspection, Membership]:
+    org_id = move_out_inspection_org_id(db, inspection_id)
+    if org_id is None:
+        raise LookupError(f"move_out_inspection {inspection_id} not found or has no organization")
+    membership = _resolve_scoped_membership(
+        db,
+        for_user_id=for_user_id,
+        object_org_id=org_id,
+        role=role,
+        object_kind="move_out_inspection",
+    )
+    obj = db.query(MoveOutInspection).filter(MoveOutInspection.id == inspection_id).first()
+    if obj is None:
+        raise LookupError(f"move_out_inspection {inspection_id} not found")
+    return obj, membership
+
+
+def scoped_get_deposit_settlement(
+    db: Session,
+    settlement_id: int,
+    *,
+    for_user_id: int,
+    role: OrganizationRole | Iterable[OrganizationRole] | None = None,
+) -> tuple[DepositSettlement, Membership]:
+    org_id = deposit_settlement_org_id(db, settlement_id)
+    if org_id is None:
+        raise LookupError(f"deposit_settlement {settlement_id} not found or has no organization")
+    membership = _resolve_scoped_membership(
+        db,
+        for_user_id=for_user_id,
+        object_org_id=org_id,
+        role=role,
+        object_kind="deposit_settlement",
+    )
+    obj = db.query(DepositSettlement).filter(DepositSettlement.id == settlement_id).first()
+    if obj is None:
+        raise LookupError(f"deposit_settlement {settlement_id} not found")
+    return obj, membership
+
+
+# ---------------------------------------------------------------------------
+# Canonical org scope ID set helpers (shared by routers, services, quick view)
+# ---------------------------------------------------------------------------
+
+
+def org_property_ids(db: Session, org_id: int) -> set[int]:
+    rows = db.execute(
+        select(Property.id).where(
+            Property.organization_id == org_id,
+            Property.deleted_at.is_(None),
+        )
+    ).all()
+    return {r[0] for r in rows}
+
+
+def org_lease_ids(db: Session, org_id: int) -> set[int]:
+    rows = db.execute(
+        select(Lease.id)
+        .join(Unit, Unit.id == Lease.unit_id)
+        .join(Property, Property.id == Unit.property_id)
+        .where(
+            Property.organization_id == org_id,
+            Lease.deleted_at.is_(None),
+        )
+    ).all()
+    return {r[0] for r in rows}
+
+
+def org_tenant_ids(db: Session, org_id: int) -> set[int]:
+    rows = db.execute(
+        select(Tenant.id).where(
+            Tenant.organization_id == org_id,
+            Tenant.deleted_at.is_(None),
+        )
+    ).all()
+    return {r[0] for r in rows}

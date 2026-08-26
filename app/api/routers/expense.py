@@ -1,6 +1,7 @@
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
@@ -10,11 +11,15 @@ from app.models.expense_claim import ClaimStatus
 from app.models.financial import Expense, ExpenseStatus
 from app.models.operations import (
     OperationalTask,
+    OperationalTaskPriority,
     OperationalTaskStatus,
     OperationalTaskType,
 )
+
+logger = logging.getLogger(__name__)
 from app.models.property import Property, Unit
 from app.models.user import User
+from app.schemas.common import Paginated
 from app.schemas.financial import (
     ExpenseCreate,
     ExpenseDetailOut,
@@ -287,12 +292,36 @@ def _evidence_for_expense(db: Session, expense: Expense, claims) -> dict:
 # Reads
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=list[ExpenseRead])
-def list_expenses(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+@router.get("", response_model=Paginated[ExpenseRead])
+def list_expenses(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
     try:
-        return scoped_list_expenses(db, for_user_id=user.id)
+        from app.services.organization_scope import list_active_org_ids_for_user
+        from app.models.property import Property
+        orgs = list_active_org_ids_for_user(db, user.id)
+        if not orgs:
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
+        org_property_ids = (
+            db.query(Property.id)
+            .filter(Property.organization_id.in_(orgs), Property.deleted_at.is_(None))
+            .subquery()
+        )
+        query = (
+            db.query(Expense)
+            .join(Property, Property.id == Expense.property_id)
+            .filter(Property.organization_id.in_(orgs))
+            .order_by(Expense.id)
+        )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    total = query.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{expense_id}", response_model=ExpenseRead)
@@ -736,14 +765,76 @@ def fail_payment_claim(
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
 
+    now = datetime.now(timezone.utc)
     try:
         claim = fail_claim(
             db, expense, claim_id,
             failed_by=user.id, reason=payload.reason or payload.result or "verification failed",
+            now=now,
         )
     except ClaimError as exc:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    dedupe_key = f"expense:{expense_id}:claim_fail:{claim_id}"
+    existing_active = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.dedupe_key == dedupe_key,
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .first()
+    )
+    mismatch = bool(getattr(claim, "mismatch", False))
+    failure_label = "金额不一致" if mismatch else "FAILED"
+    summary = (
+        f"Owner Expense Claim {failure_label}决策："
+        f"Expense #{expense_id} Claim #{claim_id} 需Owner决定后续处理方式"
+    )
+    from app.services.operations.generation import create_operational_task
+
+    scoped_org_id = _membership.organization_id
+    if existing_active is None:
+        try:
+            with db.begin_nested():
+                create_operational_task(
+                    db,
+                    fields={
+                        "task_type": OperationalTaskType.FOLLOWUP,
+                        "title": f"Expense Claim {failure_label}待处理",
+                        "description": summary,
+                        "source_type": "expense",
+                        "source_id": expense_id,
+                        "property_id": expense.property_id,
+                        "assigned_user_id": user.id,
+                        "priority": OperationalTaskPriority.high,
+                        "status": OperationalTaskStatus.PENDING,
+                        "due_at": now + timedelta(days=3),
+                        "remind_at": now,
+                        "next_check_at": now,
+                        "next_action": "PAYMENT_CLAIM_DECISION",
+                        "dedupe_key": dedupe_key,
+                        "details": {
+                            "expense_id": expense_id,
+                            "claim_id": claim_id,
+                            "claim_status": "FAILED",
+                            "mismatch": mismatch,
+                            "failure_reason": getattr(claim, "failure_reason", None),
+                            "next_actor": "OWNER",
+                            "organization_id": scoped_org_id,
+                            "summary": summary,
+                        },
+                    },
+                    now=now,
+                    actor_id=user.id,
+                )
+        except Exception:
+            logger.exception(
+                "failed to create claim-failure followup task "
+                "expense_id=%s claim_id=%s dedupe_key=%s",
+                expense_id, claim_id, dedupe_key,
+            )
     db.commit()
     db.refresh(claim)
     return PaymentClaimOut(**_claim_out(claim, expense_id))
@@ -785,6 +876,116 @@ def _finalize_paid(expense: Expense, db: Session, actor_id: int | None = None) -
     truth = payment_truth(db, expense)
     if truth.fully_paid:
         _complete_linked_payment_tasks(db, expense, actor_id=actor_id or expense.updated_by)
+        _schedule_repair_verification_followup(db, expense, actor_id=actor_id or expense.updated_by)
+
+
+def _evidence_present_for_repair_close(repair) -> bool:
+    d = repair.details or {}
+    ce = d.get("completion_evidence_ids")
+    if isinstance(ce, list) and len(ce) > 0:
+        return True
+    ev = repair.evidence
+    if isinstance(ev, (list, tuple)) and len(ev) > 0:
+        return True
+    if isinstance(ev, dict) and len(ev) > 0:
+        return True
+    return False
+
+
+def _schedule_repair_verification_followup(
+    db: Session, expense: Expense, *, actor_id: int | None
+) -> None:
+    from app.models.repair import RepairOperation, RepairOperationStatus, RepairProposal
+    from app.services.organization_scope import property_org_id, repair_org_id
+    from app.services.operations.generation import create_operational_task
+
+    proposal_row = (
+        db.query(RepairProposal.repair_id)
+        .filter(RepairProposal.expense_id == expense.id)
+        .first()
+    )
+    if proposal_row is None:
+        return
+    repair_id = proposal_row[0]
+    if repair_id is None:
+        return
+    repair = db.get(RepairOperation, repair_id)
+    if repair is None:
+        return
+    if repair.status == RepairOperationStatus.CLOSED:
+        return
+    if repair.status != RepairOperationStatus.VERIFYING:
+        return
+    exp_org = property_org_id(db, expense.property_id)
+    rep_org = repair_org_id(db, repair_id)
+    if exp_org is None or rep_org is None or exp_org != rep_org:
+        return
+    now = datetime.now(timezone.utc)
+    dedupe_key = f"repair:{repair_id}:verification_followup_from_expense_{expense.id}"
+    existing_active = (
+        db.query(OperationalTask)
+        .filter(
+            OperationalTask.dedupe_key == dedupe_key,
+            OperationalTask.status.in_(
+                [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+            ),
+        )
+        .first()
+    )
+    if existing_active is not None:
+        return
+    summary = (
+        "Repair verification follow-up: linked expense E{} fully paid. "
+        "Please perform canonical repair verification (evidence review & "
+        "explicit HUMAN_CONFIRMED or rejection) via the repairs router — "
+        "payment alone does not constitute verification."
+    ).format(expense.id)
+    repair_property_id = repair.property_id
+    if repair.unit_id is not None and repair_property_id is None:
+        unit_row = (
+            db.query(Unit.property_id)
+            .filter(Unit.id == repair.unit_id, Unit.deleted_at.is_(None))
+            .one_or_none()
+        )
+        if unit_row is not None:
+            repair_property_id = unit_row[0]
+    try:
+        with db.begin_nested():
+            create_operational_task(
+                db,
+                fields={
+                    "task_type": OperationalTaskType.FOLLOWUP,
+                    "title": f"Repair #{repair_id} 核销跟进（关联支出已支付）",
+                    "description": summary,
+                    "source_type": "repair",
+                    "source_id": repair_id,
+                    "property_id": repair_property_id,
+                    "assigned_user_id": actor_id,
+                    "priority": OperationalTaskPriority.high if _evidence_present_for_repair_close(repair) else OperationalTaskPriority.medium,
+                    "status": OperationalTaskStatus.PENDING,
+                    "due_at": now + timedelta(days=3),
+                    "remind_at": now,
+                    "next_check_at": now,
+                    "next_action": "CANONICAL_REPAIR_VERIFICATION",
+                    "dedupe_key": dedupe_key,
+                    "details": {
+                        "repair_id": repair_id,
+                        "trigger_expense_id": expense.id,
+                        "repair_status": repair.status.value,
+                        "evidence_present": _evidence_present_for_repair_close(repair),
+                        "next_actor": "OWNER",
+                        "organization_id": rep_org,
+                        "warning": "Payment is not verification. Do NOT close the repair from the expense path.",
+                    },
+                },
+                now=now,
+                actor_id=actor_id,
+            )
+    except Exception:
+        logger.exception(
+            "failed to create repair verification followup after paid expense=%s repair_id=%s",
+            expense.id, repair_id,
+        )
 
 
 @router.post("/{expense_id}/pay", response_model=ExpenseRead)
@@ -907,6 +1108,28 @@ def reverse_expense(
         except ClaimError as exc:
             db.rollback()
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    reverse_window_earliest = now - timedelta(hours=72)
+    completed_payment_task_rows = (
+        db.query(OperationalTask.id)
+        .filter(
+            OperationalTask.source_type == "expense",
+            OperationalTask.source_id == obj.id,
+            OperationalTask.task_type == OperationalTaskType.PAYMENT_PENDING,
+            OperationalTask.status == OperationalTaskStatus.COMPLETED,
+            OperationalTask.completed_at >= reverse_window_earliest,
+        )
+        .all()
+    )
+    completed_payment_task_ids = [row[0] for row in completed_payment_task_rows]
+    if completed_payment_task_ids:
+        task_projection.reopen_closed_projections(
+            db,
+            task_ids=completed_payment_task_ids,
+            actor_id=user.id,
+            source_domain="expense.reverse",
+            reason="expense_reversed_reopen_payment_pending_within_72h",
+            now=now,
+        )
     old_status = obj.status
     obj.status = ExpenseStatus.reversed
     obj.updated_by = user.id

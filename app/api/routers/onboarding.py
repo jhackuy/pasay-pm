@@ -18,7 +18,7 @@ Strictly within Issue #24 scope; never touches Property/Channel/Rent/Menu.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user

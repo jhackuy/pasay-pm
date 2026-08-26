@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -6,7 +6,7 @@ from app.database import get_db
 from app.models.membership import OrganizationRole
 from app.models.tenant import Tenant
 from app.models.user import User
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.schemas.tenant import TenantCreate, TenantPublic, TenantUpdate
 from app.services.audit import field_changes, record_audit, serialize_row
 from app.services.organization_scope import (
@@ -46,15 +46,34 @@ def _to_public(obj: Tenant) -> TenantPublic:
     )
 
 
-@router.get("", response_model=list[TenantPublic])
+@router.get("", response_model=Paginated[TenantPublic])
 def list_tenants(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return [
-        _to_public(obj)
-        for obj in scoped_list_tenants(db, for_user_id=user.id)
-    ]
+    try:
+        from app.services.organization_scope import list_active_org_ids_for_user
+        orgs = list_active_org_ids_for_user(db, user.id)
+        if not orgs:
+            return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
+        query = (
+            db.query(Tenant)
+            .filter(
+                Tenant.organization_id.in_(orgs),
+                Tenant.deleted_at.is_(None),
+            )
+            .order_by(Tenant.id)
+        )
+    except Exception as exc:
+        from app.services.organization_scope import scope_exception_to_http
+        raise scope_exception_to_http(exc) from exc
+    total = query.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = [_to_public(obj) for obj in query.offset(offset).limit(limit).all()]
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=TenantPublic, status_code=status.HTTP_201_CREATED)

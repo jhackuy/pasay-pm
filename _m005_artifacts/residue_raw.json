@@ -1,0 +1,43 @@
+{
+  "scan_root": "D:\\AI-Review\\pasay-pm",
+  "excluded_dirs": [
+    ".ai-control",
+    ".git",
+    ".idea",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".runtime",
+    ".tox",
+    ".trae",
+    ".venv",
+    ".vscode",
+    "__pycache__",
+    "_m005_artifacts",
+    "build",
+    "dist",
+    "env",
+    "node_modules",
+    "venv",
+    "worktrees"
+  ],
+  "target_tokens": [
+    "redis",
+    "kafka",
+    "celery",
+    "temporal",
+    "queue2",
+    "bot2"
+  ],
+  "hit_count": 0,
+  "files_count": 0,
+  "files": [],
+  "summary_per_token": {
+    "redis": 0,
+    "kafka": 0,
+    "celery": 0,
+    "temporal": 0,
+    "queue2": 0,
+    "bot2": 0
+  }
+}

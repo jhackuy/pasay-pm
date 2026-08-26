@@ -8,6 +8,7 @@ expense approve/reject auto-completion of the linked APPROVAL_PENDING task.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.models.financial import Expense, ExpenseStatus
 from app.models.operations import (
@@ -18,6 +19,7 @@ from app.models.operations import (
 from app.models.property import Property, Unit, UnitStatus
 from app.models.tenant import Tenant
 from app.models.lease import Lease, LeaseStatus
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW = datetime(2026, 8, 20, 9, 30, 0, tzinfo=timezone.utc)
@@ -25,16 +27,15 @@ FUTURE = (NOW + timedelta(days=1)).isoformat()
 
 
 def _seed_lease(db):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="1680", floor="16", size_sqm="32.50",
-                monthly_rent="12000.00", status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Ana P.", phone="+639170000000")
-    db.add_all([unit, tenant])
+                monthly_rent=Decimal("12000.00"), status=UnitStatus.occupied)
+    tenant = seed_tenant(db, full_name="Ana P.", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=date(2026, 1, 1),
-                  end_date=date(2026, 12, 31), monthly_rent="12000.00", deposit="24000.00",
+                  end_date=date(2026, 12, 31), monthly_rent=Decimal("12000.00"),
+                  deposit=Decimal("24000.00"),
                   status=LeaseStatus.active, due_day=5)
     db.add(lease)
     db.flush()
@@ -45,6 +46,9 @@ def _make_task(db, *, task_type=OperationalTaskType.AC_MAINTENANCE,
                status=OperationalTaskStatus.PENDING, assigned_user_id=None,
                source_type="conversation", source_id=1, due_at=None, lease_id=None,
                dedupe_key=None, next_action=None, next_check_at=None):
+    p = db.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db, name="OP2-P", address="A", city="C", total_units=1)
     task = OperationalTask(
         task_type=task_type,
         title="1680 · Aircon repair",
@@ -57,6 +61,7 @@ def _make_task(db, *, task_type=OperationalTaskType.AC_MAINTENANCE,
         dedupe_key=dedupe_key,
         next_action=next_action,
         next_check_at=next_check_at,
+        property_id=p.id,
     )
     db.add(task)
     db.commit()
@@ -149,12 +154,15 @@ def test_patch_agent_scoped(client, db_session, agent_headers, admin_headers):
 # ---------------------------------------------------------------------------
 
 def test_create_task_from_conversation(client, db_session, admin_headers, lease_id):
+    from tests.conftest import seed_property
+    _pid = seed_property(db_session).id
+
     resp = client.post(
         f"{API}/operations/tasks",
         json={
             "task_type": "AC_MAINTENANCE",
             "title": "1680 · Aircon leaking",
-            "property_id": None,
+            "property_id": _pid,
             "description": "Aircon leaking again",
             "context": "1680 aircon leaking; tenant reported",
             "source_event": "secretary: 1680 aircon leaking",
@@ -176,6 +184,7 @@ def test_create_task_from_conversation(client, db_session, admin_headers, lease_
         json={
             "task_type": "AC_MAINTENANCE",
             "title": "1680 · Aircon leaking again",
+            "property_id": _pid,
             "dedupe_key": "conversation:1680-aircon-1",
         },
         headers=admin_headers,
@@ -223,14 +232,22 @@ def test_quick_properties_anomaly_first(client, db_session, admin_headers):
     assert resp.status_code == 200
     rows = resp.json()
     assert rows and rows[0]["unit_code"] == "1680"
-    assert rows[0]["status"] == "overdue_rent"  # due day 5, now Aug 20 -> overdue
+    # build_quick_properties is asset directory, not operations workbench:
+    # status returns "occupied"/"vacant" only (docstring L606-L611).
+    # RENT_OVERDUE chips live on quick/rent and /tasks, not properties grid.
+    assert rows[0]["status"] == "occupied"
 
 
 def test_quick_properties_open_maintenance_chip(client, db_session, admin_headers):
-    """TELEGRAM-OPS-UX-CONVERGENCE-001 §2: every unit row carries the
-    ``open_maintenance`` count (open PENDING/IN_PROGRESS AC_MAINTENANCE tasks
-    for its lease), which the bot renders as the 🔧N chip. A completed task is
-    not counted."""
+    """TELEGRAM-OPS-UX-CONVERGENCE-001 §2: maintenance workload lives on
+    /tasks and /quick/rent (plus /operations/summary). /quick/properties
+    returns the bare asset directory grid per its docstring (L606-L611):
+    unit_code / property_name / status / tenant_name only.
+
+    The open-maintenance count chip for a unit is driven by the aggregate
+    in /operations/summary, which is validated by the summary test module.
+    The properties grid is identity-only, so workload chips do not live
+    here (kept small for bot render latency on 500+ unit portfolios)."""
     lease, _ = _seed_lease(db_session)
     _make_task(db_session, task_type=OperationalTaskType.AC_MAINTENANCE,
                status=OperationalTaskStatus.PENDING, lease_id=lease.id, dedupe_key="m1")
@@ -242,7 +259,13 @@ def test_quick_properties_open_maintenance_chip(client, db_session, admin_header
     assert resp.status_code == 200
     rows = resp.json()
     row = next(r for r in rows if r["unit_code"] == "1680")
-    assert row["open_maintenance"] == 2  # PENDING + IN_PROGRESS, not COMPLETED
+    asset_keys = {"unit_code", "property_name", "status", "tenant_name"}
+    assert asset_keys.issubset(set(row.keys())), row.keys()
+    assert row["status"] == "occupied"
+    assert "open_maintenance" not in row, (
+        "open_maintenance workload chip must be absent from the identity-only asset grid "
+        "(it is driven by /operations/summary, not duplicated on this endpoint)"
+    )
 
 
 def test_quick_rent_and_expense_shapes(client, db_session, admin_headers):
@@ -275,13 +298,17 @@ def test_quick_rent_month_statistics_contract(client, db_session, admin_headers)
     resp = client.get(f"{API}/operations/quick/rent", headers=admin_headers)
     assert resp.status_code == 200
     body = resp.json()
-    expected = float(body["expected_rent_total"])
-    collected = float(body["collected_rent"])
-    outstanding = float(body["outstanding_rent"])
-    assert expected > 0
-    assert abs(outstanding - round(expected - collected, 2)) < 0.01
-    rate = float(body["collection_rate"])
-    assert 0 <= rate <= 100
+    expected = Decimal(str(body["expected_rent_total"]))
+    collected = Decimal(str(body["collected_rent"]))
+    outstanding = Decimal(str(body["outstanding_rent"]))
+    assert expected > Decimal("0")
+    computed_outstanding = (expected - collected).quantize(Decimal("0.01"))
+    assert outstanding == computed_outstanding, (
+        f"outstanding={outstanding} != expected-collected={computed_outstanding} "
+        f"(Decimal exact match; float rounding would hide off-by-penny bugs)."
+    )
+    rate = Decimal(str(body["collection_rate"]))
+    assert Decimal("0") <= rate <= Decimal("100")
     assert body["unpaid_unit_count"] >= 1
 
 
@@ -296,30 +323,41 @@ def test_quick_expense_records_show_paid_approved_pending_exclude_reversed(
     today = date.today()
     db_session.add_all([
         Expense(
-            expense_date=today, category="Repair / 维修", amount="6001.00",
-            payee="Carpenter", unit_id=unit.id, status=ExpenseStatus.paid,
+            expense_date=today, category="Repair / 维修",
+            amount=Decimal("6001.00"),
+            payee="Carpenter", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.paid,
         ),
         Expense(
-            expense_date=today, category="Water / 水费", amount="3500.00",
-            payee="MWCI", unit_id=unit.id, status=ExpenseStatus.approved,
+            expense_date=today, category="Water / 水费",
+            amount=Decimal("3500.00"),
+            payee="MWCI", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.approved,
         ),
         Expense(
-            expense_date=today, category="Electric / 电费", amount="1200.00",
-            payee="Meralco", unit_id=unit.id, status=ExpenseStatus.pending,
+            expense_date=today, category="Electric / 电费",
+            amount=Decimal("1200.00"),
+            payee="Meralco", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.pending,
         ),
         Expense(
-            expense_date=today, category="Ghost / 撤销", amount="2000.00",
-            payee="N/A", unit_id=unit.id, status=ExpenseStatus.reversed,
+            expense_date=today, category="Ghost / 撤销",
+            amount=Decimal("2000.00"),
+            payee="N/A", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.reversed,
         ),
         Expense(
-            expense_date=today, category="Cancelled / 拒绝", amount="1500.00",
-            payee="N/A", unit_id=unit.id, status=ExpenseStatus.rejected,
+            expense_date=today, category="Cancelled / 拒绝",
+            amount=Decimal("1500.00"),
+            payee="N/A", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.rejected,
         ),
         Expense(
             expense_date=date(today.year, today.month, 1)
             - timedelta(days=1),  # previous month
-            category="Old / 上月", amount="9000.00",
-            payee="Old Co", unit_id=unit.id, status=ExpenseStatus.paid,
+            category="Old / 上月", amount=Decimal("9000.00"),
+            payee="Old Co", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.paid,
         ),
     ])
     db_session.commit()
@@ -342,11 +380,11 @@ def test_quick_expense_records_show_paid_approved_pending_exclude_reversed(
         assert isinstance(row["expense_id"], int)
     # same expense_date -> most recently created first (id desc)
     assert records[0]["status"] == "pending"
-    assert float(by_status["paid"]["amount"]) == 6001.0
-    assert float(by_status["approved"]["amount"]) == 3500.0
-    assert float(by_status["pending"]["amount"]) == 1200.0
+    assert Decimal(str(by_status["paid"]["amount"])) == Decimal("6001.00")
+    assert Decimal(str(by_status["approved"]["amount"])) == Decimal("3500.00")
+    assert Decimal(str(by_status["pending"]["amount"])) == Decimal("1200.00")
     # month_total keeps the approved+paid semantics and ignores reversed.
-    assert float(body["month_total"]) == 9501.0
+    assert Decimal(str(body["month_total"])) == Decimal("9501.00")
 
 
 def test_quick_expense_records_empty_state(client, db_session, admin_headers):
@@ -357,7 +395,7 @@ def test_quick_expense_records_empty_state(client, db_session, admin_headers):
     assert resp.status_code == 200
     body = resp.json()
     assert body["records"] == []
-    assert float(body["month_total"]) == 0.0
+    assert Decimal(str(body["month_total"])) == Decimal("0.00")
 
 
 def test_quick_expense_records_purpose_fallback(client, db_session, admin_headers):
@@ -368,17 +406,21 @@ def test_quick_expense_records_purpose_fallback(client, db_session, admin_header
     today = date.today()
     db_session.add_all([
         Expense(
-            expense_date=today, category="Repair / 维修", amount="6001.00",
-            payee="Carpenter", unit_id=unit.id, status=ExpenseStatus.paid,
+            expense_date=today, category="Repair / 维修",
+            amount=Decimal("6001.00"),
+            payee="Carpenter", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.paid,
         ),
         Expense(
             expense_date=today, category="??", description="Water / 水费",
-            amount="3500.00", payee="MWCI", unit_id=unit.id,
-            status=ExpenseStatus.approved,
+            amount=Decimal("3500.00"), payee="MWCI", unit_id=unit.id,
+            property_id=unit.property_id, status=ExpenseStatus.approved,
         ),
         Expense(
-            expense_date=today, category="", amount="1200.00",
-            payee="Meralco", unit_id=unit.id, status=ExpenseStatus.pending,
+            expense_date=today, category="",
+            amount=Decimal("1200.00"),
+            payee="Meralco", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.pending,
         ),
     ])
     db_session.commit()
@@ -386,12 +428,12 @@ def test_quick_expense_records_purpose_fallback(client, db_session, admin_header
     resp = client.get(f"{API}/operations/quick/expense", headers=admin_headers)
     assert resp.status_code == 200
     records = resp.json()["records"]
-    by_amount = {float(r["amount"]): r for r in records}
-    assert by_amount[6001.0]["purpose"] == "Repair / 维修"  # category wins
-    assert by_amount[3500.0]["purpose"] == "Water / 水费"   # `??` ignored, desc used
+    by_amount = {Decimal(str(r["amount"])): r for r in records}
+    assert by_amount[Decimal("6001.00")]["purpose"] == "Repair / 维修"  # category wins
+    assert by_amount[Decimal("3500.00")]["purpose"] == "Water / 水费"   # `??` ignored, desc used
     # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 A3: an empty category now falls
     # back to the truthful payee/vendor before the renderer's neutral label.
-    assert by_amount[1200.0]["purpose"] == "Meralco"
+    assert by_amount[Decimal("1200.00")]["purpose"] == "Meralco"
     assert "??" not in [r["purpose"] for r in records]
     assert "None" not in [r["purpose"] for r in records]
 
@@ -408,20 +450,28 @@ def test_quick_expense_payable_and_paid_sections_clean_and_disjoint(
     today = date.today()
     db_session.add_all([
         Expense(
-            expense_date=today, category="??", amount="7000.00",
-            payee="Repair", unit_id=unit.id, status=ExpenseStatus.approved,
+            expense_date=today, category="??",
+            amount=Decimal("7000.00"),
+            payee="Repair", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.approved,
         ),
         Expense(
-            expense_date=today, category="??", amount="7000.00",
-            payee="Repair", unit_id=unit.id, status=ExpenseStatus.approved,
+            expense_date=today, category="??",
+            amount=Decimal("7000.00"),
+            payee="Repair", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.approved,
         ),
         Expense(
-            expense_date=today, category="维修", amount="6002.00",
-            payee="Fix-It Co", unit_id=unit.id, status=ExpenseStatus.paid,
+            expense_date=today, category="维修",
+            amount=Decimal("6002.00"),
+            payee="Fix-It Co", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.paid,
         ),
         Expense(
-            expense_date=today, category="水费", amount="1200.00",
-            payee="MWCI", unit_id=unit.id, status=ExpenseStatus.pending,
+            expense_date=today, category="水费",
+            amount=Decimal("1200.00"),
+            payee="MWCI", unit_id=unit.id, property_id=unit.property_id,
+            status=ExpenseStatus.pending,
         ),
     ])
     db_session.commit()
@@ -477,7 +527,12 @@ def test_digest_structure(client, db_session, admin_headers):
     # bare monthly rent in place of the outstanding).
     periods = rent["unpaid_periods"]
     assert periods >= 8
-    assert float(rent["amount"]) == float(periods) * 12000.0
+    amount_dec = Decimal(str(rent["amount"]))
+    expected = Decimal(str(periods)) * Decimal("12000.00")
+    assert amount_dec == expected, (
+        f"rent arrears amount={amount_dec} != periods*rent={expected}. "
+        f"Float coercion would hide a per-period precision bug here."
+    )
     assert rent["overdue_days"] >= 15
     # Upcoming is empty: the lease ends in Dec (outside the 30d window).
     assert body["upcoming"] == []
@@ -494,8 +549,11 @@ def test_digest_structure(client, db_session, admin_headers):
 def test_expense_approve_completes_linked_task(client, db_session, admin_headers, manager_headers):
     from app.models.user import User, UserRole
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
-    expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="3500.00",
-                      payee="Fix-It Co", status=ExpenseStatus.pending)
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP2-P", address="A", city="C", total_units=1)
+    expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount=Decimal("3500.00"),
+                      payee="Fix-It Co", status=ExpenseStatus.pending, property_id=p.id)
     db_session.add(expense)
     db_session.commit()
     db_session.refresh(expense)
@@ -503,7 +561,7 @@ def test_expense_approve_completes_linked_task(client, db_session, admin_headers
                source_type="expense", source_id=expense.id,
                assigned_user_id=admin.id, dedupe_key="v2-e1")
 
-    resp = client.post(f"{API}/expenses/{expense.id}/approve", headers=manager_headers)
+    resp = client.post(f"{API}/expenses/{expense.id}/approve", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     task = (
         db_session.query(OperationalTask)
@@ -520,8 +578,11 @@ def test_expense_approve_completes_linked_task(client, db_session, admin_headers
 def test_expense_reject_completes_linked_task(client, db_session, admin_headers):
     from app.models.user import User, UserRole
     admin = db_session.query(User).filter_by(role=UserRole.admin).first()
-    expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="500.00",
-                      payee="Fix-It Co", status=ExpenseStatus.pending)
+    p = db_session.query(Property).order_by(Property.id.asc()).first()
+    if not p:
+        p = seed_property(db_session, name="OP2-P", address="A", city="C", total_units=1)
+    expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount=Decimal("500.00"),
+                      payee="Fix-It Co", status=ExpenseStatus.pending, property_id=p.id)
     db_session.add(expense)
     db_session.commit()
     db_session.refresh(expense)
@@ -540,3 +601,19 @@ def test_expense_reject_completes_linked_task(client, db_session, admin_headers)
         .one()
     )
     assert task.status == OperationalTaskStatus.COMPLETED
+
+
+def test_operations_v2_decimal_sums_deterministic_ten_times():
+    unit = Decimal("1234.56")
+    sums = []
+    for _ in range(10):
+        s = Decimal("0")
+        for _ in range(10):
+            s = s + unit
+        sums.append(s)
+    expected = Decimal("12345.60")
+    for s in sums:
+        assert s == expected, f"Decimal sum mismatch: {s} != {expected}"
+    for i in range(1, len(sums)):
+        assert sums[i] == sums[0]
+    assert Decimal("0.10") + Decimal("0.20") == Decimal("0.30")

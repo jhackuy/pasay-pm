@@ -23,6 +23,7 @@ from app.models.evidence import (
 )
 from app.models.expense_claim import ClaimStatus, ExpensePaymentClaim
 from app.models.financial import Expense, ExpenseStatus, Income, IncomeStatus
+from app.models.deposit_settlement import DepositSettlement, DepositSettlementStatus
 from app.models.identity import (
     ApiCredential,
     CommunicationEndpoint,
@@ -34,6 +35,7 @@ from app.models.identity import (
     TelegramIdentityBinding,
 )
 from app.models.lease import Lease, LeaseStatus
+from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.membership import (
     InviteState,
     Membership,
@@ -66,6 +68,7 @@ from app.models.repair import (
     RepairProposal,
     RepairProposalStatus,
 )
+from app.models.rent_payment_claim import RentClaimStatus, RentPaymentClaim
 from app.models.scheduled_job import ScheduledJobLedger
 from app.models.task import Task, TaskPriority, TaskStatus
 from app.models.telegram_webhook import (
@@ -99,6 +102,8 @@ __all__ = [
     "CopilotRunStatus",
     "CredentialLifecycle",
     "CredentialState",
+    "DepositSettlement",
+    "DepositSettlementStatus",
     "Evidence",
     "EvidenceCategory",
     "Expense",
@@ -111,6 +116,8 @@ __all__ = [
     "LeaseStatus",
     "Membership",
     "MembershipState",
+    "MoveOutInspection",
+    "MoveOutInspectionStatus",
     "NotificationOutbox",
     "NotificationStatus",
     "OperationalTask",
@@ -130,6 +137,8 @@ __all__ = [
     "RepairOperationStatus",
     "RepairProposal",
     "RepairProposalStatus",
+    "RentClaimStatus",
+    "RentPaymentClaim",
     "ScheduledJobLedger",
     "SecretaryInvite",
     "SecurityEvent",

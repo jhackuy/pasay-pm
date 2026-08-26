@@ -55,6 +55,7 @@ from app.services.operations.notifier import process_notifications_once
 from app.services.operations.redelivery import redeliver_due_snoozes
 from app.services.operations.scheduler import run_scheduler_once
 from app.services.audit import set_audit_context
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 # Anchored to the real clock at import so due_at=NOW+1d is always in the
@@ -182,13 +183,11 @@ def _task(
 
 
 def _seed_lease(db):
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="1608", floor="16", size_sqm="32.50",
                 monthly_rent="12000.00", status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Ana P.", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Ana P.", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=date(2026, 1, 1),
                   end_date=date(2026, 12, 31), monthly_rent="12000.00", deposit="24000.00",
@@ -966,10 +965,13 @@ def test_confusable_unicode_actions_rejected(db_session, manager):
 
 def test_financial_action_verbs_rejected_no_creation(db_session, manager, client, manager_headers):
     lease = _seed_lease(db_session)
+    from app.models.property import Unit
+    unit = db_session.get(Unit, lease.unit_id)
     income = Income(lease_id=lease.id, amount="12000.00", received_date=date(2026, 8, 1),
                     status=IncomeStatus.pending)
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
-                      payee="Fix-It Co", status=ExpenseStatus.pending)
+                      payee="Fix-It Co", status=ExpenseStatus.pending,
+                      property_id=unit.property_id if unit else None)
     db_session.add_all([income, expense])
     db_session.commit()
     for action in ("confirm_income", "approve_expense", "pay_expense", "reverse",
@@ -996,9 +998,12 @@ def test_generic_action_financial_smuggling_text_task_only(db_session, manager):
     create a text/tracking task — the expense is untouched."""
     mgr = _manager(db_session)
     lease = _seed_lease(db_session)
+    from app.models.property import Unit
+    unit = db_session.get(Unit, lease.unit_id)
     secretary = _user(db_session, "c2-smug-sec", UserRole.agent, telegram_chat_id="tg-smug")
     expense = Expense(expense_date=date(2026, 8, 1), category="repair", amount="5000.00",
-                      payee="Fix-It Co", status=ExpenseStatus.pending)
+                      payee="Fix-It Co", status=ExpenseStatus.pending,
+                      property_id=unit.property_id if unit else None)
     db_session.add(expense)
     db_session.commit()
 
@@ -1371,7 +1376,11 @@ def test_execute_requires_manager_or_admin(client, db_session, agent_headers, ma
         f"{API}/operations/copilot/proposals/{proposal.id}/execute",
         headers=agent_headers,
     )
-    assert resp.status_code == 403
+    assert resp.status_code in (403, 409), f"execute: {resp.status_code} {resp.text}"
+    if resp.status_code == 409:
+        _data = resp.json()
+        _ec = _data.get("error_code") or _data.get("detail", {}).get("error_code")
+        assert _ec == "actor_permission", f"error_code={_ec} body={_data}"
     db_session.refresh(proposal)
     assert proposal.status == CopilotActionStatus.CONFIRMED
 

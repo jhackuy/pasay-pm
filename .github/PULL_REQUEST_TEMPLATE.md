@@ -1,4 +1,4 @@
-## Linked Issue
+# Pull Request — Linked Issue
 
 - `Closes #<issue-number>`
 
@@ -37,7 +37,7 @@
 - Actual result:
 - Evidence URL:
 
-## READY_FOR_OWNER
+# READY_FOR_OWNER Gate
 
 - `READY_FOR_OWNER: YES | NO`
 - Blocker if `NO`:

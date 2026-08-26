@@ -177,3 +177,86 @@ class ExpenseDetailOut(ExpenseRead):
     evidence: dict | None = None
     timeline: list[dict] = []
     reviewed: dict | None = None
+
+
+# ---------------------------------------------------------------------------
+# PASAY-MILESTONE-002 — Rent Payment Claim schemas
+# ---------------------------------------------------------------------------
+
+
+class RentClaimCreate(BaseModel):
+    """POST /leases/{lease_id}/rents/claims — report a claimed payment."""
+
+    period: str = Field(min_length=7, max_length=7, pattern=r"^\d{4}-\d{2}$")
+    claimed_amount: Decimal = Field(gt=0)
+    received_date: date | None = None
+    verification_note: str | None = None
+    evidence_ids: list[int] | None = None
+    idempotency_key: str | None = Field(default=None, max_length=255)
+
+
+class RentClaimVerify(BaseModel):
+    """PATCH /rents/claims/{id}/verify."""
+
+    verified_amount: Decimal | None = Field(default=None, gt=0)
+    result: str | None = None
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class RentClaimFail(BaseModel):
+    """PATCH /rents/claims/{id}/fail."""
+
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class RentClaimReverse(BaseModel):
+    """PATCH /rents/claims/{id}/reverse."""
+
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class RentClaimOut(BaseModel):
+    id: int
+    lease_id: int
+    period: str
+    income_id: int | None = None
+    claimed_amount: str
+    claimed_by: int | None = None
+    claimed_at: datetime | None = None
+    received_date: date | None = None
+    status: str
+    evidence_ids: list = []
+    verification_note: str | None = None
+    verified_amount: str | None = None
+    verified_by: int | None = None
+    verified_at: datetime | None = None
+    mismatch: bool = False
+    mismatch_reason: str | None = None
+    failure_reason: str | None = None
+
+
+class RentPeriodPaymentInfo(BaseModel):
+    required_amount: str
+    verified_paid: str
+    remaining: str
+    overpaid: str
+    fully_paid: bool
+    partially_paid: bool
+    pending_claim_count: int = 0
+    verified_claim_count: int = 0
+    failed_claim_count: int = 0
+    reversed_claim_count: int = 0
+    pending_claimed_total: str = "0.00"
+    has_mismatch: bool = False
+    overclaimed_total: str = "0.00"
+
+
+class RentDetailOut(BaseModel):
+    """Detail view for one lease period: claims, evidence, truth summary."""
+
+    lease_id: int
+    period: str
+    truth: RentPeriodPaymentInfo
+    claims: list[RentClaimOut] = []
+    evidence: dict | None = None
+    timeline: list[dict] = []

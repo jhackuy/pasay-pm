@@ -16,16 +16,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import func
-
 from app.models.financial import Expense, ExpenseStatus
-from app.models.operations import NotificationOutbox, NotificationStatus, OperationalTask
+from app.models.operations import (
+    NotificationOutbox,
+    NotificationStatus,
+    OperationalTask,
+)
 from app.models.repair import (
     RepairAction,
     RepairActionStatus,
     RepairOperation,
     RepairOperationStatus,
-    RepairProposal,
     RepairProposalStatus,
 )
 from app.services.repairs import continuation as ctl
@@ -171,8 +172,47 @@ def test_case_c_new_requote_allowed_after_previous_resolved(db_session):
 # ---------------------------------------------------------------------------
 
 def test_case_d_payment_does_not_close_repair(db_session):
+    from app.models.membership import Organization
+    from app.models.property import Property, Unit
+
     db = db_session
+    # M001 org-scope ground truth: Properties/Tenants require organization_id
+    # NOT NULL; Expenses require property_id NOT NULL. Create a minimal
+    # anchor chain so the legacy test can still exercise the rule without
+    # any API / router overhead.
+    org = Organization(
+        name="M008-dummy-org",
+        created_by=None,
+        updated_by=None,
+    )
+    db.add(org)
+    db.flush()
+    prop = Property(
+        organization_id=org.id,
+        name="Dummy M008 Property",
+        address="Unit Test Lane 1",
+        city="Pasay",
+        total_units=1,
+        created_by=None,
+        updated_by=None,
+    )
+    db.add(prop)
+    db.flush()
+    unit = Unit(
+        property_id=prop.id,
+        unit_number="101",
+        floor="1",
+        size_sqm=30,
+        monthly_rent=10000,
+        status="vacant",
+        created_by=None,
+        updated_by=None,
+    )
+    db.add(unit)
+    db.flush()
     repair = _mk_repair(db)
+    repair.property_id = prop.id
+    repair.unit_id = unit.id
     p1, _ = prop_svc.submit_proposal(db, repair, amount="8000.00")
     # Approve the proposal -> WAITING_PAYMENT (not CLOSED).
     prop_svc.approve_proposal(db, repair, p1, approved_by=99)
@@ -186,6 +226,8 @@ def test_case_d_payment_does_not_close_repair(db_session):
         amount=p1.amount,
         payee="ACPro",
         status=ExpenseStatus.approved,
+        property_id=prop.id,
+        unit_id=unit.id,
     )
     db.add(expense)
     db.flush()
@@ -251,8 +293,44 @@ def test_case_e_cannot_close_without_verification_signal(db_session):
 # ---------------------------------------------------------------------------
 
 def test_case_f_history_preserved_after_closed(db_session):
+    from app.models.membership import Organization
+    from app.models.property import Property, Unit
+
     db = db_session
+    # M001 org-scope anchor chain.
+    org = Organization(
+        name="M008-f-dummy-org",
+        created_by=None,
+        updated_by=None,
+    )
+    db.add(org)
+    db.flush()
+    prop = Property(
+        organization_id=org.id,
+        name="Dummy M008-F Property",
+        address="Unit Test Lane 2",
+        city="Pasay",
+        total_units=1,
+        created_by=None,
+        updated_by=None,
+    )
+    db.add(prop)
+    db.flush()
+    unit = Unit(
+        property_id=prop.id,
+        unit_number="201",
+        floor="2",
+        size_sqm=30,
+        monthly_rent=10000,
+        status="vacant",
+        created_by=None,
+        updated_by=None,
+    )
+    db.add(unit)
+    db.flush()
     repair = _mk_repair(db)
+    repair.property_id = prop.id
+    repair.unit_id = unit.id
 
     # V1 rejected
     p1, _ = prop_svc.submit_proposal(db, repair, amount="8000.00", vendor="V1AC")
@@ -270,6 +348,8 @@ def test_case_f_history_preserved_after_closed(db_session):
         amount=p2.amount,
         payee="V2AC",
         status=ExpenseStatus.approved,
+        property_id=prop.id,
+        unit_id=unit.id,
     )
     db.add(expense)
     db.flush()
@@ -313,13 +393,14 @@ def test_case_f_history_preserved_after_closed(db_session):
 # live 500s caught during E2E are locked in as regressions).
 # ---------------------------------------------------------------------------
 
-def test_router_full_flow_create_reject_verify(client, db_session, admin_headers):
+def test_router_full_flow_create_reject_verify(client, db_session, admin_headers, unit_id):
     # Step 1: create repair (regression: record_audit must accept repair_created).
     resp = client.post("/api/v1/repairs", json={
         "issue": "Aircon compressor replacement",
         "issue_description": "Not cooling",
         "created_source": "test",
         "reported_by": 1,
+        "unit_id": unit_id,
     }, headers=admin_headers)
     assert resp.status_code == 201, resp.text
     detail = resp.json()
@@ -378,9 +459,14 @@ def _secretary_user(db):
     task can carry a real, existing assignee (FK-safe)."""
     import secrets as _secrets
 
-    from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
-    from app.models.user import User, UserRole
     from app.core.security import hash_api_key
+    from app.models.identity import (
+        ApiCredential,
+        CredentialState,
+        Principal,
+        PrincipalType,
+    )
+    from app.models.user import User, UserRole
 
     username = f"sec_{abs(hash((id(db), _secrets.token_hex(4))) )% 1000000}"
     key = _secrets.token_urlsafe(24)
@@ -423,7 +509,6 @@ def _patch_secretary(monkeypatch, user_id):
 def test_case_g_reject_projects_single_requote_into_secretary_queue(db_session, monkeypatch):
     """Reject V1 → exactly one REQUOTE appears in the Secretary task queue."""
     from app.services.operations.quick import build_quick_tasks
-    from app.services.repairs import delivery as deliv_svc
 
     db = db_session
     secretary = _secretary_user(db)
@@ -544,11 +629,12 @@ def test_case_i_submit_v2_completes_old_requote(db_session):
     assert "awaits owner decision" in (repair.next_action or "")
 
 
-def test_case_j_detail_returns_full_history_shape(client, admin_headers):
+def test_case_j_detail_returns_full_history_shape(client, admin_headers, unit_id):
     """Mini App Repair Detail serializer returns proposals/payments/actions/
     verification/timeline in one call (the frontend renders this)."""
     resp = client.post("/api/v1/repairs", json={
         "issue": "Aircon compressor replacement", "created_source": "test",
+        "unit_id": unit_id,
     }, headers=admin_headers)
     assert resp.status_code == 201, resp.text
     rid = resp.json()["id"]

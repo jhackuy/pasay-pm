@@ -1,7 +1,13 @@
-# Pasay — SOLO_HANDOFF（TRAE SOLO 完整接手合同）
+# Pasay — SOLO_HANDOFF（TRAE SOLO 历史接手合同与项目快照）
 
+> **⚠️ STATUS: NON-CANONICAL REFERENCE（历史快照，非宪法级权威源）**
 > **生效：** PASAY-SOLO-TRANSITION-001 (Issue #34) 完成后
-> **Canonical:** 本文件 + `project_rules.md` + `CURRENT_ARCHITECTURE.md` 构成全新 TRAE SOLO 会话的完整上下文
+> **Canonical Constitution Chain（当前权威链，优先级递减）：**
+> 1. `AGENTS.md` — 项目宪法（永久真相 + 身份 + 边界 + 加载指针）
+> 2. `.trae/rules/pasay-governance.md` — alwaysApply 硬安全禁令（Hard Bans ONLY）
+> 3. `project_rules.md` — 工程执行细节参考
+> 4. **本文件** — 历史接手合同与项目快照（永久真相以 `AGENTS.md` 为准）
+> 5. `CURRENT_ARCHITECTURE.md` — 架构冻结记录
 > **旧工作流状态：已退役**
 >
 > ⚠️ **旧 workflow Issue 的 `blocked` / `ready-for-dev` / `/ND` / `route:dev` 等状态不再控制 SOLO 执行。**
@@ -152,7 +158,7 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 ### 财产/租约链
 | 表 | 关键字段 | 说明 |
 |---|---|---|
-| **`properties`** | `organization_id BIGINT NULL ⚠️ TECH DEBT`, `name`, `address`, `city`, `total_units` | Property 组织归属仍可 NULL（legacy 数据遗留），技术债见 §11 |
+| **`properties`** | `organization_id BIGINT NOT NULL`, `name`, `address`, `city`, `total_units` | Property 组织归属（M1 backfill 后已强制 NOT NULL；旧历史快照 §11 已过时） |
 | `units` | `property_id NOT NULL`, `unit_number`, `floor`, `size_sqm`, `monthly_rent`, `unit_state VARCHAR(自由)`, `status[vacant/occupied/maintenance]` | 单元；unit_state 自由 VARCHAR 不是 enum（PARTIAL） |
 | `tenants` | `primary_contact_name`, `phone`, `email`, `organization_id` | 租客 |
 | `leases` | `unit_id`, `tenant_id`, `start_date`, `end_date`, `monthly_rent`, `deposit_amount`, `due_day`, `status`, `accounting_start_date` | 租约；佣金引擎基准；到期事件生成 scheduled |
@@ -259,8 +265,8 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 ❌ **完整 Excel 导出**：现 `reports/` 仅服务器聚合 JSON；无 Spreadsheet/CSV 批量导出
 ❌ **Control Panel / Mini App**：完全未开始。仅 Telegram Chat 做精简办公
 ❌ **`merchant_id` 多租户边界**：全库 grep merchant = 0 命中。当前单 Organization assumption 工作，多房东（多 merchant）架构地基未打
-❌ **Rent P0：Organization / Unit scoped 全量闭环**（Issue #26 标记 blocked）：基础 Rent 完成，但跨 Organization 严格过滤 + Unit scoped 权限严格切片 + Secretary 严格租约可见性范围未硬化到全接口
-❌ **Repair P0：Organization / Unit scoped 全量闭环**（Issue #27 标记 blocked）：基础 Repair 完成，但同上 scoped 权限 + Repair 到 Payment Claim → Verified Payment 完整对账未硬化
+❌ **Rent P0：Organization / Unit scoped 全量闭环**（Issue #26）：基础 Rent 完成，但跨 Organization 严格过滤 + Unit scoped 权限严格切片 + Secretary 严格租约可见性范围未硬化到全接口
+❌ **Repair P0：Organization / Unit scoped 全量闭环**（Issue #27）：基础 Repair 完成，但同上 scoped 权限 + Repair 到 Payment Claim → Verified Payment 完整对账未硬化
 ❌ **Telegram → TRAE Auto Wake → `/ND` 链路（Issue #29 / PR #30）**：本 Transition 已明确**退役**，不应再继续投入
 ❌ **`/ND` 显式 Issue 参数（Issue #22 / PR #23）** 已退役
 ❌ **OpenDesign 自动派发（Issue #5 / PR #16）**：Auto dispatch 存在但 `/ND` 退役后应切换为 SOLO 输入
@@ -294,7 +300,7 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 
 | 技术债 | 说明 | 风险 |
 |---|---|---|
-| **Property.organization_id = NULL（详见 §11）** | `properties.organization_id` 允许 NULL（历史 legacy）。Organization scoped enforcement 在部分接口无法严格切分 | 多 Organization 时数据泄露；无法做行级权限 |
+| **~Property.organization_id = NULL~ [RESOLVED — M1]** | ✅ M1 migration `m1_a_property_org_not_null_backfill.py` 已回填并 SET NOT NULL；历史遗留 §11 快照已过时 | 不再适用 |
 | **`unit_state` free VARCHAR vs legacy `UnitStatus` enum 并存** | `Unit.unit_state` 是 VARCHAR；另有 `UnitStatus(status)` enum。语义重复 | 未来状态机强制合法迁移困难 |
 | **i18n `More / ☰ 更多` 中文 legacy alias** | 与 canonical 英文 2×3 菜单共存 | 长期 UX 维护成本 |
 | **双任务系统**：`operations_tasks`（AI 运营任务投影）+ `tasks`（旧 CRUD Task）并存 | 两套独立的 status/recurring/assigned | 未来必须合并；否则 Owner 不知道真正待办在哪 |
@@ -306,29 +312,14 @@ Python Pydantic：[envelope.py](file:///d:/AI-Review/pasay-pm/app/schemas/envelo
 
 ---
 
-## 11. Legacy `Property.organization_id = NULL` 技术债
+## 11. Legacy `Property.organization_id = NULL` 技术债 [RESOLVED — M1]
 
-**证据：** `app/models/property.py:21-23`
-```python
-organization_id: Mapped[int | None] = mapped_column(
-    BigInteger, ForeignKey("organizations.id"), nullable=True, index=True
-)
-```
+✅ **已在 M1 Milestone 中清偿（migration `m1_a_property_org_not_null_backfill.py`）：**
+- 自动回填所有 legacy NULL organization_id（确定性唯一匹配）
+- 最终 `properties.organization_id` 已设置为 `NOT NULL`
+- 本节下方所有内容为**历史存档快照**，不再适用于当前代码库
 
-### 背景
-Pasay 早期单房东 assumption：所有 Property 同属于 Owner 直接的上下文，不需要显式组织切分。引入 Organization / Membership 体系后，`Property.organization_id` 是后加的且 nullable，以兼容历史数据。
-
-### 影响
-1. 所有 `GET /properties`、`GET /units`、`GET /leases`、`GET /tenants`、`GET /incomes`、`GET /expenses`、`GET /repairs` 的严格 Organization scoped 过滤无法对 legacy `organization_id=NULL` 的行生效
-2. 多 Organization（多 merchant）架构无法在 Property 层做严格切分
-3. Issue #26 / #27（Rent P0 / Repair P0 的 scoped 闭环）因此被标 `blocked`
-
-### Owner 需要决定的事项（Milestone）
-- 是否要求所有 `Property.organization_id` 做 non-null 回填（一个迁移 + 回填脚本 + `CHECK(organization_id IS NOT NULL)`）
-- 历史 NULL 行默认归属哪个 Organization（以及是否允许在运行时继续创建 NULL 行）
-- `units`（`property_id NOT NULL`，有 FK）、`leases`、`expense_claims.unit_id` 等通过 Property 间接组织归属的表，是否需要冗余 `organization_id` 以便直接做权限门控（减少 JOIN + 提高性能/安全性）
-
-⚠️ **SOLO 在 Owner 未决定前，禁止私自把所有 NULL `organization_id` 改成某个默认值。** 可能改变真实业务权限边界。
+**当前状态：不再需要 Owner 决策，不再阻塞 Issues #26/#27。**
 
 ---
 
@@ -339,8 +330,8 @@ Pasay 早期单房东 assumption：所有 Property 同属于 Owner 直接的上�
 |---|---|---|---|
 | **34** | **PASAY-SOLO-TRANSITION-001 退役 /ND 切换 SOLO 模式** | — | 本 Issue；当前 Transition 任务 |
 | 29 | TRAE-010 GitHub → TRAE Auto Wake P0 | route:dev | **已随本 Transition 退役**。实现不再需要；保留作历史记录 |
-| 27 | TRAE-009 Repair Operation P0（Org/Unit scoped） | route:dev, blocked | 关键能力，但 blocked 因 §11 Property.org_id NULL tech debt。SOLO 可作为 Milestone 先做 debt 清理 + 硬化 |
-| 26 | TRAE-008 Rent Collection P0（Org/Unit scoped） | route:dev, blocked | 同上 |
+| 27 | TRAE-009 Repair Operation P0（Org/Unit scoped） | route:dev | 关键能力；§11 Property.org_id NULL tech debt 已在 M1 清偿，不再 blocked。SOLO 作为 Milestone 直接硬化 scoped 权限 + 对账 |
+| 26 | TRAE-008 Rent Collection P0（Org/Unit scoped） | route:dev | 同上 |
 | 22 | PASAY-TASK-005 /ND 显式 Issue 参数 | route:dev | **已随本 Transition 退役**。ND no longer exists |
 | 12 | PASAY-ND-WORKFLOW-DOC-SYNC-001 /nd 接入 GitHub dev workflow 文档 | route:dev | **已随本 Transition 退役** |
 | 9 | PASAY-TRAE-ND-001 /nd 一键执行下一批准开发任务 | — | **已随本 Transition 退役** |
@@ -349,7 +340,7 @@ Pasay 早期单房东 assumption：所有 Property 同属于 Owner 直接的上�
 | 4 | PASAY-EXPENSE-VNEXT-001 Expense 业务闭环 Design→Dev | route:design-dev | Expense 基础已 PENDING→APPROVED→PAID（审计 PASS），后续 VNext 是否需要 OpenDesign 设计输入取决于 Owner |
 | 3 | PASAY-PRODUCT-RULES-001 建立产品规则事实源 | — | 本 §16 产品规则即部分响应；后续可整理成独立 PRODUCT_RULES.md |
 
-**⚠️ TRAE SOLO 规则：** 这些 Issue 只是需求/Bug/历史决策的输入。**不要机械 1 Issue = 1 分支 = 1 PR = STOP**。由 SOLO 先理解全局，形成 Milestone 计划（如：Milestone A = 清理 tech debt + 打通 Property.org_id NOT NULL + 硬化 Rent Org scoped + 硬化 Repair Org scoped），再执行。
+**⚠️ TRAE SOLO 规则：** 这些 Issue 只是需求/Bug/历史决策的输入。**不要机械 1 Issue = 1 分支 = 1 PR = STOP**。由 SOLO 先理解全局，形成 Milestone 计划（如：Milestone A = 硬化 Rent Org scoped + 硬化 Repair Org scoped），再执行。
 
 ### Open PRs 8 个
 | # | 标题 | 分支 | 状态 |
@@ -368,11 +359,10 @@ Pasay 早期单房东 assumption：所有 Property 同属于 Owner 直接的上�
 ## 13. Rent / Expense / Repair / Operation 后续能力优先级建议
 
 ### 高价值优先（Product Truth 完整性）
-1. **Rent：Org/Unit scoped 全硬化（解决 Issue #26 blocked）**
-   - 先决：Milestone A 先清偿 §11 Property.org_id NULL tech debt
+1. **Rent：Org/Unit scoped 全硬化（Issue #26）**
    - 动作：所有 Rent 相关接口（Income, Income Matching, Lease status, Quick Rent）强制 `WHERE organization_id = current_user.org_id`；加 failing tests 保证不过就红
-2. **Repair：Org/Unit scoped 全硬化（解决 Issue #27 blocked）**
-   - 同上先决；Payment Claim → Verified Payment 对账硬化（claim 不等于到账凭证）
+2. **Repair：Org/Unit scoped 全硬化（Issue #27）**
+   - Payment Claim → Verified Payment 对账硬化（claim 不等于到账凭证）
 3. **Property Channel 动态档案（设计目标，未来能力）业务联动增量更新**
    - 依赖先实现 `property_channel_articles` 动态档案（当前未实现；仅有 `unit_channel_bindings` 最小绑定）
    - 房租状态/维修状态/租约变化时，只更新 channel article 的相关段落，不整篇重发
@@ -457,7 +447,7 @@ Owner 产品语义决定
 ### 16.3 Role & Permission Truth
 - **Telegram ID ≠ 业务身份**：必须通过绑定 → User → Membership 验证
 - Secretary 永远不能：调 Owner bootstrap、审批自己创建的支出、执行 payment（Owner-only）、commission settlement confirm
-- Organization / Membership 切分是唯一权限边界；Property.org_id NULL 会弱化这个边界（§11 debt，谨慎处理）
+- Organization / Membership 切分是唯一权限边界（Fail-closed）；M1 后 Property.organization_id 已强制 NOT NULL，边界可严格执行
 - SecretaryInvite 状态-时间戳合规 + 一次性单消费（一个 invite 最多产生一条 Membership，`created_membership_id` UNIQUE）。PENDING invite 必须绑定有效 Organization，过期或未绑定则 fail-closed 不泄露信息（CONFIRMED BY `app/models/membership.py §SecretaryInvite CHECK 约束` + `test_onboarding_p0_024.py`）
 - PENDING invite 必须绑定有效 Organization；过期 PENDING 不能泄露 org 名称给未授权人
 
@@ -503,13 +493,12 @@ Owner 产品语义决定
 4. **删除现有已确认的业务能力**（当前 §6 CONFIRMED 能力）
 5. **Force push / rewrite shared history / merge / production deploy（TRAE SOLO 永远不做）**
 6. **写入 Production secrets / 配置 Telegram / Cloudflare / Neon 真实生产密钥**
-7. **§11 Property.org_id NULL tech debt 的清偿方案**：默认组织是谁、是否强制 NOT NULL、是否冗余 organization_id 到子表（要 Owner 拍）
-8. **双权限体系并轨最终方案（API Key ↔ Membership）**
-9. **Open PRs 6/8/10/13/16/17/23/30 哪些 close、哪些改成 SOLO 模式继续、哪些 merge**
-10. **真实 Blocker SOLO 无法自行解决**（第三方服务不可用 / 硬权限 / 生产配置 / Owner 真实 Telegram 操作）
-11. **Merchant ID 多租户架构决策**（什么时候做、做不做、首版本边界）
-12. **Mini App / Control Panel 范围与首版交付线**
-13. **高风险删除**：Organization 删除、Property 彻底删除（非软删）、Expense 硬删（现有只能 reverse）
+7. **双权限体系并轨最终方案（API Key ↔ Membership）**
+8. **Open PRs 6/8/10/13/16/17/23/30 哪些 close、哪些改成 SOLO 模式继续、哪些 merge**
+9. **真实 Blocker SOLO 无法自行解决**（第三方服务不可用 / 硬权限 / 生产配置 / Owner 真实 Telegram 操作）
+10. **Merchant ID 多租户架构决策**（什么时候做、做不做、首版本边界）
+11. **Mini App / Control Panel 范围与首版交付线**
+12. **高风险删除**：Organization 删除、Property 彻底删除（非软删）、Expense 硬删（现有只能 reverse）
 
 ---
 
@@ -523,17 +512,18 @@ Owner 产品语义决定
 ✅ Worker / Supervisor 微任务调度（Max/Lily/Hermes/Fugui/Bridge）**不再是 Pasay 开发入口**
 ✅ rules hash preflight（wf_ctl.py preflight）**不再阻塞开发启动**
 ✅ 每个小修复都要开单独 Issue **不再是工程要求**
-✅ `.ai-control/` 目录下 `RULES.md`、`tmp/rules_canonical.md`、`trae-auto-wake-test/`、`runtime-worktrees/` 等都是本地历史缓存 / runtime 产物，**不是当前开发权威源。读本文件 + project_rules.md + CURRENT_ARCHITECTURE.md。忽略本地 AI-control 历史文件**
+✅ `.ai-control/` 目录下所有内容都是本地历史缓存 / runtime 产物，**完全已退役，不是开发权威源。权威链：`AGENTS.md` → `.trae/rules/pasay-governance.md` → `project_rules.md`（→ 本文件作背景参考）。忽略本地 AI-control 历史文件**
 
 ---
 
 **TRADE SOLO READY 检查清单：**
-- 读完本文件（SOLO_HANDOFF.md）✅
-- 读完 `project_rules.md` ✅
-- 读完 `CURRENT_ARCHITECTURE.md` ✅
-- 知道 §18 Owner-only 决策边界 ✅
-- 知道 §16 产品规则（Business Truth First） ✅
-- 理解 §11 Property.org_id NULL tech debt 不私自修 ✅
+- 读完 `AGENTS.md`（项目宪法，最高权威）✅
+- 读完 `.trae/rules/pasay-governance.md`（alwaysApply 硬禁令）✅
+- 读完本文件（SOLO_HANDOFF.md，作背景快照参考）✅
+- 读完 `project_rules.md`（工程细节参考）✅
+- 读完 `CURRENT_ARCHITECTURE.md`（架构冻结记录）✅
+- 知道 Owner-only 决策边界（`AGENTS.md` §2 + 本文件 §18） ✅
+- 知道 Business Truth First 产品规则（`AGENTS.md` §4） ✅
 - 不机械逐 Issue 开 1PR；先做 Milestone 规划 ✅
 
 **确认后启动 TRAE SOLO Milestone 开发。祝顺利！**

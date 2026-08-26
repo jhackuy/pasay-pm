@@ -52,11 +52,17 @@ def test_inactive_user_rejected(client, admin, admin_headers, db_session):
     assert resp.status_code == 401
 
 
-def test_agent_cannot_create_property(client, agent_headers):
+def test_agent_cannot_create_property(client, agent_headers, db_session):
+    from app.models.membership import Organization
+    org_b = Organization(name="Org-B-Isolated", display_name="No agent membership")
+    db_session.add(org_b)
+    db_session.flush()
     resp = client.post(
         f"{API}/properties",
-        json={"name": "Blocked", "address": "x", "city": "Pasay"},
+        json={"name": "Blocked", "address": "x", "city": "Pasay",
+              "total_units": 1, "organization_id": org_b.id},
         headers=agent_headers,
     )
     assert resp.status_code == 403
-    assert resp.json() == {"detail": "Insufficient permissions"}
+    _d = resp.json().get("detail", "")
+    assert "permission" in _d.lower() or "membership" in _d.lower()

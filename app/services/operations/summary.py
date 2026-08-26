@@ -5,31 +5,83 @@ context builder so both always use the same counting semantics.
   ``_agent_scope``).
 - Snoozed tasks count toward ``pending_total`` but are skipped from the
   overdue / due buckets while ``snoozed_until`` is in the future.
+- Organization scope (``org_id``): non-agent callers only see tasks linked
+  to the caller's organization via property / lease / tenant / org-details
+  4-channel OR, following the canonical ``_scoped_task_query`` pattern in
+  operations.py.
 """
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
 
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from app.models.lease import Lease
 from app.models.operations import OperationalTask, OperationalTaskStatus
+from app.models.property import Property, Unit
+from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.schemas.operations import OperationsSummary
+from app.services.organization_scope import (
+    org_lease_ids as _canonical_org_lease_ids,
+    org_property_ids as _canonical_org_property_ids,
+    org_tenant_ids as _canonical_org_tenant_ids,
+)
+
+
+def _org_property_ids(db: Session, org_id: int) -> set[int]:
+    return _canonical_org_property_ids(db, org_id)
+
+
+def _org_lease_ids(db: Session, org_id: int) -> set[int]:
+    return _canonical_org_lease_ids(db, org_id)
+
+
+def _org_tenant_ids(db: Session, org_id: int) -> set[int]:
+    return _canonical_org_tenant_ids(db, org_id)
+
+
+def _scoped_task_query(db: Session, org_id: int):
+    from sqlalchemy import Integer
+    pids = _org_property_ids(db, org_id)
+    lids = _org_lease_ids(db, org_id)
+    tids = _org_tenant_ids(db, org_id)
+    or_terms = []
+    if pids:
+        or_terms.append(OperationalTask.property_id.in_(list(pids)))
+    if lids:
+        or_terms.append(OperationalTask.lease_id.in_(list(lids)))
+    if tids:
+        or_terms.append(OperationalTask.tenant_id.in_(list(tids)))
+    or_terms.append(
+        OperationalTask.details.op("->>")("organization_id").cast(Integer) == org_id
+    )
+    return or_(*or_terms)
 
 
 def build_operations_summary(
     db: Session, user: User, *, now: datetime | None = None,
     owner_only: bool = False,
+    org_id: int | None = None,
 ) -> OperationsSummary:
     """Count pending operational tasks visible to ``user`` at ``now``.
 
     ``owner_only=True`` applies the AI-OPS-FOUNDATION-001 §5 Owner attention
-    filter (approvals, Owner payments, decisions, escalations only)."""
+    filter (approvals, Owner payments, decisions, escalations only).
+    ``org_id`` fail-closes the payload to the resolved organization scope
+    when the caller is not a SystemReader / agent; agents are still bounded
+    by the ``assigned_user_id`` self-scope.
+    """
     query = db.query(OperationalTask).filter(
         OperationalTask.status == OperationalTaskStatus.PENDING
     )
     if user.role == UserRole.agent:
         query = query.filter(OperationalTask.assigned_user_id == user.id)
+        if org_id is not None:
+            query = query.filter(_scoped_task_query(db, org_id))
+    elif org_id is not None:
+        query = query.filter(_scoped_task_query(db, org_id))
     tasks = query.all()
     if owner_only:
         from app.services.operations.owner_scope import is_owner_actionable

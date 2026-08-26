@@ -22,7 +22,8 @@ from __future__ import annotations
 import json
 import re
 import secrets
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -41,9 +42,18 @@ from app.services.copilot import ask, llm, ranking, shared, today_fast, why
 from app.services.copilot.llm import LLMProviderError
 from app.services.operations.copilot import build_copilot_context
 from app.services.operations.timeclock import MANILA_TZ, clock
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW_MANILA = datetime(2026, 8, 11, 12, 0, 0, tzinfo=MANILA_TZ)
+NOW_UTC = datetime.now(timezone.utc)
+assert NOW_MANILA.tzinfo is not None, (
+    "Fixed test instant NOW_MANILA must carry tzinfo (naive datetime would "
+    "produce wrong calendar math across DST/timezone boundaries)."
+)
+assert NOW_UTC.tzinfo is not None, (
+    "datetime.now(timezone.utc) must produce a tz-aware datetime."
+)
 _REF_PATTERN = re.compile(
     r"\b(?:task|lease|property|expense|income|settlement|rule|tenant):\d+\b"
 )
@@ -92,9 +102,7 @@ def _headers(key):
 
 
 def _seed_property(db, name="Sunset Tower"):
-    prop = Property(name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name=name, address="1 Roxas Blvd", city="Pasay", total_units=4)
     return prop
 
 
@@ -105,8 +113,8 @@ def _seed_lease(db, *, prop=None, unit_no="101", monthly_rent="12000.00",
     unit = Unit(property_id=prop.id, unit_number=unit_no, floor="1",
                 size_sqm="32.50", monthly_rent=monthly_rent,
                 status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Juan Dela Cruz", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Juan Dela Cruz", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(unit_id=unit.id, tenant_id=tenant.id, start_date=start,
                   end_date=end, monthly_rent=monthly_rent, deposit="24000.00",
@@ -434,6 +442,15 @@ def test_why_strips_ungrounded_amounts_and_refs(db_session, client, manager_head
 def test_why_not_grounded_404_and_rbac_and_bad_provider(db_session, client, monkeypatch):
     admin, admin_key = _user_with_key(db_session, "admin-c11-why404", UserRole.admin)
     agent, agent_key = _user_with_key(db_session, "ag-c11-why403", UserRole.agent)
+    from tests.conftest import ensure_default_org
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=org.id,
+        user_id=admin.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    ))
     _seed_mandated_scenario(db_session)
     db_session.commit()
     clock.set_override(NOW_MANILA)
@@ -443,7 +460,7 @@ def test_why_not_grounded_404_and_rbac_and_bad_provider(db_session, client, monk
                        json={"item_ref": "lease:999999"})
     assert resp.status_code == 404
 
-    # agent -> 403
+    # agent -> 403 (no active org membership => permission denied)
     resp = client.post(f"{API}/operations/copilot/why", headers=_headers(agent_key),
                        json={"item_ref": "lease:1"})
     assert resp.status_code == 403
@@ -539,9 +556,18 @@ def test_ask_refuses_ungrounded_amounts(db_session, client, manager_headers, mon
 def test_ask_validation_and_rbac(db_session, client, monkeypatch):
     admin, admin_key = _user_with_key(db_session, "admin-c11-askv", UserRole.admin)
     agent, agent_key = _user_with_key(db_session, "ag-c11-ask403", UserRole.agent)
+    from tests.conftest import ensure_default_org
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=org.id,
+        user_id=admin.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    ))
     db_session.commit()
 
-    # agent -> 403
+    # agent -> 403 (no active org membership => permission denied)
     resp = client.post(f"{API}/operations/copilot/ask", headers=_headers(agent_key),
                        json={"question": "hi"})
     assert resp.status_code == 403
@@ -621,8 +647,12 @@ def test_endpoint_latency_fields_present_for_all_surfaces(
 # I. mutation invariant (Requirement 7): read-only surface
 # ---------------------------------------------------------------------------
 
-def test_mutation_invariant_today_why_ask(db_session, client, admin_headers, monkeypatch):
-    admin, _ = _user_with_key(db_session, "admin-c11-ro", UserRole.admin)
+def test_mutation_invariant_today_why_ask(db_session, client, admin, admin_headers, monkeypatch):
+    # admin fixture = (user, key) tuple from conftest. admin_headers corresponds
+    # to this same user's token. We use admin[0].id for assertions because the
+    # POST requests below use admin_headers → CopilotRun.actor_user_id will
+    # match admin[0].id. (Issue #6 fix: actor_user_id must match the caller.)
+    admin_user = admin[0]
     seeded = _seed_mandated_scenario(db_session)
     db_session.commit()
     clock.set_override(NOW_MANILA)
@@ -664,7 +694,66 @@ def test_mutation_invariant_today_why_ask(db_session, client, admin_headers, mon
         assert db_session.query(model).count() == before[name], name
     assert db_session.query(CopilotRun).count() == runs_before + 3
     for intent in ("copilot_today", "copilot_why", "copilot_ask"):
-        assert db_session.query(CopilotRun).filter_by(intent=intent).count() == 1
+        assert db_session.query(CopilotRun).filter_by(intent=intent).count() == 1, (
+            f"Expected exactly 1 CopilotRun with intent={intent}"
+        )
+
+    # ISSUE #6 fix: Assert ROW STATE not just row count.
+    #   If rows were inserted with wrong status/intent/actor, this FAILS.
+    #   Counter-example: if all 3 rows got intent=copilot_today (a bug), the
+    #   count-only assertion above would still pass but these per-row checks
+    #   catch it because status=FAILED or wrong actor_user_id would fail.
+    from app.models.copilot import CopilotRunStatus
+    all_new_runs = (
+        db_session.query(CopilotRun)
+        .order_by(CopilotRun.id.asc())
+        .offset(runs_before)
+        .limit(3)
+        .all()
+    )
+    assert len(all_new_runs) == 3
+    intents_found = set()
+    for row in all_new_runs:
+        # (a) actor matches the admin who called the endpoint
+        assert row.actor_user_id == admin_user.id, (
+            f"CopilotRun actor_user_id={row.actor_user_id} != admin_user.id={admin_user.id}. "
+            f"If the row was inserted under a wrong user, the audit trail is broken."
+        )
+        # (b) status is COMPLETED (not FAILED) for the happy-path provider stub
+        assert row.status == CopilotRunStatus.COMPLETED, (
+            f"CopilotRun id={row.id} status={row.status!r} != COMPLETED. "
+            f"A successful today/why/ask call must persist status=COMPLETED; "
+            f"a bug that swallowed the success signal but still wrote a row "
+            f"would write FAILED and be caught here."
+        )
+        # (c) intent is one of the canonical three (no typos / unknown intents)
+        assert row.intent in {"copilot_today", "copilot_why", "copilot_ask"}, (
+            f"CopilotRun id={row.id} has unknown intent={row.intent!r}"
+        )
+        assert row.intent not in intents_found, (
+            f"Duplicate CopilotRun intent={row.intent!r}; each endpoint must "
+            f"produce exactly 1 audit row. count-only assertion would have missed this."
+        )
+        intents_found.add(row.intent)
+        # (d) context_snapshot is populated (never an empty dict for these surfaces)
+        assert isinstance(row.context_snapshot, dict) and row.context_snapshot, (
+            f"CopilotRun id={row.id} context_snapshot empty or non-dict: "
+            f"{row.context_snapshot!r}"
+        )
+        # ISSUE #5 fix (continuation): datetimes in produced outputs carry tzinfo.
+        #   If created_at/updated_at were naive, the audit trail cannot be
+        #   ordered across timezone boundaries.
+        assert row.created_at is not None
+        assert row.created_at.tzinfo is not None, (
+            f"CopilotRun.created_at must carry tzinfo (naive would corrupt "
+            f"cross-timezone audit ordering). got {row.created_at!r}"
+        )
+        assert row.updated_at is not None
+        assert row.updated_at.tzinfo is not None, (
+            f"CopilotRun.updated_at must carry tzinfo. got {row.updated_at!r}"
+        )
+        assert row.created_at <= row.updated_at
+    assert intents_found == {"copilot_today", "copilot_why", "copilot_ask"}
 
 
 # ---------------------------------------------------------------------------

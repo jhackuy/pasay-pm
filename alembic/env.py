@@ -11,7 +11,11 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", settings.database_url)
+_x_db_url = context.get_x_argument(as_dictionary=True).get("db_url")
+if _x_db_url:
+    config.set_main_option("sqlalchemy.url", _x_db_url)
+else:
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 _isolated_test_metadata = config.attributes.get("pasay.test.target_metadata", None)
 if _isolated_test_metadata is not None:

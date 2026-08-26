@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
@@ -12,8 +12,10 @@ from app.models.commission import (
     CommissionSettlementStatus,
 )
 from app.models.lease import Lease
+from app.models.membership import Membership, MembershipState
+from app.models.property import Property, Unit
 from app.models.user import User
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.schemas.commission import (
     CommissionRuleCreate,
     CommissionRuleRead,
@@ -23,6 +25,7 @@ from app.schemas.commission import (
 )
 from app.services.audit import field_changes, record_audit, serialize_row
 from app.services.commission_engine import compute_settlement
+from app.services.organization_scope import list_active_org_ids_for_user
 
 router = APIRouter(prefix="/commission", tags=["commission"])
 
@@ -39,14 +42,112 @@ def _get_rule_or_404(db: Session, rule_id: int) -> CommissionRule:
     return obj
 
 
-@router.get("/rules", response_model=list[CommissionRuleRead])
-def list_rules(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return (
+def _scoped_settlement_ids(
+    db: Session, for_user_id: int, for_user_role: str
+) -> set[int]:
+    """Return CommissionSettlement.ids visible to caller.
+
+    FAIL-CLOSED org isolation contract (see PR #45 Owner comment 5425517206):
+      * Role == "agent": sees ONLY settlements whose agent_id == for_user_id
+        (historical "my commissions" self-only view preserved for agent).
+      * Role == "manager" / "admin": org-scoped ONLY — visible ids are
+        settlement→lease→unit→property.organization_id ∈ caller active
+        org_ids.  The `agent_id == caller` OR branch is intentionally
+        REMOVED for manager/admin to block the cross-org attack where a
+        foreign Org-A settlement is crafted with agent_id set to Org-B
+        caller's id, bypassing the lease→org read isolation chain.
+
+    CommissionRule global semantics are untouched (no migration, no new
+    org_id column).  Empty result set = caller sees nothing (downstream
+    routes translate to [] / 404 / 403 accordingly)."""
+    role_norm = (for_user_role.value if hasattr(for_user_role, "value") else str(for_user_role)).lower()
+    if role_norm == "agent":
+        rows = (
+            db.query(CommissionSettlement.id)
+            .filter(CommissionSettlement.agent_id == for_user_id)
+            .all()
+        )
+        return {r.id for r in rows} if rows else set()
+    # Manager / Admin: org scoping ONLY.  No agent_id self-visibility OR
+    # escape — the settlement's lease→unit→property→org chain is the
+    # single fail-closed scoping predicate for managerial roles.
+    org_ids = list_active_org_ids_for_user(db, for_user_id)
+    if not org_ids:
+        return set()
+    rows = (
+        db.query(CommissionSettlement.id)
+        .join(Lease, Lease.id == CommissionSettlement.lease_id)
+        .join(Unit, Unit.id == Lease.unit_id)
+        .join(Property, Property.id == Unit.property_id)
+        .filter(Property.organization_id.in_(org_ids))
+        .all()
+    )
+    return {r.id for r in rows} if rows else set()
+
+
+def _ensure_settlement_in_scope(
+    db: Session, settlement_id: int, visible: set[int]
+) -> CommissionSettlement:
+    if settlement_id not in visible:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Commission settlement not found"
+        )
+    obj = (
+        db.query(CommissionSettlement)
+        .filter(CommissionSettlement.id == settlement_id)
+        .first()
+    )
+    if obj is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "Commission settlement not found"
+        )
+    return obj
+
+
+def _ensure_lease_in_caller_orgs(
+    db: Session, lease: Lease, caller_org_ids: list[int]
+) -> None:
+    """Fail-closed guard for write endpoints (create/confirm): the settlement
+    is bound to a lease, so callers MUST be members of the organization that
+    owns the lease's unit's property.  Otherwise 403 so cross-org writes are
+    impossible."""
+    if not caller_org_ids:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Commission settlements require active organization membership",
+        )
+    unit = db.query(Unit).filter(Unit.id == lease.unit_id).first()
+    if unit is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease unit missing")
+    if unit.property_id is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Lease is not bound to a scoped organization property",
+        )
+    prop = db.query(Property).filter(Property.id == unit.property_id).first()
+    if prop is None or prop.organization_id not in set(caller_org_ids):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Cannot create commission settlement for another organization's lease",
+        )
+
+
+@router.get("/rules", response_model=Paginated[CommissionRuleRead])
+def list_rules(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db), _: User = Depends(get_current_user)
+):
+    query = (
         db.query(CommissionRule)
         .filter(CommissionRule.deleted_at.is_(None))
         .order_by(CommissionRule.id)
-        .all()
     )
+    total = query.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("/rules", response_model=CommissionRuleRead, status_code=status.HTTP_201_CREATED)
@@ -135,14 +236,21 @@ def delete_rule(
 
 
 # --- settlements ---
-@router.get("/settlements", response_model=list[CommissionSettlementRead])
+@router.get("/settlements")
 def list_settlements(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
-    query = db.query(CommissionSettlement)
-    if user.role == "agent":
-        query = query.filter(CommissionSettlement.agent_id == user.id)
-    return query.order_by(CommissionSettlement.id).all()
+    visible = _scoped_settlement_ids(db, user.id, user.role.value if hasattr(user.role, "value") else str(user.role))
+    if not visible:
+        return []
+    query = db.query(CommissionSettlement).filter(CommissionSettlement.id.in_(visible))
+    ordered = query.order_by(CommissionSettlement.id)
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    return rows
 
 
 @router.post(
@@ -155,12 +263,14 @@ def create_settlement(
     db: Session = Depends(get_db),
     user: User = Depends(manager_or_admin),
 ):
+    caller_org_ids = list_active_org_ids_for_user(db, user.id)
     agent = db.query(User).filter(User.id == payload.agent_id, User.is_active.is_(True)).first()
     if agent is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Agent not found")
     lease = db.query(Lease).filter(Lease.id == payload.lease_id, Lease.deleted_at.is_(None)).first()
     if lease is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
+    _ensure_lease_in_caller_orgs(db, lease, caller_org_ids)
     rule = _get_rule_or_404(db, payload.rule_id)
     if not rule.is_active:
         raise HTTPException(status.HTTP_409_CONFLICT, "Commission rule is not active")
@@ -197,14 +307,14 @@ def get_settlement(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    obj = (
-        db.query(CommissionSettlement)
-        .filter(CommissionSettlement.id == settlement_id)
-        .first()
-    )
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Commission settlement not found")
-    if user.role == "agent" and obj.agent_id != user.id:
+    visible = _scoped_settlement_ids(db, user.id, user.role.value if hasattr(user.role, "value") else str(user.role))
+    obj = _ensure_settlement_in_scope(db, settlement_id, visible)
+    # Pre-existing agent self-visibility is already handled in _scoped_settlement_ids,
+    # but we keep the original explicit "agent != owner 403" check so a cross-org
+    # agent settlement fetch still fails.
+    role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
+    is_agent_role = role_str.lower() == "agent"
+    if is_agent_role and obj.agent_id != user.id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Insufficient permissions")
     return obj
 
@@ -215,13 +325,14 @@ def confirm_settlement(
     db: Session = Depends(get_db),
     user: User = Depends(admin_only),
 ):
-    obj = (
-        db.query(CommissionSettlement)
-        .filter(CommissionSettlement.id == settlement_id)
-        .first()
-    )
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Commission settlement not found")
+    caller_org_ids = list_active_org_ids_for_user(db, user.id)
+    visible = _scoped_settlement_ids(db, user.id, user.role.value if hasattr(user.role, "value") else str(user.role))
+    obj = _ensure_settlement_in_scope(db, settlement_id, visible)
+    # Confirm is admin_only; additionally ensure the admin is writing within
+    # the organization that owns the settlement's lease (otherwise 403).
+    lease = db.query(Lease).filter(Lease.id == obj.lease_id, Lease.deleted_at.is_(None)).first()
+    if lease is not None:
+        _ensure_lease_in_caller_orgs(db, lease, caller_org_ids)
     old = serialize_row(obj)
     result = db.execute(
         update(CommissionSettlement)

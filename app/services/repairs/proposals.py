@@ -189,21 +189,106 @@ def approve_proposal(
     *,
     approved_by: int | None = None,
     now: datetime | None = None,
-) -> None:
+) -> Expense | None:
     """APPROVE the proposal VERSION. The repair moves to WAITING_PAYMENT —
     it is NOT closed (payment has not happened, and even payment alone would
-    not close it; only verification does). An Expense is linked separately."""
+    not close it; only verification does).
+
+    PASAY-MILESTONE-002 (quote ≠ expense): if no Expense is already linked to
+    the proposal, this path creates one at approval time. The RepairProposal
+    remains the authoritative QUOTE record (status APPROVED with amount =
+    proposal.amount); the Expense is the separate financial spend record
+    (status approved, amount = proposal.amount) with its own independent
+    claim→verify→paid lifecycle. The two objects are never conflated.
+
+    Returns the newly-linked Expense (created or already-linked) for the
+    caller to surface in timeline/audit; None if the repair lacks a
+    property-chain anchor needed to construct a valid Expense.
+    """
+    from datetime import date as _dt_date
+
+    from app.models.financial import Expense, ExpenseStatus
+    from app.models.property import Unit
+    from app.services.audit import record_audit, serialize_row
+    from app.services.repairs.payment import link_expense_to_proposal
+
     now = now or datetime.now(timezone.utc)
     if proposal.status != RepairProposalStatus.PENDING:
         raise ProposalError(
             f"Proposal V{proposal.version} is {proposal.status.value}, not PENDING"
         )
+
+    # --- FIX3 (repair approval anchor): the repair MUST resolve to a
+    # property_id (directly or via unit→property chain) before the proposal
+    # can be approved. Otherwise we cannot create a properly-scoped Expense
+    # yet and must fail-closed.  Raising here leaves the proposal PENDING
+    # and the repair in WAITING_APPROVAL, forcing the operator to attach
+    # the property anchor first.  This avoids a "WAITING_PAYMENT with no
+    # linked Expense on the books" lie.
+    repair_property_id: int | None = None
+    if repair.unit_id is not None:
+        row = (
+            db.query(Unit.property_id)
+            .filter(Unit.id == repair.unit_id, Unit.deleted_at.is_(None))
+            .one_or_none()
+        )
+        if row is not None:
+            repair_property_id = row[0]
+    if repair_property_id is None:
+        repair_property_id = repair.property_id
+    if repair_property_id is None:
+        raise ProposalError(
+            f"Repair #{repair.id} has no property/unit anchor; link a "
+            "property or unit before approving the proposal so the "
+            "linked Expense can be created with a correct org-chain scope."
+        )
+
     proposal.status = RepairProposalStatus.APPROVED
     proposal.decision_by = approved_by
     proposal.decision_at = now
     proposal.updated_by = approved_by
     proposal.updated_at = now
     db.flush()
+
+    linked_expense: Expense | None = None
+    # --- Create linked Expense if not already present (quote ≠ expense, but
+    # both exist and are linked for history; never overwrite an existing link)
+    if proposal.expense_id is None:
+        today = now.date() if hasattr(now, "date") else _dt_date.today()
+        linked_expense = Expense(
+            expense_date=today,
+            category="维修",
+            amount=proposal.amount,
+            payee=proposal.vendor or "-",
+            description=(
+                f"[Repair #{repair.id} V{proposal.version}] "
+                + (proposal.description or repair.issue or "")
+            )[:500],
+            unit_id=repair.unit_id,
+            property_id=repair_property_id,
+            status=ExpenseStatus.approved,
+            approved_by=approved_by,
+            approved_at=now,
+            created_by=approved_by,
+            updated_by=approved_by,
+        )
+        db.add(linked_expense)
+        db.flush()
+        link_expense_to_proposal(db, proposal, linked_expense, now=now)
+        record_audit(
+            db,
+            table_name="expenses",
+            record_id=linked_expense.id,
+            action="expense_created_from_approved_repair_proposal",
+            actor_id=approved_by,
+            changed_fields={
+                "status": [None, ExpenseStatus.approved.value],
+                "proposal_version": [None, proposal.version],
+            },
+            new_value=serialize_row(linked_expense),
+        )
+    else:
+        linked_expense = db.get(Expense, proposal.expense_id)
 
     repair.status = RepairOperationStatus.WAITING_PAYMENT
     repair.next_action = (
@@ -212,6 +297,7 @@ def approve_proposal(
     )
     repair.waiting_on = "payer"
     repair.updated_at = now
+    return linked_expense
 
 
 def supersede_pending_previous(

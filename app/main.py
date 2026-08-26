@@ -18,11 +18,13 @@ from app.api.routers import (
     audit,
     auth,
     commission,
+    deposit_settlements,
     evidence,
     expense,
     income,
     internal_ingest,
     leases,
+    move_out,
     onboarding,
     operations,
     payments,
@@ -66,6 +68,8 @@ app.include_router(audit.router, prefix=API_PREFIX)
 app.include_router(operations.router, prefix=API_PREFIX)
 app.include_router(evidence.router, prefix=API_PREFIX)
 app.include_router(viewings.router, prefix=API_PREFIX)
+app.include_router(move_out.router, prefix=API_PREFIX)
+app.include_router(deposit_settlements.router, prefix=API_PREFIX)
 
 # Telegram webhook is a *public* endpoint; it is intentionally NOT placed under
 # /api/v1 because Telegram itself delivers directly to this URL and authentication

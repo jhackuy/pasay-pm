@@ -6,6 +6,7 @@ from app.api.deps import get_current_user
 from app.database import get_db
 from app.models.property_channel import BindingStatus
 from app.models.user import User
+from app.schemas.common import Paginated
 from app.schemas.property import UnitChannelBindingCreate, UnitChannelBindingRead
 from app.services.organization_scope import scope_exception_to_http
 from app.services.property_channel import (
@@ -22,6 +23,30 @@ from app.services.property_channel import (
 )
 
 router = APIRouter(prefix="/property-channel", tags=["property_channel"])
+DEFAULT_PAGINATION_LIMIT = 50
+MAX_PAGINATION_LIMIT = 500
+
+
+def _clamp_limit_offset(limit: int, offset: int) -> tuple[int, int]:
+    if limit < 1:
+        limit = 1
+    if limit > MAX_PAGINATION_LIMIT:
+        limit = MAX_PAGINATION_LIMIT
+    if offset < 0:
+        offset = 0
+    return limit, offset
+
+
+def _paginate_list(items: list, *, limit: int, offset: int) -> Paginated:
+    limit2, offset2 = _clamp_limit_offset(limit, offset)
+    total = len(items)
+    page = items[offset2:offset2 + limit2]
+    return Paginated(
+        items=page,
+        total=total,
+        limit=limit2,
+        offset=offset2,
+    )
 
 
 def _route_exception_to_http(exc: Exception) -> HTTPException:
@@ -61,10 +86,12 @@ def lookup_unit(
     return active
 
 
-@router.get("/units/{unit_id}/bindings", response_model=list[UnitChannelBindingRead])
+@router.get("/units/{unit_id}/bindings", response_model=Paginated[UnitChannelBindingRead])
 def list_unit_bindings(
     unit_id: int,
     status_filter: BindingStatus | None = None,
+    limit: int = Query(DEFAULT_PAGINATION_LIMIT, ge=1, le=MAX_PAGINATION_LIMIT),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -72,7 +99,8 @@ def list_unit_bindings(
         _unit, _membership = scoped_get_unit(db, unit_id, for_user_id=user.id)
     except Exception as exc:
         raise _route_exception_to_http(exc) from exc
-    return list_bindings_for_unit(db, unit_id, status=status_filter)
+    all_items = list_bindings_for_unit(db, unit_id, status=status_filter)
+    return _paginate_list(all_items, limit=limit, offset=offset)
 
 
 @router.get("/units/{unit_id}/bindings/active", response_model=UnitChannelBindingRead | None)

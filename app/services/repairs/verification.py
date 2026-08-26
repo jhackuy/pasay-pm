@@ -4,12 +4,23 @@ A Repair Operation may ONLY be CLOSED after a real verification (008A §7).
 Payment, proposal approval, reminder sent, or vendor being contacted are each
 REQUIRED-but-NOT-SUFFICIENT and never fire closure on their own.
 
+PASAY-MILESTONE-002 closures (invariants enforced here):
+    * contractor says done ≠ repair closed: COMPLETION_EVENT closure-signal
+      requires completion evidence_ids or structured evidence blob before
+      we allow the gate to pass. Only HUMAN_CONFIRMED (Owner/Secretary
+      on-site or explicit OK) is allowed without media evidence, because
+      the human sign-off itself is the verification.
+    * Task is only a human-action projection: once we pass the closure gate
+      and move repair.status to CLOSED, we also mark linked OperationalTask
+      rows COMPLETED (never the reverse — tasks never close a repair).
+
 Allowed valid results (at least one):
 - A Secretary explicitly confirms the repair is fixed/completed;
 - The Owner explicitly confirms it;
 - Repair-result evidence + human confirmation exists;
 - A credibly structured completion event exists (source retained in
-  ``verification_result`` / ``details``).
+  ``verification_result`` / ``details``) WITH evidence if the signal is
+  COMPLETION_EVENT (contractor-says-done is insufficient on its own).
 
 Closure records ``verified_by``, ``verified_at``, ``verification_result`` and
 ``closure_reason`` on the Repair Operation.
@@ -18,15 +29,21 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from app.models.operations import (
+    OperationalTask,
+    OperationalTaskStatus,
+    OperationalTaskType,
+)
 from app.models.repair import (
     RepairAction,
     RepairActionStatus,
     RepairOperation,
     RepairOperationStatus,
-    RepairProposal,
 )
+from app.services.audit import record_audit, serialize_row
 from app.services.repairs.state import ClosureSignal, ensure_closable_via_verification
 
 
@@ -50,6 +67,19 @@ def mark_repair_completed(
     close them. The verification pass that follows may close it. Idempotent for
     already-VERIFYING repairs; refused for terminal statuses."""
     now = now or datetime.now(timezone.utc)
+    # Evidence must always be written (idempotently) regardless of status —
+    # if pay-expense already moved the repair to VERIFYING before we record
+    # the vendor's completion evidence, the guard still needs evidence to
+    # satisfy the COMPLETION_EVENT gate.
+    if evidence_ids:
+        details = dict(repair.details or {})
+        existing = details.get("completion_evidence_ids") or []
+        merged = list({*existing, *evidence_ids})
+        if merged != existing:
+            details["completion_evidence_ids"] = merged
+            repair.details = details
+            repair.updated_at = now
+            db.flush()
     if repair.status == RepairOperationStatus.VERIFYING:
         # Re-stating completion is a no-op (already awaiting verification).
         return repair
@@ -69,10 +99,6 @@ def mark_repair_completed(
     repair.verified_by = confirmed_by
     repair.verified_at = now
     repair.verification_result = verification_result or source or "completed"
-    if evidence_ids:
-        details = dict(repair.details or {})
-        details["completion_evidence_ids"] = evidence_ids
-        repair.details = details
     repair.updated_at = now
     db.flush()
     return repair
@@ -82,6 +108,149 @@ def mark_repair_completed(
 _COMPLETABLE = frozenset(
     {"OPEN", "IN_PROGRESS", "WAITING_HUMAN", "WAITING_VENDOR", "WAITING_APPROVAL", "WAITING_PAYMENT"}
 )
+
+
+def _evidence_present_for_close(repair: RepairOperation) -> bool:
+    """Return True if completion evidence is present for closure.
+
+    Evidence comes from:
+    (a) repair.details['completion_evidence_ids'] being a non-empty list, OR
+    (b) repair.evidence (JSONB evidence blob) being truthy with at least one
+        media/record item (we accept any non-empty dict / non-empty list).
+    """
+    d = repair.details or {}
+    ce = d.get("completion_evidence_ids")
+    if isinstance(ce, list) and len(ce) > 0:
+        return True
+    ev = repair.evidence
+    if isinstance(ev, (list, tuple)) and len(ev) > 0:
+        return True
+    if isinstance(ev, dict) and len(ev) > 0:
+        return True
+    return False
+
+
+def _complete_linked_operational_tasks(
+    db: Session,
+    repair: RepairOperation,
+    *,
+    resolved_by: int | None,
+    now: datetime,
+) -> None:
+    """Sync (closure truth → projection): any PENDING / IN_PROGRESS
+    OperationalTask associated with the repair transitions to COMPLETED.
+
+    The task is the PROJECTION (human-action to-do), not truth. The repair
+    closing IS truth. Never the reverse.
+    """
+    candidates: list[OperationalTask] = []
+    # (a) Direct operational_task_id link on repair row.
+    if repair.operational_task_id is not None:
+        t = db.get(OperationalTask, repair.operational_task_id)
+        if t is not None:
+            candidates.append(t)
+    # (b) Tasks whose details JSONB contain repair_id, or dedupe_key
+    #     references the repair_id (existing legacy projections).
+    #
+    # FIX2 (CodeRabbit 🔴 Critical) — SQL-side narrowing:
+    #   * If repair.property_id resolves, restrict to OperationalTasks on the
+    #     same property. This cuts cross-org / cross-property false positives.
+    #   * Use JSONB `metadata->>'repair_id' == str(repair.id)` to avoid the
+    #     earlier Python-only fallback scanning every open task on the DB.
+    #   * dedupe_key match only accepts exact `repair:{id}` or the prefix
+    #     `repair:{id}:` (which precedes an additional qualifier); the old
+    #     substring `in` would match repair:1 inside repair:120 / repair:11 —
+    #     closing other repairs' linked tasks (potentially cross-org).
+    #
+    # Python `t.details.get("repair_id")` secondary guard is kept as a
+    # belt-and-braces check for projections written through an older schema.
+
+    str_rid = str(repair.id)
+    repair_ref_exact = f"repair:{repair.id}"
+    repair_ref_prefix = f"repair:{repair.id}:"
+    # JSONB metadata->>'repair_id' == str(repair.id).  We write the SQL
+    # expression without a Python-side cast() wrapper because the operator
+    # already returns text; cast() can break under SQLite/ORM bindings when
+    # the JSONB-op dialect is not fully loaded.
+    jsonb_rid_text = OperationalTask.details.op("->>")("repair_id")
+    q = db.query(OperationalTask).filter(
+        OperationalTask.status.in_(
+            (
+                OperationalTaskStatus.PENDING,
+                OperationalTaskStatus.IN_PROGRESS,
+            )
+        ),
+        OperationalTask.task_type.in_(
+            (
+                OperationalTaskType.APPROVAL_PENDING,
+                OperationalTaskType.PAYMENT_PENDING,
+                OperationalTaskType.FOLLOWUP,
+                OperationalTaskType.AC_MAINTENANCE,
+                OperationalTaskType.RENT_OVERDUE,
+            )
+        ),
+        or_(
+            OperationalTask.dedupe_key == repair_ref_exact,
+            OperationalTask.dedupe_key.like(f"{repair_ref_prefix}%"),
+            jsonb_rid_text == str_rid,
+        ),
+    )
+    if repair.property_id is not None:
+        # If the repair resolves to a property, tasks must either share that
+        # property OR have a NULL property_id (legacy tasks pre-dating the
+        # property_id column).  Combined with the exact/prefix dedupe_key
+        # guard above this blocks cross-property false positives when an
+        # unrelated repair happens to have a numeric ID that is a prefix of
+        # another repair's ID (e.g. repair:1 vs repair:120).
+        q = q.filter(
+            or_(
+                OperationalTask.property_id == None,  # noqa: E711
+                OperationalTask.property_id == repair.property_id,
+            )
+        )
+    for t in q.all():
+        matched = False
+        # Secondary (belt-and-braces) Python dedupe_key guard; the SQL query
+        # already narrowed to exact/prefix matches, but we re-assert to be
+        # defensive against any unexpected future callers widening the query.
+        if t.dedupe_key and (
+            t.dedupe_key == repair_ref_exact
+            or t.dedupe_key.startswith(repair_ref_prefix)
+        ):
+            matched = True
+        elif t.details:
+            details_rid = t.details.get("repair_id")
+            if details_rid is not None and str(details_rid) == str_rid:
+                matched = True
+        if matched:
+            candidates.append(t)
+    for task in candidates:
+        if task.status == OperationalTaskStatus.COMPLETED:
+            continue
+        old_snap = serialize_row(task)
+        old_status = (
+            task.status.value
+            if hasattr(task.status, "value")
+            else str(task.status)
+        )
+        task.status = OperationalTaskStatus.COMPLETED
+        task.completed_at = now
+        task.completed_by = resolved_by
+        task.updated_by = resolved_by
+        task.updated_at = now
+        record_audit(
+            db,
+            table_name="operational_tasks",
+            record_id=task.id,
+            action="repair_closure_task_completed",
+            actor_id=resolved_by,
+            changed_fields={
+                "status": [old_status, OperationalTaskStatus.COMPLETED.value],
+                "repair_id": [None, repair.id],
+            },
+            old_value=old_snap,
+            new_value=serialize_row(task),
+        )
 
 
 def verify_and_close(
@@ -99,6 +268,14 @@ def verify_and_close(
     Guarded: an invalid closure signal is refused so the only path into CLOSED
     is verification. Records verified_by/verified_at/result + closure reason.
 
+    PASAY-MILESTONE-002 closure evidence gate:
+      * COMPLETION_EVENT (e.g. contractor says done / auto-event) —
+        evidence_ids OR repair.evidence blob required; otherwise the gate
+        raises VerificationError (contractor says done ≠ repair closed).
+      * HUMAN_CONFIRMED (Owner/Secretary explicit sign-off) — evidence is
+        recommended but the human is the authority on the real-world outcome;
+        pass.
+
     NOTE: this must never be called by the payment path, the approve path, the
     reminder path, or the vendor-contact path. Calling it from those points is
     a P0 regression.
@@ -109,6 +286,20 @@ def verify_and_close(
         return repair  # idempotent
     if repair.status == RepairOperationStatus.CANCELLED:
         raise VerificationError("Cannot close a cancelled repair")
+    # --- closure evidence gate (M002 invariant: contractor says done ≠ closed)
+    # COMPLETION_EVENT (= structured "vendor/contractor completion signal" — ALWAYS requires
+    # evidence regardless of verified_by; Owner sign-off. A human Owner/Secretary who wants
+    # to close without evidence should use HUMAN_CONFIRMED (no evidence needed) instead.
+    if (
+        closure_signal == ClosureSignal.COMPLETION_EVENT.value
+        and not _evidence_present_for_close(repair)
+    ):
+        raise VerificationError(
+            "Closure signal COMPLETION_EVENT requires completion evidence_ids "
+            "attached to the repair — contractor says done alone is not "
+            "sufficient to close a repair. Use HUMAN_CONFIRMED if a human "
+            "authority overrides without evidence."
+        )
     repair.status = RepairOperationStatus.CLOSED
     repair.verified_by = verified_by
     repair.verified_at = now
@@ -122,6 +313,10 @@ def verify_and_close(
     db.flush()
     # Complete any active VERIFY/RECORD_RESULT actions so they no longer pend.
     _close_result_actions(db, repair.id, resolved_by=verified_by, now=now)
+    # Sync truth → task projection (M002 truth consistency).
+    _complete_linked_operational_tasks(
+        db, repair, resolved_by=verified_by, now=now
+    )
     return repair
 
 
