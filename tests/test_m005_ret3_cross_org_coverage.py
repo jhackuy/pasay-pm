@@ -607,3 +607,73 @@ def test_commission_settlement_cross_org_four_endpoints_failclosed(
         f"Cross-org confirm settlement/{settlement_id_a} must be 403/404, "
         f"got {confirm_resp.status_code}. Body[:300]={confirm_resp.text[:300]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 12. Owner C1 EXACT regression — manager/admin agent_id==caller OR escape
+#     (PR #45 Owner comment 5425517206 counterexample):
+#     1. Org-A owner creates Org-A lease.
+#     2. Org-A owner creates settlement on that lease with
+#        agent_id = owner_b.id (Owner-B is active Org-B user, no Org-A mem).
+#     3. Owner-B GET /commission/settlements -> that settlement EXCLUDED.
+#     4. Owner-B GET /commission/settlements/{id} -> HTTP 404.
+# ---------------------------------------------------------------------------
+
+
+def test_commission_settlement_agent_id_owner_b_org_b_cannot_see_org_a(
+    client, owner_a, owner_b, org_a, org_b, db_session
+):
+    """PR #45 C1 exact regression.  Manager/admin scoping MUST NOT have an
+    agent_id self-visibility OR branch; only settlement→lease→unit→property→org
+    chain determines visibility for non-agent roles."""
+    prop_id_a, unit_id_a = _setup_org_a_property_and_unit(client, owner_a, org_a)
+    tenant_id_a = _create_org_a_tenant(client, owner_a, org_a)
+    lease_id_a = _create_org_a_active_lease(client, owner_a, unit_id_a, tenant_id_a)
+    rule_id_a = _create_active_commission_rule(client, owner_a)
+
+    # Step 2: Org-A owner creates a settlement whose agent_id = owner_b.id
+    #         (foreign Org-B principal, zero Org-A memberships).
+    owner_a_headers = _bearer(owner_a[1])
+    owner_b_user_id = owner_b[0].id
+    create_resp = client.post(
+        f"{API}/commission/settlements",
+        json={
+            "agent_id": owner_b_user_id,
+            "lease_id": lease_id_a,
+            "rule_id": rule_id_a,
+            "notes": "C1 trap: agent_id=owner_b cross-org bypass attempt",
+        },
+        headers=owner_a_headers,
+    )
+    assert create_resp.status_code == 201, (
+        f"OrgA owner creating settlement with foreign agent_id must 201, "
+        f"got {create_resp.status_code}. Body[:300]={create_resp.text[:300]!r}"
+    )
+    trap_settlement_id = create_resp.json()["id"]
+
+    owner_b_headers = _bearer(owner_b[1])
+
+    # Step 3: Owner-B GET list — must be [] (type list), trap id absent.
+    list_resp = client.get(f"{API}/commission/settlements", headers=owner_b_headers)
+    assert list_resp.status_code == 200, list_resp.text[:300]
+    list_body = list_resp.json()
+    assert isinstance(list_body, list), (
+        f"settlements list must stay list type (orig contract), "
+        f"got {type(list_body).__name__}: {str(list_body)[:300]!r}"
+    )
+    visible_ids = {item.get("id") for item in list_body if isinstance(item, dict)}
+    assert trap_settlement_id not in visible_ids, (
+        f"C1 LEAK — Org-B owner_b.list includes Org-A settlement id={trap_settlement_id} "
+        f"whose agent_id==owner_b.id; the agent_id OR-branch must be disabled for "
+        f"manager/admin roles.  visible_ids={visible_ids!r}"
+    )
+
+    # Step 4: Owner-B GET /settlements/{id} — HTTP 404 (existence deny).
+    get_resp = client.get(
+        f"{API}/commission/settlements/{trap_settlement_id}", headers=owner_b_headers
+    )
+    assert get_resp.status_code == 404, (
+        f"C1 LEAK — Org-B owner_b GET /settlements/{trap_settlement_id} must be 404, "
+        f"got {get_resp.status_code}. Body[:300]={get_resp.text[:300]!r}"
+    )
+

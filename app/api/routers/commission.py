@@ -47,16 +47,19 @@ def _scoped_settlement_ids(
 ) -> set[int]:
     """Return CommissionSettlement.ids visible to caller.
 
-    Scoping rules match pre-existing test_commission.py contract:
-      * Agent role: sees ONLY settlements with agent_id == for_user_id (their
-        own generated settlements — this is the historical "my commissions"
-        view preserved so test_agent_sees_only_own_settlements still passes).
-      * Manager / Admin role: sees settlements scoped via org membership
-        (settlement -> lease -> unit -> property.organization_id IN caller
-        active orgs) PLUS the historical agent self-visibility OR.
+    FAIL-CLOSED org isolation contract (see PR #45 Owner comment 5425517206):
+      * Role == "agent": sees ONLY settlements whose agent_id == for_user_id
+        (historical "my commissions" self-only view preserved for agent).
+      * Role == "manager" / "admin": org-scoped ONLY — visible ids are
+        settlement→lease→unit→property.organization_id ∈ caller active
+        org_ids.  The `agent_id == caller` OR branch is intentionally
+        REMOVED for manager/admin to block the cross-org attack where a
+        foreign Org-A settlement is crafted with agent_id set to Org-B
+        caller's id, bypassing the lease→org read isolation chain.
 
-    The result set is fail-closed: empty = caller sees nothing (downstream
-    returns [] / 404 / 403 accordingly)."""
+    CommissionRule global semantics are untouched (no migration, no new
+    org_id column).  Empty result set = caller sees nothing (downstream
+    routes translate to [] / 404 / 403 accordingly)."""
     role_norm = (for_user_role.value if hasattr(for_user_role, "value") else str(for_user_role)).lower()
     if role_norm == "agent":
         rows = (
@@ -65,24 +68,18 @@ def _scoped_settlement_ids(
             .all()
         )
         return {r.id for r in rows} if rows else set()
-    # Manager / Admin: org scoping via JOIN chain, OR with agent self-visibility
-    from sqlalchemy import or_ as _sa_or
+    # Manager / Admin: org scoping ONLY.  No agent_id self-visibility OR
+    # escape — the settlement's lease→unit→property→org chain is the
+    # single fail-closed scoping predicate for managerial roles.
     org_ids = list_active_org_ids_for_user(db, for_user_id)
-    clauses: list = []
-    if org_ids:
-        clauses.append(
-            CommissionSettlement.id.in_(
-                db.query(CommissionSettlement.id)
-                .join(Lease, Lease.id == CommissionSettlement.lease_id)
-                .join(Unit, Unit.id == Lease.unit_id)
-                .join(Property, Property.id == Unit.property_id)
-                .filter(Property.organization_id.in_(org_ids))
-            )
-        )
-    clauses.append(CommissionSettlement.agent_id == for_user_id)
+    if not org_ids:
+        return set()
     rows = (
         db.query(CommissionSettlement.id)
-        .filter(_sa_or(*clauses))
+        .join(Lease, Lease.id == CommissionSettlement.lease_id)
+        .join(Unit, Unit.id == Lease.unit_id)
+        .join(Property, Property.id == Unit.property_id)
+        .filter(Property.organization_id.in_(org_ids))
         .all()
     )
     return {r.id for r in rows} if rows else set()
