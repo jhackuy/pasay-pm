@@ -119,8 +119,7 @@ def _resolve_attachment_org_scope_filter(db: Session, for_user_id: int):
             (Attachment.related_type == "deposit_settlement")
             & Attachment.related_id.in_(settlement_q)
         )
-    clauses.append(Attachment.related_type.is_(None))
-    clauses.append(Attachment.related_id.is_(None))
+    clauses.append(Attachment.uploaded_by == for_user_id)
     return _sa_or(*clauses)
 
 

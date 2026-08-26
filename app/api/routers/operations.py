@@ -618,9 +618,24 @@ def list_tasks(
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
     if scope == "owner":
-        all_filtered = [t for t in ordered.all() if is_owner_actionable(t, user)]
-        total = len(all_filtered)
-        rows = all_filtered[offset:offset + limit]
+        candidate_tasks = ordered.with_entities(
+            OperationalTask.id,
+            OperationalTask.details,
+            OperationalTask.task_type,
+            OperationalTask.assigned_user_id,
+        ).all()
+        scoped_task_ids = []
+        for t in candidate_tasks:
+            full_task = OperationalTask()
+            full_task.id = t.id
+            full_task.details = t.details
+            full_task.task_type = t.task_type
+            full_task.assigned_user_id = t.assigned_user_id
+            if is_owner_actionable(full_task, user):
+                scoped_task_ids.append(t.id)
+        scoped_query = ordered.filter(OperationalTask.id.in_(scoped_task_ids))
+        total = scoped_query.count()
+        rows = scoped_query.offset(offset).limit(limit).all()
     else:
         total = ordered.count()
         rows = ordered.offset(offset).limit(limit).all()
@@ -1244,7 +1259,8 @@ def quick_rent(
     summary = quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    return Paginated(items=[summary], total=1, limit=limit, offset=offset)
+    items = [summary] if offset == 0 else []
+    return Paginated(items=items, total=1, limit=limit, offset=offset)
 
 
 @router.get("/quick/expense")
@@ -1260,7 +1276,8 @@ def quick_expense(
     summary = quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
     limit = max(1, min(limit, 500))
     offset = max(0, offset)
-    return Paginated(items=[summary], total=1, limit=limit, offset=offset)
+    items = [summary] if offset == 0 else []
+    return Paginated(items=items, total=1, limit=limit, offset=offset)
 
 
 @router.get("/quick/expense-duplicates")
