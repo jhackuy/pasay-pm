@@ -114,7 +114,7 @@ jobs:
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
-          PASAY_TEST_DB_NAME: "pasay_pm_test"
+          PASAY_TEST_DB_NAME: "pasay_gate_001"
           TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
