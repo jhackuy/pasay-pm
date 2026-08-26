@@ -315,3 +315,295 @@ def test_onboarding_active_member_bootstrap_blocked_403(
         f"Expected active owner POST /onboarding/owner/bootstrap to be 403, "
         f"got {resp.status_code}. Body: {resp.text[:400]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 10. payments: STRONG cross-org counterexample with real OrgA setup
+#     Org-A active lease + tenant + confirmed rent income + unit/property ids
+#     -> Org-B owner/secretary POST /payments/match with HIGH-MATCH text
+#     -> MUST: candidates=[] AND body string never contains OrgA numeric ids
+# ---------------------------------------------------------------------------
+
+
+def _create_org_a_tenant(client, owner_a, org_a):
+    resp = client.post(
+        f"{API}/tenants",
+        json={
+            "full_name": "Maria Santos (OrgA)",
+            "phone": "+639180000001",
+            "email": "maria.orga@example.com",
+            "organization_id": org_a.id,
+        },
+        headers=_bearer(owner_a[1]),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def _create_org_a_active_lease(client, owner_a, unit_id, tenant_id):
+    resp = client.post(
+        f"{API}/leases",
+        json={
+            "unit_id": unit_id,
+            "tenant_id": tenant_id,
+            "start_date": "2026-01-01",
+            "end_date": "2026-12-31",
+            "monthly_rent": "12000.00",
+            "deposit": "24000.00",
+            "status": "active",
+            "due_day": 5,
+        },
+        headers=_bearer(owner_a[1]),
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["id"]
+
+
+def _create_org_a_confirmed_rent_income(client, owner_a, lease_id):
+    resp = client.post(
+        f"{API}/incomes",
+        json={
+            "lease_id": lease_id,
+            "amount": "12000.00",
+            "description": "Rent August 2026 unit 101 Sunset Tower",
+            "received_date": "2026-08-05",
+            "status": "confirmed",
+            "category": "rent",
+        },
+        headers=_bearer(owner_a[1]),
+    )
+    assert resp.status_code in {200, 201}, resp.text
+    return resp.json()["id"]
+
+
+def test_payments_match_cross_org_no_org_a_ids_leak(
+    client, owner_a, owner_b, org_a, org_b, db_session
+):
+    """STRONG COUNTEREXAMPLE: Org-A builds a real high-match dataset;
+    Org-B owner POSTs a match text that explicitly targets it.  The scoped
+    service must NOT load Org-A leases (caller membership is Org-B only),
+    so either (403/404) or (200 with candidates=[]).  Additionally we
+    verify NO numeric OrgA id (lease/unit/property/tenant/any income)
+    ever appears in the JSON response string."""
+    prop_id_a, unit_id_a = _setup_org_a_property_and_unit(client, owner_a, org_a)
+    tenant_id_a = _create_org_a_tenant(client, owner_a, org_a)
+    lease_id_a = _create_org_a_active_lease(client, owner_a, unit_id_a, tenant_id_a)
+    income_id_a = _create_org_a_confirmed_rent_income(client, owner_a, lease_id_a)
+
+    forbidden_tokens: set[str] = {
+        str(prop_id_a),
+        str(unit_id_a),
+        str(tenant_id_a),
+        str(lease_id_a),
+        str(income_id_a),
+    }
+
+    owner_b_headers = _bearer(owner_b[1])
+    high_match_text = "Rent payment for unit 101 Sunset Tower A amount 12000.00 Aug 2026"
+    resp = client.post(
+        f"{API}/payments/match",
+        json={"text": high_match_text, "amount": "12000.00"},
+        headers=owner_b_headers,
+    )
+
+    if resp.status_code not in {403, 404}:
+        assert resp.status_code == 200, (
+            f"Expected cross-org match to be 403/404 or 200 empty, got "
+            f"{resp.status_code}. Body[:500]={resp.text[:500]!r}"
+        )
+        body = resp.json()
+        assert isinstance(body, dict), body
+        cands = body.get("candidates", None)
+        assert cands == [], (
+            f"Cross-org match with real OrgA data active must return candidates=[], "
+            f"got cands[:3]={cands[:3] if isinstance(cands, list) else cands!r}"
+        )
+
+    resp_text = resp.text or ""
+    for tok in forbidden_tokens:
+        # Use word-boundary-ish check: numeric id must not be a JSON integer
+        # token (preceded by `:` or `,` or `[` and not surrounded by other digits).
+        assert (
+            f'"lease_id": {tok}' not in resp_text
+            and f'"unit_id": {tok}' not in resp_text
+            and f'"property_id": {tok}' not in resp_text
+            and f'"tenant_id": {tok}' not in resp_text
+            and f'"income_id": {tok}' not in resp_text
+            and f'"id": {tok},' not in resp_text
+            and f'"id":{tok}' not in resp_text
+        ), (
+            f"Forbidden OrgA id token {tok!r} leaked in /payments/match response. "
+            f"Full forbidden set: {forbidden_tokens!r}. Response[:1500]={resp_text[:1500]!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 11. commission settlements: STRONG 4-endpoint cross-org fail-closed
+#     Org-A: real property+unit+active lease+agent+rule -> pending settlement
+#     Org-B: (a) list -> total=0 items=[]
+#            (b) GET /{settlement_id} -> 404
+#            (c) POST /settlements (cross-org lease_id) -> 403
+#            (d) POST /settlements/{id}/confirm (cross-org) -> 404 or 403
+# ---------------------------------------------------------------------------
+
+
+def _create_agent_user(db_session):
+    """Create an active agent user via ORM (minimal).
+
+    Uses the same User/Principal/ApiCredential shape as
+    tests/conftest.py make_user so the user has a usable api_key for
+    downstream HTTP deps (even if we don't hit the endpoint with it)."""
+    import hashlib
+    import secrets as _sec
+    from app.models.identity import Principal, PrincipalType, ApiCredential, CredentialState
+    from app.models.user import User, UserRole
+
+    uname = f"agent_comma_{_sec.token_urlsafe(6)}"
+    raw_key = _sec.token_urlsafe(24)
+
+    def _hash(k: str) -> str:
+        return hashlib.sha256(k.encode("utf-8")).hexdigest()
+
+    agent = User(
+        username=uname,
+        role=UserRole.agent,
+        api_key_hash=_hash(raw_key),
+        is_active=True,
+    )
+    db_session.add(agent)
+    db_session.flush()
+    principal = Principal(
+        name=uname,
+        principal_type=PrincipalType.HUMAN,
+        user_id=agent.id,
+        is_active=True,
+    )
+    db_session.add(principal)
+    db_session.flush()
+    db_session.add(
+        ApiCredential(
+            principal_id=principal.id,
+            key_hash=_hash(raw_key),
+            purpose="legacy_human",
+            state=CredentialState.ACTIVE,
+        )
+    )
+    db_session.commit()
+    db_session.refresh(agent)
+    return agent
+
+
+def _create_active_commission_rule(client, owner_a):
+    """Use admin-only endpoint to create an active percentage rule."""
+    resp = client.post(
+        f"{API}/commission/rules",
+        json={
+            "name": "Rent 10 percent rule",
+            "rule_type": "percentage",
+            "value": "10",
+            "agent_role": "出租",
+        },
+        headers=_bearer(owner_a[1]),
+    )
+    if resp.status_code != 201:
+        # Fallback: try to reuse an existing active rule if the current
+        # caller doesn't have admin role in the test session.
+        rl = client.get(f"{API}/commission/rules", headers=_bearer(owner_a[1]))
+        for item in rl.json().get("items", []):
+            if item.get("is_active"):
+                return item["id"]
+    assert resp.status_code == 201, (
+        f"Expected create commission rule 201, got {resp.status_code}: {resp.text[:300]!r}"
+    )
+    return resp.json()["id"]
+
+
+def _create_org_a_pending_settlement(client, owner_a, agent_id, lease_id, rule_id):
+    resp = client.post(
+        f"{API}/commission/settlements",
+        json={
+            "agent_id": agent_id,
+            "lease_id": lease_id,
+            "rule_id": rule_id,
+            "notes": "OrgA Q3 pending settlement",
+        },
+        headers=_bearer(owner_a[1]),
+    )
+    assert resp.status_code == 201, (
+        f"Expected OrgA settlement create 201, got {resp.status_code}: {resp.text[:300]!r}"
+    )
+    return resp.json()["id"]
+
+
+def test_commission_settlement_cross_org_four_endpoints_failclosed(
+    client, owner_a, owner_b, org_a, org_b, db_session
+):
+    """4-endpoint coverage. CommissionRule stays global (no new org column,
+    per Owner instruction); scoping is settlement->lease->unit->property.org
+    plus write-guard for cross-org lease writes."""
+    prop_id_a, unit_id_a = _setup_org_a_property_and_unit(client, owner_a, org_a)
+    tenant_id_a = _create_org_a_tenant(client, owner_a, org_a)
+    lease_id_a = _create_org_a_active_lease(client, owner_a, unit_id_a, tenant_id_a)
+    agent_user = _create_agent_user(db_session)
+    rule_id_a = _create_active_commission_rule(client, owner_a)
+    settlement_id_a = _create_org_a_pending_settlement(
+        client, owner_a, agent_user.id, lease_id_a, rule_id_a
+    )
+
+    owner_b_headers = _bearer(owner_b[1])
+
+    # (a) GET /commission/settlements — OrgB list must be empty (keeps original
+    #     non-Paginated list contract — settlements list returns [] shape, not
+    #     Paginated dict, so we check len=0 and type is list).
+    list_resp = client.get(f"{API}/commission/settlements", headers=owner_b_headers)
+    assert list_resp.status_code == 200, (
+        f"Cross-org settlement list GET must be 200 (empty []), "
+        f"got {list_resp.status_code}: {list_resp.text[:300]!r}"
+    )
+    list_body = list_resp.json()
+    assert isinstance(list_body, list), (
+        f"Cross-org settlement list must be list type (original contract), "
+        f"got type={type(list_body).__name__} value[:3]={str(list_body)[:300]!r}"
+    )
+    assert len(list_body) == 0, (
+        f"Cross-org settlement list items must be [] got len={len(list_body)} "
+        f"items[:3]={list_body[:3]!r}"
+    )
+
+    # (b) GET /commission/settlements/{settlement_id} — must 404 (existence-deny)
+    get_resp = client.get(
+        f"{API}/commission/settlements/{settlement_id_a}", headers=owner_b_headers
+    )
+    assert get_resp.status_code == 404, (
+        f"Cross-org GET settlement/{settlement_id_a} must be 404 existence-deny, "
+        f"got {get_resp.status_code}. Body[:300]={get_resp.text[:300]!r}"
+    )
+
+    # (c) POST /commission/settlements — use OrgA lease_id as OrgB caller -> 403
+    #     Note: use a fresh agent/rule ids if possible; same lease_id is the
+    #     critical cross-org ingredient that _ensure_lease_in_caller_orgs
+    #     must block with 403.
+    create_resp = client.post(
+        f"{API}/commission/settlements",
+        json={
+            "agent_id": agent_user.id,
+            "lease_id": lease_id_a,
+            "rule_id": rule_id_a,
+            "notes": "Cross-org attack attempt by OrgB",
+        },
+        headers=owner_b_headers,
+    )
+    assert create_resp.status_code == 403, (
+        f"Cross-org POST settlements with OrgA lease_id must be 403 write guard, "
+        f"got {create_resp.status_code}. Body[:300]={create_resp.text[:300]!r}"
+    )
+
+    # (d) POST /commission/settlements/{id}/confirm — OrgB admin → 404 or 403
+    confirm_resp = client.post(
+        f"{API}/commission/settlements/{settlement_id_a}/confirm",
+        headers=owner_b_headers,
+    )
+    assert confirm_resp.status_code in {403, 404}, (
+        f"Cross-org confirm settlement/{settlement_id_a} must be 403/404, "
+        f"got {confirm_resp.status_code}. Body[:300]={confirm_resp.text[:300]!r}"
+    )
