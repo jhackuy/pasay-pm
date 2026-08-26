@@ -57,7 +57,7 @@ from app.services.operations.timeclock import MANILA_TZ
 from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 TEST_DB_NAME = "pasay_pm_test"
-NOW = datetime(2026, 8, 11, 12, 0, 0, tzinfo=MANILA_TZ)
+NOW = datetime(2026, 8, 11, 4, 0, 0, tzinfo=timezone.utc)
 
 # P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 B1: fail closed even in the opt-in
 # eval harness — never run against the live/production database.

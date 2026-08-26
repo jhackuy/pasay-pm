@@ -226,11 +226,8 @@ def resolve_org_membership(
 
 
 def _scoped_task_query(db: Session, org_id: int):
-    """Return a WHERE clause fragment for scoping OperationalTask to org_id.
-
-    Three-channel OR: any of property_id / lease_id / tenant_id links the
-    task to the organization.
-    """
+    """Four-channel OR mirroring canonical summary.py; details->>organization_id."""
+    from sqlalchemy import Integer as _SAInteger
     pids = _org_property_ids(db, org_id)
     lids = _org_lease_ids(db, org_id)
     tids = _org_tenant_ids(db, org_id)
@@ -243,6 +240,9 @@ def _scoped_task_query(db: Session, org_id: int):
         or_terms.append(OperationalTask.lease_id.in_(list(lids)))
     if tids:
         or_terms.append(OperationalTask.tenant_id.in_(list(tids)))
+    or_terms.append(
+        OperationalTask.details.op("->>")("organization_id").cast(_SAInteger) == org_id
+    )
     return or_(*or_terms)
 
 

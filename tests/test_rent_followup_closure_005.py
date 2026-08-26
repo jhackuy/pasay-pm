@@ -11,6 +11,7 @@ Pins:
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.models.financial import Expense, ExpenseStatus
 from app.models.lease import Lease, LeaseStatus
@@ -26,11 +27,10 @@ NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _moneyd(v) -> str:
-    from decimal import Decimal
     return str(Decimal(str(v)))
 
 
-def _seed_fixture(db, *, rent="25000.00", due_day=20):
+def _seed_fixture(db, *, rent=Decimal("25000.00"), due_day=20):
     """One occupied, 3-period-overdue unit + an active lease + user."""
     from tests.conftest import make_user
 
@@ -39,14 +39,14 @@ def _seed_fixture(db, *, rent="25000.00", due_day=20):
     db.flush()
     prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="1680", floor="16", size_sqm="32.50",
-                monthly_rent=rent, status=UnitStatus.occupied)
+                monthly_rent=Decimal(str(rent)), status=UnitStatus.occupied)
     tenant = seed_tenant(db, full_name="Carlo Reyes", phone="+639170000000")
     db.add_all([unit])
     db.flush()
     lease = Lease(
         unit_id=unit.id, tenant_id=tenant.id,
         start_date=date(2025, 1, 1), end_date=date(2026, 12, 31),
-        monthly_rent=rent, deposit="50000.00", status=LeaseStatus.active,
+        monthly_rent=Decimal(str(rent)), deposit=Decimal("50000.00"), status=LeaseStatus.active,
         due_day=due_day,
     )
     db.add(lease)

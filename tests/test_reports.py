@@ -7,12 +7,14 @@ from app.services.dates import add_months, month_range
 
 
 def _patch_reports_date_today(monkeypatch, target: date):
-    """Override ``date.today`` inside app.api.routers.reports module.
+    """Override ``date.today`` and ``_today_utc`` inside app.api.routers.reports.
 
-    The router uses ``from datetime import date`` then ``date.today()``.
-    We replace its module-level ``date`` object with a subclass whose
-    ``today()`` returns *target*. All other ``date`` behavior falls through
-    to the real ``datetime.date`` because we subclass it.
+    The router originally used ``from datetime import date`` + ``date.today()``
+    which we override via a ``date`` subclass. It also calls a module-level
+    helper ``_today_utc()`` which we override directly to *target* so
+    endpoints compute overdue against *current_date* fixture (not real today).
+    Without this, Dec→Jan case would compute overdue from real today (e.g. Aug
+    2026) and produce ~16 months instead of the expected 9.
     """
     import app.api.routers.reports as _reports_mod
     import datetime as _std_dt
@@ -23,6 +25,7 @@ def _patch_reports_date_today(monkeypatch, target: date):
             return target
 
     monkeypatch.setattr(_reports_mod, "date", _FixedDate)
+    monkeypatch.setattr(_reports_mod, "_today_utc", lambda: target)
 
 
 @pytest.fixture()

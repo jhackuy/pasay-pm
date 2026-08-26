@@ -655,7 +655,7 @@ def build_quick_properties(
     tenant_by_id = {
         t.id: t
         for t in db.query(Tenant)
-        .filter(Tenant.id.in_([l.tenant_id for l in leases if l.tenant_id is not None]))
+        .filter(Tenant.id.in_([lease.tenant_id for lease in leases if lease.tenant_id is not None]))
         .all()
     }
 

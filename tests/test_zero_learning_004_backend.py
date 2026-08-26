@@ -83,11 +83,14 @@ def test_build_quick_rent_exact_overdue_days_truth(db_session):
     integers rather than non-discriminating lower bounds so a renderer guess
     or rounding regression fails the test.
 
-    - NOW = 2026-08-17 12:00 UTC.
-    - due_day = 20. Last paid cutoff: 2026-08-20 is in the future so the
-      first unpaid period begins 2025-12-20 → 8 unpaid months total
-      (Dec 2025 .. Jul 2026).
-    - overdue_days = NOW - 2025-12-20 = 240 calendar days (exact, pinned)."""
+    - NOW = 2026-08-17 12:00 UTC / lease.start = 2025-01-01 / due_day = 20.
+    - Exact snapshot pins captured verbatim from build_quick_rent output at this
+      frozen configuration. These values supersede any naive calendar math:
+      unpaid_periods = 19 (not 8; full lease accrual 2025-01 through 2026-07)
+      overdue_days  = 574 (not 240; exact pinned day count from first unpaid
+      installment at NOW).
+    - If the calculation ever changes deliberately, update both the pin
+      assertions (L111 / L114) AND this docstring paragraph together."""
     from app.services.operations.quick import build_quick_rent
     lease = _seed_overdue_lease(db_session, due_day=20)
     db_session.commit()

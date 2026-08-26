@@ -102,17 +102,38 @@ def test_issue6_priority_enum_has_no_normal_only_medium():
     assert {*valid_values} == {"low", "medium", "high", "critical"}
 
 
-def test_issue6_expense_repair_followup_uses_medium(db_session: Session):
+def test_issue6_expense_repair_priority_truth_by_evidence_fields(db_session: Session):
+    """Issue 6 Major (test truth via real details/evidence predicate path).
+
+    The CodeRabbit finding correctly identified a false-pass: the previous
+    version set ``fake_repair.attachment_ids`` but the real predicate
+    :func:`_evidence_present_for_repair_close` inspects
+    ``RepairOperation.details["completion_evidence_ids"]``. We verify both
+    branches via the same attribute paths the production predicate reads.
+    """
     from app.api.routers.expense import _evidence_present_for_repair_close
-    fake_repair = MagicMock(spec=RepairOperation)
-    fake_repair.attachment_ids = []
-    assert _evidence_present_for_repair_close(fake_repair) is False
-    chosen = (
+
+    # Branch A: no completion_evidence_ids written → predicate False → medium
+    fake_repair_a = MagicMock(spec=RepairOperation)
+    fake_repair_a.details = {}
+    assert _evidence_present_for_repair_close(fake_repair_a) is False
+    chosen_a = (
         OperationalTaskPriority.high
-        if _evidence_present_for_repair_close(fake_repair)
+        if _evidence_present_for_repair_close(fake_repair_a)
         else OperationalTaskPriority.medium
     )
-    assert chosen == OperationalTaskPriority.medium
+    assert chosen_a == OperationalTaskPriority.medium
+
+    # Branch B: non-empty completion_evidence_ids in details → predicate True → high
+    fake_repair_b = MagicMock(spec=RepairOperation)
+    fake_repair_b.details = {"completion_evidence_ids": [101, 102, 103]}
+    assert _evidence_present_for_repair_close(fake_repair_b) is True
+    chosen_b = (
+        OperationalTaskPriority.high
+        if _evidence_present_for_repair_close(fake_repair_b)
+        else OperationalTaskPriority.medium
+    )
+    assert chosen_b == OperationalTaskPriority.high
 
 
 # ---------------------------------------------------------------------------

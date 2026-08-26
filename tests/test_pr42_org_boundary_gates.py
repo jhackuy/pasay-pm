@@ -344,6 +344,9 @@ def test_scheduler_run_does_not_claim_or_mutate_other_org_rules(
     db_session.refresh(rule_a)
     db_session.refresh(rule_b)
 
+    a_next_run_before = rule_a.next_run_at
+    a_enabled_before = rule_a.enabled
+    a_title_before = rule_a.title
     b_next_run_before = rule_b.next_run_at
     b_enabled_before = rule_b.enabled
     b_title_before = rule_b.title
@@ -352,13 +355,31 @@ def test_scheduler_run_does_not_claim_or_mutate_other_org_rules(
     assert resp.status_code == 200, resp.text
 
     db_session.expire_all()
+    db_session.refresh(rule_a)
     db_session.refresh(rule_b)
+    assert rule_a.next_run_at > a_next_run_before, (
+        "org A rule next_run_at MUST advance when org A runs scheduler (positive control)"
+    )
+    assert rule_a.enabled is a_enabled_before
+    assert rule_a.title == a_title_before
     assert rule_b.next_run_at == b_next_run_before, (
         "org B rule next_run_at must NOT advance when org A runs scheduler"
     )
     assert rule_b.enabled is b_enabled_before
     assert rule_b.title == b_title_before
     from app.models.operations import OperationalTask
+    org_a_rows = (
+        db_session.query(OperationalTask)
+        .filter(OperationalTask.property_id == prop_a.id)
+        .all()
+    )
+    assert len(org_a_rows) >= 1, (
+        "scheduler triggered by org A admin MUST write at least 1 OperationalTask to org A property (positive AC claim). rows=%r"
+        % [(r.task_type, r.title, r.property_id) for r in org_a_rows]
+    )
+    assert any(
+        r.title == "A org AC filter (due now - should be claimed)" for r in org_a_rows
+    ), "org A AC rule title must be present in generated OperationalTask rows"
     org_b_rows = (
         db_session.query(OperationalTask)
         .filter(OperationalTask.property_id == prop_b.id)

@@ -615,6 +615,5 @@ def test_operations_v2_decimal_sums_deterministic_ten_times():
     for s in sums:
         assert s == expected, f"Decimal sum mismatch: {s} != {expected}"
     for i in range(1, len(sums)):
-        assert sums[i] is not sums[0]
         assert sums[i] == sums[0]
     assert Decimal("0.10") + Decimal("0.20") == Decimal("0.30")

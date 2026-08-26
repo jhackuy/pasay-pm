@@ -34,7 +34,7 @@ TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 # Any such configuration is refused here, deterministically, before any engine
 # is created.
 _CONFIGURED_DB = make_url(settings.database_url).database
-_FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test"}
+_FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test", "pasay_pm_test"}
 
 # Strict pasay_pm_* / pasay_*_gate_* / pasay_freeze_* / pasay_closeout_* prefix
 # are the only allowed isolated test-database name families. Any other name
@@ -265,6 +265,7 @@ def agent(db_session, request):
         want_secretary = bool(param["secretary"])
 
     user, _key = make_user(db_session, "agent", UserRole.agent)
+    user._pytest_agent_want_secretary = want_secretary
     ensure_default_org(db_session)
     from app.models.membership import Membership, OrganizationRole, MembershipState
     from app.models.membership import Organization
@@ -336,17 +337,19 @@ def org_a(db_session):
                 ))
         agent_user = db_session.query(User).filter(User.username == "agent").first()
         if agent_user is not None:
-            has_agent = db_session.query(Membership.id).filter(
-                Membership.organization_id == existing.id,
-                Membership.user_id == agent_user.id,
-                Membership.role == OrganizationRole.SECRETARY,
-                Membership.state == MembershipState.ACTIVE,
-            ).first()
-            if has_agent is None:
-                db_session.add(Membership(
-                    organization_id=existing.id, user_id=agent_user.id,
-                    role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE,
-                ))
+            want_agent_secretary = bool(getattr(agent_user, "_pytest_agent_want_secretary", True))
+            if want_agent_secretary:
+                has_agent = db_session.query(Membership.id).filter(
+                    Membership.organization_id == existing.id,
+                    Membership.user_id == agent_user.id,
+                    Membership.role == OrganizationRole.SECRETARY,
+                    Membership.state == MembershipState.ACTIVE,
+                ).first()
+                if has_agent is None:
+                    db_session.add(Membership(
+                        organization_id=existing.id, user_id=agent_user.id,
+                        role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE,
+                    ))
         db_session.commit()
         db_session.refresh(existing)
         return existing

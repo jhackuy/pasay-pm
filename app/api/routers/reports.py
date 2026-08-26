@@ -73,8 +73,13 @@ def _d2(value) -> Decimal:
     return Decimal(value).quantize(_TWO_PLACES)
 
 
+def _today_utc() -> date:
+    """Single source of UTC today; deterministic for tests via monkeypatch."""
+    return datetime.now(timezone.utc).date()
+
+
 def _current_month() -> str:
-    return date.today().strftime("%Y-%m")
+    return _today_utc().strftime("%Y-%m")
 
 
 def _resolve_month(month: str | None) -> str:
@@ -300,7 +305,7 @@ def overdue_rents(
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     org_id = membership.organization_id
-    today = date.today()
+    today = _today_utc()
     leases = (
         db.query(Lease)
         .join(Unit, Lease.unit_id == Unit.id)
@@ -549,7 +554,7 @@ def tasks_report(
             OperationalTask.details.op("->>")("organization_id").cast(Integer) == org_id,
         )
     )
-    today = date.today()
+    today = _today_utc()
     if status is not None:
         if status == "pending":
             query = query.filter(

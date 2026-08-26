@@ -403,7 +403,10 @@ def test_expense_fully_paid_schedules_repair_verification_followup_not_close(
                 f"{API}/expenses/{linked.id}/approve", json={}, headers=headers
             )
             if appro.status_code != 200:
-                pass
+                body_500 = (appro.text or "")[:500]
+                assert appro.status_code == 200, (
+                    f"Expected expense approve HTTP 200, got {appro.status_code}: {body_500}"
+                )
         eid = linked.id
 
     # 4. Drive linked Expense through payment truth: claim + verify + pay fully.
