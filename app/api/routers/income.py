@@ -47,6 +47,7 @@ from app.services.rent_claims import (
     verify_claim,
 )
 from app.services.rent_payment_truth import snapshot
+from app.schemas.common import Paginated
 
 router = APIRouter(prefix="/incomes", tags=["incomes"])
 
@@ -83,12 +84,21 @@ def _assert_income_co_org(db: Session, user: User, income_id: int) -> None:
         raise LookupError(f"income {income_id} not found")
 
 
-@router.get("", response_model=list[IncomeRead])
-def list_incomes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+@router.get("", response_model=Paginated[IncomeRead])
+def list_incomes(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
     try:
-        return scoped_list_incomes(db, for_user_id=user.id)
+        rows = scoped_list_incomes(db, for_user_id=user.id)
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=IncomeRead, status_code=status.HTTP_201_CREATED)
@@ -194,9 +204,11 @@ def _claim_out(c) -> dict:
     }
 
 
-@router.get("/claims", response_model=list[RentClaimOut])
+@router.get("/claims", response_model=Paginated[RentClaimOut])
 def list_all_rent_claims(
     lease_id: int | None = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -206,7 +218,12 @@ def list_all_rent_claims(
         )
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
-    return [_claim_out(c) for c in claims]
+    rows = [_claim_out(c) for c in claims]
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.get("/claims/{claim_id}", response_model=RentClaimOut)

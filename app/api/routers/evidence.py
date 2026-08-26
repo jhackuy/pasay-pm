@@ -25,6 +25,7 @@ from app.database import get_db
 from app.models.evidence import Evidence, EvidenceCategory
 from app.models.property import Property, Unit
 from app.models.user import User
+from app.schemas.common import Paginated
 from app.services.audit import record_audit, serialize_row
 
 router = APIRouter(prefix="/evidence", tags=["evidence"])
@@ -175,13 +176,15 @@ def create_evidence(
     return _serialize(obj)
 
 
-@router.get("", response_model=list[EvidenceRead])
+@router.get("", response_model=Paginated[EvidenceRead])
 def list_evidence(
     property_id: Optional[int] = Query(default=None),
     unit_id: Optional[int] = Query(default=None),
     entity_type: Optional[str] = Query(default=None),
     entity_id: Optional[int] = Query(default=None),
     category: Optional[str] = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -196,8 +199,13 @@ def list_evidence(
         query = query.filter(Evidence.entity_id == entity_id)
     if category is not None:
         query = query.filter(Evidence.category == category)
-    rows = query.order_by(Evidence.created_at.desc(), Evidence.id.desc()).all()
-    return [_serialize(ev) for ev in rows]
+    ordered = query.order_by(Evidence.created_at.desc(), Evidence.id.desc())
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    items = [_serialize(ev) for ev in rows]
+    return Paginated(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{evidence_id}", response_model=EvidenceRead)

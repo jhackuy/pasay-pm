@@ -23,6 +23,7 @@ Repair closed).
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -30,10 +31,12 @@ from app.models.audit_log import AuditLog
 from app.models.expense_claim import ClaimStatus
 from app.models.financial import Expense, ExpenseStatus
 
+_TWO = Decimal("0.01")
+
 
 def _money(value) -> str:
     try:
-        d = round(float(value or 0), 2)
+        d = Decimal(str(value or 0)).quantize(_TWO)
         return f"₱{d:,.2f}"
     except (TypeError, ValueError):
         return ""

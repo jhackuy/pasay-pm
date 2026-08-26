@@ -30,6 +30,7 @@ from app.schemas.reports import (
     OverdueRentPeriod,
     ReportTask,
 )
+from app.schemas.common import Paginated
 from app.services.dates import add_months, month_range
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -299,8 +300,10 @@ def financial_summary(
     )
 
 
-@router.get("/overdue-rents", response_model=list[OverdueRent])
+@router.get("/overdue-rents", response_model=Paginated[OverdueRent])
 def overdue_rents(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
@@ -381,12 +384,18 @@ def overdue_rents(
             )
         )
     rows.sort(key=lambda r: r.overdue_days, reverse=True)
-    return rows
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
-@router.get("/monthly", response_model=list[MonthlyLeaseSummary])
+@router.get("/monthly", response_model=Paginated[MonthlyLeaseSummary])
 def monthly_report(
     month: str | None = Query(default=None, pattern=MONTH_PATTERN),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
@@ -452,13 +461,19 @@ def monthly_report(
                 outstanding=_d2(lease.monthly_rent - collected),
             )
         )
-    return rows
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
-@router.get("/commission", response_model=list[CommissionSummaryRow])
+@router.get("/commission", response_model=Paginated[CommissionSummaryRow])
 def commission_report(
     month: str | None = Query(default=None, pattern=MONTH_PATTERN),
     agent_id: int | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
@@ -512,10 +527,14 @@ def commission_report(
             )
         )
     rows.sort(key=lambda r: (r.agent, r.rule))
-    return rows
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
-@router.get("/tasks", response_model=list[ReportTask])
+@router.get("/tasks", response_model=Paginated[ReportTask])
 def tasks_report(
     status: str | None = Query(
         default=None,
@@ -526,6 +545,8 @@ def tasks_report(
         default=None, ge=1,
         description="Only tasks with due_date within the next N days (future window).",
     ),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
@@ -658,7 +679,11 @@ def tasks_report(
                 next_due_date=None,
             )
         )
-    return rows
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.get("/expenses", response_model=ExpenseSummary)

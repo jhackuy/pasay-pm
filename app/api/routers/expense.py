@@ -1,7 +1,7 @@
 import logging
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
@@ -19,6 +19,7 @@ from app.models.operations import (
 logger = logging.getLogger(__name__)
 from app.models.property import Property, Unit
 from app.models.user import User
+from app.schemas.common import Paginated
 from app.schemas.financial import (
     ExpenseCreate,
     ExpenseDetailOut,
@@ -291,12 +292,21 @@ def _evidence_for_expense(db: Session, expense: Expense, claims) -> dict:
 # Reads
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=list[ExpenseRead])
-def list_expenses(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+@router.get("", response_model=Paginated[ExpenseRead])
+def list_expenses(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
     try:
-        return scoped_list_expenses(db, for_user_id=user.id)
+        rows = scoped_list_expenses(db, for_user_id=user.id)
     except Exception as exc:
         raise scope_exception_to_http(exc) from exc
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    total = len(rows)
+    paged = rows[offset:offset + limit]
+    return Paginated(items=paged, total=total, limit=limit, offset=offset)
 
 
 @router.get("/{expense_id}", response_model=ExpenseRead)

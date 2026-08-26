@@ -27,6 +27,7 @@ from app.models.user import User
 from app.services.audit import record_audit, serialize_row
 from app.services.operations.config import SECRETARY_ASSIGNEE_ID
 from app.services.operations.generation import create_operational_task
+from app.schemas.common import Paginated
 
 router = APIRouter(prefix="/viewings", tags=["viewings"])
 
@@ -137,10 +138,12 @@ def create_viewing(
     return _serialize(obj)
 
 
-@router.get("", response_model=list[ViewingRead])
+@router.get("", response_model=Paginated[ViewingRead])
 def list_viewings(
     status_filter: Optional[str] = Query(default=None, alias="status"),
     unit_id: Optional[int] = Query(default=None),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
@@ -152,7 +155,13 @@ def list_viewings(
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Unknown viewing status")
     if unit_id is not None:
         query = query.filter(Viewing.unit_id == unit_id)
-    return [_serialize(v) for v in query.order_by(Viewing.scheduled_at, Viewing.id).all()]
+    ordered = query.order_by(Viewing.scheduled_at, Viewing.id)
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    items = [_serialize(v) for v in rows]
+    return Paginated(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.post("/{viewing_id}/outcome", response_model=ViewingRead)

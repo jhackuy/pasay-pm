@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, update
 from sqlalchemy.orm import Session
 
@@ -13,7 +13,7 @@ from app.models.commission import (
 )
 from app.models.lease import Lease
 from app.models.user import User
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.schemas.commission import (
     CommissionRuleCreate,
     CommissionRuleRead,
@@ -39,14 +39,22 @@ def _get_rule_or_404(db: Session, rule_id: int) -> CommissionRule:
     return obj
 
 
-@router.get("/rules", response_model=list[CommissionRuleRead])
-def list_rules(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return (
+@router.get("/rules", response_model=Paginated[CommissionRuleRead])
+def list_rules(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db), _: User = Depends(get_current_user)
+):
+    query = (
         db.query(CommissionRule)
         .filter(CommissionRule.deleted_at.is_(None))
         .order_by(CommissionRule.id)
-        .all()
     )
+    total = query.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = query.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("/rules", response_model=CommissionRuleRead, status_code=status.HTTP_201_CREATED)
@@ -135,14 +143,21 @@ def delete_rule(
 
 
 # --- settlements ---
-@router.get("/settlements", response_model=list[CommissionSettlementRead])
+@router.get("/settlements", response_model=Paginated[CommissionSettlementRead])
 def list_settlements(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db), user: User = Depends(get_current_user)
 ):
     query = db.query(CommissionSettlement)
     if user.role == "agent":
         query = query.filter(CommissionSettlement.agent_id == user.id)
-    return query.order_by(CommissionSettlement.id).all()
+    ordered = query.order_by(CommissionSettlement.id)
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post(

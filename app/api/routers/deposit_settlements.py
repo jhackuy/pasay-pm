@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -11,7 +11,7 @@ from app.models.deposit_settlement import DepositSettlement, DepositSettlementSt
 from app.models.lease import Lease
 from app.models.move_out import MoveOutInspection, MoveOutInspectionStatus
 from app.models.user import User
-from app.schemas.common import MessageResponse
+from app.schemas.common import MessageResponse, Paginated
 from app.schemas.deposit_settlement import (
     DepositSettlementConfirm,
     DepositSettlementCreate,
@@ -36,9 +36,11 @@ from app.services.organization_scope import (
 router = APIRouter(prefix="/deposit-settlements", tags=["deposit_settlements"])
 
 
-@router.get("", response_model=list[DepositSettlementRead])
+@router.get("", response_model=Paginated[DepositSettlementRead])
 def list_settlements(
     lease_id: int | None = None,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -48,7 +50,7 @@ def list_settlements(
 
     orgs = list_active_org_ids_for_user(db, user.id)
     if not orgs:
-        return []
+        return Paginated(items=[], total=0, limit=max(1, min(limit, 500)), offset=max(0, offset))
     org_property_ids = (
         select(Property.id).where(Property.organization_id.in_(orgs), Property.deleted_at.is_(None)).scalar_subquery()
     )
@@ -57,7 +59,12 @@ def list_settlements(
     q = db.query(DepositSettlement).filter(DepositSettlement.lease_id.in_(org_lease_ids))
     if lease_id is not None:
         q = q.filter(DepositSettlement.lease_id == lease_id)
-    return q.order_by(DepositSettlement.id.desc()).all()
+    ordered = q.order_by(DepositSettlement.id.desc())
+    total = ordered.count()
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    rows = ordered.offset(offset).limit(limit).all()
+    return Paginated(items=rows, total=total, limit=limit, offset=offset)
 
 
 @router.post("", response_model=DepositSettlementRead, status_code=status.HTTP_201_CREATED)

@@ -18,6 +18,7 @@ Issue reported → Proposal V1 submitted → V1 rejected → Requote requested
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy.orm import Session
 
@@ -29,10 +30,12 @@ from app.models.repair import (
     RepairProposalStatus,
 )
 
+_TWO = Decimal("0.01")
+
 
 def _money(value) -> str:
     try:
-        d = round(float(value or 0), 2)
+        d = Decimal(str(value or 0)).quantize(_TWO)
         return f"₱{d:,.2f}"
     except (TypeError, ValueError):
         return ""
