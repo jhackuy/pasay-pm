@@ -386,6 +386,12 @@ jobs:
           # the bot dev-dependencies install state (the bot count proof exists in
           # Part B via filesystem + import tracking below).
           #
+          # Sanity: confirm app package is importable BEFORE pytest collect, and
+          # echo the actual PYTHONPATH value used on the runner. This catches
+          # silent import/env issues that would otherwise manifest as collected=0.
+          echo "--- pytest collect preflight: app import sanity + PYTHONPATH ---"
+          python -c 'import os,sys; print("PYTHONPATH_ACTUAL=" + os.environ.get("PYTHONPATH","<none>")); sys.path.insert(0, "."); from app import models; print("IMPORT_APP_MODELS_OK: 1")' || echo "IMPORT_APP_MODELS_FAIL: rc=$?"
+          echo "--- end preflight ---"
           # Use --no-header -q; ignore worktrees and known ephemeral dirs.
           # Keep || true + explicit "x collected / x test" regex because pytest may
           # return exit=5 (no tests collected) on odd test layouts; we parse output
@@ -428,6 +434,18 @@ jobs:
           )
           BACKEND_COLLECTED=${BACKEND_COLLECTED:-0}
           echo "Backend tests collected (pytest --co tests app): ${BACKEND_COLLECTED}"
+
+          # --- Run23 regression root cause (d): backend parser gave 0 but OR gate
+          # passed because bot=644. Unconditionally dump first100 + last100 lines
+          # whenever backend<250 so the true runner-side pytest error is visible
+          # even when the total/backend OR branch accidentally passes.
+          if [ "${BACKEND_COLLECTED}" -lt 250 ]; then
+            echo "--- BACKEND_COLLECTED_UNDER_250: dumping HEAD100 of door_15_collect_backend.log ---"
+            sed -n '1,100p' artifacts/doors/door_15_collect_backend.log || true
+            echo "--- BACKEND_COLLECTED_UNDER_250: dumping TAIL100 of door_15_collect_backend.log ---"
+            tail -n 100 artifacts/doors/door_15_collect_backend.log || true
+            echo "--- END_BACKEND_COLLECTED_UNDER_250 ---"
+          fi
 
           # Bot tests counted too if the bot dev-dependencies happen to be installed,
           # but they are NOT required for the >= 250 mass gate (backend alone already
@@ -625,6 +643,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/summary
+          echo "BACKEND_FREEZE_GATE__DOOR_13_OK=1" >> $GITHUB_ENV
+          echo "OK=1" >> "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null || true
           {
             echo "BACKEND_FREEZE_GATE: 17 DOOR SUMMARY (stage1=00-06 stage2=07-10 stage3=11-13 stage4=14-16)"
             echo "RUN_ID=${GITHUB_RUN_ID}"
