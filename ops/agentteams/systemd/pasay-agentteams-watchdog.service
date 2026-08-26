@@ -1,0 +1,11 @@
+[Unit]
+Description=PASAY AgentTeams no-progress circuit breaker
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=PASAY_WATCHDOG_TEAM=pasay-engineering
+Environment=PASAY_WATCHDOG_STALL_POLLS=6
+Environment=PASAY_WATCHDOG_DRY_RUN=0
+Environment=PASAY_WATCHDOG_CONTAINER_CMD=docker
+ExecStart=/usr/bin/env python3 %h/.local/share/pasay-agentteams/watchdog.py
