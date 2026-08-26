@@ -1,26 +1,26 @@
 """V1.2 PROACTIVE OPERATIONS API router (/api/v1/operations).
 
 RBAC (re-checked on EVERY request, including task transitions):
-- admin: everything
-- manager: view + process operational tasks, manage recurring rules
-- agent: only view / process tasks assigned to themselves (403 otherwise)
+- OWNER: everything, with explicit org_id scope
+- SECRETARY: view + process operational tasks, manage recurring rules, with org_id scope
+- SECRETARY self-filter: only view / process tasks assigned to themselves (403 otherwise) when user is not OWNER
 
 Task handlers NEVER write incomes/expenses/commission settlements — the
 V1.1 financial state machine is the only writer for those tables.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.api.deps import (
     SystemReader,
     get_current_user,
     get_operations_reader,
-    manager_or_admin,
 )
 from app.config import settings
 from app.database import get_db
@@ -33,7 +33,18 @@ from app.models.operations import (
     OperationalTaskType,
     RecurringRule,
 )
+from app.models.financial import Expense
+from app.models.lease import Lease
+from app.models.membership import Membership, MembershipState, OrganizationRole
+from app.models.property import Property, Unit
+from app.models.tenant import Tenant
 from app.models.user import User, UserRole
+from app.services.organization_scope import (
+    list_active_org_ids_for_user,
+    org_property_ids as _org_property_ids,
+    org_lease_ids as _org_lease_ids,
+    org_tenant_ids as _org_tenant_ids,
+)
 from app.schemas.operations import (
     OperationsSummary,
     OperationalTaskRead,
@@ -99,6 +110,191 @@ from app.services.operations.truth_validator import assert_completion_allowed
 router = APIRouter(prefix="/operations", tags=["operations"])
 
 SNOOZE_PRESETS = {"1h", "today_afternoon", "tomorrow_morning", "3d"}
+
+
+def resolve_org_membership(
+    role: Iterable[OrganizationRole] | None = None,
+):
+    """Depends factory: resolve ACTIVE Membership for the current user+org scope.
+
+    Returns Membership object (with .organization_id). Raises HTTP 403 on role
+    mismatch / missing membership, or HTTP 409 when a SYSTEM reader presents
+    an ambiguous org scope (multiple ACTIVE memberships, no explicit trusted
+    org context).
+
+    HUMAN path (unchanged contract):
+      * Uses the HUMAN user's ACTIVE memberships via list_active_org_ids_for_user.
+      * No ACTIVE membership -> HTTP 403.
+      * Otherwise picks the caller's first active org_id (HUMANs are expected to
+        belong to a single active org in the frozen topology).
+      * Role mismatch on the resolved membership -> HTTP 403.
+
+    SYSTEM / SystemReader path (fail-closed for ambiguous scope):
+      * A SYSTEM reader must never implicitly fall back to the "first available"
+        ACTIVE membership (no .first() / no ordered select / no memberships[0]).
+      * Decisions (after filtering state=ACTIVE + removed_at=NULL + role match):
+        * 0 qualifying memberships  -> HTTP 403 "Active organization membership
+          required" (fail-closed, no org exposure).
+        * exactly 1 qualifying membership -> use that unique Membership.  The
+          singleton case is unambiguous even without an explicit trusted org
+          context, so legacy single-org deployments keep working.
+        * >= 2 qualifying memberships AND a trusted organization context is
+          available -> query ONLY for that single organization_id and confirm
+          an ACTIVE, role-matching Membership exists.  No fallback to other
+          memberships on mismatch; fail 403 immediately.  The trusted org
+          context currently comes from the request's reader-bound scheduler
+          operation (a SystemReader operation always has a single-org target
+          already proven by the caller), mirrored through the resolved reader.
+        * >= 2 qualifying memberships WITHOUT a trusted explicit organization
+          context -> HTTP 409 "Organization context required" (fail-closed).
+          No DB default ordering / no "pick first" heuristic — ambiguous scope
+          is rejected explicitly.
+    """
+    role_set: set[OrganizationRole] = set(role) if role else set()
+
+    def _base_membership_query(db: Session):
+        q = db.query(Membership).filter(
+            Membership.state == MembershipState.ACTIVE,
+            Membership.removed_at.is_(None),
+        )
+        if role_set:
+            q = q.filter(Membership.role.in_(role_set))
+        return q
+
+    def _dep(
+        db: Session = Depends(get_db),
+        reader: User | SystemReader = Depends(get_operations_reader),
+    ) -> Membership:
+        if isinstance(reader, SystemReader):
+            # Explicit trusted organization_id context for the SYSTEM reader is
+            # carried on the reader.credential when an internal caller binds it
+            # to a single target org.  SystemReader uses __slots__ so the
+            # credential SQLAlchemy instance (with __dict__) is used as the
+            # stable attachment surface for internal scope hints.  When absent
+            # (legacy single-org jobs), attribute is None and we fall to the
+            # 0/1/N ambiguity guard below.
+            trusted_org_id: int | None = getattr(
+                reader.credential, "trusted_organization_id", None
+            )
+            base_q = _base_membership_query(db)
+
+            if trusted_org_id is not None:
+                # Case: explicit trusted org context.  Only the trusted org
+                # qualifies; never fall back to other memberships even if this
+                # one is missing.
+                picked = (
+                    base_q.filter(Membership.organization_id == trusted_org_id)
+                    .one_or_none()
+                )
+                if picked is None:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Active organization membership required",
+                    )
+                return picked
+
+            # No explicit trusted org context.  Ambiguity guard: read up to 2
+            # rows with an UNORDERED query so DB default ordering can never
+            # choose an org for us.  Exactly 1 is unambiguous; 0 and >=2 are
+            # fail-closed with stable contracts above.
+            small_batch = base_q.limit(2).all()
+            if len(small_batch) == 0:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Active organization membership required",
+                )
+            if len(small_batch) == 1:
+                return small_batch[0]
+            raise HTTPException(
+                status_code=409,
+                detail="Organization context required",
+            )
+
+        user = reader
+        base_q = _base_membership_query(db).filter(Membership.user_id == user.id)
+        small_batch = base_q.limit(2).all()
+        if len(small_batch) == 0:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "No active organization membership")
+        if len(small_batch) == 1:
+            return small_batch[0]
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Organization context required",
+        )
+
+    return _dep
+
+
+def _scoped_task_query(db: Session, org_id: int):
+    """Four-channel OR mirroring canonical summary.py; details->>organization_id."""
+    from sqlalchemy import Integer as _SAInteger
+    pids = _org_property_ids(db, org_id)
+    lids = _org_lease_ids(db, org_id)
+    tids = _org_tenant_ids(db, org_id)
+    if not pids and not lids and not tids:
+        return OperationalTask.id == -1
+    or_terms = []
+    if pids:
+        or_terms.append(OperationalTask.property_id.in_(list(pids)))
+    if lids:
+        or_terms.append(OperationalTask.lease_id.in_(list(lids)))
+    if tids:
+        or_terms.append(OperationalTask.tenant_id.in_(list(tids)))
+    or_terms.append(
+        OperationalTask.details.op("->>")("organization_id").cast(_SAInteger) == org_id
+    )
+    return or_(*or_terms)
+
+
+def _scoped_get_task(db: Session, task_id: int, org_id: int) -> OperationalTask:
+    """scoped_get for OperationalTask: LookupError semantics → HTTP 404 if cross-org or missing."""
+    where_scope = _scoped_task_query(db, org_id)
+    task = (
+        db.query(OperationalTask)
+        .filter(OperationalTask.id == task_id, where_scope)
+        .first()
+    )
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operational task not found")
+    return task
+
+
+def _scoped_lock_task_for_update(db: Session, task_id: int, org_id: int) -> OperationalTask:
+    where_scope = _scoped_task_query(db, org_id)
+    task = (
+        db.execute(
+            select(OperationalTask)
+            .where(OperationalTask.id == task_id, where_scope)
+            .with_for_update()
+        )
+        .scalar_one_or_none()
+    )
+    if task is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Operational task not found")
+    return task
+
+
+def _self_filter_required(user: User, membership: Membership) -> bool:
+    """True if the caller should only see tasks assigned to themselves.
+
+    OWNER and SECRETARY-manager tiers see every task in the org (bypass).
+    Only SECRETARY-agent tier (UserRole.agent inside a SECRETARY org
+    membership) is restricted to their own assigned tasks (double-checked
+    by :func:`_agent_scope` as a defense-in-depth redundancy).
+    """
+    return user.role == UserRole.agent
+
+
+def _forbid_agent_role(user: User) -> None:
+    """UserRole.agent is a worker tier within SECRETARY org membership: it
+    can act on tasks but never CRUD rules, approve expenses or configure the
+    business. Always checked after org-level SECRETARY/OWNER membership gate.
+    """
+    if user.role == UserRole.agent:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Agent role cannot manage rules, approval or financial configuration",
+        )
 
 
 def _agent_scope(query, user: User):
@@ -300,12 +496,30 @@ def _deliver_rent_followup_outbox_row(
         return "failed", db.get(NotificationOutbox, outbox_id)
 
 
-def _check_assignee(db: Session, user_id: int | None) -> None:
+def _check_assignee(db: Session, user_id: int | None, *, org_id: int | None = None) -> None:
     if user_id is None:
         return
     user = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assigned user not found")
+    if org_id is not None:
+        # Fail-closed: assignee MUST be an ACTIVE member of the caller's organization.
+        # This prevents cross-organization task assignment and accidental DM disclosure.
+        m = (
+            db.query(Membership)
+            .filter(
+                Membership.user_id == user_id,
+                Membership.organization_id == org_id,
+                Membership.state == MembershipState.ACTIVE,
+                Membership.removed_at.is_(None),
+            )
+            .first()
+        )
+        if m is None:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Assignee is not an active member of the caller's organization",
+            )
 
 
 def _check_property(db: Session, property_id: int | None) -> None:
@@ -362,11 +576,17 @@ def list_tasks(
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    query = _agent_scope(db.query(OperationalTask), user)
-    if user.role != UserRole.agent and assignee is not None:
+    org_id = membership.organization_id
+    query = db.query(OperationalTask).filter(_scoped_task_query(db, org_id))
+    if _self_filter_required(user, membership):
+        query = query.filter(OperationalTask.assigned_user_id == user.id)
+    if membership.role == OrganizationRole.OWNER and assignee is not None:
         query = query.filter(OperationalTask.assigned_user_id == assignee)
     if property_id is not None:
+        if property_id not in _org_property_ids(db, org_id):
+            return []
         query = query.filter(OperationalTask.property_id == property_id)
     if task_type is not None:
         query = query.filter(OperationalTask.task_type == task_type)
@@ -374,8 +594,6 @@ def list_tasks(
         query = query.filter(OperationalTask.status == status)
     rows = query.order_by(OperationalTask.due_at, OperationalTask.id).all()
     if scope == "owner":
-        # AI-OPS-FOUNDATION-001 §5: Owner queue contains ONLY tasks needing
-        # the Owner (approvals, payments they owe, decisions, escalations).
         rows = [t for t in rows if is_owner_actionable(t, user)]
     return rows
 
@@ -385,9 +603,14 @@ def get_task(
     task_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    task = _get_task_or_404(db, task_id)
-    _require_access(task, user)
+    org_id = membership.organization_id
+    task = _scoped_get_task(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     return task
 
 
@@ -396,9 +619,14 @@ def complete_task(
     task_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    task = _get_task_or_404(db, task_id)
-    _require_access(task, user)
+    org_id = membership.organization_id
+    task = _scoped_get_task(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     now = datetime.now(timezone.utc)
     if task.status == OperationalTaskStatus.PENDING:
         assert_completion_allowed(db, task)
@@ -434,8 +662,6 @@ def complete_task(
         suppress_pending_redeliveries(
             db, task_id, actor_id=user.id, reason="task_completed", now=now
         )
-        # AI-OPS-FOUNDATION-001 §13: a repair that completes without minimal
-        # completion evidence gets a SECRETARY follow-up (never the Owner).
         if task.task_type == OperationalTaskType.AC_MAINTENANCE:
             from app.services.operations.repair_flow import ensure_evidence_followup
 
@@ -456,9 +682,14 @@ def snooze_task(
     payload: TaskSnoozeIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    task = _get_task_or_404(db, task_id)
-    _require_access(task, user)
+    org_id = membership.organization_id
+    task = _scoped_get_task(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     now = datetime.now(timezone.utc)
     until = _resolve_snooze_until(payload, now)
     old = serialize_row(task)
@@ -508,9 +739,14 @@ def cancel_task(
     task_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    task = _get_task_or_404(db, task_id)
-    _require_access(task, user)
+    org_id = membership.organization_id
+    task = _scoped_get_task(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     now = datetime.now(timezone.utc)
     old = serialize_row(task)
     result = db.execute(
@@ -557,20 +793,14 @@ def acknowledge_task(
     task_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    """✅ Acknowledge (TELEGRAM-OPS-UX-CONVERGENCE-003 §1.5): one tap on the
-    reminder card stops today's proactive reminders for this business item.
-
-    PENDING -> IN_PROGRESS (the product rule: "in progress -> stop the
-    corresponding reminders"; the notifier send-time guard drops any pending
-    outbox row for a non-PENDING task, so no further reminder can reach
-    Telegram). ``next_action``/``next_check_at`` get deterministic defaults
-    when the task never carried them (the V2 transition rule requires both
-    for IN_PROGRESS). Idempotent: a repeat tap on an already-acknowledged
-    task returns the current state.
-    """
-    task = _get_task_or_404(db, task_id)
-    _require_access(task, user)
+    org_id = membership.organization_id
+    task = _scoped_get_task(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     now = datetime.now(timezone.utc)
     if task.status != OperationalTaskStatus.PENDING:
         return TaskActionOut(task=task, detail="Task already acknowledged")
@@ -662,9 +892,14 @@ def update_task(
     payload: TaskUpdateIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    task = _get_task_or_404(db, task_id)
-    _require_access(task, user)
+    org_id = membership.organization_id
+    task = _scoped_get_task(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     now = datetime.now(timezone.utc)
     want_status = payload.status if payload.status is not None else task.status
     _validate_transition(task, want_status, payload)
@@ -737,12 +972,17 @@ def deliver_task_followup(
     task_id: int,
     payload: TaskFollowupDeliveryIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Deliver one rent follow-up DM via the canonical outbox/notifier seam."""
+    org_id = membership.organization_id
     now = datetime.now(timezone.utc)
-    task = _lock_task_for_update(db, task_id)
-    _require_access(task, user)
+    task = _scoped_lock_task_for_update(db, task_id, org_id)
+    if _self_filter_required(user, membership) and task.assigned_user_id != user.id:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "Cannot access a task assigned to another user"
+        )
     if task.status != OperationalTaskStatus.PENDING:
         db.commit()
         return TaskFollowupDeliveryOut(
@@ -760,7 +1000,7 @@ def deliver_task_followup(
             detail="Follow-up already assigned",
             telegram_message_id=None,
         )
-    _check_assignee(db, payload.assignee_user_id)
+    _check_assignee(db, payload.assignee_user_id, org_id=org_id)
     recipient = resolve_recipient(db, payload.assignee_user_id)
     if not recipient:
         db.rollback()
@@ -811,7 +1051,7 @@ def deliver_task_followup(
             detail="Follow-up delivered",
             telegram_message_id=message_id,
         )
-    current_task = _get_task_or_404(db, task.id)
+    current_task = _scoped_get_task(db, task.id, org_id)
     if delivery_state == "failed":
         return TaskFollowupDeliveryOut(
             task=_task_read(db, current_task),
@@ -832,16 +1072,21 @@ def create_task(
     payload: TaskCreateIn,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Create a V2 task from a conversation event. Dedupes on dedupe_key when
     supplied (at most one active task per key); otherwise a fresh row."""
-    if user.role == UserRole.agent:
+    org_id = membership.organization_id
+    if _self_filter_required(user, membership):
         if payload.assigned_user_id not in (None, user.id):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
-                "Agents may only assign tasks to themselves",
+                "Agent role may only assign tasks to themselves",
             )
-    _check_assignee(db, payload.assigned_user_id)
+    if payload.property_id is not None:
+        if payload.property_id not in _org_property_ids(db, org_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+    _check_assignee(db, payload.assigned_user_id, org_id=org_id)
     _check_property(db, payload.property_id)
     now = datetime.now(timezone.utc)
     fields: dict = {
@@ -878,12 +1123,13 @@ def create_task(
     )
     db.commit()
     if task is None:
-        # dedupe hit: return the existing active task as a 200-style read
+        where_scope = _scoped_task_query(db, org_id)
         existing = (
             db.query(OperationalTask)
             .filter(
                 OperationalTask.dedupe_key == payload.dedupe_key,
                 OperationalTask.status == OperationalTaskStatus.PENDING,
+                where_scope,
             )
             .first()
         )
@@ -903,49 +1149,67 @@ def quick_tasks(
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     reader: User | SystemReader = Depends(get_operations_reader),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    # JOB-SERVICE-AUTH-002: a SYSTEM job reads the deterministic active-task
-    # set as itself (global scope, no human, no owner filter). The Owner
-    # attention filter is a personal HUMAN view — a SYSTEM credential is
-    # never allowed to request it.
+    org_id = membership.organization_id
+    from app.services.operations.summary import _scoped_task_query
+    org_prop_ids = _org_property_ids(db, org_id)
+    task_scope = _scoped_task_query(db, org_id)
     if isinstance(reader, SystemReader):
         if scope == "owner":
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN, "SYSTEM reader cannot use the owner scope"
             )
-        return quick_svc.build_quick_tasks(db, reader, owner_only=False)
-    return quick_svc.build_quick_tasks(db, reader, owner_only=(scope == "owner"))
+        rows = quick_svc.build_quick_tasks(
+            db, reader, owner_only=False,
+            task_scope=task_scope, org_property_ids=org_prop_ids,
+        )
+        return rows
+    return quick_svc.build_quick_tasks(
+        db, reader, owner_only=(scope == "owner"),
+        task_scope=task_scope, org_property_ids=org_prop_ids,
+    )
 
 
 @router.get("/quick/properties")
 def quick_properties(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    return quick_svc.build_quick_properties(db)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_quick_properties(db, org_property_ids=org_prop_ids)
 
 
 @router.get("/quick/rent")
 def quick_rent(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    return quick_svc.build_quick_rent(db)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_quick_rent(db, org_property_ids=org_prop_ids)
 
 
 @router.get("/quick/expense")
 def quick_expense(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    return quick_svc.build_quick_expense(db, user_id=user.id)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_quick_expense(db, org_property_ids=org_prop_ids)
 
 
 @router.get("/quick/expense-duplicates")
 def quick_expense_duplicates(
     expense_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Possible-duplicate matcher for one payable expense (PASAY-V2
     -EXPENSE-PAYABLE-TASK-006 §7/§8).
@@ -956,7 +1220,15 @@ def quick_expense_duplicates(
     no business record is ever deleted or rejected here."""
     from app.models.financial import Expense
 
-    expense = db.query(Expense).filter(Expense.id == expense_id).first()
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    if not org_prop_ids:
+        return []
+    expense = (
+        db.query(Expense)
+        .filter(Expense.id == expense_id, Expense.property_id.in_(list(org_prop_ids)))
+        .first()
+    )
     if expense is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Expense not found")
     return quick_svc.find_similar_paid_expenses(db, expense)
@@ -966,18 +1238,35 @@ def quick_expense_duplicates(
 def quick_unit_timeline(
     unit_id: int,
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """AI-OPS-FOUNDATION-001 §15: the unit's digital file — deterministic
     time-ordered timeline (rent/payment history, expenses, repairs/tasks,
     evidence, lease events) for NL queries like 'Give me the history of 1608'."""
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    if org_prop_ids:
+        unit_owned = (
+            db.execute(
+                select(Unit.id).where(
+                    Unit.id == unit_id,
+                    Unit.property_id.in_(list(org_prop_ids)),
+                    Unit.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+        )
+        if unit_owned is None:
+            return []
+    else:
+        return []
     return quick_svc.build_unit_timeline(db, unit_id)
 
 
 @router.get("/remind-owner-target")
 def remind_owner_target(
     db: Session = Depends(get_db),
-    _: User = Depends(manager_or_admin),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """ZERO-LEARNING-004 §4: the canonical HUMAN Owner's Telegram DM target.
 
@@ -990,12 +1279,16 @@ def remind_owner_target(
     Returns ``{"telegram_chat_id": "5177241442"}`` or 404 when no Owner with a
     Telegram destination exists (fail closed — the caller must NOT report the
     reminder as delivered)."""
-    from app.models.user import User, UserRole
+    org_id = membership.organization_id
 
     owner = (
         db.query(User)
+        .join(Membership, Membership.user_id == User.id)
         .filter(
-            User.role == UserRole.admin,
+            Membership.organization_id == org_id,
+            Membership.role == OrganizationRole.OWNER,
+            Membership.state == MembershipState.ACTIVE,
+            Membership.removed_at.is_(None),
             User.is_active.is_(True),
             User.telegram_chat_id.isnot(None),
         )
@@ -1010,7 +1303,7 @@ def remind_owner_target(
 @router.get("/secretary-target")
 def secretary_target(
     db: Session = Depends(get_db),
-    _: User = Depends(manager_or_admin),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """TELEGRAM-OPS-REAL-WORLD-CLOSURE-005 §2.2/§9: resolve the canonical HUMAN
     Secretary's Telegram DM target for a real ``📞 催租`` assign-to-Secretary DM.
@@ -1028,16 +1321,35 @@ def secretary_target(
     from app.services.identity import resolve_telegram_destination
     from app.services.operations.config import SECRETARY_ASSIGNEE_ID
 
+    org_id = membership.organization_id
+    org_member_user_ids = {
+        r[0]
+        for r in db.execute(
+            select(Membership.user_id).where(
+                Membership.organization_id == org_id,
+                Membership.state == MembershipState.ACTIVE,
+                Membership.removed_at.is_(None),
+            )
+        ).all()
+    }
+    if not org_member_user_ids:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No Secretary Telegram destination configured")
+
     preferred_id = SECRETARY_ASSIGNEE_ID
     for candidate_id in [preferred_id, None]:
         if candidate_id is not None:
+            if candidate_id not in org_member_user_ids:
+                continue
             cand = db.get(User, candidate_id)
         else:
-            # Fall back to the lowest-id active manager with a Telegram binding.
             cand = (
                 db.query(User)
+                .join(Membership, Membership.user_id == User.id)
                 .filter(
-                    User.role == UserRole.manager,
+                    Membership.organization_id == org_id,
+                    Membership.role == OrganizationRole.SECRETARY,
+                    Membership.state == MembershipState.ACTIVE,
+                    Membership.removed_at.is_(None),
                     User.is_active.is_(True),
                     User.telegram_chat_id.isnot(None),
                 )
@@ -1049,7 +1361,6 @@ def secretary_target(
         try:
             chat_id = resolve_telegram_destination(db, cand.id)
         except LookupError:
-            # Fall back to the legacy chat-id when no canonical endpoint exists.
             legacy = str(cand.telegram_chat_id or "").strip()
             if not legacy:
                 continue
@@ -1064,10 +1375,11 @@ def secretary_target(
 def daily_digest(
     db: Session = Depends(get_db),
     reader: User | SystemReader = Depends(get_operations_reader),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    # JOB-SERVICE-AUTH-002: SYSTEM jobs read the deterministic daily digest as
-    # themselves (global active-task scope); human callers keep their own scope.
-    return quick_svc.build_digest(db, reader)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    return quick_svc.build_digest(db, reader, org_property_ids=org_prop_ids)
 
 
 @router.get("/summary", response_model=OperationsSummary)
@@ -1075,11 +1387,13 @@ def operations_summary(
     scope: str | None = Query(default=None, description="'owner' = Owner attention filter"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Operational counts for the current user (agents scoped to their own)."""
     from app.services.operations.summary import build_operations_summary
 
-    return build_operations_summary(db, user, owner_only=(scope == "owner"))
+    org_id = membership.organization_id
+    return build_operations_summary(db, user, owner_only=(scope == "owner"), org_id=org_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,13 +1411,37 @@ def _get_rule_or_404(db: Session, rule_id: int) -> RecurringRule:
     return rule
 
 
+def _scoped_get_rule(db: Session, rule_id: int, org_id: int) -> RecurringRule:
+    org_prop_ids = _org_property_ids(db, org_id)
+    q = db.query(RecurringRule).filter(
+        RecurringRule.id == rule_id,
+        RecurringRule.deleted_at.is_(None),
+    )
+    if org_prop_ids:
+        q = q.filter(RecurringRule.property_id.in_(list(org_prop_ids)))
+    else:
+        q = q.filter(RecurringRule.id == -1)
+    rule = q.first()
+    if rule is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recurring rule not found")
+    return rule
+
+
 @router.get("/rules", response_model=list[RecurringRuleRead])
 def list_rules(
     enabled: bool | None = Query(default=None),
     db: Session = Depends(get_db),
-    _: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
+    _forbid_agent_role(user)
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
     query = db.query(RecurringRule).filter(RecurringRule.deleted_at.is_(None))
+    if org_prop_ids:
+        query = query.filter(RecurringRule.property_id.in_(list(org_prop_ids)))
+    else:
+        query = query.filter(RecurringRule.id == -1)
     if enabled is not None:
         query = query.filter(RecurringRule.enabled.is_(enabled))
     return query.order_by(RecurringRule.id).all()
@@ -1113,9 +1451,15 @@ def list_rules(
 def create_rule(
     payload: RecurringRuleCreate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    _check_assignee(db, payload.assigned_user_id)
+    _forbid_agent_role(user)
+    org_id = membership.organization_id
+    if payload.property_id is not None:
+        if payload.property_id not in _org_property_ids(db, org_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+    _check_assignee(db, payload.assigned_user_id, org_id=org_id)
     _check_property(db, payload.property_id)
     obj = RecurringRule(**payload.model_dump(exclude={"next_run_at"}))
     obj.next_run_at = payload.next_run_at or datetime.now(timezone.utc)
@@ -1141,13 +1485,19 @@ def update_rule(
     rule_id: int,
     payload: RecurringRuleUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    obj = _get_rule_or_404(db, rule_id)
+    _forbid_agent_role(user)
+    org_id = membership.organization_id
+    obj = _scoped_get_rule(db, rule_id, org_id)
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return obj
-    _check_assignee(db, updates.get("assigned_user_id"))
+    if updates.get("property_id") is not None:
+        if updates["property_id"] not in _org_property_ids(db, org_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Property not found")
+    _check_assignee(db, updates.get("assigned_user_id"), org_id=org_id)
     _check_property(db, updates.get("property_id"))
     old = serialize_row(obj)
     for field, value in updates.items():
@@ -1171,9 +1521,12 @@ def update_rule(
 def disable_rule(
     rule_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
-    obj = _get_rule_or_404(db, rule_id)
+    _forbid_agent_role(user)
+    org_id = membership.organization_id
+    obj = _scoped_get_rule(db, rule_id, org_id)
     if not obj.enabled:
         return obj
     old = serialize_row(obj)
@@ -1200,7 +1553,7 @@ def disable_rule(
 @router.post("/scheduler/run", response_model=SchedulerRunResult)
 def trigger_scheduler(
     db: Session = Depends(get_db),
-    _: User = Depends(manager_or_admin),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Run one scheduler pass on demand (same code path as the worker loop).
 
@@ -1212,8 +1565,24 @@ def trigger_scheduler(
     from app.services.operations.config import DEFAULT_ASSIGNED_USER_ID
     from app.services.operations.assignee import validate_default_assignee
 
-    validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
-    return run_scheduler_once(db)
+    org_id = membership.organization_id
+    default_user = validate_default_assignee(db, DEFAULT_ASSIGNED_USER_ID)
+    dm = (
+        db.query(Membership)
+        .filter(
+            Membership.user_id == default_user.id,
+            Membership.organization_id == org_id,
+            Membership.state == MembershipState.ACTIVE,
+            Membership.removed_at.is_(None),
+        )
+        .first()
+    )
+    if dm is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Default assignee is not an active member of the caller's organization",
+        )
+    return run_scheduler_once(db, org_id=org_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1224,6 +1593,7 @@ def trigger_scheduler(
 def copilot_context(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Deterministic, RBAC-scoped Copilot context.
 
@@ -1232,7 +1602,8 @@ def copilot_context(
     the ``copilot_runs`` audit row for this build. No LLM is involved and
     nothing executes any action in Phase A+B.
     """
-    context = copilot_svc.build_copilot_context(db, user)
+    org_id = membership.organization_id
+    context = copilot_svc.build_copilot_context(db, user, org_id=org_id)
     copilot_svc.log_context_run(db, actor=user, context=context)
     db.commit()
     return context
@@ -1246,7 +1617,8 @@ def copilot_context(
 def copilot_today(
     payload: CopilotTodayIn | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Read-only TODAY brief (C1.1 deterministic-first).
 
@@ -1373,7 +1745,8 @@ def copilot_today(
 def copilot_why(
     payload: CopilotWhyIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Per-item WHY enrichment (on-demand LLM, deterministic fail-closed).
 
@@ -1441,7 +1814,8 @@ def copilot_why(
 def copilot_ask(
     payload: CopilotAskIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """On-demand Q&A enrichment (grounded, deterministic fail-closed).
 
@@ -1504,7 +1878,8 @@ def copilot_ask(
 def copilot_nl_parse(
     payload: CopilotNlParseIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """BOT-V1-USABLE-001 P0-5: grounded NL intent parsing for the bot's AI
     fallback lane.
@@ -1632,7 +2007,8 @@ def copilot_recommend(
     payload: CopilotRecommendIn,
     response: Response,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Canonical proposal builder endpoint (V1.2.2 Phase C2).
 
@@ -1689,7 +2065,8 @@ def copilot_recommend(
 def execute_copilot_proposal(
     proposal_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """CONFIRMED -> EXECUTED (V1.2.2 Phase C2).
 
@@ -1744,7 +2121,8 @@ def create_copilot_proposal(
     payload: CopilotProposalCreate,
     response: Response,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Create a PENDING action proposal.
 
@@ -1790,7 +2168,8 @@ def create_copilot_proposal(
 def confirm_copilot_proposal(
     proposal_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Confirm a PENDING proposal (PENDING -> CONFIRMED).
 
@@ -1841,7 +2220,8 @@ def confirm_copilot_proposal(
 def cancel_copilot_proposal(
     proposal_id: int,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """Cancel a PENDING proposal (PENDING -> CANCELLED, idempotent replay)."""
     before = db.get(CopilotActionProposal, proposal_id)
@@ -1876,7 +2256,8 @@ def cancel_copilot_proposal(
 def rent_action_pack(
     unit_id: int = Query(...),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """§11-§15: the FULL Rent Action Pack for a unit — tenant phone, real
     outstanding / periods / overdue days, last follow-up, latest payment
@@ -1885,6 +2266,23 @@ def rent_action_pack(
     ``blocked_hint``) when the tenant phone is missing/invalid — the caller
     must NOT hand a collection job to the Secretary in that case (§12)."""
     from app.services.operations.rent_pack import build_rent_action_pack
+
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    if org_prop_ids:
+        unit_owned = (
+            db.execute(
+                select(Unit.id).where(
+                    Unit.id == unit_id,
+                    Unit.property_id.in_(list(org_prop_ids)),
+                    Unit.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+        )
+        if unit_owned is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
+    else:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
 
     pack = build_rent_action_pack(db, unit_id)
     if pack.get("error") == "unit_not_found":
@@ -1898,19 +2296,36 @@ def rent_action_pack(
 def conflict_report(
     unit_id: int = Query(...),
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """§10: deterministic DATA-CONFLICT report for one unit — never silently
     chooses; returns human-resolvable options for rent-vs-legacy conflicts."""
     from app.services.operations.conflicts import build_conflict_report
 
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    if org_prop_ids:
+        unit_owned = (
+            db.execute(
+                select(Unit.id).where(
+                    Unit.id == unit_id,
+                    Unit.property_id.in_(list(org_prop_ids)),
+                    Unit.deleted_at.is_(None),
+                )
+            ).scalar_one_or_none()
+        )
+        if unit_owned is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
+    else:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unit not found")
     return build_conflict_report(db, unit_id)
 
 
 @router.get("/route")
 def action_route(
     action_type: str = Query(..., description="RENT_FOLLOWUP / EXPENSE_OWNER_PAYMENT"),
-    _: User = Depends(manager_or_admin),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """§19: resolve the canonical responsibility for an action type
     (RENT_FOLLOWUP -> SECRETARY, EXPENSE_OWNER_PAYMENT -> OWNER). Fails closed
@@ -1934,7 +2349,8 @@ def action_route(
 def record_payment_promise(
     payload: PaymentPromiseIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """§17: persist a REAL payment promise (amount / promised_date / recorded_by)
     on the unit's active rent task so the workflow auto-checks it at the
@@ -1947,18 +2363,26 @@ def record_payment_promise(
     from app.models.operations import OperationalTask, OperationalTaskType, OperationalTaskStatus
     from app.services.operations.promises import apply_payment_promise
 
+    org_id = membership.organization_id
+    org_lease_ids = _org_lease_ids(db, org_id)
     lease = None
     if payload.lease_id is not None:
-        lease = db.query(Lease).filter(Lease.id == payload.lease_id).first()
+        lease_q = db.query(Lease).filter(Lease.id == payload.lease_id)
+        if org_lease_ids:
+            lease_q = lease_q.filter(Lease.id.in_(list(org_lease_ids)))
+        else:
+            lease_q = lease_q.filter(Lease.id == -1)
+        lease = lease_q.first()
     if lease is None:
-        # Resolve lease from unit if not given (caller may pass either).
         if payload.lease_id is None:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "lease_id is required")
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Lease not found")
 
+    where_scope = _scoped_task_query(db, org_id)
     task = (
         db.query(OperationalTask)
         .filter(
+            where_scope,
             OperationalTask.lease_id == lease.id,
             OperationalTask.task_type.in_(
                 [OperationalTaskType.RENT_OVERDUE, OperationalTaskType.FOLLOWUP]
@@ -2033,7 +2457,8 @@ def record_payment_promise(
 def resume_blocked(
     payload: ResumeActionIn,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """§2 / §8: self-healing. The human supplied the missing low-risk data
     (e.g. ``tenant_phone``); this saves it, resolves the block on any matching
@@ -2045,25 +2470,34 @@ def resume_blocked(
     from app.services.operations import resolver as resolver_svc
     from app.services.operations.resolver import task_blocked
 
+    org_id = membership.organization_id
+    org_prop_ids = _org_property_ids(db, org_id)
+    org_lease_ids = _org_lease_ids(db, org_id)
+    org_tenant_ids = _org_tenant_ids(db, org_id)
     lease_id = payload.lease_id
     unit_id = payload.unit_id
     task = None
 
     if payload.task_id is not None:
-        task = db.query(OperationalTask).filter(OperationalTask.id == payload.task_id).first()
+        task = _scoped_get_task(db, payload.task_id, org_id)
 
     if task is None and lease_id is not None:
-        task = (
-            db.query(OperationalTask)
-            .filter(
-                OperationalTask.lease_id == lease_id,
-                OperationalTask.status.in_(
-                    [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-                ),
+        if not org_lease_ids or lease_id not in org_lease_ids:
+            pass
+        else:
+            where_scope = _scoped_task_query(db, org_id)
+            task = (
+                db.query(OperationalTask)
+                .filter(
+                    where_scope,
+                    OperationalTask.lease_id == lease_id,
+                    OperationalTask.status.in_(
+                        [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
+                    ),
+                )
+                .order_by(OperationalTask.id)
+                .first()
             )
-            .order_by(OperationalTask.id)
-            .first()
-        )
 
     # 1) Apply the low-risk direct write.
     message_parts = []
@@ -2072,19 +2506,31 @@ def resume_blocked(
         if lease_id is not None:
             from app.models.lease import Lease as _Lease
 
-            lease = db.get(_Lease, lease_id)
+            q = db.query(_Lease).filter(_Lease.id == lease_id)
+            if org_lease_ids:
+                q = q.filter(_Lease.id.in_(list(org_lease_ids)))
+            else:
+                q = q.filter(_Lease.id == -1)
+            lease = q.first()
         if lease is None and unit_id is not None:
             from app.models.lease import Lease as _Lease
 
-            lease = (
+            q = (
                 db.query(_Lease)
                 .filter(_Lease.unit_id == unit_id, _Lease.status == "active",
                         _Lease.deleted_at.is_(None))
-                .first()
             )
+            if org_prop_ids:
+                q = q.join(Unit, Unit.id == _Lease.unit_id).filter(
+                    Unit.property_id.in_(list(org_prop_ids))
+                )
+            else:
+                q = q.filter(_Lease.id == -1)
+            lease = q.first()
         tenant = None
         if lease is not None:
-            tenant = db.get(Tenant, lease.tenant_id)
+            if org_tenant_ids and lease.tenant_id in org_tenant_ids:
+                tenant = db.get(Tenant, lease.tenant_id)
         if tenant is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "Tenant not found for the block")
         old_phone = tenant.phone
@@ -2140,7 +2586,8 @@ def resume_blocked(
 @router.get("/resolver/issues")
 def list_resolver_issues(
     db: Session = Depends(get_db),
-    _: User = Depends(get_current_user),
+    user: User = Depends(get_current_user),
+    membership: Membership = Depends(resolve_org_membership(role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY])),
 ):
     """§8: current blocked issues across active tasks (what is blocking, why,
     and the one-line fix each) — the Owner / dashboard can enumerate dead-ends
@@ -2148,12 +2595,15 @@ def list_resolver_issues(
     from app.models.operations import OperationalTask, OperationalTaskStatus
     from app.services.operations.resolver import task_blocked
 
+    org_id = membership.organization_id
+    where_scope = _scoped_task_query(db, org_id)
     active = (
         db.query(OperationalTask)
         .filter(
+            where_scope,
             OperationalTask.status.in_(
                 [OperationalTaskStatus.PENDING, OperationalTaskStatus.IN_PROGRESS]
-            )
+            ),
         )
         .all()
     )

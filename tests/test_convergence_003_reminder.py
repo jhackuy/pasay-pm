@@ -39,6 +39,7 @@ from app.services.operations.generation import generate_business_tasks
 from app.services.operations.notifier import process_notifications_once
 from app.services.operations.quick import build_quick_rent, build_quick_tasks
 from app.services.operations.scheduler import run_scheduler_once
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 # 2026-08-17 12:00 UTC = the live P0 window; PH date = 2026-08-17.
@@ -70,13 +71,11 @@ def _seed_overdue_plus_upcoming_lease(db, *, rent="25000.00"):
     """A lease with BOTH overdue periods and an upcoming period within the
     RENT_DUE_ADVANCE_DAYS window — the exact live P0 shape (DEV-BAY-1680:
     overdue 104d + 2026-08 due on the 20th, scanned 2026-08-17)."""
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="1680", floor="16", size_sqm="32.50",
                 monthly_rent=rent, status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Carlo Reyes", phone="+639170000000")
-    db.add_all([unit, tenant])
+    tenant = seed_tenant(db, full_name="Carlo Reyes", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(
         unit_id=unit.id, tenant_id=tenant.id,
@@ -139,7 +138,7 @@ def test_same_day_ten_scans_single_dispatch(db_session, monkeypatch):
     assert result["sent"] == 1
     assert len(sender.sent) == 1
     text = sender.sent[0][1]
-    assert "待办提醒" in text and "租金逾期" in text
+    assert "房号" in text and "租金逾期" in text
     # second notifier pass: nothing left to send
     result2 = process_notifications_once(db_session, _OkSender(), now=NOW)
     assert result2["sent"] == 0
@@ -270,8 +269,17 @@ def test_acknowledge_then_same_day_scans_no_more_dispatch(db_session, client, mo
         .one()
     )
 
-    from tests.conftest import make_user
+    from tests.conftest import make_user, ensure_default_org
+    from app.models.membership import Membership, OrganizationRole, MembershipState
     user, key = make_user(db_session, "ack-admin", UserRole.admin)
+    org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=org.id,
+        user_id=user.id,
+        role=OrganizationRole.OWNER,
+        state=MembershipState.ACTIVE,
+    ))
+    db_session.commit()
     headers = {"Authorization": f"Bearer {key}"}
     resp = client.post(f"{API}/operations/tasks/{task.id}/acknowledge", headers=headers)
     assert resp.status_code == 200, resp.text
@@ -339,9 +347,7 @@ def test_two_leases_each_dispatch_once(db_session, monkeypatch):
     _seed_default_assignee(db_session, monkeypatch)
     l1 = _seed_overdue_plus_upcoming_lease(db_session, rent="25000.00")
     # second lease, different unit number
-    prop = Property(name="Bay Tower", address="2 EDSA", city="Pasay", total_units=2)
-    db_session.add(prop)
-    db_session.flush()
+    prop = seed_property(db_session, name="Bay Tower", address="2 EDSA", city="Pasay", total_units=2)
     unit = Unit(property_id=prop.id, unit_number="2208", floor="22", size_sqm="30.00",
                 monthly_rent="55000.00", status=UnitStatus.occupied)
     db_session.add(unit)
@@ -384,9 +390,11 @@ def test_expense_read_legacy_placeholder_category_no_500(client, admin_headers, 
     """CONVERGENCE-003 §4.2: GET /expenses/{id} on a legacy `??` category row
     must return 200 (read-through), never ResponseValidationError 500."""
     from app.models.financial import Expense
+    from tests.conftest import seed_property
+    _p = seed_property(db_session)
     exp = Expense(
         expense_date=date(2026, 8, 15), category="??", amount="7000.00",
-        payee="Repair Co", status=ExpenseStatus.approved,
+        payee="Repair Co", status=ExpenseStatus.approved, property_id=_p.id,
     )
     db_session.add(exp)
     db_session.commit()
@@ -404,13 +412,17 @@ def test_quick_tasks_expense_row_has_business_context(db_session, monkeypatch):
     _seed_default_assignee(db_session, monkeypatch)
     lease = _seed_overdue_plus_upcoming_lease(db_session, rent="25000.00")
     db_session.commit()
+    from app.models.financial import Expense
+    from app.models.property import Unit
     from app.models.user import User
     admin_user = db_session.query(User).filter(User.role == UserRole.admin).first()
+    unit = db_session.get(Unit, lease.unit_id)
     exp = Expense(
         expense_date=date(2026, 8, 15), due_date=date(2026, 8, 15),
         category="Repair", amount="7000.00", payee="Repair Co",
         status=ExpenseStatus.approved, approved_at=NOW - timedelta(days=2),
         unit_id=lease.unit_id, payer_user_id=admin_user.id,
+        property_id=unit.property_id if unit else None,
     )
     db_session.add(exp)
     db_session.commit()

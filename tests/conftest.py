@@ -1,3 +1,4 @@
+import re
 import secrets
 import os
 
@@ -16,7 +17,12 @@ from app.main import app
 from app.models.user import User, UserRole
 from app.models.identity import ApiCredential, CredentialState, Principal, PrincipalType
 from app.models.membership import Organization, Membership, OrganizationRole, MembershipState
+from app.models.property import Property, Unit
+from app.models.tenant import Tenant
+from app.models.financial import Expense, ExpenseStatus
 from app.services.audit import audit_context
+from decimal import Decimal
+from datetime import date as _date
 
 TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 
@@ -28,24 +34,44 @@ TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
 # Any such configuration is refused here, deterministically, before any engine
 # is created.
 _CONFIGURED_DB = make_url(settings.database_url).database
-_FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test"}
+_FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test", "pasay_pm_test"}
+
+# Strict pasay_pm_* / pasay_*_gate_* / pasay_freeze_* / pasay_closeout_* prefix
+# are the only allowed isolated test-database name families. Any other name
+# (including the bare legacy "pasay_pm_test" default fallback when not otherwise
+# overridden) is refused unless it matches one of the approved patterns.
+_ALLOWED_TEST_DB_PREFIX_RE = re.compile(
+    r"^(?:pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_[a-zA-Z0-9_]+|test_pasay_[a-zA-Z0-9_]+)$"
+)
 
 
 def _test_db_allowed(name: str, configured_db: str) -> bool:
     """True only when the requested test DB is a real, isolated test database
-    (never the configured live DB and never a production/live-named DB)."""
+    (never the configured live DB and never a production/live-named DB).
+
+    Strict prefix whitelist (§四·原则6): only names matching
+    ``pasay_(pm|gate*|freeze|closeout|return|fresh|alembic)_*`` are accepted.
+    Any other name including the historical bare ``pasay_pm_test" pattern without
+    underscore prefix-family is refused; forbidden literal names are also refused.
+
+    Uses fullmatch (NOT substring / partial match) so a name like
+    ``production_pasay`` — which merely *contains* an allowed token as a
+    substring — is deterministically refused (fail-closed)."""
     if not name:
         return False
     if name == configured_db:
         return False
-    return name not in _FORBIDDEN_TEST_DBS
+    if name in _FORBIDDEN_TEST_DBS:
+        return False
+    return bool(_ALLOWED_TEST_DB_PREFIX_RE.fullmatch(name))
 
 
 if not _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB):
     raise SystemExit(
         "REFUSED: PASAY_TEST_DB_NAME=%r would run tests against the "
         "live/production database (configured DATABASE_URL db=%r). "
-        "Set PASAY_TEST_DB_NAME to an isolated test database (e.g. pasay_pm_test)."
+        "Set PASAY_TEST_DB_NAME to an isolated test database "
+        "(e.g. pasay_pm_r1_20260101_001 or pasay_freeze_gate_001)."
         % (TEST_DB_NAME, _CONFIGURED_DB)
     )
 
@@ -180,17 +206,82 @@ def make_user(db, username, role, active=True):
 
 @pytest.fixture()
 def admin(db_session):
-    return make_user(db_session, "admin", UserRole.admin)
+    user, _key = make_user(db_session, "admin", UserRole.admin)
+    ensure_default_org(db_session)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from app.models.membership import Organization
+    org = db_session.query(Organization).order_by(Organization.id.asc()).first()
+    if org:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            m = Membership(user_id=user.id, organization_id=org.id,
+                           role=OrganizationRole.OWNER, state=MembershipState.ACTIVE)
+            db_session.add(m)
+            db_session.commit()
+    return user, _key
 
 
 @pytest.fixture()
 def manager(db_session):
-    return make_user(db_session, "manager", UserRole.manager)
+    user, _key = make_user(db_session, "manager", UserRole.manager)
+    ensure_default_org(db_session)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from app.models.membership import Organization
+    org = db_session.query(Organization).order_by(Organization.id.asc()).first()
+    if org:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            m = Membership(user_id=user.id, organization_id=org.id,
+                           role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE)
+            db_session.add(m)
+            db_session.commit()
+    return user, _key
 
 
 @pytest.fixture()
-def agent(db_session):
-    return make_user(db_session, "agent", UserRole.agent)
+def agent(db_session, request):
+    """Generic agent fixture — SECRETARY membership granted by default so
+    existing tests that exercise real secretary flows continue to work.
+
+    For FAIL-CLOSED security verification (negative tests) use marker
+    ``@pytest.mark.agent_no_secretary`` to explicitly request NO membership.
+    The companion RET3 tests exercise this opt-out path to prove endpoints
+    reject requests when the agent lacks a SECRETARY role (403 / empty set).
+    """
+    want_secretary = True
+    mark_no = request.node.get_closest_marker("agent_no_secretary")
+    if mark_no is not None:
+        want_secretary = False
+    param = getattr(request, "param", None)
+    if isinstance(param, dict) and "secretary" in param:
+        want_secretary = bool(param["secretary"])
+
+    user, _key = make_user(db_session, "agent", UserRole.agent)
+    user._pytest_agent_want_secretary = want_secretary
+    ensure_default_org(db_session)
+    from app.models.membership import Membership, OrganizationRole, MembershipState
+    from app.models.membership import Organization
+    org = db_session.query(Organization).order_by(Organization.id.asc()).first()
+    if org and want_secretary:
+        exists = db_session.query(Membership.id).filter(
+            Membership.user_id == user.id,
+            Membership.organization_id == org.id,
+            Membership.state == MembershipState.ACTIVE,
+        ).first()
+        if not exists:
+            m = Membership(user_id=user.id, organization_id=org.id,
+                           role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE)
+            db_session.add(m)
+            db_session.commit()
+    return user, _key
 
 
 def _headers(user_key):
@@ -216,6 +307,52 @@ def agent_headers(agent):
 
 @pytest.fixture()
 def org_a(db_session):
+    existing = db_session.query(Organization).filter(Organization.name == "Org-A").first()
+    if existing is not None:
+        admin_user = db_session.query(User).filter(User.username == "admin").first()
+        if admin_user is not None:
+            has_owner = db_session.query(Membership.id).filter(
+                Membership.organization_id == existing.id,
+                Membership.user_id == admin_user.id,
+                Membership.role == OrganizationRole.OWNER,
+                Membership.state == MembershipState.ACTIVE,
+            ).first()
+            if has_owner is None:
+                db_session.add(Membership(
+                    organization_id=existing.id, user_id=admin_user.id,
+                    role=OrganizationRole.OWNER, state=MembershipState.ACTIVE,
+                ))
+        manager_user = db_session.query(User).filter(User.username == "manager").first()
+        if manager_user is not None:
+            has_sec = db_session.query(Membership.id).filter(
+                Membership.organization_id == existing.id,
+                Membership.user_id == manager_user.id,
+                Membership.role == OrganizationRole.SECRETARY,
+                Membership.state == MembershipState.ACTIVE,
+            ).first()
+            if has_sec is None:
+                db_session.add(Membership(
+                    organization_id=existing.id, user_id=manager_user.id,
+                    role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE,
+                ))
+        agent_user = db_session.query(User).filter(User.username == "agent").first()
+        if agent_user is not None:
+            want_agent_secretary = bool(getattr(agent_user, "_pytest_agent_want_secretary", True))
+            if want_agent_secretary:
+                has_agent = db_session.query(Membership.id).filter(
+                    Membership.organization_id == existing.id,
+                    Membership.user_id == agent_user.id,
+                    Membership.role == OrganizationRole.SECRETARY,
+                    Membership.state == MembershipState.ACTIVE,
+                ).first()
+                if has_agent is None:
+                    db_session.add(Membership(
+                        organization_id=existing.id, user_id=agent_user.id,
+                        role=OrganizationRole.SECRETARY, state=MembershipState.ACTIVE,
+                    ))
+        db_session.commit()
+        db_session.refresh(existing)
+        return existing
     org = Organization(name="Org-A", display_name="Pasay Org A")
     db_session.add(org)
     db_session.flush()
@@ -250,6 +387,10 @@ def org_a(db_session):
 
 @pytest.fixture()
 def org_b(db_session):
+    existing = db_session.query(Organization).filter(Organization.name == "Org-B").first()
+    if existing is not None:
+        db_session.refresh(existing)
+        return existing
     org = Organization(name="Org-B", display_name="Pasay Org B")
     db_session.add(org)
     db_session.commit()
@@ -300,6 +441,130 @@ def owner_b(db_session, org_b):
     db_session.commit()
     db_session.refresh(membership)
     return user, api_key, membership
+
+
+# --- shared factory helpers (for tests that directly build ORM objects) --------
+
+def ensure_default_org(db, *, name: str = "Org-A", display_name: str = "Pasay Org A"):
+    """Lazily create (or return the existing) named Organization with a deterministic
+    admin/manager/agent membership chain.
+
+    Used by tests that directly construct Property/Tenant/ExpenseClaim ORM objects
+    instead of going through the API fixtures. Always builds a real
+    ``org → (membership → User.role) → Property → Unit/Tenant → Lease → Expense``
+    chain when combined with :func:`seed_property` / :func:`seed_tenant` below.
+
+    For FAIL-CLOSED security verification (negative tests) callers can use the
+    ``@pytest.mark.agent_no_secretary`` marker on the agent fixture to opt out
+    of the SECRETARY grant specifically for the fixture-backed user; the helper
+    membership grant via :func:`ensure_default_org` remains deterministic for
+    the direct-ORM construction path but tests may delete the membership to
+    exercise the no-access path if truly needed.
+
+    Idempotent per session/database: returns the same Organization when an org
+    with the same ``name`` already exists (no duplicate org creation)."""
+    existing = db.query(Organization).filter(Organization.name == name).first()
+    if existing is not None:
+        return existing
+    org = Organization(name=name, display_name=display_name)
+    db.add(org)
+    db.flush()
+    role_mapping = {
+        UserRole.admin: OrganizationRole.OWNER,
+        UserRole.manager: OrganizationRole.SECRETARY,
+        UserRole.agent: OrganizationRole.SECRETARY,
+    }
+    for (username, user_role) in (
+        ("admin", UserRole.admin),
+        ("manager", UserRole.manager),
+        ("agent", UserRole.agent),
+    ):
+        user = db.query(User).filter(User.username == username).first()
+        if user is None:
+            continue
+        db.add(Membership(
+            organization_id=org.id,
+            user_id=user.id,
+            role=role_mapping[user_role],
+            state=MembershipState.ACTIVE,
+        ))
+    db.flush()
+    return org
+
+
+def seed_property(db, *, org=None, **kw):
+    """Construct and flush a Property with a real organization_id.
+
+    When ``org`` is explicitly None the property is attached to the deterministic
+    default organization produced by :func:`ensure_default_org`. Any extra keyword
+    arguments override defaults (name/address/city/total_units)."""
+    if org is None:
+        org = ensure_default_org(db)
+    data = {
+        "name": "Sunset Tower",
+        "address": "1 Roxas Blvd",
+        "city": "Pasay",
+        "total_units": 4,
+    }
+    data.update(kw)
+    data["organization_id"] = org.id
+    prop = Property(**data)
+    db.add(prop)
+    db.flush()
+    return prop
+
+
+def seed_unit(db, *, prop=None, **kw):
+    if prop is None:
+        prop = seed_property(db)
+    data = {
+        "property_id": prop.id,
+        "unit_number": "101",
+        "floor": "1",
+        "size_sqm": Decimal("32.50"),
+        "monthly_rent": Decimal("12000.00"),
+        "status": "vacant",
+    }
+    data.update(kw)
+    unit = Unit(**data)
+    db.add(unit)
+    db.flush()
+    return unit
+
+
+def seed_tenant(db, *, org=None, **kw):
+    if org is None:
+        org = ensure_default_org(db)
+    data = {
+        "full_name": "Juan Dela Cruz",
+        "phone": "+639170000000",
+        "email": "juan@example.com",
+        "organization_id": org.id,
+    }
+    data.update(kw)
+    tenant = Tenant(**data)
+    db.add(tenant)
+    db.flush()
+    return tenant
+
+
+def seed_expense(db, *, prop=None, **kw):
+    if prop is None:
+        prop = seed_property(db)
+    data = {
+        "property_id": prop.id,
+        "expense_date": _date.today(),
+        "category": "maintenance",
+        "description": "Plumbing fix",
+        "amount": Decimal("2500.00"),
+        "payee": "Local Vendor Co",
+        "status": ExpenseStatus.pending,
+    }
+    data.update(kw)
+    exp = Expense(**data)
+    db.add(exp)
+    db.flush()
+    return exp
 
 
 # --- shared data fixtures (created through the API as Org Owner) ---

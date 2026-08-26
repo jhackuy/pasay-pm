@@ -27,6 +27,10 @@
  *   - containerInstances[instanceId] = fakeContainer whose fetch() tests can assert on
  */
 
+export interface ContainerOptions {
+  [key: string]: unknown;
+}
+
 export abstract class Container {
   /** Default HTTP port the container image listens on. */
   defaultPort?: number = 8000;
@@ -38,11 +42,12 @@ export abstract class Container {
    * Environment-variable provisioning table (Cloudflare Containers runtime).
    *
    * REAL @cloudflare/containers@0.3.7 signature: Record<string, string>.
-   * Worker secrets / wrangler.toml [vars] are AUTOMATICALLY propagated into
-   * the Container process by the Cloudflare platform; subclassers set ONLY
-   * static string-valued tags here, never function-valued maps.
+   * Pasay closeout RETURN-1 §2: explicit 6-key envVars (5 dynamic mapped
+   * from env + 1 static PASAY_RUNTIME_MODE).
    */
   envVars: Record<string, string> = {};
+
+  constructor(public ctx: unknown = {}, public env: unknown = {}, public options?: ContainerOptions) {}
 }
 
 export interface MockContainerHandle {

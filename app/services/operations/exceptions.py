@@ -16,7 +16,7 @@ never to the Secretary's routine queue.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
@@ -35,16 +35,40 @@ LONG_VACANCY_DAYS = 60
 UNUSUAL_EXPENSE_MULTIPLIER = 2
 
 
-def scan_exceptions(db: Session, *, now: datetime | None = None) -> list[dict]:
+def scan_exceptions(
+    db: Session, *, now: datetime | None = None,
+    org_id: int | None = None,
+) -> list[dict]:
     """One deterministic scan pass; returns the findings list and enqueues
-    Owner notifications (deduped per kind+unit+date)."""
+    Owner notifications (deduped per kind+unit+date).
+
+    ``org_id`` fail-closes the unit/lease/task scan via canonical
+    property→organization scoping; None preserves the global standalone-worker
+    behavior (daemon owns all tenants).
+    """
     now = now or datetime.now(timezone.utc)
     findings: list[dict] = []
     today = now.date().isoformat()
 
-    units = db.query(Unit).filter(Unit.deleted_at.is_(None)).all()
+    unit_query = db.query(Unit).filter(Unit.deleted_at.is_(None))
+    if org_id is not None:
+        from app.services.operations.summary import _org_property_ids
+        pids = _org_property_ids(db, org_id)
+        if pids:
+            unit_query = unit_query.filter(Unit.property_id.in_(list(pids)))
+        else:
+            unit_query = unit_query.filter(Unit.id == -1)
+    units = unit_query.all()
     unit_by_id = {u.id: u for u in units}
-    leases = db.query(Lease).filter(Lease.deleted_at.is_(None)).all()
+    lease_query = db.query(Lease).filter(Lease.deleted_at.is_(None))
+    if org_id is not None:
+        from app.services.operations.summary import _org_lease_ids
+        lids = _org_lease_ids(db, org_id)
+        if lids:
+            lease_query = lease_query.filter(Lease.id.in_(list(lids)))
+        else:
+            lease_query = lease_query.filter(Lease.id == -1)
+    leases = lease_query.all()
     active_leases_by_unit: dict[int, list[Lease]] = {}
     for lease in leases:
         if lease.status == LeaseStatus.active:

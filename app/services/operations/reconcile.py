@@ -78,16 +78,21 @@ def auto_transition(db: Session, task: OperationalTask, *, to: OperationalTaskSt
     return True
 
 
-def reconcile_tasks(db: Session, *, now: datetime) -> tuple[int, int]:
-    """Settle stale PENDING tasks. Returns (auto_completed, auto_cancelled)."""
+def reconcile_tasks(db: Session, *, now: datetime, org_id: int | None = None) -> tuple[int, int]:
+    """Settle stale PENDING tasks. Returns (auto_completed, auto_cancelled).
+
+    ``org_id`` scopes the scan via the canonical 3-channel OR (property / lease
+    / tenant → organization) fail-closed pattern; None preserves the global
+    worker-path behavior (standalone daemon owns all tenants).
+    """
     bind_internal_audit(db, "reconcile")
     completed = 0
     cancelled = 0
-    tasks = (
-        db.query(OperationalTask)
-        .filter(OperationalTask.status == OperationalTaskStatus.PENDING)
-        .all()
-    )
+    query = db.query(OperationalTask).filter(OperationalTask.status == OperationalTaskStatus.PENDING)
+    if org_id is not None:
+        from app.services.operations.summary import _scoped_task_query
+        query = query.filter(_scoped_task_query(db, org_id))
+    tasks = query.all()
     for task in tasks:
         outcome = _reconcile_one(db, task, now=now)
         if outcome == "completed":

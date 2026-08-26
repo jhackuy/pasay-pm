@@ -1,197 +1,131 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, manager_or_admin
+from app.api.deps import get_current_user
 from app.database import get_db
+from app.models.membership import OrganizationRole
 from app.models.task import Task, TaskStatus
 from app.models.user import User
 from app.schemas.common import MessageResponse
 from app.schemas.task import TaskCompleteResult, TaskCreate, TaskRead, TaskUpdate
-from app.services.audit import field_changes, record_audit, serialize_row
-from app.services.dates import add_months
+from app.services.organization_scope import (
+    resolve_org_membership,
+    scope_exception_to_http,
+    list_active_org_ids_for_user,
+)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
+_DEPRECATED_HEADER = "legacy-tasks-router-v1; use /operations/tasks"
+_DEPRECATION_DETAIL = {
+    "error": "METHOD_NOT_ALLOWED",
+    "message": "Legacy /tasks write endpoints are deprecated in Pasay V1. Use /operations/tasks instead.",
+    "deprecation": "See PASAY-M003 Scope Unification",
+}
 
-def _get_or_404(db: Session, task_id: int) -> Task:
-    obj = db.query(Task).filter(Task.id == task_id, Task.deleted_at.is_(None)).first()
-    if obj is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
-    return obj
+
+def _deprecation_headers(response: Response) -> None:
+    response.headers["X-Deprecated-Endpoint"] = _DEPRECATED_HEADER
 
 
-def _check_assignee(db: Session, assigned_to: int | None) -> None:
-    if assigned_to is None:
-        return
-    user = (
-        db.query(User)
-        .filter(User.id == assigned_to, User.is_active.is_(True))
-        .first()
+def _write_405(response: Response):
+    _deprecation_headers(response)
+    raise HTTPException(
+        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+        detail=_DEPRECATION_DETAIL,
+        headers={"X-Deprecated-Endpoint": _DEPRECATED_HEADER},
     )
-    if user is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assigned user not found")
-
-
-def _sync_next_due_date(obj: Task) -> None:
-    """Derive next_due_date for recurring tasks (or clear it otherwise)."""
-    if obj.recurring and obj.interval_months and obj.due_date:
-        obj.next_due_date = add_months(obj.due_date, obj.interval_months)
-    else:
-        obj.next_due_date = None
 
 
 @router.get("", response_model=list[TaskRead])
-def list_tasks(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    return db.query(Task).filter(Task.deleted_at.is_(None)).order_by(Task.id).all()
+def list_tasks(
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _deprecation_headers(response)
+    try:
+        org_ids = list_active_org_ids_for_user(db, user.id)
+        if not org_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active organization membership",
+            )
+        resolve_org_membership(
+            db, user.id, org_ids[0],
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    return db.query(Task).filter(False).all()
 
 
 @router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 def create_task(
+    response: Response,
     payload: TaskCreate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _check_assignee(db, payload.assigned_to)
-    obj = Task(**payload.model_dump())
-    _sync_next_due_date(obj)
-    obj.created_by = user.id
-    obj.updated_by = user.id
-    db.add(obj)
-    db.flush()
-    record_audit(
-        db,
-        table_name="tasks",
-        record_id=obj.id,
-        action="create",
-        actor_id=user.id,
-        new_value=serialize_row(obj),
-    )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    _write_405(response)
 
 
 @router.get("/{task_id}", response_model=TaskRead)
 def get_task(
-    task_id: int, db: Session = Depends(get_db), _: User = Depends(get_current_user)
+    task_id: int,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    return _get_or_404(db, task_id)
+    _deprecation_headers(response)
+    try:
+        org_ids = list_active_org_ids_for_user(db, user.id)
+        if not org_ids:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="No active organization membership",
+            )
+        resolve_org_membership(
+            db, user.id, org_ids[0],
+            role=[OrganizationRole.OWNER, OrganizationRole.SECRETARY],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise scope_exception_to_http(exc) from exc
+    raise HTTPException(status.HTTP_404_NOT_FOUND, "Task not found")
 
 
 @router.patch("/{task_id}", response_model=TaskRead)
 def update_task(
     task_id: int,
+    response: Response,
     payload: TaskUpdate,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, task_id)
-    updates = payload.model_dump(exclude_unset=True)
-    if not updates:
-        return obj
-    _check_assignee(db, updates.get("assigned_to"))
-    old = serialize_row(obj)
-    changed = field_changes(obj, updates)
-    for field, value in updates.items():
-        setattr(obj, field, value)
-    _sync_next_due_date(obj)
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="tasks",
-        record_id=obj.id,
-        action="update",
-        actor_id=user.id,
-        changed_fields=changed,
-        old_value=old,
-        new_value=serialize_row(obj),
-    )
-    db.commit()
-    db.refresh(obj)
-    return obj
+    _write_405(response)
 
 
 @router.delete("/{task_id}", response_model=MessageResponse)
 def delete_task(
     task_id: int,
+    response: Response,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, task_id)
-    from datetime import datetime, timezone
-
-    obj.deleted_at = datetime.now(timezone.utc)
-    obj.updated_by = user.id
-    record_audit(
-        db,
-        table_name="tasks",
-        record_id=obj.id,
-        action="soft_delete",
-        actor_id=user.id,
-        old_value=serialize_row(obj),
-    )
-    db.commit()
-    return MessageResponse(detail="Task deleted")
+    _write_405(response)
 
 
 @router.post("/{task_id}/complete", response_model=TaskCompleteResult)
 def complete_task(
     task_id: int,
+    response: Response,
     db: Session = Depends(get_db),
-    user: User = Depends(manager_or_admin),
+    user: User = Depends(get_current_user),
 ):
-    obj = _get_or_404(db, task_id)
-    if obj.status == TaskStatus.completed:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Task already completed")
-
-    now = datetime.now(timezone.utc)
-    obj.status = TaskStatus.completed
-    obj.completed_at = now
-    obj.last_completed_at = now
-    obj.updated_by = user.id
-
-    next_task = None
-    if obj.recurring and obj.interval_months and obj.due_date:
-        next_due = add_months(obj.due_date, obj.interval_months)
-        next_task = Task(
-            title=obj.title,
-            description=obj.description,
-            unit_id=obj.unit_id,
-            status=TaskStatus.scheduled,
-            priority=obj.priority,
-            due_date=next_due,
-            recurring=True,
-            interval_months=obj.interval_months,
-            assigned_to=obj.assigned_to,
-        )
-        _sync_next_due_date(next_task)
-        next_task.created_by = user.id
-        next_task.updated_by = user.id
-        db.add(next_task)
-        db.flush()
-        record_audit(
-            db,
-            table_name="tasks",
-            record_id=next_task.id,
-            action="create",
-            actor_id=user.id,
-            new_value=serialize_row(next_task),
-        )
-
-    old = serialize_row(obj)
-    record_audit(
-        db,
-        table_name="tasks",
-        record_id=obj.id,
-        action="update",
-        actor_id=user.id,
-        old_value=old,
-        new_value=serialize_row(obj),
-    )
-    db.commit()
-    db.refresh(obj)
-    if next_task is not None:
-        db.refresh(next_task)
-    return TaskCompleteResult(completed=obj, next=next_task)
+    _write_405(response)

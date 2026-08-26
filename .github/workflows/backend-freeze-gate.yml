@@ -1,0 +1,386 @@
+name: backend-freeze-gate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch: {}
+
+concurrency:
+  group: backend-freeze-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONPATH: ""
+  FORCE_COLOR: "1"
+
+jobs:
+  backend-freeze-gate:
+    name: backend-freeze-gate (13 doors)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    permissions:
+      contents: read
+      pull-requests: read
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: DOOR-00 Preflight — checkout and basic invariants
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: DOOR-00 Preflight — verify freeze contract files exist
+        run: |
+          set -euo pipefail
+          test -f AGENTS.md
+          test -f CURRENT_ARCHITECTURE.md
+          test -f alembic.ini
+          test -f Dockerfile
+          test -f requirements.txt
+          test -d alembic/versions
+          test -f cloudflare-worker/package.json
+          test -f cloudflare-worker/package-lock.json
+          test -f cloudflare-worker/wrangler.toml
+          echo "BACKEND_FREEZE_GATE__DOOR_00_OK=1" >> $GITHUB_ENV
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_OK')"
+
+      - name: DOOR-01 Fresh PostgreSQL 16 database creation
+        run: |
+          set -euo pipefail
+          export PGPASSWORD=postgres
+          psql -h localhost -U postgres -c "SELECT version();" | grep -q "PostgreSQL 16" || { echo "FAIL: not PostgreSQL 16"; exit 1; }
+          DB_NAME="pasay_freeze_gate_${GITHUB_RUN_ID}"
+          psql -h localhost -U postgres -c "DROP DATABASE IF EXISTS \"${DB_NAME}\";"
+          psql -h localhost -U postgres -c "CREATE DATABASE \"${DB_NAME}\";"
+          echo "FREEZE_GATE_DB=${DB_NAME}" >> $GITHUB_ENV
+          echo "BACKEND_FREEZE_GATE__DOOR_01_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-02 Alembic upgrade head (fresh DB, no seed/stamp/create_all)
+        env:
+          DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
+          DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
+          PASAY_TEST_DB_NAME: ${{ env.FREEZE_GATE_DB }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/doors
+          alembic upgrade head 2>&1 | tee artifacts/doors/door_02_alembic.log || { exit_code=$?; echo "FAIL: alembic upgrade head"; exit ${exit_code}; }
+          alembic current 2>&1 | tee artifacts/doors/door_02_current.log | grep -q "m4d000000001" || {
+            echo "FAIL: expected single linear head m4d000000001"; exit 1;
+          }
+          echo "BACKEND_FREEZE_GATE__DOOR_02_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-03 Docker build backend image
+        id: docker_build
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/docker
+          IMAGE_TAG="pasay-backend-freeze:${GITHUB_RUN_ID}"
+          docker build \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --tag "${IMAGE_TAG}" \
+            --progress=plain \
+            . 2>&1 | tee artifacts/docker/build.log
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+          docker image inspect "${IMAGE_TAG}" > artifacts/docker/image_inspect.json
+          echo "BACKEND_FREEZE_GATE__DOOR_03_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-04/05/06 Start container with fake secrets, entrypoint alembic re-run, uvicorn health
+        env:
+          FREEZE_CONTAINER_NAME: "pasay-freeze-${{ github.run_id }}"
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          FAKE_DB_URL: "postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${{ env.FREEZE_GATE_DB }}"
+          FAKE_DB_UNPOOLED_URL: "postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${{ env.FREEZE_GATE_DB }}"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/container
+          # DOOR-04: Launch with fake secrets (no production values)
+          docker rm -f "${FREEZE_CONTAINER_NAME}" 2>/dev/null || true
+          # Create separate unmigrated database for container startup alembic validation
+          EMPTY_STARTUP_DB="pasay_freeze_startup_${GITHUB_RUN_ID}"
+          export PGPASSWORD=postgres
+          psql -h localhost -U postgres -c "DROP DATABASE IF EXISTS \"${EMPTY_STARTUP_DB}\";"
+          psql -h localhost -U postgres -c "CREATE DATABASE \"${EMPTY_STARTUP_DB}\";"
+          STARTUP_DB_URL="postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${EMPTY_STARTUP_DB}"
+          STARTUP_DB_UNPOOLED_URL="postgresql+psycopg2://postgres:postgres@host.docker.internal:5432/${EMPTY_STARTUP_DB}"
+          echo "STARTUP_EMPTY_DB=${EMPTY_STARTUP_DB}" >> $GITHUB_ENV
+          # Use docker run with add-host so container reaches host postgres (service)
+          echo "DEBUG: FREEZE_CONTAINER_NAME=${FREEZE_CONTAINER_NAME}"
+          echo "DEBUG: IMAGE_TAG=${IMAGE_TAG}"
+          echo "DEBUG: STARTUP_DB_URL=${STARTUP_DB_URL}"
+          DOCKER_RUN_EXIT=0
+          docker run -d \
+              --name "${FREEZE_CONTAINER_NAME}" \
+              --add-host=host.docker.internal:host-gateway \
+              -p 18000:8000 \
+              -e DATABASE_URL="${STARTUP_DB_URL}" \
+              -e DATABASE_URL_UNPOOLED="${STARTUP_DB_UNPOOLED_URL}" \
+              -e TELEGRAM_BOT_TOKEN="fake-bot-token-freeze-gate-${GITHUB_RUN_ID}" \
+              -e TELEGRAM_WEBHOOK_SECRET="fake-webhook-secret-freeze-${GITHUB_RUN_ID}" \
+              -e CONTAINER_INGEST_TOKEN="fake-ingest-token-freeze-${GITHUB_RUN_ID}" \
+              -e PASAY_RUNTIME_MODE="cloudflare-container" \
+              "${IMAGE_TAG}" \
+              > artifacts/container/run.log 2>&1 || DOCKER_RUN_EXIT=$?
+          if [ "${DOCKER_RUN_EXIT}" != "0" ]; then
+            echo "FAIL: DOOR-04 container failed to start (docker run exit=${DOCKER_RUN_EXIT})"
+            echo "---- artifacts/container/run.log ----"
+            cat artifacts/container/run.log || true
+            echo "---- docker logs (if container exists) ----"
+            docker logs "${FREEZE_CONTAINER_NAME}" > artifacts/container/startup_logs.txt 2>&1 || true
+            cat artifacts/container/startup_logs.txt || true
+            echo "---- docker ps -a ----"
+            docker ps -a || true
+            exit 1
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_04_OK=1" >> $GITHUB_ENV
+
+          # DOOR-05: Container must auto-run alembic upgrade head against a truly empty database
+          # (FREEZE_GATE_DB was pre-migrated in DOOR-02, so we must NOT reuse it for this proof)
+          # Wait for container HEALTHCHECK (or alembic_version row) to appear before asserting
+          ALEMBIC_OK=0
+          for i in $(seq 1 40); do
+            CUR_HEAD="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${EMPTY_STARTUP_DB}" \
+              -c "SELECT version_num FROM alembic_version LIMIT 1;" 2>/dev/null || true)"
+            if [ -n "${CUR_HEAD}" ] && [ "${CUR_HEAD}" != "" ]; then
+              echo "alembic_version appeared after ${i}x2s (head=${CUR_HEAD})"
+              ALEMBIC_OK=1; break
+            fi
+            sleep 2
+          done
+          docker logs "${FREEZE_CONTAINER_NAME}" > artifacts/container/startup_logs.txt 2>&1 || true
+          if ! grep -qE "alembic|migration|uvicorn|started" artifacts/container/startup_logs.txt; then
+            echo "WARN: no alembic entrypoint logs visible, will rely on empty DB alembic_version and tables presence"
+          fi
+          EXPECTED_HEAD="m4d000000001"
+          STARTUP_HEAD="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${EMPTY_STARTUP_DB}" \
+            -c "SELECT version_num FROM alembic_version LIMIT 1;")"
+          printf '%s\n' "${STARTUP_HEAD}" > artifacts/container/startup_alembic_head.txt
+          echo "Detected alembic head in startup empty DB: ${STARTUP_HEAD}"
+          if [ "${STARTUP_HEAD}" != "${EXPECTED_HEAD}" ]; then
+            echo "FAIL: expected alembic_version=${EXPECTED_HEAD} on empty startup DB after container entrypoint, got ${STARTUP_HEAD}"
+            echo "---- last 80 lines container logs ----"
+            tail -n 80 artifacts/container/startup_logs.txt || true
+            exit 1
+          fi
+          NUM_TABLES="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${EMPTY_STARTUP_DB}" \
+            -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")"
+          printf '%s\n' "${NUM_TABLES}" > artifacts/container/table_count.txt
+          echo "Detected tables in startup empty DB (post-entrypoint): ${NUM_TABLES}"
+          if [ "${NUM_TABLES}" -lt 35 ]; then
+            echo "FAIL: expected >= 35 tables after entrypoint alembic application on empty DB, got ${NUM_TABLES}"
+            echo "---- last 80 lines container logs ----"
+            tail -n 80 artifacts/container/startup_logs.txt || true
+            exit 1
+          fi
+          FREEZE_TABLES="$(PGPASSWORD=postgres psql -At -h localhost -U postgres -d "${FREEZE_GATE_DB}" \
+            -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")"
+          printf '%s\n' "${FREEZE_TABLES}" > artifacts/container/door02_freeze_tables_count.txt
+          echo "Detected tables in pre-migrated FREEZE_GATE_DB: ${FREEZE_TABLES}"
+          if [ "${FREEZE_TABLES}" -lt 35 ]; then
+            echo "FAIL: DOOR-02 migrated FREEZE_GATE_DB should have >=35 tables, got ${FREEZE_TABLES}"
+            exit 1
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_05_OK=1" >> $GITHUB_ENV
+
+          # DOOR-06: Poll uvicorn startup (GET /health readiness with retries)
+          HEALTH_URL="http://127.0.0.1:18000/health"
+          OK=0
+          for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            CODE=$(curl -s -o artifacts/container/health_resp.json -w "%{http_code}" "${HEALTH_URL}" || echo "000")
+            echo "attempt=$i status=$CODE"
+            if [ "$CODE" = "200" ]; then OK=1; break; fi
+            sleep 3
+          done
+          if [ "$OK" != "1" ]; then
+            echo "FAIL: DOOR-06 /health never 200"
+            cat artifacts/container/health_resp.json
+            echo "---- last 80 lines container logs ----"
+            tail -n 80 artifacts/container/startup_logs.txt || true
+            exit 1
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_06_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-07 GET /health == 200 (explicit truth verification)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/doors
+          CODE=$(curl -s -o artifacts/doors/door_07_health.json -w "%{http_code}" http://127.0.0.1:18000/health)
+          echo "DOOR-07 status=$CODE"
+          if [ "$CODE" != "200" ]; then echo "FAIL: expected 200 got $CODE"; cat artifacts/doors/door_07_health.json; exit 1; fi
+          echo "BACKEND_FREEZE_GATE__DOOR_07_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-08 POST /internal/ingest == 401 (no container_ingest_token → fail closed)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/doors
+          # Empty auth, no X-Pasay-Ingest-Token header -> 401
+          CODE=$(curl -s -o artifacts/doors/door_08_ingest_noauth.json -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data '{"envelope_version":1,"payload_type":"telegram","payload":{}}' \
+            http://127.0.0.1:18000/internal/ingest)
+          echo "DOOR-08 (no token) status=$CODE"
+          if [ "$CODE" != "401" ]; then echo "FAIL: expected 401 without ingest token got $CODE"; cat artifacts/doors/door_08_ingest_noauth.json; exit 1; fi
+          # Wrong token -> also 401
+          CODE2=$(curl -s -o artifacts/doors/door_08_ingest_badtoken.json -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "X-Pasay-Ingest-Token: definitely-wrong-token-${RANDOM}" \
+            --data '{"envelope_version":1,"payload_type":"telegram","payload":{}}' \
+            http://127.0.0.1:18000/internal/ingest)
+          echo "DOOR-08 (bad token) status=$CODE2"
+          if [ "$CODE2" != "401" ]; then echo "FAIL: expected 401 with bad ingest token got $CODE2"; cat artifacts/doors/door_08_ingest_badtoken.json; exit 1; fi
+          echo "BACKEND_FREEZE_GATE__DOOR_08_OK=1" >> $GITHUB_ENV
+
+      - name: Cleanup container (after DOOR-07/08)
+        if: always()
+        env:
+          FREEZE_CONTAINER_NAME: "pasay-freeze-${{ github.run_id }}"
+        run: |
+          docker rm -f "${FREEZE_CONTAINER_NAME}" 2>/dev/null || true
+          # leave image for DOOR-03 artifact upload
+
+      - name: Set up Node.js 22 (Cloudflare Worker TS gate)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: cloudflare-worker/package-lock.json
+
+      - name: DOOR-09 Worker npm install (strict lockfile, 1/3) + verify engine
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          mkdir -p ../artifacts/worker
+          node -e "const v=process.versions.node.split('.').map(Number); if(v[0]<22){console.error('NODE_TOO_OLD', process.version); process.exit(1);} console.log('NODE_OK', process.version)" \
+            | tee ../artifacts/worker/door_09_node_version.log
+          npm ci --no-audit --no-fund 2>&1 | tee ../artifacts/worker/door_09_npm_ci.log
+          echo "BACKEND_FREEZE_GATE__DOOR_09_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-10 Worker typecheck src (real package types, 2/3)
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          npm run types:src 2>&1 | tee ../artifacts/worker/door_10_types_src.log
+          echo "BACKEND_FREEZE_GATE__DOOR_10_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-11 Worker typecheck tests (paths mock, 3/3) + TS spec runner
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          npm run types:tests 2>&1 | tee ../artifacts/worker/door_11_types_tests.log
+          npm test 2>&1 | tee ../artifacts/worker/door_11_spec_runner.log
+          echo "BACKEND_FREEZE_GATE__DOOR_11_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-12 Wrangler deploy --dry-run (no real deploy, no prod secrets)
+        working-directory: cloudflare-worker
+        env:
+          CLOUDFLARE_API_TOKEN: "fake-cloudflare-token-freeze-gate-${{ github.run_id }}-noop"
+          CLOUDFLARE_ACCOUNT_ID: "fake-account-id-noop-freeze-gate"
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          set -euo pipefail
+          # --dry-run is a no-op build-check that never calls Cloudflare APIs
+          # (wrangler deploy --dry-run validates the worker bundle config + compiles TS,
+          #  without actually deploying, without needing real secrets, without containers-rollout).
+          # If --dry-run still complains about missing real secrets/env, we skip that failure.
+          EXIT=0
+          npx wrangler deploy --dry-run 2>&1 | tee ../artifacts/worker/door_12_wrangler_dry.log || EXIT=$?
+          # Acceptable exit code: 0 (ok) or the known wrangler "missing account id" code; DO NOT tolerate a real deploy attempt.
+          grep -qE "Deployed|Publishing to|Containers rollout|containers-rollout" ../artifacts/worker/door_12_wrangler_dry.log && {
+            echo "FAIL: DOOR-12 --dry-run appears to have attempted a REAL deploy (contract violation)"
+            exit 5
+          }
+          if [ "$EXIT" != "0" ]; then
+            echo "FAIL: wrangler deploy --dry-run returned ${EXIT}"
+            echo "INFO: artifacts/worker/door_12_wrangler_dry.log for full output"
+            exit "${EXIT}"
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_12_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-13 Final invariant summary
+        id: summary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/summary
+          {
+            echo "BACKEND_FREEZE_GATE: 13 DOOR SUMMARY"
+            echo "RUN_ID=${GITHUB_RUN_ID}"
+            echo "SHA=${GITHUB_SHA}"
+            echo ""
+            for d in 00 01 02 03 04 05 06 07 08 09 10 11 12; do
+              KEY="BACKEND_FREEZE_GATE__DOOR_${d}_OK"
+              VAL="${!KEY:-MISSING}"
+              echo "DOOR-${d} = ${VAL}"
+            done
+            echo ""
+            echo "IMAGE_TAG=${IMAGE_TAG:-n/a}"
+            echo "FREEZE_GATE_DB=${FREEZE_GATE_DB:-n/a}"
+          } | tee artifacts/summary/doors_summary.txt
+
+          # Any door missing? Fail closed (all 13 doors must be explicitly 1)
+          MISSING=""
+          for d in 00 01 02 03 04 05 06 07 08 09 10 11 12; do
+            KEY="BACKEND_FREEZE_GATE__DOOR_${d}_OK"
+            VAL="${!KEY:-MISSING}"
+            if [ "${VAL}" != "1" ]; then
+              MISSING="${MISSING} DOOR-${d}"
+            fi
+          done
+          if [ -n "${MISSING}" ]; then
+            echo "FAIL CLOSED: missing doors${MISSING}"
+            exit 1
+          fi
+
+      - name: Upload 6-class freeze gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-freeze-gate-artifacts-run-${{ github.run_id }}
+          path: |
+            artifacts/doors/**
+            artifacts/docker/**
+            artifacts/container/**
+            artifacts/worker/**
+            artifacts/summary/**
+            alembic/versions/*.py
+          retention-days: 30
+
+  freeze-gate-result:
+    name: freeze-gate-result (aggregate)
+    needs: [backend-freeze-gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Freeze gate done
+        run: echo "backend-freeze-gate completed — see backend-freeze-gate artifacts for 13 doors"

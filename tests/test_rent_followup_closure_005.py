@@ -11,6 +11,7 @@ Pins:
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 
 from app.models.financial import Expense, ExpenseStatus
 from app.models.lease import Lease, LeaseStatus
@@ -19,35 +20,33 @@ from app.models.tenant import Tenant
 from app.models.user import User, UserRole
 from app.services.operations.config import SECRETARY_ASSIGNEE_ID
 from app.services.operations.quick import build_quick_properties, build_quick_rent, build_quick_tasks
+from tests.conftest import ensure_default_org, seed_property, seed_unit, seed_tenant, seed_expense  # noqa: F401 (seed helpers shared via conftest)
 
 API = "/api/v1"
 NOW = datetime(2026, 8, 17, 12, 0, 0, tzinfo=timezone.utc)
 
 
 def _moneyd(v) -> str:
-    from decimal import Decimal
     return str(Decimal(str(v)))
 
 
-def _seed_fixture(db, *, rent="25000.00", due_day=20):
+def _seed_fixture(db, *, rent=Decimal("25000.00"), due_day=20):
     """One occupied, 3-period-overdue unit + an active lease + user."""
     from tests.conftest import make_user
 
     owner, _key = make_user(db, "closure-admin", UserRole.admin)
     db.query(User).filter_by(id=owner.id).update({"telegram_chat_id": "5177241442"})
     db.flush()
-    prop = Property(name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
-    db.add(prop)
-    db.flush()
+    prop = seed_property(db, name="Sunset Tower", address="1 Roxas Blvd", city="Pasay", total_units=4)
     unit = Unit(property_id=prop.id, unit_number="1680", floor="16", size_sqm="32.50",
-                monthly_rent=rent, status=UnitStatus.occupied)
-    tenant = Tenant(full_name="Carlo Reyes", phone="+639170000000")
-    db.add_all([unit, tenant])
+                monthly_rent=Decimal(str(rent)), status=UnitStatus.occupied)
+    tenant = seed_tenant(db, full_name="Carlo Reyes", phone="+639170000000")
+    db.add_all([unit])
     db.flush()
     lease = Lease(
         unit_id=unit.id, tenant_id=tenant.id,
         start_date=date(2025, 1, 1), end_date=date(2026, 12, 31),
-        monthly_rent=rent, deposit="50000.00", status=LeaseStatus.active,
+        monthly_rent=Decimal(str(rent)), deposit=Decimal("50000.00"), status=LeaseStatus.active,
         due_day=due_day,
     )
     db.add(lease)
@@ -55,14 +54,30 @@ def _seed_fixture(db, *, rent="25000.00", due_day=20):
     return owner, unit, lease
 
 
-def test_secretary_target_resolves_configured_secretary(client, db_session, admin_headers):
+def test_secretary_target_resolves_configured_secretary(client, db_session, admin_headers, monkeypatch):
     """The 催租 assign-to-Secretary DM needs the canonical Secretary target."""
     from tests.conftest import make_user
+    from app.models.membership import Organization, Membership, MembershipState, OrganizationRole
+    from app.services.operations import config as ops_config
 
-    # Seed an active manager (the Secretary) with a Telegram destination.
     sec, _ = make_user(db_session, "closure-secretary", UserRole.manager)
     db_session.query(User).filter_by(id=sec.id).update({"telegram_chat_id": "1083657401"})
+    db_session.flush()
+    org = ensure_default_org(db_session)
+    exists = db_session.query(Membership).filter(
+        Membership.organization_id == org.id,
+        Membership.user_id == sec.id,
+        Membership.removed_at.is_(None),
+    ).first()
+    if not exists:
+        db_session.add(Membership(
+            organization_id=org.id,
+            user_id=sec.id,
+            role=OrganizationRole.SECRETARY,
+            state=MembershipState.ACTIVE,
+        ))
     db_session.commit()
+    monkeypatch.setattr(ops_config, "SECRETARY_ASSIGNEE_ID", sec.id)
     resp = client.get(f"{API}/operations/secretary-target", headers=admin_headers)
     assert resp.status_code == 200, resp.text
     assert resp.json()["telegram_chat_id"].strip() == "1083657401"

@@ -1,16 +1,19 @@
 API = "/api/v1"
 
 
-def _create_property(client, headers):
+def _create_property(client, headers, db_session):
+    from tests.conftest import ensure_default_org
+    org = ensure_default_org(db_session)
     return client.post(
         f"{API}/properties",
-        json={"name": "Audited", "address": "1 St", "city": "Pasay"},
+        json={"name": "Audited", "address": "1 St", "city": "Pasay",
+              "total_units": 1, "organization_id": org.id},
         headers=headers,
     )
 
 
-def test_create_is_audited(client, admin_headers):
-    resp = _create_property(client, admin_headers)
+def test_create_is_audited(client, admin_headers, db_session):
+    resp = _create_property(client, admin_headers, db_session)
     assert resp.status_code == 201
 
     logs = client.get(f"{API}/audit-logs", headers=admin_headers).json()
@@ -23,7 +26,7 @@ def test_create_is_audited(client, admin_headers):
 def test_update_is_audited_with_changes(client, admin_headers, property_id):
     client.patch(f"{API}/properties/{property_id}", json={"city": "Taguig"}, headers=admin_headers)
     logs = client.get(f"{API}/audit-logs", headers=admin_headers).json()
-    update_log = next(l for l in logs if l["action"] == "update")
+    update_log = next(log for log in logs if log["action"] == "update")
     assert update_log["changed_fields"] == {"city": ["Pasay", "Taguig"]}
 
 
@@ -43,7 +46,7 @@ def test_confirm_action_is_audited(client, admin_headers, lease_id):
     logs = client.get(
         f"{API}/audit-logs?table_name=incomes&record_id={income_id}", headers=admin_headers
     ).json()
-    assert [l["action"] for l in logs] == ["confirm", "create"]
+    assert [log["action"] for log in logs] == ["confirm", "create"]
 
 
 def test_audit_logs_admin_only(client, manager_headers):
@@ -51,8 +54,8 @@ def test_audit_logs_admin_only(client, manager_headers):
     assert resp.status_code == 403
 
 
-def test_audit_logs_filter(client, admin_headers):
-    _create_property(client, admin_headers)
+def test_audit_logs_filter(client, admin_headers, db_session):
+    _create_property(client, admin_headers, db_session)
     client.post(
         f"{API}/incomes",
         json={"amount": "500.00", "received_date": "2026-04-01", "status": "pending"},
@@ -60,4 +63,4 @@ def test_audit_logs_filter(client, admin_headers):
     )
     logs = client.get(f"{API}/audit-logs?table_name=properties", headers=admin_headers).json()
     assert len(logs) == 1
-    assert all(l["table_name"] == "properties" for l in logs)
+    assert all(log["table_name"] == "properties" for log in logs)

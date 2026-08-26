@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import sessionmaker
 
 from app.api.routers import operations as ops_router
+from app.models.membership import Membership, MembershipState, OrganizationRole
 from app.models.operations import OperationalTask, OperationalTaskStatus, OperationalTaskType
 from app.models.user import User, UserRole
 from app.schemas.operations import TaskFollowupDeliveryIn
@@ -29,6 +30,8 @@ def _user(db, username: str, role: UserRole, telegram_chat_id: str | None = None
 
 
 def _task(db, *, assigned_user_id=None) -> OperationalTask:
+    from tests.conftest import seed_property
+    _p = seed_property(db)
     task = OperationalTask(
         task_type=OperationalTaskType.FOLLOWUP,
         title="Rent follow-up",
@@ -37,6 +40,7 @@ def _task(db, *, assigned_user_id=None) -> OperationalTask:
         assigned_user_id=assigned_user_id,
         status=OperationalTaskStatus.PENDING,
         due_at=NOW,
+        property_id=_p.id,
     )
     db.add(task)
     db.commit()
@@ -67,6 +71,16 @@ class _FailOnceSender:
 def test_followup_delivery_concurrent_single_send(db_session, test_engine, monkeypatch, admin):
     actor = db_session.get(User, admin[0].id)
     assignee = _user(db_session, "sec-005b", UserRole.agent, telegram_chat_id="tg-sec-005b")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     payload = TaskFollowupDeliveryIn(
         assignee_user_id=assignee.id,
@@ -84,8 +98,14 @@ def test_followup_delivery_concurrent_single_send(db_session, test_engine, monke
         db = Session()
         try:
             local_actor = db.get(User, actor.id)
+            local_membership = db.query(Membership).filter(
+                Membership.user_id == local_actor.id,
+                Membership.state == MembershipState.ACTIVE,
+                Membership.role.in_([OrganizationRole.OWNER, OrganizationRole.SECRETARY]),
+                Membership.removed_at.is_(None),
+            ).first()
             barrier.wait(timeout=20)
-            ops_router.deliver_task_followup(task.id, payload, db=db, user=local_actor)
+            ops_router.deliver_task_followup(task.id, payload, db=db, user=local_actor, membership=local_membership)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
         finally:
@@ -106,20 +126,36 @@ def test_followup_delivery_concurrent_single_send(db_session, test_engine, monke
 
 def test_followup_delivery_failure_then_retry(db_session, monkeypatch, admin):
     actor = db_session.get(User, admin[0].id)
+    membership = db_session.query(Membership).filter(
+        Membership.user_id == actor.id,
+        Membership.state == MembershipState.ACTIVE,
+        Membership.role.in_([OrganizationRole.OWNER, OrganizationRole.SECRETARY]),
+        Membership.removed_at.is_(None),
+    ).first()
     assignee = _user(db_session, "sec-005b-fail", UserRole.agent, telegram_chat_id="tg-sec-005b-fail")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     payload = TaskFollowupDeliveryIn(assignee_user_id=assignee.id, message="Retry me", reply_markup=None)
     sender = _FailOnceSender()
     monkeypatch.setattr(ops_router, "_build_notification_sender", lambda db: sender)
 
-    first = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor)
+    first = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor, membership=membership)
     assert first.delivery_state == "FAILED"
     db_session.refresh(task)
     assert task.assigned_user_id is None
     assert (task.details or {}).get("assigned_to") is None
     assert task.status == OperationalTaskStatus.PENDING
 
-    second = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor)
+    second = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor, membership=membership)
     assert second.delivery_state == "DELIVERED"
     db_session.refresh(task)
     assert task.assigned_user_id == assignee.id
@@ -129,14 +165,30 @@ def test_followup_delivery_failure_then_retry(db_session, monkeypatch, admin):
 
 def test_followup_delivery_sequential_duplicate_no_resend(db_session, monkeypatch, admin):
     actor = db_session.get(User, admin[0].id)
+    membership = db_session.query(Membership).filter(
+        Membership.user_id == actor.id,
+        Membership.state == MembershipState.ACTIVE,
+        Membership.role.in_([OrganizationRole.OWNER, OrganizationRole.SECRETARY]),
+        Membership.removed_at.is_(None),
+    ).first()
     assignee = _user(db_session, "sec-005b-seq", UserRole.agent, telegram_chat_id="tg-sec-005b-seq")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     payload = TaskFollowupDeliveryIn(assignee_user_id=assignee.id, message="Only once", reply_markup=None)
     sent: list[tuple] = []
     monkeypatch.setattr(ops_router, "_build_notification_sender", lambda db: _SharedSender(sent))
 
-    first = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor)
-    second = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor)
+    first = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor, membership=membership)
+    second = ops_router.deliver_task_followup(task.id, payload, db=db_session, user=actor, membership=membership)
 
     assert first.delivery_state == "DELIVERED"
     assert second.delivery_state == "ALREADY_DELIVERED"
@@ -145,7 +197,23 @@ def test_followup_delivery_sequential_duplicate_no_resend(db_session, monkeypatc
 
 def test_followup_delivery_retry_refreshes_render_payload(db_session, monkeypatch, admin):
     actor = db_session.get(User, admin[0].id)
+    membership = db_session.query(Membership).filter(
+        Membership.user_id == actor.id,
+        Membership.state == MembershipState.ACTIVE,
+        Membership.role.in_([OrganizationRole.OWNER, OrganizationRole.SECRETARY]),
+        Membership.removed_at.is_(None),
+    ).first()
     assignee = _user(db_session, "sec-005c-render", UserRole.agent, telegram_chat_id="tg-sec-005c")
+    from tests.conftest import ensure_default_org
+    default_org = ensure_default_org(db_session)
+    db_session.add(Membership(
+        organization_id=default_org.id,
+        user_id=assignee.id,
+        role=OrganizationRole.SECRETARY,
+        state=MembershipState.ACTIVE,
+        removed_at=None,
+    ))
+    db_session.commit()
     task = _task(db_session)
     first_payload = TaskFollowupDeliveryIn(
         assignee_user_id=assignee.id,
@@ -169,9 +237,9 @@ def test_followup_delivery_retry_refreshes_render_payload(db_session, monkeypatc
 
     monkeypatch.setattr(ops_router, "_build_notification_sender", lambda db: _MixedSender())
 
-    first = ops_router.deliver_task_followup(task.id, first_payload, db=db_session, user=actor)
+    first = ops_router.deliver_task_followup(task.id, first_payload, db=db_session, user=actor, membership=membership)
     assert first.delivery_state == "FAILED"
-    second = ops_router.deliver_task_followup(task.id, second_payload, db=db_session, user=actor)
+    second = ops_router.deliver_task_followup(task.id, second_payload, db=db_session, user=actor, membership=membership)
     assert second.delivery_state == "DELIVERED"
     assert sent
     assert "Rent collection follow-up" in sent[-1][1]

@@ -28,10 +28,18 @@ from app.services.identity import bind_internal_audit
 logger = logging.getLogger(__name__)
 
 
-def claim_due_rules(db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_BATCH) -> list[RecurringRule]:
+def claim_due_rules(
+    db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_BATCH,
+    org_id: int | None = None,
+) -> list[RecurringRule]:
     """Claim enabled rules that are due. SKIP LOCKED: concurrent workers each
     claim a disjoint set; a crashed worker's uncommitted claims are released
-    automatically and picked up again on the next pass."""
+    automatically and picked up again on the next pass.
+
+    ``org_id`` fail-closes the rule scan to the caller's organization scope
+    via RecurringRule.property_id → organization-owned properties (empty set
+    collapses to id==-1, never full-table).
+    """
     stmt = (
         select(RecurringRule)
         .where(
@@ -43,20 +51,35 @@ def claim_due_rules(db: Session, *, now: datetime, batch: int = SCHEDULER_RULE_B
         .limit(batch)
         .with_for_update(skip_locked=True)
     )
+    if org_id is not None:
+        from app.services.operations.summary import _org_property_ids
+        pids = _org_property_ids(db, org_id)
+        if pids:
+            stmt = stmt.where(RecurringRule.property_id.in_(list(pids)))
+        else:
+            stmt = stmt.where(RecurringRule.id == -1)
     return list(db.execute(stmt).scalars())
 
 
-def run_scheduler_once(db: Session, *, now: datetime | None = None) -> SchedulerRunResult:
+def run_scheduler_once(
+    db: Session, *, now: datetime | None = None,
+    org_id: int | None = None,
+) -> SchedulerRunResult:
     """Run one full scheduler pass and commit. Returns a result summary.
 
     Order matters for snooze safety: reconcile settles stale PENDING tasks
     BEFORE the snooze redelivery scan, so a task that reconcile completed or
     cancelled in the same pass is never redelivered (the scan only selects
     tasks still PENDING after reconciliation).
+
+    ``org_id`` scopes rule-claim and downstream generation/reconciliation to
+    the resolved organization (fail-closed for the on-demand HTTP endpoint;
+    the standalone worker passes None and scans globally, as it owns all
+    tenants).
     """
     now = now or datetime.now(timezone.utc)
     bind_internal_audit(db, "scheduler")
-    rules = claim_due_rules(db, now=now)
+    rules = claim_due_rules(db, now=now, org_id=org_id)
     tasks_created = 0
     notifications_enqueued = 0
     for rule in rules:
@@ -64,29 +87,29 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
         tasks_created += 1
         notifications_enqueued += 1 if enqueued else 0
 
-    biz_created, biz_notif = generate_business_tasks(db, now=now)
+    biz_created, biz_notif = generate_business_tasks(db, now=now, org_id=org_id)
     tasks_created += biz_created
     notifications_enqueued += biz_notif
 
     bind_internal_audit(db, "reconcile")
-    auto_completed, auto_cancelled = reconcile_tasks(db, now=now)
+    auto_completed, auto_cancelled = reconcile_tasks(db, now=now, org_id=org_id)
 
     bind_internal_audit(db, "scheduler")
-    snooze_redelivered = redeliver_due_snoozes(db, now=now)
+    snooze_redelivered = redeliver_due_snoozes(db, now=now, org_id=org_id)
 
     # AI-OPS-FOUNDATION-001 §8: due human promises are reminded / escalated
     # deterministically AFTER reconcile (a resolved business state is never
     # re-reminded; reconcile already COMPLETED its task).
     from app.services.operations.promises import escalate_due_promises
 
-    promise_result = escalate_due_promises(db, now=now)
+    promise_result = escalate_due_promises(db, now=now, org_id=org_id)
 
     # PASAY-AI-EMPLOYEE-FOUNDATION-007 §17.2: at the promised date, a payment
     # promise is auto-fulfilled if payment arrived, else a Secretary follow-up
     # is re-created (no one keeps the calendar in their head).
     from app.services.operations.promises import check_due_payment_promises
 
-    payment_promise_result = check_due_payment_promises(db, now=now)
+    payment_promise_result = check_due_payment_promises(db, now=now, org_id=org_id)
 
     # AI-OPS-FOUNDATION-001 §19: deterministic exception hooks (repeated
     # repair / long vacancy / occupied-missing-lease / unusual expense) —
@@ -94,7 +117,7 @@ def run_scheduler_once(db: Session, *, now: datetime | None = None) -> Scheduler
     try:
         from app.services.operations.exceptions import scan_exceptions
 
-        exceptions_found = scan_exceptions(db, now=now)
+        exceptions_found = scan_exceptions(db, now=now, org_id=org_id)
     except Exception:  # noqa: BLE001 - exception scan must never break the pass
         logger.exception("exception scan failed")
         exceptions_found = []

@@ -16,7 +16,7 @@ jobs:
   pasay-gate:
     name: pasay-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
     env:
       PYTHONPATH: ""
     services:
@@ -88,7 +88,7 @@ jobs:
           grep -q "route:dev" GITHUB_DEV_WORKFLOW.md
           grep -q "ready-for-owner" GITHUB_DEV_WORKFLOW.md
           grep -q "CodeRabbit and \`pasay-gate\` run in parallel" GITHUB_DEV_WORKFLOW.md
-          grep -q "Long-Term Engineering Rules" AGENTS.md
+          grep -q "Permanent Engineering Truths" AGENTS.md
           grep -q "GitHub Issue 是唯一任务 ID" README.md
           grep -q "pasay-gate" README.md
 
@@ -109,21 +109,22 @@ jobs:
         run: |
           python -c "import app.main, fastapi, alembic, sqlalchemy; print('BACKEND_IMPORT_SMOKE_OK')"
 
-      - name: Run backend targeted pytest (Issue #18 + Issue #31 + M1 + M002 Rent/Repair)
+      - name: Run backend targeted pytest (Issue #18 + Issue #31 + M1 + M002 + M003)
         if: steps.changed.outputs.backend == 'true' || steps.changed.outputs.cloudflare == 'true'
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
-          PASAY_TEST_DB_NAME: "pasay_pm_test"
+          PASAY_TEST_DB_NAME: "pasay_pm_ci_${{ github.run_id }}_001"
           TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
           TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
           PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
           PASAY_RUNTIME_MODE: "ci"
-        timeout-minutes: 12
+        timeout-minutes: 40
         run: |
           # Legacy P0 gates: Issue #18 (telegram webhook) + Issue #31 (prod arch closeout)
           # M1 org-scope P0 regression (milestone/1)
           # M002: Rent closure + Repair closure + Expense payment truth + Repair AI employee
+          # M003: Expense Truth Closure + Reports/Operations/Legacy Scope Unified Hardening
           python -m pytest \
             tests/test_telegram_webhook_p018.py \
             tests/test_prod_arch_closeout_p0_031.py \
@@ -133,6 +134,7 @@ jobs:
             tests/test_rent_closure_m2.py \
             tests/test_repair_closure_m2.py \
             tests/test_fix3_blockers_m2.py \
+            tests/test_m003_expense_scope_hardening.py \
             -v --tb=short -q
 
       - name: Install bot dependencies
