@@ -16,6 +16,14 @@ TEAM_NAME = os.environ.get("PASAY_WATCHDOG_TEAM", "pasay-engineering")
 STALL_POLLS = int(os.environ.get("PASAY_WATCHDOG_STALL_POLLS", "6"))
 DRY_RUN = os.environ.get("PASAY_WATCHDOG_DRY_RUN", "1") != "0"
 CONTAINER_CMD = os.environ.get("PASAY_WATCHDOG_CONTAINER_CMD", "docker")
+TEAM_WORKERS = (
+    "pasay-lead",
+    "pasay-auditor",
+    "pasay-builder",
+    "pasay-qa",
+    "pasay-reviewer",
+    "pasay-brake",
+)
 STATE_PATH = pathlib.Path(
     os.environ.get(
         "PASAY_WATCHDOG_STATE",
@@ -118,7 +126,24 @@ def pause_project(project_id: str, reason: str) -> None:
         print(f"WATCHDOG_DRY_RUN project={project_id} reason={reason}")
         return
     run_agt(["project", "pause", project_id, "--reason", reason])
+    pause_team_workers()
     print(f"WATCHDOG_PAUSED project={project_id} reason={reason}")
+
+
+def pause_team_workers() -> None:
+    """Freeze only PASAY Worker containers to stop in-flight token use."""
+    for worker in TEAM_WORKERS:
+        container = f"agentteams-worker-{worker}"
+        completed = subprocess.run(
+            [CONTAINER_CMD, "pause", container],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if completed.returncode not in (0,):
+            message = completed.stderr.strip() or "container pause failed"
+            print(f"WATCHDOG_CONTAINER_WARNING container={container} error={message}")
 
 
 def main() -> int:
