@@ -1,0 +1,154 @@
+name: deploy-agentteams-gx10
+
+on:
+  pull_request:
+    branches:
+      - milestone/4-lease-moveout-closure
+    types: [opened, synchronize, reopened]
+    paths:
+      - .github/workflows/deploy-agentteams-gx10.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-agentteams-gx10
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: gx10-deploy
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.number == 44
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 60
+    env:
+      GX10_HOST: 192.168.50.42
+      GX10_USER: cunzhang
+      PASAY_GITHUB_MCP_URL: ${{ secrets.PASAY_GITHUB_MCP_URL }}
+    steps:
+      - name: Checkout deployment candidate
+        uses: actions/checkout@v4
+
+      - name: Verify Mac runner to GX10 bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${RUNNER_OS}" = "macOS"
+          ssh -o BatchMode=yes -o ConnectTimeout=10 -o ConnectionAttempts=1             -o StrictHostKeyChecking=yes "${GX10_USER}@${GX10_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          command -v docker >/dev/null
+          command -v curl >/dev/null
+          command -v python3 >/dev/null
+          docker ps >/dev/null
+          model_json="$(mktemp)"
+          trap 'rm -f -- "${model_json}"' EXIT
+          curl --fail --silent --show-error http://127.0.0.1:8002/v1/models > "${model_json}"
+          python3 - "${model_json}" <<'PY'
+          import json
+          import pathlib
+          import sys
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          models = payload.get("data", [])
+          if not models or not models[0].get("id"):
+              raise SystemExit("GX10 vLLM endpoint returned no model id")
+          print("GX10_MODEL_READY", models[0]["id"])
+          PY
+          REMOTE
+
+      - name: Copy PASAY AgentTeams bundle to GX10
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C "${GITHUB_WORKSPACE}" -czf - ops/agentteams |             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes               "${GX10_USER}@${GX10_HOST}"               'install -d -m 0755 "$HOME/.local/src/pasay-agentteams" && tar -xzf - -C "$HOME/.local/src/pasay-agentteams" --strip-components=2'
+
+      - name: Install pinned AgentTeams control plane
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes             "${GX10_USER}@${GX10_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          config_dir="${HOME}/.config/pasay-agentteams"
+          install -d -m 0700 "${config_dir}"
+          password_file="${config_dir}/admin-password"
+          if [ ! -s "${password_file}" ]; then
+            umask 077
+            python3 - <<'PY' > "${password_file}"
+          import secrets
+          print(secrets.token_urlsafe(32))
+          PY
+          fi
+          model_id="$(curl --fail --silent --show-error http://127.0.0.1:8002/v1/models | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
+          installer="$(mktemp)"
+          trap 'rm -f -- "${installer}"' EXIT
+          curl --fail --silent --show-error --location             https://raw.githubusercontent.com/agentscope-ai/AgentTeams/v1.2.3/install/agentteams-install.sh             --output "${installer}"
+          export AGENTTEAMS_NON_INTERACTIVE=1
+          export AGENTTEAMS_LLM_PROVIDER=openai-compat
+          export AGENTTEAMS_DEFAULT_MODEL="${model_id}"
+          export AGENTTEAMS_OPENAI_BASE_URL="http://192.168.50.42:8002/v1"
+          export AGENTTEAMS_LLM_API_KEY=local-gx10-no-auth
+          export AGENTTEAMS_ADMIN_USER=admin
+          export AGENTTEAMS_ADMIN_PASSWORD
+          AGENTTEAMS_ADMIN_PASSWORD="$(cat "${password_file}")"
+          export AGENTTEAMS_VERSION=v1.2.3
+          export AGENTTEAMS_MOUNT_SOCKET=1
+          export AGENTTEAMS_DASHBOARD=1
+          if ! docker ps --format '{{.Names}}' | grep -qx agentteams-manager; then
+            bash "${installer}" manager
+          fi
+          docker ps --format '{{.Names}}' | grep -qx agentteams-manager
+          printf '%s\n' CONTROL_PLANE_READY > "${HOME}/.local/src/pasay-agentteams/DEPLOYMENT_STATUS"
+          REMOTE
+
+      - name: Apply PASAY team and watchdog
+        if: env.PASAY_GITHUB_MCP_URL != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${PASAY_GITHUB_MCP_URL}" |             ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes               "${GX10_USER}@${GX10_HOST}"               'umask 077; cat > "$HOME/.config/pasay-agentteams/github-mcp-url"'
+          ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes             "${GX10_USER}@${GX10_HOST}" 'bash -s' <<'REMOTE'
+          set -euo pipefail
+          src="${HOME}/.local/src/pasay-agentteams"
+          model_id="$(curl --fail --silent --show-error http://127.0.0.1:8002/v1/models | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
+          mcp_url="$(cat "${HOME}/.config/pasay-agentteams/github-mcp-url")"
+          rendered="$(mktemp)"
+          apply_script="$(mktemp)"
+          trap 'rm -f -- "${rendered}" "${apply_script}"' EXIT
+          python3 - "${src}/pasay-team.yaml.tpl" "${rendered}" "${model_id}" "${mcp_url}" <<'PY'
+          import pathlib
+          import sys
+          source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+          source = source.replace("__PASAY_AGENT_MODEL__", sys.argv[3])
+          source = source.replace("__PASAY_GITHUB_MCP_URL__", sys.argv[4])
+          if "__PASAY_" in source:
+              raise SystemExit("unresolved PASAY template placeholder")
+          pathlib.Path(sys.argv[2]).write_text(source, encoding="utf-8")
+          PY
+          curl --fail --silent --show-error --location             https://raw.githubusercontent.com/agentscope-ai/AgentTeams/v1.2.3/install/agentteams-apply.sh             --output "${apply_script}"
+          AGENTTEAMS_CONTAINER_CMD=docker bash "${apply_script}" -f "${rendered}"
+          PASAY_WATCHDOG_CONTAINER_CMD=docker bash "${src}/install-watchdog.sh"
+          docker exec agentteams-manager agt get workers pasay-builder -o json >/dev/null
+          docker exec agentteams-manager agt get teams pasay-engineering -o json >/dev/null
+          printf '%s\n' PASAY_AGENTTEAMS_READY > "${src}/DEPLOYMENT_STATUS"
+          REMOTE
+
+      - name: Report missing GitHub MCP route
+        if: env.PASAY_GITHUB_MCP_URL == ''
+        shell: bash
+        run: |
+          echo "::warning::AgentTeams control plane was installed, but PASAY workers were not applied because repository secret PASAY_GITHUB_MCP_URL is absent."
+          {
+            echo "### GX10 deployment"
+            echo
+            echo "- Control plane: installed"
+            echo "- Local vLLM: reachable"
+            echo "- PASAY team: blocked only by PASAY_GITHUB_MCP_URL"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Smoke check web endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --max-time 20 "http://${GX10_HOST}:18088/" >/dev/null
+          curl --fail --silent --show-error --max-time 20 "http://${GX10_HOST}:13000/" >/dev/null
+          ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes             "${GX10_USER}@${GX10_HOST}"             'cat "$HOME/.local/src/pasay-agentteams/DEPLOYMENT_STATUS"'
