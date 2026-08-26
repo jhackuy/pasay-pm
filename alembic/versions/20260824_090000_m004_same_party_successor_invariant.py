@@ -96,9 +96,22 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint(
-        "fk_leases_superseded_same_party", "leases", type_="foreignkey"
-    )
-    op.drop_constraint(
-        "uq_leases_id_unit_tenant", "leases", type_="unique"
-    )
+    # Idempotent IF-EXISTS safety for disposable / partially-prepared DBs
+    # where the original migration was never run; drop_constraint would
+    # otherwise fail-fast. Real production DOWNGRADE always finds the
+    # constraints because upgrade() created them on COMMIT.
+    from sqlalchemy.engine import reflection
+
+    bind = op.get_bind()
+    insp = reflection.Inspector.from_engine(bind)
+    existing_fks = {fk["name"] for fk in insp.get_foreign_keys("leases")}
+    existing_uqs = {uq["name"] for uq in insp.get_unique_constraints("leases")}
+
+    if "fk_leases_superseded_same_party" in existing_fks:
+        op.drop_constraint(
+            "fk_leases_superseded_same_party", "leases", type_="foreignkey"
+        )
+    if "uq_leases_id_unit_tenant" in existing_uqs:
+        op.drop_constraint(
+            "uq_leases_id_unit_tenant", "leases", type_="unique"
+        )
