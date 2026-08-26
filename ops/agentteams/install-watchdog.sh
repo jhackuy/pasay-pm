@@ -22,6 +22,7 @@ command -v systemctl >/dev/null 2>&1 || {
 
 install -d -m 0755 "${INSTALL_DIR}" "${UNIT_DIR}"
 install -m 0755 "${SCRIPT_DIR}/watchdog.py" "${INSTALL_DIR}/watchdog.py"
+install -m 0755 "${SCRIPT_DIR}/resume-project.sh" "${INSTALL_DIR}/resume-project.sh"
 
 sed "s/PASAY_WATCHDOG_CONTAINER_CMD=docker/PASAY_WATCHDOG_CONTAINER_CMD=${WATCHDOG_CONTAINER_CMD}/" \
   "${SCRIPT_DIR}/systemd/pasay-agentteams-watchdog.service" \
