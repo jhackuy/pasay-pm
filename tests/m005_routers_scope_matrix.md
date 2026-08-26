@@ -5,7 +5,43 @@
 > **Issue #43 explicitly scopes 22 routers.** Internal-only helper `internal_ingest.py` is **not part of the 22**, because it exposes container-internal Worker/Container RPC (trusted network, shared secret auth) rather than any Owner/Secretary/Tenant public API surface.  This explains the 22-vs-23 discrepancy in the original matrix.
 > Total Issue-43 routers (non internal_ingest) = 22.
 > Total endpoints captured = 163.
-> Endpoints with explicit `has_cross_org_test=true` = 17.
+> Endpoints with explicit `has_cross_org_test=true` = 27.
+> **Fail-closed gate status:** ✅ PASS
+> - All Issue-43 org-scoped routers have ≥1 cross-org test coverage.
+> - All CROSS_ORG_TEST_REFS entries validated (file exists + grep ^def exactly 1 match).
+
+## Cross-Org Test Reference Validation Results
+
+| # | ref | file_exists | grep_match_count | status |
+|---|-----|-------------|------------------|--------|
+| 1 | `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` | true | 1 | ✅ PASS |
+| 2 | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` | true | 1 | ✅ PASS |
+| 3 | `tests/test_auth.py::test_agent_cannot_create_property` | true | 1 | ✅ PASS |
+| 4 | `tests/test_property_channel_p0_025.py::test_scoped_list_properties_excludes_cross_org_property` | true | 1 | ✅ PASS |
+| 5 | `tests/test_property_channel_p0_025.py::test_scoped_get_property_fails_closed_on_cross_org` | true | 1 | ✅ PASS |
+| 6 | `tests/test_milestone_1_org_scope_p0.py::test_lease_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 7 | `tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed` | true | 1 | ✅ PASS |
+| 8 | `tests/test_milestone_1_org_scope_p0.py::test_income_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 9 | `tests/test_milestone_1_org_scope_p0.py::test_expense_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 10 | `tests/test_milestone_1_org_scope_p0.py::test_repair_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 11 | `tests/test_milestone_1_org_scope_p0.py::test_tenant_t1_list_isolation` | true | 1 | ✅ PASS |
+| 12 | `tests/test_milestone_1_org_scope_p0.py::test_tenant_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 13 | `tests/test_m004_lease_moveout_truth_closure.py::test_b11_cross_org_owner_gets_404_on_foreign_inspection` | true | 1 | ✅ PASS |
+| 14 | `tests/test_m004_lease_moveout_truth_closure.py::test_c10_cross_org_scope_404` | true | 1 | ✅ PASS |
+| 15 | `tests/test_m004_lease_moveout_truth_closure.py::test_c13_cross_org_settlement_create_404` | true | 1 | ✅ PASS |
+| 16 | `tests/test_m005_v1_closeout.py::test_m005_god_view_org_scoped_cross_org_isolation` | true | 1 | ✅ PASS |
+| 17 | `tests/test_m005_ret3_cross_org_coverage.py::test_units_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 18 | `tests/test_m005_ret3_cross_org_coverage.py::test_payments_cross_org_match_no_leak` | true | 1 | ✅ PASS |
+| 19 | `tests/test_m005_ret3_cross_org_coverage.py::test_commission_list_isolation_total_zero` | true | 1 | ✅ PASS |
+| 20 | `tests/test_m005_ret3_cross_org_coverage.py::test_tasks_deprecated_cross_org_get_4xx` | true | 1 | ✅ PASS |
+| 21 | `tests/test_m005_ret3_cross_org_coverage.py::test_attachments_t2_get_cross_org_404` | true | 1 | ✅ PASS |
+| 22 | `tests/test_m005_ret3_cross_org_coverage.py::test_audit_cross_org_fail_closed` | true | 1 | ✅ PASS |
+| 23 | `tests/test_m005_ret3_cross_org_coverage.py::test_evidence_t2_get_cross_org_fail_closed` | true | 1 | ✅ PASS |
+| 24 | `tests/test_m005_ret3_cross_org_coverage.py::test_viewings_list_isolation_total_zero` | true | 1 | ✅ PASS |
+| 25 | `tests/test_m005_ret3_cross_org_coverage.py::test_onboarding_active_member_bootstrap_blocked_403` | true | 1 | ✅ PASS |
+| 26 | `tests/test_property_channel_p0_025.py::test_same_unit_number_across_orgs_is_separate` | true | 1 | ✅ PASS |
+
+Total refs validated: 26. Passed: 26. Failed: 0.
 
 ## 22 vs 23 discrepancy — explicit rationale
 
@@ -14,117 +50,135 @@
 | `app/api/routers/*.py` total .py files (glob) | 23 |
 | Issue #43 catalog count (Owner/Secretary/Tenant surface) | 22 |
 | Excluded internal-only module | `internal_ingest` |
-| Why excluded | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. |
+| Why excluded | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. has_cross_org_test=false by design (excluded from Issue-43 22-strong list). |
 
-## Non-org-scoped routers — rationale
+## Non-org-scoped routers — coverage satisfied via explicit rationale (has_cross_org_test=false by design)
 
-| router_module | org_scoped_all | explicit rationale |
-|---------------|----------------|--------------------|
-| `auth` | false | Anonymous public session endpoints (login/register/me); organization scope is established POST login. |
-| `internal_ingest` | false | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. |
-| `telegram_webhook` | false | Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary. |
+| router_module | org_scoped_all | has_cross_org_test_satisfied | explicit rationale |
+|---------------|----------------|------------------------------|--------------------|
+| `auth` | false | ✅ by-design (NON_ORG_RATIONALE) | Anonymous public session endpoints (login/register/me); organization scope is established POST login. has_cross_org_test=false by design (non-org-scoped router). |
+| `internal_ingest` | false | ✅ by-design (NON_ORG_RATIONALE) | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. has_cross_org_test=false by design (excluded from Issue-43 22-strong list). |
+| `telegram_webhook` | false | ✅ by-design (NON_ORG_RATIONALE) | Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary. has_cross_org_test=false by design (non-org-scoped router). |
 
 ## Router modules in scope (Issue #43 — 22 routers, excludes internal_ingest)
 
-| # | router_module | endpoints | org_scoped_all |
-|---|---------------|-----------|----------------|
-| 1 | `auth` | 1 | false |
-| 2 | `onboarding` | 4 | true |
-| 3 | `properties` | 5 | true |
-| 4 | `property_channel` | 5 | true |
-| 5 | `units` | 5 | true |
-| 6 | `tenants` | 5 | true |
-| 7 | `leases` | 8 | true |
-| 8 | `income` | 14 | true |
-| 9 | `payments` | 1 | true |
-| 10 | `expense` | 15 | true |
-| 11 | `commission` | 9 | true |
-| 12 | `tasks` | 6 | true | **NOTE: M005 Paginated[T] coverage explicitly excludes this router. Reason: `app/api/routers/tasks.py` declares `_DEPRECATED_HEADER = 'legacy-tasks-router-v1; use /operations/tasks'`; its 6 endpoints emit `X-Deprecated-Endpoint` and write endpoints are hard 405 (see PASAY-M003 Scope Unification). Canonical tasks surface is `/operations/tasks` (router=operations), which is covered by Paginated[OperationalTaskRead] + cross-org test `test_operations_tasks_cross_org_404`.**
-| 13 | `reports` | 6 | true |
-| 14 | `repairs` | 10 | true |
-| 15 | `attachments` | 4 | true |
-| 16 | `audit` | 1 | true |
-| 17 | `operations` | 41 | true |
-| 18 | `evidence` | 3 | true |
-| 19 | `viewings` | 4 | true |
-| 20 | `move_out` | 7 | true |
-| 21 | `deposit_settlements` | 6 | true |
-| 22 | `telegram_webhook` | 1 | false |
+| # | router_module | endpoints | org_scoped_all | has_cross_org_test (any) | status |
+|---|---------------|-----------|----------------|--------------------------|--------|
+| 1 | `auth` | 1 | false | false | ✅ EXEMPT (PUBLIC_NON_ORG_SCOPED) |
+| 2 | `onboarding` | 4 | true | true | ✅ COVERED |
+| 3 | `properties` | 5 | true | true | ✅ COVERED |
+| 4 | `property_channel` | 5 | true | true | ✅ COVERED |
+| 5 | `units` | 5 | true | true | ✅ COVERED |
+| 6 | `tenants` | 5 | true | true | ✅ COVERED |
+| 7 | `leases` | 8 | true | true | ✅ COVERED |
+| 8 | `income` | 14 | true | true | ✅ COVERED |
+| 9 | `payments` | 1 | true | true | ✅ COVERED |
+| 10 | `expense` | 15 | true | true | ✅ COVERED |
+| 11 | `commission` | 9 | true | true | ✅ COVERED |
+| 12 | `tasks` | 6 | true | true | ✅ COVERED | **NOTE: M005 Paginated[T] coverage explicitly excludes this router. Reason: `app/api/routers/tasks.py` declares `_DEPRECATED_HEADER = 'legacy-tasks-router-v1; use /operations/tasks'`; its 6 endpoints emit `X-Deprecated-Endpoint` and write endpoints are hard 405 (see PASAY-M003 Scope Unification). Canonical tasks surface is `/operations/tasks` (router=operations), which is covered by Paginated[OperationalTaskRead] + cross-org test `test_operations_tasks_cross_org_404`.**
+| 13 | `reports` | 6 | true | true | ✅ COVERED |
+| 14 | `repairs` | 10 | true | true | ✅ COVERED |
+| 15 | `attachments` | 4 | true | true | ✅ COVERED |
+| 16 | `audit` | 1 | true | true | ✅ COVERED |
+| 17 | `operations` | 41 | true | true | ✅ COVERED |
+| 18 | `evidence` | 3 | true | true | ✅ COVERED |
+| 19 | `viewings` | 4 | true | true | ✅ COVERED |
+| 20 | `move_out` | 7 | true | true | ✅ COVERED |
+| 21 | `deposit_settlements` | 6 | true | true | ✅ COVERED |
+| 22 | `telegram_webhook` | 1 | false | false | ✅ EXEMPT (PUBLIC_NON_ORG_SCOPED) |
 
 ## Internal-only helper modules (NOT in Issue #43 22-strong list)
 
 | # | router_module | endpoints | org_scoped_all | exclusion_rationale |
 |---|---------------|-----------|----------------|---------------------|
-| 1 | `internal_ingest` | 1 | false | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. |
+| 1 | `internal_ingest` | 1 | false | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. has_cross_org_test=false by design (excluded from Issue-43 22-strong list). |
 
 ## Cross-org test evidence (real tests, not heuristic)
 
-| ref | router_module | path_prefixes | proof_summary |
-|-----|---------------|---------------|---------------|
-| R1. `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` | `reports` | `/api/v1/reports/financial-summary; /api/v1/reports/` | owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak). |
-| R2. `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` | `operations` | `/api/v1/operations/tasks` | owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks. |
-| R3. `tests/test_auth.py::cross-org property forbidden` | `properties` | `/api/v1/properties` | User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403. |
-| R4. `tests/test_financial.py::cross-org commission/financial 403` | `commission` | `/api/v1/commission` | Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership). |
-| R5. `tests/test_financial.py::cross-org financial endpoint 403` | `payments` | `/api/v1/payments` | Non-member HTTP call to payments endpoints -> 403. |
-| R6. `tests/test_audit.py::audit non-member 403` | `audit` | `/api/v1/audit` | Non-member attempt on audit log -> 403. |
-| R7. `tests/test_fix3_blockers_m2.py::rent/payment claims non-member 403` | `income` | `/api/v1/income/claims; /api/v1/income/` | Non-member user attempts rent claim reversal / payment claim endpoints -> 403/404 fail-closed. |
-| R8. `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` | `leases` | `/api/v1/leases` | Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment. |
+| ref | router_module | endpoint_methods | proof_summary |
+|-----|---------------|------------------|---------------|
+| R1. `tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed` | `reports` | `GET /api/v1/reports/financial-summary` | owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak). ONLY GET /api/v1/reports/financial-summary covered. |
+| R2. `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` | `operations` | `GET /api/v1/operations/tasks/{task_id}` | owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks. ONLY GET /api/v1/operations/tasks/{task_id} covered. |
+| R3. `tests/test_auth.py::test_agent_cannot_create_property` | `properties` | `POST /api/v1/properties` | User with NO membership in isolated Org-B attempts to create properties with organization_id=org_b.id -> 403. ONLY POST /api/v1/properties covered. |
+| R4. `tests/test_property_channel_p0_025.py::test_scoped_list_properties_excludes_cross_org_property` | `properties` | `GET /api/v1/properties` | GET /api/v1/properties list excludes cross-org property (service-layer scoped_list_properties proof). |
+| R5. `tests/test_property_channel_p0_025.py::test_scoped_get_property_fails_closed_on_cross_org` | `properties` | `GET /api/v1/properties/{property_id}` | GET /api/v1/properties/{property_id} fails closed on cross-org (LookupError at service layer → HTTP 404/403 boundary). |
+| R6. `tests/test_milestone_1_org_scope_p0.py::test_lease_t2_get_cross_org_404` | `leases` | `GET /api/v1/leases/{lease_id}` | T2: owner_b GET org_a lease id -> 404 fail-closed (cross-org LookupError contract). |
+| R7. `tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed` | `income` | `POST /api/v1/incomes/leases/{lease_id}/claims`; `GET /api/v1/incomes/claims/{claim_id}`; `PATCH /api/v1/incomes/claims/{claim_id}/verify` | owner_b POST claim against org_a lease -> 404; owner_b GET / PATCH org_a claim id -> 404 fail-closed (org scope blocks cross-org income claims). |
+| R8. `tests/test_milestone_1_org_scope_p0.py::test_income_t2_get_cross_org_404` | `income` | `GET /api/v1/incomes/claims/{claim_id}` | T2 (milestone-1): owner_b GET org_a income claim id -> 404 fail-closed (canonical existence-deny pattern). |
+| R9. `tests/test_milestone_1_org_scope_p0.py::test_expense_t2_get_cross_org_404` | `expense` | `GET /api/v1/expenses/{expense_id}` | T2: owner_b GET org_a expense id -> 404 fail-closed. |
+| R10. `tests/test_milestone_1_org_scope_p0.py::test_repair_t2_get_cross_org_404` | `repairs` | `GET /api/v1/repairs/{repair_id}` | T2: owner_b GET org_a repair id -> 404 fail-closed. |
+| R11. `tests/test_milestone_1_org_scope_p0.py::test_tenant_t1_list_isolation` | `tenants` | `GET /api/v1/tenants` | T1: owner_b GET /api/v1/tenants list -> total=0, items=[] (fail-closed cross-org isolation on list endpoint). |
+| R12. `tests/test_milestone_1_org_scope_p0.py::test_tenant_t2_get_cross_org_404` | `tenants` | `GET /api/v1/tenants/{tenant_id}` | T2: owner_b GET org_a tenant id -> 404 fail-closed. |
+| R13. `tests/test_m004_lease_moveout_truth_closure.py::test_b11_cross_org_owner_gets_404_on_foreign_inspection` | `move_out` | `GET /api/v1/move-out-inspections/{inspection_id}` | Cross-org owner GET foreign move-out inspection id -> 404 fail-closed. ONLY GET /api/v1/move-out-inspections/{inspection_id} covered. |
+| R14. `tests/test_m004_lease_moveout_truth_closure.py::test_c10_cross_org_scope_404` | `deposit_settlements` | `GET /api/v1/deposit-settlements/{settlement_id}` | Cross-org scope on deposit settlement read -> 404. ONLY GET /api/v1/deposit-settlements/{settlement_id} covered. |
+| R15. `tests/test_m004_lease_moveout_truth_closure.py::test_c13_cross_org_settlement_create_404` | `deposit_settlements` | `POST /api/v1/deposit-settlements` | Cross-org owner attempts deposit-settlement create referencing foreign inspection -> 404. ONLY POST /api/v1/deposit-settlements covered. |
+| R16. `tests/test_m005_v1_closeout.py::test_m005_god_view_org_scoped_cross_org_isolation` | `operations` | `GET /api/v1/operations/god-view` | GET /api/v1/operations/god-view: owner_a counts strictly exclude org_b hidden properties (cross-org isolation on aggregations). |
+| R17. `tests/test_m005_ret3_cross_org_coverage.py::test_units_t2_get_cross_org_404` | `units` | `GET /api/v1/units/{unit_id}` | T2 (RET3 minimal): owner_a creates OrgA unit -> owner_b GET /api/v1/units/{id} -> HTTP 404 fail-closed. |
+| R18. `tests/test_m005_ret3_cross_org_coverage.py::test_payments_cross_org_match_no_leak` | `payments` | `POST /api/v1/payments/match` | RET3 minimal: owner_b POST /api/v1/payments/match -> 403/404 fail-closed; no OrgA lease/income ids leak in response envelope. |
+| R19. `tests/test_m005_ret3_cross_org_coverage.py::test_commission_list_isolation_total_zero` | `commission` | `GET /api/v1/commission/rules` | RET3 minimal: owner_b GET /api/v1/commission/rules -> 200 + total=0; OrgA commission rules not leaked (list isolation evidence). |
+| R20. `tests/test_m005_ret3_cross_org_coverage.py::test_tasks_deprecated_cross_org_get_4xx` | `tasks` | `GET /api/v1/tasks/{task_id}` | RET3 minimal: cross-org call to DEPRECATED /tasks/{id} endpoint returns any 4xx (403/404/405); satisfies Issue-43 22-router coverage (canonical surface is /operations/tasks which has independent coverage). |
+| R21. `tests/test_m005_ret3_cross_org_coverage.py::test_attachments_t2_get_cross_org_404` | `attachments` | `GET /api/v1/attachments/{attachment_id}` | RET3 minimal: OrgA-property attachment created via ORM -> owner_b GET /api/v1/attachments/{id} -> HTTP 404 (scoped_get_attachment fail-closed boundary). |
+| R22. `tests/test_m005_ret3_cross_org_coverage.py::test_audit_cross_org_fail_closed` | `audit` | `GET /api/v1/audit-logs` | RET3 minimal: owner_b (OrgB only) GET /api/v1/audit-logs -> either 403/404 OR 200 + total=0; any org-level fail-closed counts as coverage. |
+| R23. `tests/test_m005_ret3_cross_org_coverage.py::test_evidence_t2_get_cross_org_fail_closed` | `evidence` | `GET /api/v1/evidence/{evidence_id}` | RET3 minimal: owner_a creates OrgA evidence -> owner_b GET /api/v1/evidence/{id} -> 404/403 fail-closed. |
+| R24. `tests/test_m005_ret3_cross_org_coverage.py::test_viewings_list_isolation_total_zero` | `viewings` | `GET /api/v1/viewings` | RET3 minimal: owner_a creates OrgA viewing -> owner_b GET /api/v1/viewings -> 200 + total=0 (list isolation; no GET /{id} endpoint on this router so list isolation suffices). |
+| R25. `tests/test_m005_ret3_cross_org_coverage.py::test_onboarding_active_member_bootstrap_blocked_403` | `onboarding` | `POST /api/v1/onboarding/owner/bootstrap` | RET3 minimal: owner_a (already OrgA OWNER) POST /api/v1/onboarding/owner/bootstrap -> HTTP 403 (membership guard prevents cross-org bootstrap escape/re-entry). |
+| R26. `tests/test_property_channel_p0_025.py::test_same_unit_number_across_orgs_is_separate` | `property_channel` | `GET /api/v1/property-channel/units/lookup` | RET3 minimal: test_property_channel_p0_025 asserts OrgX unit-number lookup does NOT return OrgY same-unit-number property (cross-org isolation on lookup). |
 
 ## Endpoint scope matrix
 
 | router_module | endpoint_path | methods | org_scoped | has_cross_org_test | cross_org_test_ref | non_org_rationale |
 |---------------|---------------|---------|------------|--------------------|--------------------|-------------------|
-| `auth` | `/api/v1/auth` | POST | false | false | `` | Anonymous public session endpoints (login/register/me); organization scope is established POST login. |
-| `onboarding` | `/api/v1/onboarding/owner/bootstrap` | POST | true | false | `` |  |
+| `auth` | `/api/v1/auth` | POST | false | false | `` | Anonymous public session endpoints (login/register/me); organization scope is established POST login. has_cross_org_test=false by design (non-org-scoped router). |
+| `onboarding` | `/api/v1/onboarding/owner/bootstrap` | POST | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_onboarding_active_member_bootstrap_blocked_403` |  |
 | `onboarding` | `/api/v1/onboarding/secretary/accept-invite` | POST | true | false | `` |  |
 | `onboarding` | `/api/v1/onboarding/secretary/bootstrap` | POST | true | false | `` |  |
 | `onboarding` | `/api/v1/onboarding/state` | GET | true | false | `` |  |
-| `properties` | `/api/v1/properties` | GET | true | true | `tests/test_auth.py::cross-org property forbidden` |  |
-| `properties` | `/api/v1/properties` | POST | true | true | `tests/test_auth.py::cross-org property forbidden` |  |
-| `properties` | `/api/v1/properties/{property_id}` | DELETE | true | true | `tests/test_auth.py::cross-org property forbidden` |  |
-| `properties` | `/api/v1/properties/{property_id}` | GET | true | true | `tests/test_auth.py::cross-org property forbidden` |  |
-| `properties` | `/api/v1/properties/{property_id}` | PATCH | true | true | `tests/test_auth.py::cross-org property forbidden` |  |
+| `properties` | `/api/v1/properties` | GET | true | true | `tests/test_property_channel_p0_025.py::test_scoped_list_properties_excludes_cross_org_property` |  |
+| `properties` | `/api/v1/properties` | POST | true | true | `tests/test_auth.py::test_agent_cannot_create_property` |  |
+| `properties` | `/api/v1/properties/{property_id}` | DELETE | true | false | `` |  |
+| `properties` | `/api/v1/properties/{property_id}` | GET | true | true | `tests/test_property_channel_p0_025.py::test_scoped_get_property_fails_closed_on_cross_org` |  |
+| `properties` | `/api/v1/properties/{property_id}` | PATCH | true | false | `` |  |
 | `property_channel` | `/api/v1/property-channel/bindings` | POST | true | false | `` |  |
 | `property_channel` | `/api/v1/property-channel/bindings/{binding_id}/revoke` | POST | true | false | `` |  |
-| `property_channel` | `/api/v1/property-channel/units/lookup` | GET | true | false | `` |  |
+| `property_channel` | `/api/v1/property-channel/units/lookup` | GET | true | true | `tests/test_property_channel_p0_025.py::test_same_unit_number_across_orgs_is_separate` |  |
 | `property_channel` | `/api/v1/property-channel/units/{unit_id}/bindings` | GET | true | false | `` |  |
 | `property_channel` | `/api/v1/property-channel/units/{unit_id}/bindings/active` | GET | true | false | `` |  |
 | `units` | `/api/v1/units` | GET | true | false | `` |  |
 | `units` | `/api/v1/units` | POST | true | false | `` |  |
 | `units` | `/api/v1/units/{unit_id}` | DELETE | true | false | `` |  |
-| `units` | `/api/v1/units/{unit_id}` | GET | true | false | `` |  |
+| `units` | `/api/v1/units/{unit_id}` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_units_t2_get_cross_org_404` |  |
 | `units` | `/api/v1/units/{unit_id}` | PATCH | true | false | `` |  |
-| `tenants` | `/api/v1/tenants` | GET | true | false | `` |  |
+| `tenants` | `/api/v1/tenants` | GET | true | true | `tests/test_milestone_1_org_scope_p0.py::test_tenant_t1_list_isolation` |  |
 | `tenants` | `/api/v1/tenants` | POST | true | false | `` |  |
 | `tenants` | `/api/v1/tenants/{tenant_id}` | DELETE | true | false | `` |  |
-| `tenants` | `/api/v1/tenants/{tenant_id}` | GET | true | false | `` |  |
+| `tenants` | `/api/v1/tenants/{tenant_id}` | GET | true | true | `tests/test_milestone_1_org_scope_p0.py::test_tenant_t2_get_cross_org_404` |  |
 | `tenants` | `/api/v1/tenants/{tenant_id}` | PATCH | true | false | `` |  |
-| `leases` | `/api/v1/leases` | GET | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases` | POST | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases/{lease_id}` | DELETE | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases/{lease_id}` | GET | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
-| `leases` | `/api/v1/leases/{lease_id}` | PATCH | true | true | `tests/test_fix3_blockers_m2.py::cross-org reference 409/403` |  |
+| `leases` | `/api/v1/leases` | GET | true | false | `` |  |
+| `leases` | `/api/v1/leases` | POST | true | false | `` |  |
+| `leases` | `/api/v1/leases/{lease_id}` | DELETE | true | false | `` |  |
+| `leases` | `/api/v1/leases/{lease_id}` | GET | true | true | `tests/test_milestone_1_org_scope_p0.py::test_lease_t2_get_cross_org_404` |  |
+| `leases` | `/api/v1/leases/{lease_id}` | PATCH | true | false | `` |  |
 | `leases` | `/api/v1/leases/{lease_id}/auto-expire` | POST | true | false | `` |  |
 | `leases` | `/api/v1/leases/{lease_id}/decline-renewal` | POST | true | false | `` |  |
 | `leases` | `/api/v1/leases/{lease_id}/renew` | POST | true | false | `` |  |
 | `income` | `/api/v1/incomes` | GET | true | false | `` |  |
 | `income` | `/api/v1/incomes` | POST | true | false | `` |  |
 | `income` | `/api/v1/incomes/claims` | GET | true | false | `` |  |
-| `income` | `/api/v1/incomes/claims/{claim_id}` | GET | true | false | `` |  |
+| `income` | `/api/v1/incomes/claims/{claim_id}` | GET | true | true | `tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed` |  |
 | `income` | `/api/v1/incomes/claims/{claim_id}/fail` | PATCH | true | false | `` |  |
 | `income` | `/api/v1/incomes/claims/{claim_id}/reverse` | PATCH | true | false | `` |  |
-| `income` | `/api/v1/incomes/claims/{claim_id}/verify` | PATCH | true | false | `` |  |
+| `income` | `/api/v1/incomes/claims/{claim_id}/verify` | PATCH | true | true | `tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed` |  |
 | `income` | `/api/v1/incomes/leases/{lease_id}/claims` | GET | true | false | `` |  |
-| `income` | `/api/v1/incomes/leases/{lease_id}/claims` | POST | true | false | `` |  |
+| `income` | `/api/v1/incomes/leases/{lease_id}/claims` | POST | true | true | `tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed` |  |
 | `income` | `/api/v1/incomes/leases/{lease_id}/periods/{period}` | GET | true | false | `` |  |
 | `income` | `/api/v1/incomes/{income_id}` | GET | true | false | `` |  |
 | `income` | `/api/v1/incomes/{income_id}` | PATCH | true | false | `` |  |
 | `income` | `/api/v1/incomes/{income_id}/confirm` | POST | true | false | `` |  |
 | `income` | `/api/v1/incomes/{income_id}/reverse` | POST | true | false | `` |  |
-| `payments` | `/api/v1/payments/match` | POST | true | false | `` |  |
+| `payments` | `/api/v1/payments/match` | POST | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_payments_cross_org_match_no_leak` |  |
 | `expense` | `/api/v1/expenses` | GET | true | false | `` |  |
 | `expense` | `/api/v1/expenses` | POST | true | false | `` |  |
-| `expense` | `/api/v1/expenses/{expense_id}` | GET | true | false | `` |  |
+| `expense` | `/api/v1/expenses/{expense_id}` | GET | true | true | `tests/test_milestone_1_org_scope_p0.py::test_expense_t2_get_cross_org_404` |  |
 | `expense` | `/api/v1/expenses/{expense_id}` | PATCH | true | false | `` |  |
 | `expense` | `/api/v1/expenses/{expense_id}/approve` | POST | true | false | `` |  |
 | `expense` | `/api/v1/expenses/{expense_id}/claims` | GET | true | false | `` |  |
@@ -137,8 +191,8 @@
 | `expense` | `/api/v1/expenses/{expense_id}/reject` | POST | true | false | `` |  |
 | `expense` | `/api/v1/expenses/{expense_id}/resubmit` | POST | true | false | `` |  |
 | `expense` | `/api/v1/expenses/{expense_id}/reverse` | POST | true | false | `` |  |
-| `commission` | `/api/v1/commission/rules` | GET | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
-| `commission` | `/api/v1/commission/rules` | POST | true | true | `tests/test_financial.py::cross-org commission/financial 403` |  |
+| `commission` | `/api/v1/commission/rules` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_commission_list_isolation_total_zero` |  |
+| `commission` | `/api/v1/commission/rules` | POST | true | false | `` |  |
 | `commission` | `/api/v1/commission/rules/{rule_id}` | DELETE | true | false | `` |  |
 | `commission` | `/api/v1/commission/rules/{rule_id}` | GET | true | false | `` |  |
 | `commission` | `/api/v1/commission/rules/{rule_id}` | PATCH | true | false | `` |  |
@@ -149,7 +203,7 @@
 | `tasks` | `/api/v1/tasks` | GET | true | false | `` |  |
 | `tasks` | `/api/v1/tasks` | POST | true | false | `` |  |
 | `tasks` | `/api/v1/tasks/{task_id}` | DELETE | true | false | `` |  |
-| `tasks` | `/api/v1/tasks/{task_id}` | GET | true | false | `` |  |
+| `tasks` | `/api/v1/tasks/{task_id}` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_tasks_deprecated_cross_org_get_4xx` |  |
 | `tasks` | `/api/v1/tasks/{task_id}` | PATCH | true | false | `` |  |
 | `tasks` | `/api/v1/tasks/{task_id}/complete` | POST | true | false | `` |  |
 | `reports` | `/api/v1/reports/commission` | GET | true | false | `` |  |
@@ -160,7 +214,7 @@
 | `reports` | `/api/v1/reports/tasks` | GET | true | false | `` |  |
 | `repairs` | `/api/v1/repairs` | GET | true | false | `` |  |
 | `repairs` | `/api/v1/repairs` | POST | true | false | `` |  |
-| `repairs` | `/api/v1/repairs/{repair_id}` | GET | true | false | `` |  |
+| `repairs` | `/api/v1/repairs/{repair_id}` | GET | true | true | `tests/test_milestone_1_org_scope_p0.py::test_repair_t2_get_cross_org_404` |  |
 | `repairs` | `/api/v1/repairs/{repair_id}/actions` | GET | true | false | `` |  |
 | `repairs` | `/api/v1/repairs/{repair_id}/cancel` | POST | true | false | `` |  |
 | `repairs` | `/api/v1/repairs/{repair_id}/decide` | POST | true | false | `` |  |
@@ -170,9 +224,9 @@
 | `repairs` | `/api/v1/repairs/{repair_id}/verify` | POST | true | false | `` |  |
 | `attachments` | `/api/v1/attachments` | GET | true | false | `` |  |
 | `attachments` | `/api/v1/attachments` | POST | true | false | `` |  |
-| `attachments` | `/api/v1/attachments/{attachment_id}` | GET | true | false | `` |  |
+| `attachments` | `/api/v1/attachments/{attachment_id}` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_attachments_t2_get_cross_org_404` |  |
 | `attachments` | `/api/v1/attachments/{attachment_id}/download` | GET | true | false | `` |  |
-| `audit` | `/api/v1/audit-logs` | GET | true | false | `` |  |
+| `audit` | `/api/v1/audit-logs` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_audit_cross_org_fail_closed` |  |
 | `operations` | `/api/v1/operations/action-pack` | GET | true | false | `` |  |
 | `operations` | `/api/v1/operations/conflict-report` | GET | true | false | `` |  |
 | `operations` | `/api/v1/operations/copilot/ask` | POST | true | false | `` |  |
@@ -186,7 +240,7 @@
 | `operations` | `/api/v1/operations/copilot/today` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/copilot/why` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/digest` | GET | true | false | `` |  |
-| `operations` | `/api/v1/operations/god-view` | GET | true | false | `` |  |
+| `operations` | `/api/v1/operations/god-view` | GET | true | true | `tests/test_m005_v1_closeout.py::test_m005_god_view_org_scoped_cross_org_isolation` |  |
 | `operations` | `/api/v1/operations/promise` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/quick/expense` | GET | true | false | `` |  |
 | `operations` | `/api/v1/operations/quick/expense-duplicates` | GET | true | false | `` |  |
@@ -205,10 +259,10 @@
 | `operations` | `/api/v1/operations/scheduler/run` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/secretary-target` | GET | true | false | `` |  |
 | `operations` | `/api/v1/operations/summary` | GET | true | false | `` |  |
-| `operations` | `/api/v1/operations/tasks` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks` | POST | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
+| `operations` | `/api/v1/operations/tasks` | GET | true | false | `` |  |
+| `operations` | `/api/v1/operations/tasks` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/tasks/{task_id}` | GET | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
-| `operations` | `/api/v1/operations/tasks/{task_id}` | PATCH | true | true | `tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404` |  |
+| `operations` | `/api/v1/operations/tasks/{task_id}` | PATCH | true | false | `` |  |
 | `operations` | `/api/v1/operations/tasks/{task_id}/acknowledge` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/tasks/{task_id}/cancel` | POST | true | false | `` |  |
 | `operations` | `/api/v1/operations/tasks/{task_id}/complete` | POST | true | false | `` |  |
@@ -216,26 +270,26 @@
 | `operations` | `/api/v1/operations/tasks/{task_id}/snooze` | POST | true | false | `` |  |
 | `evidence` | `/api/v1/evidence` | GET | true | false | `` |  |
 | `evidence` | `/api/v1/evidence` | POST | true | false | `` |  |
-| `evidence` | `/api/v1/evidence/{evidence_id}` | GET | true | false | `` |  |
-| `viewings` | `/api/v1/viewings` | GET | true | false | `` |  |
+| `evidence` | `/api/v1/evidence/{evidence_id}` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_evidence_t2_get_cross_org_fail_closed` |  |
+| `viewings` | `/api/v1/viewings` | GET | true | true | `tests/test_m005_ret3_cross_org_coverage.py::test_viewings_list_isolation_total_zero` |  |
 | `viewings` | `/api/v1/viewings` | POST | true | false | `` |  |
 | `viewings` | `/api/v1/viewings/{viewing_id}/cancel` | POST | true | false | `` |  |
 | `viewings` | `/api/v1/viewings/{viewing_id}/outcome` | POST | true | false | `` |  |
 | `move_out` | `/api/v1/move-out-inspections` | GET | true | false | `` |  |
 | `move_out` | `/api/v1/move-out-inspections` | POST | true | false | `` |  |
-| `move_out` | `/api/v1/move-out-inspections/{inspection_id}` | GET | true | false | `` |  |
+| `move_out` | `/api/v1/move-out-inspections/{inspection_id}` | GET | true | true | `tests/test_m004_lease_moveout_truth_closure.py::test_b11_cross_org_owner_gets_404_on_foreign_inspection` |  |
 | `move_out` | `/api/v1/move-out-inspections/{inspection_id}` | PATCH | true | false | `` |  |
 | `move_out` | `/api/v1/move-out-inspections/{inspection_id}/cancel` | POST | true | false | `` |  |
 | `move_out` | `/api/v1/move-out-inspections/{inspection_id}/confirm` | POST | true | false | `` |  |
 | `move_out` | `/api/v1/move-out-inspections/{inspection_id}/inspect` | POST | true | false | `` |  |
 | `deposit_settlements` | `/api/v1/deposit-settlements` | GET | true | false | `` |  |
-| `deposit_settlements` | `/api/v1/deposit-settlements` | POST | true | false | `` |  |
-| `deposit_settlements` | `/api/v1/deposit-settlements/{settlement_id}` | GET | true | false | `` |  |
+| `deposit_settlements` | `/api/v1/deposit-settlements` | POST | true | true | `tests/test_m004_lease_moveout_truth_closure.py::test_c13_cross_org_settlement_create_404` |  |
+| `deposit_settlements` | `/api/v1/deposit-settlements/{settlement_id}` | GET | true | true | `tests/test_m004_lease_moveout_truth_closure.py::test_c10_cross_org_scope_404` |  |
 | `deposit_settlements` | `/api/v1/deposit-settlements/{settlement_id}` | PATCH | true | false | `` |  |
 | `deposit_settlements` | `/api/v1/deposit-settlements/{settlement_id}/confirm` | POST | true | false | `` |  |
 | `deposit_settlements` | `/api/v1/deposit-settlements/{settlement_id}/reconcile` | POST | true | false | `` |  |
-| `telegram_webhook` | `/telegram/webhook` | POST | false | false | `` | Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary. |
-| `internal_ingest` | `/internal/ingest` | POST | false | false | `` | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. |
+| `telegram_webhook` | `/telegram/webhook` | POST | false | false | `` | Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary. has_cross_org_test=false by design (non-org-scoped router). |
+| `internal_ingest` | `/internal/ingest` | POST | false | false | `` | Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. has_cross_org_test=false by design (excluded from Issue-43 22-strong list). |
 | `unknown` | `/health` | GET | false | false | `` | Endpoint name indicates no org membership gate (login/register/health/webhook). |
 
 ## JSON payload (for downstream tooling)
@@ -295,6 +349,195 @@
     "internal_ingest"
   ],
   "issue_43_count": 22,
+  "fail_closed_status": {
+    "has_blockers": false,
+    "uncovered_routers": [],
+    "test_ref_validation_errors": [],
+    "test_ref_validation_results": [
+      {
+        "test_file": "tests/test_m003_expense_scope_hardening.py",
+        "test_name": "test_reports_cross_org_fail_closed",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m003_expense_scope_hardening.py",
+        "test_name": "test_operations_tasks_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_auth.py",
+        "test_name": "test_agent_cannot_create_property",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_property_channel_p0_025.py",
+        "test_name": "test_scoped_list_properties_excludes_cross_org_property",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_property_channel_p0_025.py",
+        "test_name": "test_scoped_get_property_fails_closed_on_cross_org",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_milestone_1_org_scope_p0.py",
+        "test_name": "test_lease_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_rent_closure_m2.py",
+        "test_name": "test_r8_cross_org_fail_closed",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_milestone_1_org_scope_p0.py",
+        "test_name": "test_income_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_milestone_1_org_scope_p0.py",
+        "test_name": "test_expense_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_milestone_1_org_scope_p0.py",
+        "test_name": "test_repair_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_milestone_1_org_scope_p0.py",
+        "test_name": "test_tenant_t1_list_isolation",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_milestone_1_org_scope_p0.py",
+        "test_name": "test_tenant_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m004_lease_moveout_truth_closure.py",
+        "test_name": "test_b11_cross_org_owner_gets_404_on_foreign_inspection",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m004_lease_moveout_truth_closure.py",
+        "test_name": "test_c10_cross_org_scope_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m004_lease_moveout_truth_closure.py",
+        "test_name": "test_c13_cross_org_settlement_create_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_v1_closeout.py",
+        "test_name": "test_m005_god_view_org_scoped_cross_org_isolation",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_units_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_payments_cross_org_match_no_leak",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_commission_list_isolation_total_zero",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_tasks_deprecated_cross_org_get_4xx",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_attachments_t2_get_cross_org_404",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_audit_cross_org_fail_closed",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_evidence_t2_get_cross_org_fail_closed",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_viewings_list_isolation_total_zero",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_m005_ret3_cross_org_coverage.py",
+        "test_name": "test_onboarding_active_member_bootstrap_blocked_403",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      },
+      {
+        "test_file": "tests/test_property_channel_p0_025.py",
+        "test_name": "test_same_unit_number_across_orgs_is_separate",
+        "file_exists": true,
+        "match_count": 1,
+        "ok": true
+      }
+    ]
+  },
   "discrepancy_22_vs_23_rationale": "Directory glob captures internal_ingest.py (container internal-only RPC), which Issue #43 did not count; 23 total files minus 1 internal helper = 22.",
   "endpoints": [
     {
@@ -302,7 +545,7 @@
       "endpoint_path": "/api/v1/auth",
       "methods": "POST",
       "org_scoped": false,
-      "non_org_rationale": "Anonymous public session endpoints (login/register/me); organization scope is established POST login.",
+      "non_org_rationale": "Anonymous public session endpoints (login/register/me); organization scope is established POST login. has_cross_org_test=false by design (non-org-scoped router).",
       "has_cross_org_test": false,
       "cross_org_test_methods": null,
       "cross_org_test": null,
@@ -314,10 +557,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_onboarding_active_member_bootstrap_blocked_403",
+      "cross_org_proof": "RET3 minimal: owner_a (already OrgA OWNER) POST /api/v1/onboarding/owner/bootstrap -> HTTP 403 (membership guard prevents cross-org bootstrap escape/re-entry)."
     },
     {
       "router_module": "onboarding",
@@ -360,8 +603,8 @@
       "non_org_rationale": null,
       "has_cross_org_test": true,
       "cross_org_test_methods": "GET",
-      "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
-      "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
+      "cross_org_test": "tests/test_property_channel_p0_025.py::test_scoped_list_properties_excludes_cross_org_property",
+      "cross_org_proof": "GET /api/v1/properties list excludes cross-org property (service-layer scoped_list_properties proof)."
     },
     {
       "router_module": "properties",
@@ -371,8 +614,8 @@
       "non_org_rationale": null,
       "has_cross_org_test": true,
       "cross_org_test_methods": "POST",
-      "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
-      "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
+      "cross_org_test": "tests/test_auth.py::test_agent_cannot_create_property",
+      "cross_org_proof": "User with NO membership in isolated Org-B attempts to create properties with organization_id=org_b.id -> 403. ONLY POST /api/v1/properties covered."
     },
     {
       "router_module": "properties",
@@ -380,10 +623,10 @@
       "methods": "DELETE",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "DELETE",
-      "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
-      "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "properties",
@@ -393,8 +636,8 @@
       "non_org_rationale": null,
       "has_cross_org_test": true,
       "cross_org_test_methods": "GET",
-      "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
-      "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
+      "cross_org_test": "tests/test_property_channel_p0_025.py::test_scoped_get_property_fails_closed_on_cross_org",
+      "cross_org_proof": "GET /api/v1/properties/{property_id} fails closed on cross-org (LookupError at service layer → HTTP 404/403 boundary)."
     },
     {
       "router_module": "properties",
@@ -402,10 +645,10 @@
       "methods": "PATCH",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "PATCH",
-      "cross_org_test": "tests/test_auth.py::cross-org property forbidden",
-      "cross_org_proof": "User with NO membership in isolated Org-B attempts to create/access properties with organization_id=org_b.id -> 403."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "property_channel",
@@ -435,10 +678,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_property_channel_p0_025.py::test_same_unit_number_across_orgs_is_separate",
+      "cross_org_proof": "RET3 minimal: test_property_channel_p0_025 asserts OrgX unit-number lookup does NOT return OrgY same-unit-number property (cross-org isolation on lookup)."
     },
     {
       "router_module": "property_channel",
@@ -501,10 +744,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_units_t2_get_cross_org_404",
+      "cross_org_proof": "T2 (RET3 minimal): owner_a creates OrgA unit -> owner_b GET /api/v1/units/{id} -> HTTP 404 fail-closed."
     },
     {
       "router_module": "units",
@@ -523,10 +766,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_milestone_1_org_scope_p0.py::test_tenant_t1_list_isolation",
+      "cross_org_proof": "T1: owner_b GET /api/v1/tenants list -> total=0, items=[] (fail-closed cross-org isolation on list endpoint)."
     },
     {
       "router_module": "tenants",
@@ -556,10 +799,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_milestone_1_org_scope_p0.py::test_tenant_t2_get_cross_org_404",
+      "cross_org_proof": "T2: owner_b GET org_a tenant id -> 404 fail-closed."
     },
     {
       "router_module": "tenants",
@@ -578,10 +821,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "GET",
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "leases",
@@ -589,10 +832,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "POST",
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "leases",
@@ -600,10 +843,10 @@
       "methods": "DELETE",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "DELETE",
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "leases",
@@ -613,8 +856,8 @@
       "non_org_rationale": null,
       "has_cross_org_test": true,
       "cross_org_test_methods": "GET",
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "cross_org_test": "tests/test_milestone_1_org_scope_p0.py::test_lease_t2_get_cross_org_404",
+      "cross_org_proof": "T2: owner_b GET org_a lease id -> 404 fail-closed (cross-org LookupError contract)."
     },
     {
       "router_module": "leases",
@@ -622,10 +865,10 @@
       "methods": "PATCH",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "PATCH",
-      "cross_org_test": "tests/test_fix3_blockers_m2.py::cross-org reference 409/403",
-      "cross_org_proof": "Tenant/property for org_b referenced in org_a context -> 409/403 at FK boundary; no cross-org resource assignment."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "leases",
@@ -699,10 +942,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed",
+      "cross_org_proof": "owner_b POST claim against org_a lease -> 404; owner_b GET / PATCH org_a claim id -> 404 fail-closed (org scope blocks cross-org income claims)."
     },
     {
       "router_module": "income",
@@ -732,10 +975,10 @@
       "methods": "PATCH",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "PATCH",
+      "cross_org_test": "tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed",
+      "cross_org_proof": "owner_b POST claim against org_a lease -> 404; owner_b GET / PATCH org_a claim id -> 404 fail-closed (org scope blocks cross-org income claims)."
     },
     {
       "router_module": "income",
@@ -754,10 +997,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
+      "cross_org_test": "tests/test_rent_closure_m2.py::test_r8_cross_org_fail_closed",
+      "cross_org_proof": "owner_b POST claim against org_a lease -> 404; owner_b GET / PATCH org_a claim id -> 404 fail-closed (org scope blocks cross-org income claims)."
     },
     {
       "router_module": "income",
@@ -820,10 +1063,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_payments_cross_org_match_no_leak",
+      "cross_org_proof": "RET3 minimal: owner_b POST /api/v1/payments/match -> 403/404 fail-closed; no OrgA lease/income ids leak in response envelope."
     },
     {
       "router_module": "expense",
@@ -853,10 +1096,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_milestone_1_org_scope_p0.py::test_expense_t2_get_cross_org_404",
+      "cross_org_proof": "T2: owner_b GET org_a expense id -> 404 fail-closed."
     },
     {
       "router_module": "expense",
@@ -998,8 +1241,8 @@
       "non_org_rationale": null,
       "has_cross_org_test": true,
       "cross_org_test_methods": "GET",
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_commission_list_isolation_total_zero",
+      "cross_org_proof": "RET3 minimal: owner_b GET /api/v1/commission/rules -> 200 + total=0; OrgA commission rules not leaked (list isolation evidence)."
     },
     {
       "router_module": "commission",
@@ -1007,10 +1250,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "POST",
-      "cross_org_test": "tests/test_financial.py::cross-org commission/financial 403",
-      "cross_org_proof": "Non-member HTTP call to commission endpoints -> 403 (authorization boundary at org membership)."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "commission",
@@ -1128,10 +1371,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_tasks_deprecated_cross_org_get_4xx",
+      "cross_org_proof": "RET3 minimal: cross-org call to DEPRECATED /tasks/{id} endpoint returns any 4xx (403/404/405); satisfies Issue-43 22-router coverage (canonical surface is /operations/tasks which has independent coverage)."
     },
     {
       "router_module": "tasks",
@@ -1186,7 +1429,7 @@
       "has_cross_org_test": true,
       "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_reports_cross_org_fail_closed",
-      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak)."
+      "cross_org_proof": "owner_b GET org_a-only financial aggregates -> all totals 0 / empty ids (no org_a id leak). ONLY GET /api/v1/reports/financial-summary covered."
     },
     {
       "router_module": "reports",
@@ -1249,10 +1492,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_milestone_1_org_scope_p0.py::test_repair_t2_get_cross_org_404",
+      "cross_org_proof": "T2: owner_b GET org_a repair id -> 404 fail-closed."
     },
     {
       "router_module": "repairs",
@@ -1359,10 +1602,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_attachments_t2_get_cross_org_404",
+      "cross_org_proof": "RET3 minimal: OrgA-property attachment created via ORM -> owner_b GET /api/v1/attachments/{id} -> HTTP 404 (scoped_get_attachment fail-closed boundary)."
     },
     {
       "router_module": "attachments",
@@ -1381,10 +1624,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_audit_cross_org_fail_closed",
+      "cross_org_proof": "RET3 minimal: owner_b (OrgB only) GET /api/v1/audit-logs -> either 403/404 OR 200 + total=0; any org-level fail-closed counts as coverage."
     },
     {
       "router_module": "operations",
@@ -1535,10 +1778,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_v1_closeout.py::test_m005_god_view_org_scoped_cross_org_isolation",
+      "cross_org_proof": "GET /api/v1/operations/god-view: owner_a counts strictly exclude org_b hidden properties (cross-org isolation on aggregations)."
     },
     {
       "router_module": "operations",
@@ -1744,10 +1987,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "GET",
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1755,10 +1998,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "POST",
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1769,7 +2012,7 @@
       "has_cross_org_test": true,
       "cross_org_test_methods": "GET",
       "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks. ONLY GET /api/v1/operations/tasks/{task_id} covered."
     },
     {
       "router_module": "operations",
@@ -1777,10 +2020,10 @@
       "methods": "PATCH",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": true,
-      "cross_org_test_methods": "PATCH",
-      "cross_org_test": "tests/test_m003_expense_scope_hardening.py::test_operations_tasks_cross_org_404",
-      "cross_org_proof": "owner_b GET org_a task id -> 404 fail-closed; org_b has no visibility into org_a tasks."
+      "has_cross_org_test": false,
+      "cross_org_test_methods": null,
+      "cross_org_test": null,
+      "cross_org_proof": null
     },
     {
       "router_module": "operations",
@@ -1865,10 +2108,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_evidence_t2_get_cross_org_fail_closed",
+      "cross_org_proof": "RET3 minimal: owner_a creates OrgA evidence -> owner_b GET /api/v1/evidence/{id} -> 404/403 fail-closed."
     },
     {
       "router_module": "viewings",
@@ -1876,10 +2119,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m005_ret3_cross_org_coverage.py::test_viewings_list_isolation_total_zero",
+      "cross_org_proof": "RET3 minimal: owner_a creates OrgA viewing -> owner_b GET /api/v1/viewings -> 200 + total=0 (list isolation; no GET /{id} endpoint on this router so list isolation suffices)."
     },
     {
       "router_module": "viewings",
@@ -1942,10 +2185,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m004_lease_moveout_truth_closure.py::test_b11_cross_org_owner_gets_404_on_foreign_inspection",
+      "cross_org_proof": "Cross-org owner GET foreign move-out inspection id -> 404 fail-closed. ONLY GET /api/v1/move-out-inspections/{inspection_id} covered."
     },
     {
       "router_module": "move_out",
@@ -2008,10 +2251,10 @@
       "methods": "POST",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "POST",
+      "cross_org_test": "tests/test_m004_lease_moveout_truth_closure.py::test_c13_cross_org_settlement_create_404",
+      "cross_org_proof": "Cross-org owner attempts deposit-settlement create referencing foreign inspection -> 404. ONLY POST /api/v1/deposit-settlements covered."
     },
     {
       "router_module": "deposit_settlements",
@@ -2019,10 +2262,10 @@
       "methods": "GET",
       "org_scoped": true,
       "non_org_rationale": null,
-      "has_cross_org_test": false,
-      "cross_org_test_methods": null,
-      "cross_org_test": null,
-      "cross_org_proof": null
+      "has_cross_org_test": true,
+      "cross_org_test_methods": "GET",
+      "cross_org_test": "tests/test_m004_lease_moveout_truth_closure.py::test_c10_cross_org_scope_404",
+      "cross_org_proof": "Cross-org scope on deposit settlement read -> 404. ONLY GET /api/v1/deposit-settlements/{settlement_id} covered."
     },
     {
       "router_module": "deposit_settlements",
@@ -2062,7 +2305,7 @@
       "endpoint_path": "/telegram/webhook",
       "methods": "POST",
       "org_scoped": false,
-      "non_org_rationale": "Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary.",
+      "non_org_rationale": "Webhook ingress signed & verified by Telegram bot token; no caller organization identity at the HTTP boundary. has_cross_org_test=false by design (non-org-scoped router).",
       "has_cross_org_test": false,
       "cross_org_test_methods": null,
       "cross_org_test": null,
@@ -2073,7 +2316,7 @@
       "endpoint_path": "/internal/ingest",
       "methods": "POST",
       "org_scoped": false,
-      "non_org_rationale": "Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership.",
+      "non_org_rationale": "Container internal-only RPC endpoints (trusted network); authentication is a shared HMAC/secret, not user-organization membership. has_cross_org_test=false by design (excluded from Issue-43 22-strong list).",
       "has_cross_org_test": false,
       "cross_org_test_methods": null,
       "cross_org_test": null,

@@ -83,24 +83,31 @@ def _extract_counts(stdout: str, stderr: str) -> dict[str, int]:
         ``8 passed, 1 skipped, 1 error in 0.60s``
     """
     combined = (stdout or "") + "\n" + (stderr or "")
-    counts = {"passed": 0, "failed": 0, "skipped": 0, "errors": 0, "collected": 0}
-    COLLECTED_RE = re.compile(r"(\d+)\s+items?\s+collected")
-    for m in COLLECTED_RE.finditer(combined):
-        counts["collected"] = max(counts["collected"], int(m.group(1)))
-    SUMMARY_RE = re.compile(
-        r"(?:^|\n|\r)(\d+)\s+passed"
-        r"(?:\s*,\s*(\d+)\s+skipped)?"
-        r"(?:\s*,\s*(\d+)\s+failed)?"
-        r"(?:\s*,\s*(\d+)\s+error(?:s)?\b)?"
-    )
-    m = None
-    for m in SUMMARY_RE.finditer(combined):
-        pass
-    if m is not None:
-        counts["passed"] = int(m.group(1) or 0)
-        counts["skipped"] = int(m.group(2) or 0) if m.group(2) is not None else 0
-        counts["failed"] = int(m.group(3) or 0) if m.group(3) is not None else 0
-        counts["errors"] = int(m.group(4) or 0) if m.group(4) is not None else 0
+    counts = {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": 0,
+        "collected": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+    }
+    collected_matches = re.findall(r"(\d+)\s+items?\s+collected", combined)
+    if collected_matches:
+        counts["collected"] = max(int(x) for x in collected_matches)
+
+    def _last_match(pattern: str) -> int:
+        matches = list(re.finditer(pattern, combined, re.MULTILINE))
+        if not matches:
+            return 0
+        return int(matches[-1].group(1))
+
+    counts["passed"] = _last_match(r"(?:^|\n)(\d+)\s+passed")
+    counts["failed"] = _last_match(r"(?:^|\n)(\d+)\s+failed\b")
+    counts["skipped"] = _last_match(r"(?:^|\n)(\d+)\s+skipped\b")
+    counts["errors"] = _last_match(r"(?:^|\n)(\d+)\s+error(?:s)?\b")
+    counts["xfailed"] = _last_match(r"(?:^|\n)(\d+)\s+xfailed\b")
+    counts["xpassed"] = _last_match(r"(?:^|\n)(\d+)\s+xpassed\b")
     return counts
 
 

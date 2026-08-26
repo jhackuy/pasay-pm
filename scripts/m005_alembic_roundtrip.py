@@ -34,7 +34,7 @@ VERSIONS_DIR = REPO_ROOT / "alembic" / "versions"
 
 ALEMBIC = [sys.executable, "-m", "alembic", "-c", str(ALEMBIC_INI)]
 
-REV_LINE_HISTORY = re.compile(r"([0-9a-zA-Z_]{8,})\s*(?:->|,|\s*\(.*?\))")
+REV_LINE_HISTORY = re.compile(r"([0-9a-zA-Z_]{8,})\s*(?:->|,|\s*\(.*?\)|$)")
 REV_FILE_HEADER = re.compile(r"^#?\s*Revision ID:\s*([^\s#]+)", re.M)
 REV_FILE_REVISES = re.compile(r"^#?\s*Revises:\s*([^\s#]+)", re.M)
 
@@ -384,11 +384,13 @@ def main() -> int:
                     count_ok_or_missing_fk += 1
                     continue
                 has_missing_fk = (
-                    ("UndefinedObject" in err and "constraint" in err and "does not exist" in err)
-                    or "fk_leases_superseded_same_party" in err
+                    ("UndefinedObject" in err or "UndefinedTable" in err)
+                    and "fk_leases_superseded_same_party" in err
                 )
                 if has_missing_fk:
                     count_ok_or_missing_fk += 1
+                else:
+                    return False
         return count_total > 0 and count_ok_or_missing_fk == count_total
 
     all_missing_fk = _all_errors_missing_fk_only(results)
