@@ -19,7 +19,14 @@ env:
 
 jobs:
   backend-freeze-gate:
-    name: backend-freeze-gate (13 doors)
+    # -------------------------------------------------------------------
+    # pasay-gate 4-stage concept (PASAY-M005-SA-A):
+    #   stage1 = DOORs 00-06  : repo + DB + Docker + container health chain
+    #   stage2 = DOORs 07-10  : container HTTP truth + Worker build/typecheck
+    #   stage3 = DOORs 11-13  : Worker tests/dry-run + final invariant summary
+    #   stage4 = DOORs 14-16  : money safety, test mass, envelope contract
+    # -------------------------------------------------------------------
+    name: backend-freeze-gate (17 doors, 4 stages)
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -328,17 +335,173 @@ jobs:
           fi
           echo "BACKEND_FREEZE_GATE__DOOR_12_OK=1" >> $GITHUB_ENV
 
-      - name: DOOR-13 Final invariant summary
+      # =================================================================
+      # stage4 DOORs 14-16: money safety, test mass, envelope contract
+      # =================================================================
+
+      - name: DOOR-14 Float/money safety gate (fail-closed)
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/doors
+          python scripts/pasay_gate_float_safety.py --json-only . > artifacts/doors/door_14_float_safety.json 2>&1 || EXIT=$?
+          EXIT=${EXIT:-0}
+          echo "---- float safety summary ----"
+          python - <<'PYEOF'
+          import json, sys
+          r = json.load(open("artifacts/doors/door_14_float_safety.json"))
+          print(f"files_scanned: {r['files_scanned']}")
+          print(f"blacklist_hit_files: {r['blacklist_hit_files']}")
+          print(f"blacklist_total_hits: {r['total_blacklist_hits']}")
+          print(f"non_whitelist_hit_files: {r['non_whitelist_hit_files']}")
+          print(f"non_whitelist_total_hits: {r['total_non_whitelist_hits']}")
+          for f in r['per_file']:
+              if f['hit_count'] and not f['whitelisted']:
+                  for h in f['hits']:
+                      print(f"  REAL_HIT {f['file']}:{h['line']}:{h['col']} {h['pattern']}: {h['context']}")
+          if r['fail']:
+              print("FAIL: blacklist file real float usage")
+              sys.exit(2)
+          PYEOF
+          if [ "${EXIT}" != "0" ]; then
+            echo "FAIL: DOOR-14 float safety gate exit=${EXIT}"
+            exit "${EXIT}"
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_14_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-15 Test count >= 250 AND bot coverage >= 15 source files
+        env:
+          DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
+          DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
+          PASAY_TEST_DB_NAME: ${{ env.FREEZE_GATE_DB }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/doors
+
+          # --- Part A: total pytest collected >= 250 ---
+          pytest tests/ --collect-only -q > artifacts/doors/door_15_collect_backend.log 2>&1 || true
+          BACKEND_COLLECTED=$(tail -n 5 artifacts/doors/door_15_collect_backend.log | grep -oE '[0-9]+ test' | head -n1 | awk '{print $1}')
+          BACKEND_COLLECTED=${BACKEND_COLLECTED:-0}
+          echo "Backend tests collected: ${BACKEND_COLLECTED}"
+
+          # Bot tests also counted toward the >= 250 mass gate
+          cd pasay-telegram-bot
+          pytest tests/ --collect-only -q > ../artifacts/doors/door_15_collect_bot.log 2>&1 || true
+          cd ..
+          BOT_COLLECTED=$(tail -n 5 artifacts/doors/door_15_collect_bot.log | grep -oE '[0-9]+ test' | head -n1 | awk '{print $1}')
+          BOT_COLLECTED=${BOT_COLLECTED:-0}
+          echo "Bot tests collected: ${BOT_COLLECTED}"
+
+          TOTAL_COLLECTED=$((BACKEND_COLLECTED + BOT_COLLECTED))
+          echo "Total collected tests: ${TOTAL_COLLECTED} (backend=${BACKEND_COLLECTED} + bot=${BOT_COLLECTED})"
+          if [ "${TOTAL_COLLECTED}" -lt 250 ]; then
+            echo "FAIL: DOOR-15 test count ${TOTAL_COLLECTED} < 250"
+            exit 1
+          fi
+
+          # --- Part B: bot tests import >= 15 distinct pasay_bot source files ---
+          # Run pytest with traceconfig-style import tracking: dump every module imported
+          # during test collection that lives under pasay-telegram-bot/pasay_bot/
+          python - <<'PYEOF'
+          import os, sys, importlib, json, subprocess, re
+          root = os.path.abspath("pasay-telegram-bot")
+          src_root = os.path.join(root, "pasay_bot")
+          mod_to_file = {}
+
+          # Collect through pytest rewrite tracing: use a small sitecustomize-like
+          # approach: run pytest with PYTHONPATH + a wrapper that records.
+          env = os.environ.copy()
+          env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
+          wrapper = os.path.abspath("artifacts/doors/_bot_import_tracker.py")
+          with open(wrapper, "w") as f:
+              f.write("""
+          import sys, os, builtins
+          _seen = set()
+          _real_import = builtins.__import__
+          ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'pasay-telegram-bot', 'pasay_bot'))
+          def _imp(name, *a, **kw):
+              m = _real_import(name, *a, **kw)
+              f = getattr(m, '__file__', None)
+              if f:
+                  fn = os.path.normpath(f)
+                  if fn.startswith(ROOT) and fn.endswith('.py') and fn not in _seen:
+                      _seen.add(fn)
+                      print(f"BOTIMPORT:{fn}", flush=True)
+              return m
+          builtins.__import__ = _imp
+          """)
+          p = subprocess.run(
+              [sys.executable, "-c",
+               "import sys; sys.path.insert(0, r'" + os.path.dirname(wrapper) + r"'); "
+               "import _bot_import_tracker; "
+               "import pytest; "
+               "sys.argv = ['pytest', 'pasay-telegram-bot/tests/', '--collect-only', '-q']; "
+               "sys.exit(pytest.main())"],
+              capture_output=True, text=True, cwd=os.path.abspath("."), env=env,
+          )
+          out = (p.stdout or "") + "\n" + (p.stderr or "")
+          hits = set()
+          for line in out.splitlines():
+              if line.startswith("BOTIMPORT:"):
+                  hits.add(line[len("BOTIMPORT:"):])
+          # Normalize to paths relative to pasay_bot dir, strip __pycache__
+          clean = set()
+          for h in hits:
+              if "__pycache__" in h:
+                  continue
+              if os.path.isfile(h):
+                  rel = os.path.relpath(h, src_root)
+                  clean.add(rel)
+          result = sorted(clean)
+          print(f"Distinct bot source files imported by tests: {len(result)}")
+          for r in result:
+              print(f"  BOTSRC: {r}")
+          with open("artifacts/doors/door_15_bot_coverage.json", "w") as f:
+              json.dump({"count": len(result), "files": result}, f, indent=2)
+          sys.exit(0 if len(result) >= 15 else 3)
+          PYEOF
+          BOT_COV_EXIT=$?
+          if [ "${BOT_COV_EXIT}" != "0" ]; then
+            echo "FAIL: DOOR-15 bot source-file coverage < 15 (exit=${BOT_COV_EXIT})"
+            exit 1
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_15_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-16 Envelope Python <-> TypeScript compatibility check
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/doors
+          python scripts/envelope_schema_compat.py --json-only . > artifacts/doors/door_16_envelope_compat.json 2>&1 || EXIT=$?
+          EXIT=${EXIT:-0}
+          echo "---- envelope compat summary ----"
+          python - <<'PYEOF'
+          import json, sys
+          r = json.load(open("artifacts/doors/door_16_envelope_compat.json"))
+          print(f"ok: {r['ok']}")
+          for f in r['findings']:
+              print(f"  OK  {f}")
+          for i in r['issues']:
+              print(f"  BAD {i}")
+          if not r['ok']:
+              sys.exit(2)
+          PYEOF
+          PYEXIT=$?
+          if [ "${EXIT}" != "0" ] || [ "${PYEXIT}" != "0" ]; then
+            echo "FAIL: DOOR-16 envelope compat exit=${EXIT} pyexit=${PYEXIT}"
+            exit 1
+          fi
+          echo "BACKEND_FREEZE_GATE__DOOR_16_OK=1" >> $GITHUB_ENV
+
+      - name: DOOR-13 Final invariant summary (00-16)
         id: summary
         run: |
           set -euo pipefail
           mkdir -p artifacts/summary
           {
-            echo "BACKEND_FREEZE_GATE: 13 DOOR SUMMARY"
+            echo "BACKEND_FREEZE_GATE: 17 DOOR SUMMARY (stage1=00-06 stage2=07-10 stage3=11-13 stage4=14-16)"
             echo "RUN_ID=${GITHUB_RUN_ID}"
             echo "SHA=${GITHUB_SHA}"
             echo ""
-            for d in 00 01 02 03 04 05 06 07 08 09 10 11 12; do
+            for d in 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16; do
               KEY="BACKEND_FREEZE_GATE__DOOR_${d}_OK"
               VAL="${!KEY:-MISSING}"
               echo "DOOR-${d} = ${VAL}"
@@ -348,9 +511,9 @@ jobs:
             echo "FREEZE_GATE_DB=${FREEZE_GATE_DB:-n/a}"
           } | tee artifacts/summary/doors_summary.txt
 
-          # Any door missing? Fail closed (all 13 doors must be explicitly 1)
+          # Any door missing? Fail closed (all 17 doors must be explicitly 1)
           MISSING=""
-          for d in 00 01 02 03 04 05 06 07 08 09 10 11 12; do
+          for d in 00 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16; do
             KEY="BACKEND_FREEZE_GATE__DOOR_${d}_OK"
             VAL="${!KEY:-MISSING}"
             if [ "${VAL}" != "1" ]; then
@@ -383,4 +546,4 @@ jobs:
     timeout-minutes: 1
     steps:
       - name: Freeze gate done
-        run: echo "backend-freeze-gate completed — see backend-freeze-gate artifacts for 13 doors"
+        run: echo "backend-freeze-gate completed — see artifacts for 17 doors in 4 stages (stage1=00-06 stage2=07-10 stage3=11-13 stage4=14-16)"
