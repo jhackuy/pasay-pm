@@ -372,13 +372,13 @@ jobs:
         env:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
-          PASAY_TEST_DB_NAME: ${{ env.FREEZE_GATE_DB }}
+          PASAY_TEST_DB_NAME: "pasay_freeze_collect_${{ github.run_id }}"
           PYTHONPATH: "${{ github.workspace }}"
         run: |
           set -euo pipefail
           mkdir -p artifacts/doors
 
-          # --- Part A: total pytest collected >= 250 (fail-closed proof of test mass) ---
+          # --- Part A: backend pytest collected >= 250 (fail-closed proof of backend test mass) ---
           # Root backend repo tests + app code. Backend freeze gate has *already*
           # installed root requirements.txt in step 6, so pytest is available here.
           # The bot tests may or may not have a venv/dev dependencies installed;
@@ -437,8 +437,7 @@ jobs:
 
           # --- Run23 regression root cause (d): backend parser gave 0 but OR gate
           # passed because bot=644. Unconditionally dump first100 + last100 lines
-          # whenever backend<250 so the true runner-side pytest error is visible
-          # even when the total/backend OR branch accidentally passes.
+          # whenever backend<250 so the true runner-side pytest error is visible.
           if [ "${BACKEND_COLLECTED}" -lt 250 ]; then
             echo "--- BACKEND_COLLECTED_UNDER_250: dumping HEAD100 of door_15_collect_backend.log ---"
             sed -n '1,100p' artifacts/doors/door_15_collect_backend.log || true
@@ -448,8 +447,8 @@ jobs:
           fi
 
           # Bot tests counted too if the bot dev-dependencies happen to be installed,
-          # but they are NOT required for the >= 250 mass gate (backend alone already
-          # provides >= 1000). We accumulate / echo them for transparency only.
+          # but they are NOT allowed to satisfy the >= 250 backend mass gate (backend
+          # alone is expected to provide >= 1000). We accumulate / echo them for transparency only.
           BOT_COLLECTED=0
           if [ -f "pasay-telegram-bot/pyproject.toml" ]; then
             # Try once, no error; if bot pytest isn't installed BOT_COLLECTED stays 0
@@ -475,8 +474,8 @@ jobs:
           echo "BACKEND_COLLECTED=${BACKEND_COLLECTED}"  >> "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null || true
           echo "BOT_COLLECTED=${BOT_COLLECTED}"          >> "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null || true
           echo "TOTAL_COLLECTED=${TOTAL_COLLECTED}"      >> "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null || true
-          if [ "${TOTAL_COLLECTED}" -lt 250 ] && [ "${BACKEND_COLLECTED}" -lt 250 ]; then
-            echo "FAIL: DOOR-15 test count total=${TOTAL_COLLECTED} backend=${BACKEND_COLLECTED} both < 250"
+          if [ "${BACKEND_COLLECTED}" -lt 250 ]; then
+            echo "FAIL: DOOR-15 backend test count ${BACKEND_COLLECTED} < 250 (total=${TOTAL_COLLECTED}; bot cannot satisfy backend mass gate)"
             echo "--- debug door_15_collect_backend.log (full) ---"
             cat artifacts/doors/door_15_collect_backend.log || true
             echo "--- end debug door_15_collect_backend.log (full) ---"
@@ -485,7 +484,7 @@ jobs:
             echo "--- end debug door_15_collect_bot.log (full) ---"
             exit 1
           fi
-          echo "DOOR-15 Part A mass gate OK (backend=${BACKEND_COLLECTED} >= 250 OR total=${TOTAL_COLLECTED} >= 250)"
+          echo "DOOR-15 Part A mass gate OK (backend=${BACKEND_COLLECTED} >= 250; total=${TOTAL_COLLECTED} informational only)"
 
           # --- Part B: bot coverage >= 15 distinct pasay_bot source files ---
           # Two independent proofs: filesystem (deterministic lower bound, >=15 IS the
@@ -643,6 +642,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/summary
+          export BACKEND_FREEZE_GATE__DOOR_13_OK=1
           echo "BACKEND_FREEZE_GATE__DOOR_13_OK=1" >> $GITHUB_ENV
           echo "OK=1" >> "${GITHUB_OUTPUT:-/dev/null}" 2>/dev/null || true
           {
