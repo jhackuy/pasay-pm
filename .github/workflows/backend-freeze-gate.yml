@@ -373,6 +373,7 @@ jobs:
           DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
           DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/${{ env.FREEZE_GATE_DB }}"
           PASAY_TEST_DB_NAME: ${{ env.FREEZE_GATE_DB }}
+          PYTHONPATH: "${{ github.workspace }}"
         run: |
           set -euo pipefail
           mkdir -p artifacts/doors
@@ -436,16 +437,16 @@ jobs:
             # Try once, no error; if bot pytest isn't installed BOT_COLLECTED stays 0
             (cd pasay-telegram-bot && (python -m pytest tests/ --co --no-header -q > ../artifacts/doors/door_15_collect_bot.log 2>&1 || true)) || true
             BOT_COLLECTED=$(python - <<'PYEOF' 2>/dev/null || echo 0
-            import re
-            text = open("artifacts/doors/door_15_collect_bot.log", encoding="utf-8", errors="replace").read()
-            tail = text.splitlines()[-12:]
-            for line in tail:
-                m = re.search(r'(\d+)\s*tests\s*collected', line)
-                if m: print(m.group(1)); raise SystemExit(0)
-                m2 = re.search(r'(\d+)\s*item(s)?\s*collected', line)
-                if m2: print(m2.group(1)); raise SystemExit(0)
-            print(0)
-            PYEOF
+          import re
+          text = open("artifacts/doors/door_15_collect_bot.log", encoding="utf-8", errors="replace").read()
+          tail = text.splitlines()[-12:]
+          for line in tail:
+              m = re.search(r'(\d+)\s*tests\s*collected', line)
+              if m: print(m.group(1)); raise SystemExit(0)
+              m2 = re.search(r'(\d+)\s*item(s)?\s*collected', line)
+              if m2: print(m2.group(1)); raise SystemExit(0)
+          print(0)
+          PYEOF
             )
           fi
           BOT_COLLECTED=${BOT_COLLECTED:-0}
