@@ -14,7 +14,7 @@ This directory turns AgentTeams v1.2.3 into a PASAY-specific Manager → Team Le
 | `pasay-reviewer` | Read-only scope/security/architecture review |
 | `pasay-brake` | Stops drift, duplicate findings and revision loops |
 
-The systemd watchdog is a second, non-LLM brake. Every five minutes it fingerprints Project task states. Six unchanged checks pause the project instead of allowing an invisible token loop.
+The systemd watchdog is a second, non-LLM brake. Every five minutes it fingerprints Project task states. Six unchanged checks pause the Project and freeze only the six PASAY Worker containers, stopping in-flight token use instead of allowing an invisible loop. The Manager and AgentTeams control plane remain available.
 
 ## One-time deployment on GX10
 
@@ -48,7 +48,7 @@ The Manager must create a Project rather than free-form chat. Final states are:
 
 - `READY_FOR_OWNER`: implementation and independent evidence are complete; Owner performs final acceptance/merge decision.
 - `BLOCKED_FOR_PRODUCT_DECISION`: the goal conflicts with an Owner-only business boundary or a required credential/capability is absent. The team stops once and reports evidence; it must not repeatedly ask.
-- `PAUSED_BY_WATCHDOG`: workflow state did not change for 30 minutes. Inspect the Project timeline before resuming or replanning.
+- `PAUSED_BY_WATCHDOG`: workflow state did not change for 30 minutes. The Project and PASAY Worker containers are paused. After inspecting/replanning, resume with `~/.local/share/pasay-agentteams/resume-project.sh <project-id>`.
 
 ## Local checks
 
@@ -56,6 +56,7 @@ The Manager must create a Project rather than free-form chat. Final states are:
 python3 -m pytest -q ops/agentteams/tests/test_watchdog.py
 bash -n ops/agentteams/bootstrap.sh
 bash -n ops/agentteams/install-watchdog.sh
+bash -n ops/agentteams/resume-project.sh
 ```
 
 ## Known external prerequisites
