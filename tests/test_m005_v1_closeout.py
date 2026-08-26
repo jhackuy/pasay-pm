@@ -241,37 +241,47 @@ def test_m005_float_safety_script_exit_0_on_clean_codebase():
 
 
 def test_m005_float_safety_fail_closed_on_real_float_ctor_in_blacklist(tmp_path, db_session):
-    """Inject a fake lease.py containing `float(1)` and assert FAIL (exit 1).
+    """REAL-BLACKLIST injection: append float() to app/api/routers/expense.py,
+    run scanner against the REAL repository root, prove exit=1, then restore
+    the file (fail-closed on ANY failure to restore).
 
-    Never modify real blacklist files in the test; create tmp tree copy
-    of one blacklist file and point the scanner at it.
+    We do NOT use tmp_path tree; we use the actual repo blacklist file
+    basename=expense.py (appears in FINANCIAL_BLACKLIST).  Under no
+    circumstances may the file stay modified after the test returns.
     """
     import os
-    from app.schemas.lease import __file__ as _lease_py
-    target_blacklist = Path(_lease_py)
-    sc_src = (REPO_ROOT / "scripts" / "pasay_gate_float_safety.py").read_text(encoding="utf-8")
-    needle = f"\"{target_blacklist.relative_to(REPO_ROOT).as_posix()}\""
-    if needle not in sc_src:
-        pytest.skip("file no longer in blacklist — skip sanity injection subtest")
+    target = REPO_ROOT / "app" / "api" / "routers" / "expense.py"
+    assert target.exists() and target.name in {"expense.py"}
+    sc = REPO_ROOT / "scripts" / "pasay_gate_float_safety.py"
+    assert sc.exists()
 
-    tree_root = tmp_path / "repo"
-    dst = tree_root / target_blacklist.relative_to(REPO_ROOT)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.write_bytes(target_blacklist.read_bytes())
-    with dst.open("a", encoding="utf-8") as f:
-        f.write("\n\n# injected float() for M005 test\n_UNUSED = float(1.5)\n")
+    original_bytes = target.read_bytes()
+    needle_line = "\n# injected float by M005 float-safety counterexample test\n_pasay_m005_unused = float(0.333)\n"
+    restored = False
+    try:
+        with target.open("a", encoding="utf-8") as f:
+            f.write(needle_line)
+        # Confirm the injection actually took effect on the target file.
+        assert needle_line in target.read_text(encoding="utf-8")
 
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    proc = subprocess.run(
-        [_py(), str(REPO_ROOT / "scripts" / "pasay_gate_float_safety.py"),
-         str(tree_root)],
-        capture_output=True, cwd=str(tree_root), timeout=120, env=env,
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.run(
+            [_py(), str(sc), str(REPO_ROOT)],
+            capture_output=True, cwd=str(REPO_ROOT), timeout=120, env=env,
+        )
+        stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
+        assert proc.returncode == 1, (
+            "Float gate must fail-closed after real blacklist injection; "
+            f"got exit 0. stdout:\n{stdout_text}\n\nstderr:\n{stderr_text}"
+        )
+        assert "FAIL" in stdout_text or "BLACKLIST-FAIL" in stdout_text, stdout_text
+        assert "expense.py" in stdout_text, stdout_text
+    finally:
+        target.write_bytes(original_bytes)
+        restored = target.read_bytes() == original_bytes
+    assert restored, (
+        "SAFETY FAILURE: app/api/routers/expense.py was NOT restored after "
+        "float-safety injection subtest.  The file must be recovered from git."
     )
-    stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
-    stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
-    assert proc.returncode == 1, (
-        "Float gate must fail-closed; got exit 0. stdout: "
-        + stdout_text + " stderr: " + stderr_text
-    )
-    assert "FAIL" in stdout_text or "float" in stdout_text.lower(), stdout_text
