@@ -1153,7 +1153,7 @@ jobs:
               SUB="${CF_ACCOUNT_ID_}"
           fi
           echo "CF workers subdomain namespace configured = ${SUB:0:6}… (len=${#SUB})"
-          WEBHOOK_URL="https://${WORKER_NAME}.${SUB}.workers.dev/telegram/webhook"
+          export WEBHOOK_URL="https://${WORKER_NAME}.${SUB}.workers.dev/telegram/webhook"
           # mask the full URL (it's semi-secret; Owner knows but we don't print in public logs)
           echo "::add-mask::${WEBHOOK_URL}"
           echo "worker public webhook URL = [MASKED workers.dev /telegram/webhook]; len=${#WEBHOOK_URL}"
