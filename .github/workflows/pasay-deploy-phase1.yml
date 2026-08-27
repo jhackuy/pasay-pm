@@ -752,19 +752,45 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Ensure we use setup-python's Python interpreter (hostedtoolcache) where psycopg2 was installed
-          # (wrangler/npx PATH pollution can cause bare `python` to resolve to system python3 without site-packages).
-          if [[ -n "${Python3_ROOT_DIR:-}" && -x "${Python3_ROOT_DIR}/bin/python" ]]; then
-            export PATH="${Python3_ROOT_DIR}/bin:${PATH}"
+          # STEP 0/STEP 6 both import psycopg2 and pass, but STEP 7 historically cannot find psycopg2
+          # because PATH was modified by npx wrangler invocations and we picked the wrong python binary.
+          # Strategy: probe a list of candidate pythons and use THE FIRST one that can actually import psycopg2.
+          # This matches whatever python STEP 6 / INSTALL Python deps step used without guessing.
+          PYTHON_BIN=""
+          candidates=(
+            "${Python3_ROOT_DIR:+${Python3_ROOT_DIR}/bin/python}"
+            "${Python3_ROOT_DIR:+${Python3_ROOT_DIR}/bin/python3}"
+            "${pythonLocation:+${pythonLocation}/bin/python}"
+            "${pythonLocation:+${pythonLocation}/bin/python3}"
+            "$(command -v python3 2>/dev/null || true)"
+            "$(command -v python 2>/dev/null || true)"
+          )
+          echo "step7 python candidates (will use the first one that can import psycopg2):"
+          for c in "${candidates[@]}"; do
+            if [[ -z "${c:-}" ]]; then continue; fi
+            if [[ ! -x "$c" ]]; then continue; fi
+            echo "  probe: $c"
+            if "$c" -c "import psycopg2; pass" 2>/dev/null; then
+              PYTHON_BIN="$c"
+              echo "  -> SELECTED (psycopg2 is importable)."
+              break
+            fi
+          done
+          if [[ -z "$PYTHON_BIN" ]]; then
+            echo "FATAL: none of the candidate python interpreters can import psycopg2 (INSTALL Python deps step should have installed it into one)."
+            echo "Debug dump:"
+            command -v python3 || true
+            command -v python  || true
+            (command -v pip3 >/dev/null 2>&1)  && pip3 show psycopg2 2>&1 || echo "no pip3"
+            (command -v pip  >/dev/null 2>&1)  && pip  show psycopg2 2>&1 || echo "no pip"
+            (command -v python3 >/dev/null 2>&1) && python3 -c "import sys; print('python3 executable =', sys.executable); print('python3 sys.path ='); [print('  ', p) for p in sys.path]" 2>&1 || true
+            (command -v python  >/dev/null 2>&1) && python  -c "import sys; print('python executable =',  sys.executable); print('python sys.path =');  [print('  ', p) for p in sys.path]" 2>&1 || true
+            exit 1
           fi
-          echo "python resolved to: $(command -v python 2>/dev/null || echo NO_PYTHON)"
-          echo "python3 resolved to: $(command -v python3 2>/dev/null || echo NO_PYTHON3)"
-          python --version 2>&1 || true
-          python -c "import sys; print('sys.executable =', sys.executable)" 2>&1 || true
-          python -c "import psycopg2; print('psycopg2 version:', getattr(psycopg2, '__version__', 'installed-no-version'))" 2>&1 || true
-          # Combined single-Python pass: derive Neon URIs (masked) + fail-closed identity validation + idempotent bootstrap.
+          "$PYTHON_BIN" --version
+          "$PYTHON_BIN" -c "import sys; print('using python executable =', sys.executable); import psycopg2; print('psycopg2 location =', getattr(psycopg2, '__file__', '?'))"
           echo "::group::(A) Re-derive Neon URIs (masked) + (B) Validate identity vars (fail-closed) + (C) Idempotent INSERT org/users/memberships/principals/bindings/endpoints/ApiCredential (ONLY if organizations empty)"
-          python - <<'PY'
+          "$PYTHON_BIN" - <<'PY'
           import json, os, urllib.request, urllib.error, ssl, base64, re, time, secrets, hashlib
           import urllib.parse as _urllib_parse
           import psycopg2
