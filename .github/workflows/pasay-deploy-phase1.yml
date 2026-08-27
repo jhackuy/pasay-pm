@@ -752,10 +752,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Re-derive URIs (idempotent; already masked in step outputs)
-          echo "::group::Re-derive Neon URIs for bootstrap (masked)"
+          # Combined single-Python pass: derive Neon URIs (masked) + fail-closed identity validation + idempotent bootstrap.
+          # (Single Python = same site-packages = psycopg2 import guaranteed if installed; avoids shell-inherited python PATH gaps.)
+          echo "::group::(A) Re-derive Neon URIs (masked) + (B) Validate identity vars (fail-closed) + (C) Idempotent INSERT org/users/memberships/principals/bindings/endpoints/ApiCredential (ONLY if organizations empty)"
           python - <<'PY'
-          import json, os, urllib.request, urllib.error, ssl, base64
+          import json, os, urllib.request, urllib.error, ssl, base64, re, time, secrets, hashlib
+          import urllib.parse as _urllib_parse
+          import psycopg2
+          from datetime import datetime, timezone
+
+          # ═══════════════════════════════════════════════════════════
+          # PART (A) — Re-derive Neon URIs (idempotent; mask everything)
+          # ═══════════════════════════════════════════════════════════
           token = os.environ["NEON_API_KEY"]; pid = os.environ["NEON_PROJECT_ID"]; bid = os.environ["NEON_BRANCH_ID"]
           base  = "https://console.neon.tech/api/v2"
           headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
@@ -780,69 +788,50 @@ jobs:
               raise SystemExit(f"derive conn_uri {db}/{role}/pooled={pooled} FAILED shape: {str(r)[:400]}")
           db_pooled   = conn_uri("neondb", "pasay_runtime", True)
           db_unpooled = conn_uri("neondb", "neondb_owner", False)
-          # mask
           for u in (db_pooled, db_unpooled):
               print(f"::add-mask::{u}")
-              import urllib.parse as _p
-              parsed = _p.urlparse(u)
+              parsed = _urllib_parse.urlparse(u)
               if parsed.password: print(f"::add-mask::{parsed.password}")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"DATABASE_URL={db_pooled}\nDATABASE_URL_UNPOOLED={db_unpooled}\n")
-          print("[step7] DATABASE_URL(DUAL) derived & masked.")
-          PY
-          echo "::endgroup::"
+          print("[step7.A] DATABASE_URL(DUAL) derived & masked.", flush=True)
 
-          echo "::group::STEP 7.1 — Validate identity vars (fail-closed) + Idempotent INSERT organizations / users / memberships (ONLY if none exist)"
-          python - <<'PY'
-          import os, json, time, secrets, hashlib, re
-          import psycopg2
-          from datetime import datetime, timezone
-
+          # ═══════════════════════════════════════════════════════════
+          # PART (B) — FAIL-CLOSED identity validation (NO defaults)
+          # ═══════════════════════════════════════════════════════════
           OWNER_TG_UID  = os.environ.get("OWNER_TG_USER_ID", "").strip()
           OWNER_TG_NAME = os.environ.get("OWNER_TG_USERNAME", "").strip()
           SEC_TG_UID    = os.environ.get("SEC_TG_USER_ID", "").strip()
           SEC_TG_NAME   = os.environ.get("SEC_TG_USERNAME", "").strip()
 
-          # --- FAIL-CLOSED validations (NO secrets printed). ---
-          # Owner identity is MANDATORY for bootstrap; NO defaults / fallbacks.
           if not OWNER_TG_UID or not OWNER_TG_NAME:
               raise SystemExit(
-                  "[step7.1] FAIL: Owner identity REQUIRED from GitHub Repository Variables "
+                  "[step7.B] FAIL: Owner identity REQUIRED from GitHub Repository Variables "
                   "(vars.PASAY_OWNER_TG_USER_ID / vars.PASAY_OWNER_TG_USERNAME); "
                   "got: uid_len=%s uname_len=%s. NO defaults permitted."
                   % (len(OWNER_TG_UID), len(OWNER_TG_NAME))
               )
           if not re.fullmatch(r"\d{3,20}", OWNER_TG_UID):
-              raise SystemExit("[step7.1] FAIL: PASAY_OWNER_TG_USER_ID must be numeric Telegram user_id (len 3-20); actual len=%s" % len(OWNER_TG_UID))
-          # Secretary1: both-or-none. If only one provided -> hard fail (no half-bindings).
+              raise SystemExit("[step7.B] FAIL: PASAY_OWNER_TG_USER_ID must be numeric Telegram user_id len 3-20; actual=%s" % len(OWNER_TG_UID))
           has_sec_uid  = bool(SEC_TG_UID)
           has_sec_name = bool(SEC_TG_NAME)
           if has_sec_uid != has_sec_name:
               raise SystemExit(
-                  "[step7.1] FAIL: PASAY_SECRETARY1 pair must be BOTH set or BOTH empty. "
+                  "[step7.B] FAIL: PASAY_SECRETARY1 pair must be BOTH set or BOTH empty. "
                   "Got: sec_uid_len=%s sec_uname_len=%s. NO partial identity permitted."
                   % (len(SEC_TG_UID), len(SEC_TG_NAME))
               )
           if has_sec_uid and not re.fullmatch(r"\d{3,20}", SEC_TG_UID):
-              raise SystemExit("[step7.1] FAIL: PASAY_SECRETARY1_TG_USER_ID must be numeric Telegram user_id (len 3-20); actual len=%s" % len(SEC_TG_UID))
-          # Ensure no OWNER/SECRETARY overlap (same TG identity cannot occupy both roles in seed).
+              raise SystemExit("[step7.B] FAIL: PASAY_SECRETARY1_TG_USER_ID must be numeric Telegram user_id len 3-20; actual=%s" % len(SEC_TG_UID))
           if has_sec_uid and (OWNER_TG_UID == SEC_TG_UID or OWNER_TG_NAME.lower() == SEC_TG_NAME.lower()):
-              raise SystemExit("[step7.1] FAIL: Owner identity cannot equal Secretary1 identity (same TG user bound to both roles in bootstrap).")
-          print("[step7.1] validate: OWNER identity configured (uid_len=%s uname_len=%s); SEC1 configured=%s (uid_len=%s uname_len=%s) PASS"
-                % (len(OWNER_TG_UID), len(OWNER_TG_NAME), "TRUE" if has_sec_uid else "FALSE", len(SEC_TG_UID), len(SEC_TG_NAME)), flush=True)
-          # Normalize owner_uid -> int early (fail-closed if not numeric beyond regex; shouldn't trigger).
-          try:
-              OWNER_TG_UID_INT = int(OWNER_TG_UID)
-          except Exception:
-              raise SystemExit("[step7.1] FAIL: OWNER_TG_USER_ID cannot be coerced to integer (non-numeric?).")
-          SEC_TG_UID_INT = None
+              raise SystemExit("[step7.B] FAIL: Owner identity cannot equal Secretary1 identity (same TG user bound to both roles in bootstrap).")
+          # Coerce early (fail-closed) to int for BIGINT columns downstream.
+          OWNER_TG_UID_INT = int(OWNER_TG_UID)
+          SEC_TG_UID_INT: int | None = None
           if has_sec_uid:
-              try:
-                  SEC_TG_UID_INT = int(SEC_TG_UID)
-              except Exception:
-                  raise SystemExit("[step7.1] FAIL: SEC_TG_USER_ID cannot be coerced to integer.")
-          # Alias (keep SEC_* name consistent downstream; now both-or-none already enforced, so pair = SEC_TG_UID_INT & SEC_TG_NAME only when has_sec_uid)
-          # We shadow SEC_TG_UID/SEC_TG_NAME downstream with originals (stripped) but rely on has_sec_uid gating downstream.
+              SEC_TG_UID_INT = int(SEC_TG_UID)
+          print("[step7.B] validate: OWNER identity (uid_len=%s uname_len=%s); SEC1 configured=%s (uid_len=%s uname_len=%s) PASS"
+                % (len(OWNER_TG_UID), len(OWNER_TG_NAME), "TRUE" if has_sec_uid else "FALSE", len(SEC_TG_UID), len(SEC_TG_NAME)), flush=True)
 
           url = os.environ["DATABASE_URL_UNPOOLED"]
           now = datetime.now(timezone.utc)
