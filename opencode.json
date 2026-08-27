@@ -1,4 +1,10 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["superpowers@git+https://github.com/obra/superpowers.git#v6.1.1"]
+  "plugin": ["superpowers@git+https://github.com/obra/superpowers.git#v6.1.1"],
+  "permission": {
+    "question": "deny",
+    "doom_loop": "deny",
+    "task": "deny",
+    "external_directory": "deny"
+  }
 }
