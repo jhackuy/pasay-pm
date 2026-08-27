@@ -752,8 +752,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Ensure we use setup-python's Python interpreter (hostedtoolcache) where psycopg2 was installed
+          # (wrangler/npx PATH pollution can cause bare `python` to resolve to system python3 without site-packages).
+          if [[ -n "${Python3_ROOT_DIR:-}" && -x "${Python3_ROOT_DIR}/bin/python" ]]; then
+            export PATH="${Python3_ROOT_DIR}/bin:${PATH}"
+          fi
+          echo "python resolved to: $(command -v python 2>/dev/null || echo NO_PYTHON)"
+          echo "python3 resolved to: $(command -v python3 2>/dev/null || echo NO_PYTHON3)"
+          python --version 2>&1 || true
+          python -c "import sys; print('sys.executable =', sys.executable)" 2>&1 || true
+          python -c "import psycopg2; print('psycopg2 version:', getattr(psycopg2, '__version__', 'installed-no-version'))" 2>&1 || true
           # Combined single-Python pass: derive Neon URIs (masked) + fail-closed identity validation + idempotent bootstrap.
-          # (Single Python = same site-packages = psycopg2 import guaranteed if installed; avoids shell-inherited python PATH gaps.)
           echo "::group::(A) Re-derive Neon URIs (masked) + (B) Validate identity vars (fail-closed) + (C) Idempotent INSERT org/users/memberships/principals/bindings/endpoints/ApiCredential (ONLY if organizations empty)"
           python - <<'PY'
           import json, os, urllib.request, urllib.error, ssl, base64, re, time, secrets, hashlib
