@@ -2,6 +2,13 @@ name = "pasay-cloudflare-worker"
 main = "src/index.ts"
 compatibility_date = "2026-08-20"
 
+# RETURN2 STEP A: Enable official Worker observability to retain Container
+# stdout/stderr lifecycle logs (onStart / onStop exitCode/reason).
+# Ref: https://developers.cloudflare.com/containers/faq/
+#      https://developers.cloudflare.com/workers/observability/logs/real-time-logs/
+[observability]
+enabled = true
+
 # ── Cloudflare Containers — OFFICIAL native binding (ND_RETURN FIX2 #1) ──
 # Container class is declared in src/index.ts as "export class PasayContainer extends Container"
 # with defaultPort=8000 matching Dockerfile CMD "uvicorn ... --port 8000".

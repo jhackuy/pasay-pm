@@ -46,6 +46,7 @@ interface Env {
   DATABASE_URL?: string;
   DATABASE_URL_UNPOOLED?: string;
   TELEGRAM_BOT_TOKEN?: string;
+  PASAY_BUILD_SHA?: string;
 }
 
 // ── OFFICIAL Container class declaration ────────────────────────────────
@@ -75,6 +76,47 @@ export class PasayContainer extends Container {
       PASAY_RUNTIME_MODE: "cloudflare-container",
       PASAY_BUILD_SHA: env.PASAY_BUILD_SHA ?? "",
     };
+  }
+
+  // ── RETURN2 STEP A: Official lifecycle hooks (evidence, never secrets) ──
+  // Ref: https://developers.cloudflare.com/containers/examples/status-hooks/
+  async onStart(): Promise<void> {
+    console.log(
+      "[PasayContainer onStart]",
+      JSON.stringify({
+        at: now_iso(),
+        default_port: this.defaultPort,
+        sleep_after: this.sleepAfter,
+        mode: this.envVars.PASAY_RUNTIME_MODE,
+        build_sha_head: (this.envVars.PASAY_BUILD_SHA || "").slice(0, 12) + "…",
+      }),
+    );
+  }
+
+  async onStop(params: { exitCode?: number; reason?: string } = {}): Promise<void> {
+    const safe_reason = mask_sensitive(String(params.reason ?? "N/A")).slice(0, 240);
+    console.log(
+      "[PasayContainer onStop]",
+      JSON.stringify({
+        at: now_iso(),
+        exit_code: params.exitCode ?? null,
+        reason: safe_reason,
+      }),
+    );
+  }
+
+  async onError(error: unknown): Promise<void> {
+    const safe_msg = mask_sensitive(error instanceof Error ? error.message : String(error)).slice(0, 200);
+    console.log(
+      "[PasayContainer onError]",
+      JSON.stringify({
+        at: now_iso(),
+        type: error instanceof Error ? error.name : typeof error,
+        msg_head: safe_msg,
+      }),
+    );
+    if (error instanceof Error) throw error;
+    throw new Error(safe_msg || "PasayContainer unknown error");
   }
 }
 
@@ -398,6 +440,62 @@ export default {
           ok: false, error: "container_handle_missing_fetch",
         }), { status: 503, headers: { "Content-Type": "application/json" } });
       }
+
+      // RETURN2 STEP B: Official explicit start + wait for port readiness.
+      // Classification (from Run#2 artifact): Container lifecycle / startup race
+      // with slow entrypoint (alembic upgrade head → uvicorn :8000) matching
+      // upstream cloudflare/containers#232 exact symptom.  getContainer() alone
+      // does NOT start the instance; fetch() auto-start can race with port
+      // binding after a version roll.  The official primitive per docs is
+      // startAndWaitForPorts before the first fetch().
+      // Refs:
+      //   https://developers.cloudflare.com/containers/container-class/
+      //   https://developers.cloudflare.com/containers/platform-details/scaling-and-routing/
+      //   https://github.com/cloudflare/containers/issues/232
+      type ContainerHandleFull = ContainerHandle & {
+        startAndWaitForPorts?: (args: {
+          ports: number | number[];
+          cancellationOptions?: {
+            abort?: AbortSignal;
+            instanceGetTimeoutMS?: number;
+            portReadyTimeoutMS?: number;
+            waitInterval?: number;
+          };
+          startOptions?: any;
+        }) => Promise<void>;
+      };
+      const handleFull = handle as ContainerHandleFull;
+      if (typeof handleFull.startAndWaitForPorts === "function") {
+        const startAbort = new AbortController();
+        const startTimeoutMs = 150_000;
+        const startTimer = setTimeout(() => startAbort.abort(), startTimeoutMs);
+        try {
+          await handleFull.startAndWaitForPorts({
+            ports: [8000],
+            cancellationOptions: {
+              abort: startAbort.signal,
+              instanceGetTimeoutMS: 30_000,
+              portReadyTimeoutMS: 120_000,
+              waitInterval: 500,
+            },
+          });
+        } catch (startErr) {
+          const msg = mask_sensitive(startErr instanceof Error ? startErr.message : String(startErr)).slice(0, 240);
+          return new Response(
+            JSON.stringify({
+              ok: false,
+              error: "container_start_timeout",
+              detail: msg,
+              start_timeout_ms: startTimeoutMs,
+              port_ready_timeout_ms: 120_000,
+            }),
+            { status: 503, headers: { "Content-Type": "application/json" } },
+          );
+        } finally {
+          clearTimeout(startTimer);
+        }
+      }
+
       const absoluteUrl = `${PASAY_CONTAINER_ORIGIN}/health`;
       let probeRequest: Request;
       try {

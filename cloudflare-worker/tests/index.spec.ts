@@ -771,9 +771,9 @@ run("CLOSEOUT#6: Container status codes → EXACT ack/retry/terminal mapping (20
   }
 });
 
-run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL 6 unique keys (5 mapped from env + 1 static PASAY_RUNTIME_MODE)", () => {
-  const envVarEntries = [...WORKER_SRC.matchAll(/(?:PASAY_RUNTIME_MODE|DATABASE_URL(?:_UNPOOLED)?|TELEGRAM_BOT_TOKEN|TELEGRAM_WEBHOOK_SECRET|CONTAINER_INGEST_TOKEN)\s*:/g)].length;
-  assert(envVarEntries >= 6, `source should list the 6-keys envVars map (found ${envVarEntries} key assignments)`);
+run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL 7 unique keys (6 mapped from env + 1 static PASAY_RUNTIME_MODE)", () => {
+  const envVarEntries = [...WORKER_SRC.matchAll(/(?:PASAY_RUNTIME_MODE|PASAY_BUILD_SHA|DATABASE_URL(?:_UNPOOLED)?|TELEGRAM_BOT_TOKEN|TELEGRAM_WEBHOOK_SECRET|CONTAINER_INGEST_TOKEN)\s*:/g)].length;
+  assert(envVarEntries >= 7, `source should list the 7-keys envVars map (found ${envVarEntries} key assignments)`);
 });
 
 run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env → exact keyset + per-key mapping source verified", () => {
@@ -785,12 +785,13 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     DATABASE_URL: "postgres://u:p@h/d",
     DATABASE_URL_UNPOOLED: "postgres://u:p@h/d_direct",
     TELEGRAM_BOT_TOKEN: "123:abc",
+    PASAY_BUILD_SHA: "sha_35ab6ddabcdef1234567",
   };
   const inst = new (PasayContainer as any)({ id: "stub" }, fullEnv);
   const keys = Object.keys(inst.envVars).sort();
   const expected = [
     "CONTAINER_INGEST_TOKEN", "DATABASE_URL", "DATABASE_URL_UNPOOLED",
-    "PASAY_RUNTIME_MODE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
+    "PASAY_BUILD_SHA", "PASAY_RUNTIME_MODE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
   ].sort();
   assert_eq(keys.length, expected.length,
     `envVars keys length = ${expected.length} unique — got ${keys.length}: ${keys}`);
@@ -798,7 +799,7 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     assert(k in inst.envVars, `envVars must contain key ${k}`);
   }
   // Per-key exact mapping source:
-  //   4 keys = direct 1:1 from Env → envVars
+  //   5 keys = direct 1:1 from Env → envVars
   assert_eq(inst.envVars.DATABASE_URL, fullEnv.DATABASE_URL,
     "DATABASE_URL <-- env.DATABASE_URL (1:1)");
   assert_eq(inst.envVars.DATABASE_URL_UNPOOLED, fullEnv.DATABASE_URL_UNPOOLED,
@@ -807,6 +808,8 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     "TELEGRAM_BOT_TOKEN <-- env.TELEGRAM_BOT_TOKEN (1:1)");
   assert_eq(inst.envVars.TELEGRAM_WEBHOOK_SECRET, fullEnv.TELEGRAM_WEBHOOK_SECRET,
     "TELEGRAM_WEBHOOK_SECRET <-- env.TELEGRAM_WEBHOOK_SECRET (1:1)");
+  assert_eq(inst.envVars.PASAY_BUILD_SHA, fullEnv.PASAY_BUILD_SHA,
+    "PASAY_BUILD_SHA <-- env.PASAY_BUILD_SHA (1:1, used by CI Truth Gate build_sha 2x stable match)");
   //   1 key = NAME MAPPING (PASAY_CONTAINER_INGEST_TOKEN in Env →
   //     CONTAINER_INGEST_TOKEN in envVars), to match backend snake_case
   //     "container_ingest_token" Settings key.
