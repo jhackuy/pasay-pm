@@ -466,16 +466,14 @@ export default {
       };
       const handleFull = handle as ContainerHandleFull;
       if (typeof handleFull.startAndWaitForPorts === "function") {
-        const startAbort = new AbortController();
-        const startTimeoutMs = 150_000;
-        const startTimer = setTimeout(() => startAbort.abort(), startTimeoutMs);
+        const instanceGetTimeoutMs = 30_000;
+        const portReadyTimeoutMs = 120_000;
         try {
           await handleFull.startAndWaitForPorts({
             ports: [8000],
             cancellationOptions: {
-              abort: startAbort.signal,
-              instanceGetTimeoutMS: 30_000,
-              portReadyTimeoutMS: 120_000,
+              instanceGetTimeoutMS: instanceGetTimeoutMs,
+              portReadyTimeoutMS: portReadyTimeoutMs,
               waitInterval: 500,
             },
           });
@@ -486,13 +484,11 @@ export default {
               ok: false,
               error: "container_start_timeout",
               detail: msg,
-              start_timeout_ms: startTimeoutMs,
-              port_ready_timeout_ms: 120_000,
+              instance_get_timeout_ms: instanceGetTimeoutMs,
+              port_ready_timeout_ms: portReadyTimeoutMs,
             }),
             { status: 503, headers: { "Content-Type": "application/json" } },
           );
-        } finally {
-          clearTimeout(startTimer);
         }
       }
 
