@@ -309,16 +309,39 @@ jobs:
         working-directory: cloudflare-worker
         run: |
           set -euo pipefail
-          echo "whoami: $(npx wrangler whoami 2>&1 | head -5)"
+
+          # === Safe credential diagnostics (NO values — only length/hex-pattern) ===
+          echo "[step1-diag] CF_ACCOUNT_ID length=${#CF_ACCOUNT_ID}"
+          if [ "${#CF_ACCOUNT_ID}" -ge 10 ]; then
+            echo "[step1-diag] CF_ACCOUNT_ID prefix=${CF_ACCOUNT_ID:0:6}... suffix=...${CF_ACCOUNT_ID: -4}"
+          fi
+          echo "[step1-diag] CF_API_TOKEN length=${#CF_API_TOKEN}"
+          if [ "${#CF_API_TOKEN}" -ge 8 ]; then
+            echo "[step1-diag] CF_API_TOKEN prefix=${CF_API_TOKEN:0:6}..."
+          fi
+          echo "[step1-diag] CLOUDFLARE_API_TOKEN length=${#CLOUDFLARE_API_TOKEN}"
+          # wrangler whoami raw (capture exit code)
+          set +e
+          WRANGLER_OUT=$(npx wrangler whoami 2>&1)
+          WRANGLER_RC=$?
+          set -e
+          echo "[step1-diag] wrangler whoami exit=${WRANGLER_RC}"
+          echo "whoami-tail: $(echo "${WRANGLER_OUT}" | tail -10)"
 
           python - <<'PY'
-          import os, json, urllib.request, ssl
-          account_id = os.environ["CF_ACCOUNT_ID"]
-          token      = os.environ["CF_API_TOKEN"]
+          import os, json, re, urllib.request, ssl
+          account_id = os.environ.get("CF_ACCOUNT_ID", "")
+          token      = os.environ.get("CF_API_TOKEN", "")
+          cf_token   = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+          print(f"[step1-py] CF_ACCOUNT_ID len={len(account_id)} hex_match={bool(re.fullmatch(r'[0-9a-f]{32}', account_id))}", flush=True)
+          print(f"[step1-py] CF_API_TOKEN len={len(token)} starts_with_CF_ = {token[:3].lower()=='cf-'}", flush=True)
+          print(f"[step1-py] CLOUDFLARE_API_TOKEN len={len(cf_token)}", flush=True)
+          print(f"[step1-py] CF_API_TOKEN==CLOUDFLARE_API_TOKEN? {len(token)>0 and len(cf_token)>0 and token==cf_token}", flush=True)
           base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type":  "application/json",
+              "Accept":        "application/json",
           }
 
           def cf(method, path, body=None):
