@@ -1,0 +1,302 @@
+name: PASAY Cloudflare production deploy
+
+on:
+  push:
+    branches:
+      - "ops/cloudflare-production-deploy-001-20260827"
+    paths:
+      - ".github/workflows/deploy-cloudflare-production.yml"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DEPLOY_PRODUCTION to run the production deployment"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pasay-cloudflare-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.event_name == 'push' || inputs.confirm == 'DEPLOY_PRODUCTION'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: cloudflare-worker
+
+    steps:
+      - name: Checkout accepted default-branch baseline
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: cloudflare-worker/package-lock.json
+
+      - name: Fail closed when a required GitHub Secret is absent
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          PASAY_CONTAINER_INGEST_TOKEN: ${{ secrets.PASAY_CONTAINER_INGEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for key in             CLOUDFLARE_API_TOKEN             CLOUDFLARE_ACCOUNT_ID             NEON_API_KEY             TELEGRAM_BOT_TOKEN             TELEGRAM_WEBHOOK_SECRET             PASAY_CONTAINER_INGEST_TOKEN
+          do
+            if [[ -z "${!key:-}" ]]; then
+              missing+=("$key")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            printf '::error::Missing required GitHub Secret: %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "Required GitHub Secret names are present."
+
+      - name: Install locked Worker dependencies
+        run: npm ci
+
+      - name: Validate source, tests, and deployment bundle
+        run: |
+          set -euo pipefail
+          npm run types
+          npm test
+          npx wrangler deploy --dry-run --containers-rollout=none
+
+      - name: Verify Cloudflare account, token, and Containers entitlement
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler whoami
+          npx wrangler containers images list --json > "$RUNNER_TEMP/pasay-container-images.json"
+          jq -e 'type == "array" or type == "object"' "$RUNNER_TEMP/pasay-container-images.json" >/dev/null
+          echo "Cloudflare authentication and Containers API access confirmed."
+
+      - name: Fetch Neon PG16 URLs and verify the accepted migration head
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          PASAY_CONTAINER_INGEST_TOKEN: ${{ secrets.PASAY_CONTAINER_INGEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+
+          project_id="bold-moon-60669478"
+          branch_id="br-frosty-shadow-azdncr3d"
+          base="https://console.neon.tech/api/v2/projects/$project_id/connection_uri"
+          common="branch_id=$branch_id&database_name=neondb&role_name=neondb_owner"
+
+          pooled_response="$(
+            curl -fsS               -H "Authorization: Bearer $NEON_API_KEY"               "$base?$common&pooled=true"
+          )"
+          direct_response="$(
+            curl -fsS               -H "Authorization: Bearer $NEON_API_KEY"               "$base?$common&pooled=false"
+          )"
+          pooled_url="$(jq -er '.uri' <<<"$pooled_response")"
+          direct_url="$(jq -er '.uri' <<<"$direct_response")"
+
+          echo "::add-mask::$pooled_url"
+          echo "::add-mask::$direct_url"
+
+          current_head="$(
+            PGCONNECT_TIMEOUT=15 psql "$direct_url"               -X -A -t -v ON_ERROR_STOP=1               -c 'SELECT version_num FROM alembic_version LIMIT 1;'
+          )"
+          if [[ "$current_head" != "m4d000000001" ]]; then
+            echo "::error::Unexpected Neon Alembic head: $current_head"
+            exit 1
+          fi
+
+          secrets_file="$RUNNER_TEMP/pasay-cloudflare-secrets.json"
+          jq -n             --arg database_url "$pooled_url"             --arg database_url_unpooled "$direct_url"             --arg telegram_bot_token "$TELEGRAM_BOT_TOKEN"             --arg telegram_webhook_secret "$TELEGRAM_WEBHOOK_SECRET"             --arg ingest_token "$PASAY_CONTAINER_INGEST_TOKEN"             '{
+              DATABASE_URL: $database_url,
+              DATABASE_URL_UNPOOLED: $database_url_unpooled,
+              TELEGRAM_BOT_TOKEN: $telegram_bot_token,
+              TELEGRAM_WEBHOOK_SECRET: $telegram_webhook_secret,
+              PASAY_CONTAINER_INGEST_TOKEN: $ingest_token
+            }' > "$secrets_file"
+          chmod 600 "$secrets_file"
+          echo "Neon production branch and Alembic head verified."
+
+      - name: Ensure the frozen Queue and DLQ exist
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          ensure_queue() {
+            local queue_name="$1"
+            if npx wrangler queues info "$queue_name" >/dev/null 2>&1; then
+              echo "Queue exists: $queue_name"
+            else
+              npx wrangler queues create "$queue_name"
+            fi
+          }
+          ensure_queue "pasay-events-dlq"
+          ensure_queue "pasay-events"
+
+      - name: Deploy Worker, Container image, bindings, and encrypted secrets
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx wrangler deploy             --secrets-file "$RUNNER_TEMP/pasay-cloudflare-secrets.json"             --containers-rollout=immediate
+
+      - name: Verify public Worker health
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          subdomain_response="$(
+            curl -fsS               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"
+          )"
+          workers_subdomain="$(jq -er 'select(.success == true) | .result.subdomain' <<<"$subdomain_response")"
+          worker_base_url="https://pasay-cloudflare-worker.$workers_subdomain.workers.dev"
+          health_file="$RUNNER_TEMP/pasay-worker-health.json"
+
+          ready=0
+          for _ in $(seq 1 36); do
+            if curl -fsS "$worker_base_url/health" -o "$health_file"; then
+              if jq -e '
+                .worker == "alive" and
+                .architecture == "worker→queue→container→neon" and
+                .bindings.queue == true and
+                .bindings.container == true and
+                .secrets_configured.telegram_secret_configured == true and
+                .secrets_configured.container_ingest_token_configured == true and
+                .envelope_version == "1"
+              ' "$health_file" >/dev/null; then
+                ready=1
+                break
+              fi
+            fi
+            sleep 5
+          done
+          if [[ "$ready" != "1" ]]; then
+            echo "::error::Worker health contract did not become ready."
+            exit 1
+          fi
+          printf '%s' "$worker_base_url" > "$RUNNER_TEMP/pasay-worker-base-url"
+          echo "Worker health contract passed."
+
+      - name: Run Queue to Container to Neon production smoke
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          secrets_file="$RUNNER_TEMP/pasay-cloudflare-secrets.json"
+          direct_url="$(jq -er '.DATABASE_URL_UNPOOLED' "$secrets_file")"
+          echo "::add-mask::$direct_url"
+
+          queues_response="$(
+            curl -fsS               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/queues?per_page=100"
+          )"
+          queue_id="$(
+            jq -er '
+              select(.success == true)
+              | [.result[] | select(.queue_name == "pasay-events")]
+              | first
+              | .queue_id
+            ' <<<"$queues_response"
+          )"
+
+          occurred_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          event_id="sched:pasay_deploy_smoke:$(date -u +'%Y-%m-%dT%H-%M-%S')"
+          message_file="$RUNNER_TEMP/pasay-queue-smoke.json"
+          jq -n             --arg event_id "$event_id"             --arg occurred_at "$occurred_at"             '{
+              body: {
+                version: "1",
+                kind: "scheduled_job",
+                event_id: $event_id,
+                occurred_at: $occurred_at,
+                payload: {
+                  job_name: "pasay_deploy_smoke",
+                  scheduled_at: $occurred_at,
+                  params: {source: "github-actions-production-deploy"}
+                }
+              },
+              content_type: "json"
+            }' > "$message_file"
+
+          push_response="$(
+            curl -fsS -X POST               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               -H "Content-Type: application/json"               --data-binary "$$message_file"               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/queues/$queue_id/messages"
+          )"
+          jq -e '.success == true' <<<"$push_response" >/dev/null
+
+          smoke_ok=0
+          for _ in $(seq 1 60); do
+            found="$(
+              PGCONNECT_TIMEOUT=10 psql "$direct_url"                 -X -A -t -v ON_ERROR_STOP=1                 -v smoke_event_id="$event_id"                 -c "SELECT event_id FROM pasay_scheduled_job_ledger WHERE event_id = :'smoke_event_id' LIMIT 1;"                 2>/dev/null || true
+            )"
+            if [[ "$found" == "$event_id" ]]; then
+              smoke_ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [[ "$smoke_ok" != "1" ]]; then
+            echo "::error::Queue to Container to Neon smoke did not reach the ledger."
+            exit 1
+          fi
+          printf '%s' "$event_id" > "$RUNNER_TEMP/pasay-smoke-event-id"
+          echo "End-to-end production smoke passed."
+
+      - name: Cut Telegram webhook over only after end-to-end smoke passes
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+        run: |
+          set -euo pipefail
+          worker_base_url="$(cat "$RUNNER_TEMP/pasay-worker-base-url")"
+          webhook_url="$worker_base_url/telegram/webhook"
+
+          set_response="$(
+            curl -fsS -X POST               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook"               --data-urlencode "url=$webhook_url"               --data-urlencode "secret_token=$TELEGRAM_WEBHOOK_SECRET"
+          )"
+          jq -e '.ok == true and .result == true' <<<"$set_response" >/dev/null
+
+          info_response="$(
+            curl -fsS               "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getWebhookInfo"
+          )"
+          actual_url="$(jq -er '.result.url' <<<"$info_response")"
+          if [[ "$actual_url" != "$webhook_url" ]]; then
+            echo "::error::Telegram webhook URL verification failed."
+            exit 1
+          fi
+
+          {
+            echo "### PASAY production deployment"
+            echo
+            echo "- Worker: $worker_base_url"
+            echo "- Health: $worker_base_url/health"
+            echo "- Queue smoke event: $(cat "$RUNNER_TEMP/pasay-smoke-event-id")"
+            echo "- Neon Alembic head: m4d000000001"
+            echo "- Telegram webhook: verified"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Telegram webhook cutover verified."
+
+      - name: Remove transient secret files
+        if: always()
+        run: |
+          rm -f             "$RUNNER_TEMP/pasay-cloudflare-secrets.json"             "$RUNNER_TEMP/pasay-container-images.json"             "$RUNNER_TEMP/pasay-worker-health.json"             "$RUNNER_TEMP/pasay-worker-base-url"             "$RUNNER_TEMP/pasay-queue-smoke.json"             "$RUNNER_TEMP/pasay-smoke-event-id"
