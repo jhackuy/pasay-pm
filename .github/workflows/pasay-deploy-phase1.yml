@@ -97,7 +97,7 @@ jobs:
           . .venv/bin/activate
 
           python - <<'PY'
-          import os, json, urllib.request, urllib.error, ssl
+          import os, json, re, urllib.request, urllib.parse, ssl
           api_key    = os.environ["NEON_API_KEY"]
           project_id = os.environ["NEON_PROJECT_ID"]
           branch_id  = os.environ["NEON_BRANCH_ID"]
@@ -109,96 +109,107 @@ jobs:
               "Accept":        "application/json",
           }
 
-          def api(method, path):
-              req = urllib.request.Request(f"{base}{path}", method=method, headers=headers)
-              with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
-                  return json.loads(r.read().decode())
+          def api(method, path, body=None):
+              data = body.encode("utf-8") if isinstance(body, str) else body
+              req = urllib.request.Request(f"{base}{path}", method=method, data=data, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
+                      resp_body = r.read().decode()
+                      return json.loads(resp_body) if resp_body else {}
+              except urllib.error.HTTPError as e:
+                  msg = e.read().decode()
+                  raise SystemExit(f"Neon API {method} {path} -> HTTP {e.code}: {msg[:800]}")
 
-          endpoints = api("GET", f"/projects/{project_id}/endpoints")["endpoints"]
-          branch_endpoints = [e for e in endpoints if e.get("branch_id") == branch_id]
-          if not branch_endpoints:
-              raise SystemExit(f"No endpoints for branch {branch_id}; total endpoints={len(endpoints)}")
+          db_name     = "neondb"
+          owner_role  = "neondb_owner"
+          runtime_role = "pasay_runtime"
 
-          pooled   = None
-          direct   = None
-          for e in branch_endpoints:
-              etype = e.get("type", "")
-              host  = e.get("host", "")
-              if not host:
-                  continue
-              if etype == "read_write" and "-pooler" in host:
-                  pooled = e
-              elif etype == "read_write":
-                  direct = e
+          # List roles so we can detect if pasay_runtime is missing (needs create)
+          roles_resp = api("GET", f"/projects/{project_id}/branches/{branch_id}/roles")
+          roles = roles_resp.get("roles", [])
+          role_names = {r.get("name") for r in roles}
+          print(f"[step0] existing neon roles on branch: {sorted(role_names)}", flush=True)
 
-          if direct is None:
-              direct = branch_endpoints[0] if branch_endpoints else None
-          if pooled is None and direct is not None and "-pooler" not in direct.get("host", ""):
-              # Neon naming convention often <compute-id>-pooler.<region>.aws.neon.tech
-              pool_host = direct["host"].replace(".aws.neon.tech", "-pooler.aws.neon.tech")
-              # find matching
-              for e in branch_endpoints:
-                  if e.get("host") == pool_host:
-                      pooled = e
-                      break
+          if runtime_role not in role_names:
+              print(f"[step0] creating missing neon role '{runtime_role}' via Neon API", flush=True)
+              created = api("POST", f"/projects/{project_id}/branches/{branch_id}/roles",
+                            body=json.dumps({"role": {"name": runtime_role}}))
+              new_role = created.get("role") or created.get("roles") or {}
+              if isinstance(new_role, list):
+                  new_role = new_role[0]
+              print(f"[step0] role {runtime_role} created (name={new_role.get('name')})", flush=True)
 
-          if direct is None:
-              raise SystemExit("Cannot resolve direct/unpooled endpoint")
-          if pooled is None:
-              print(f"WARN: explicit pooled endpoint not found; will derive via hostname suffix convention", flush=True)
-              pooled_host = direct["host"].replace(".aws.neon.tech", "-pooler.aws.neon.tech")
-          else:
-              pooled_host = pooled["host"]
+          # Use Neon connection_uri endpoint with official pooled=true param
+          def conn_uri(role, pooled=False):
+              qp = urllib.parse.urlencode({
+                  "database_name": db_name,
+                  "role_name": role,
+                  "branch_id": branch_id,
+                  "pooled": "true" if pooled else "false",
+              })
+              data = api("GET", f"/projects/{project_id}/connection_uri?{qp}")
+              # Support all common shapes: {"connection_uri":..}, {"uri":..}, {"result":{"uri":..}}
+              if isinstance(data, dict):
+                  for k in ["connection_uri", "uri", "connectionUri", "url", "postgres_uri"]:
+                      if isinstance(data.get(k), str) and data[k].startswith("postgres"):
+                          return data[k]
+                  v = data.get("result") or data.get("data")
+                  if isinstance(v, dict):
+                      for k in ["connection_uri", "uri", "connectionUri", "url", "postgres_uri"]:
+                          if isinstance(v.get(k), str) and v[k].startswith("postgres"):
+                              return v[k]
+              raise SystemExit(f"conn_uri: unexpected connection_uri response keys={list(data) if isinstance(data, dict) else type(data).__name__}")
 
-          direct_host = direct["host"]
-          print(f"resolved direct_host = {direct_host}",    flush=True)
-          print(f"resolved pooled_host = {pooled_host}",    flush=True)
+          runtime_pooled = conn_uri(runtime_role, pooled=True)
+          owner_direct   = conn_uri(owner_role,   pooled=False)
 
+          # Sanity: runtime_pooled host should contain -pooler; owner_direct should not
+          r_m = re.match(r"postgresql://[^:]+:[^@]+@([^/]+)/", runtime_pooled)
+          o_m = re.match(r"postgresql://[^:]+:[^@]+@([^/]+)/", owner_direct)
+          if r_m:
+              print(f"[step0] runtime_pooled host = {r_m.group(1)}", flush=True)
+          if o_m:
+              print(f"[step0] owner_direct   host = {o_m.group(1)}", flush=True)
+
+          # Extract direct/pooled hosts for step output
+          def host_of(u):
+              m = re.match(r"postgresql://[^:]+:[^@]+@([^/]+)/", u)
+              return m.group(1) if m else ""
+
+          pooled_host = host_of(runtime_pooled)
+          direct_host = host_of(owner_direct)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"direct_host={direct_host}\n")
               f.write(f"pooled_host={pooled_host}\n")
 
-          # Also set as env vars for next step (masked)
-          db_name = "neondb"
-          owner_role = "neondb_owner"
-          runtime_role = "pasay_runtime"
+          # Persist URIs into step env + register masks
+          env_file = os.environ["GITHUB_ENV"]
+          mask_cmds = []
+          def register_mask(val):
+              if not val:
+                  return
+              # Use GITHUB_ENV mask syntax: append a MASKED_ marker is not supported; issue workflow command
+              mask_cmds.append(f"::add-mask::{val}")
+              # Also mask password component (the sub-segment after ://<user>: up to @)
+              m = re.match(r"postgresql://([^:]+):([^@]+)@", val)
+              if m:
+                  mask_cmds.append(f"::add-mask::{m.group(2)}")
 
-          # We need passwords for the two roles; list roles via Neon API to get role passwords?
-          # Neon exposes connection strings via /projects/{id}/connection_uri?role=xxx endpoint
-          def conn_uri(role):
-              data = api("GET", f"/projects/{project_id}/connection_uri?database_name={db_name}&role_name={role}&branch_id={branch_id}")
-              return data["connection_uri"]
+          register_mask(runtime_pooled)
+          register_mask(owner_direct)
 
-          uri_runtime = conn_uri(runtime_role)
-          uri_owner   = conn_uri(owner_role)
-
-          # swap host for pooled on runtime
-          # Neon URIs look like: postgresql://role:password@host/dbname?options...
-          import re
-          runtime_pooled = re.sub(
-              r"postgresql://([^:]+):([^@]+)@([^/]+)/",
-              lambda m: f"postgresql://{m.group(1)}:{m.group(2)}@{pooled_host}/",
-              uri_runtime, count=1
-          )
-          owner_direct = uri_owner  # direct already
-
-          with open(os.environ["GITHUB_ENV"], "a") as f:
+          with open(env_file, "a") as f:
               f.write(f"DATABASE_URL={runtime_pooled}\n")
               f.write(f"DATABASE_URL_UNPOOLED={owner_direct}\n")
 
-          # Force GITHUB env mask for full URIs + password components
-          def pw_of(u):
-              m = re.match(r"postgresql://[^:]+:([^@]+)@", u)
-              return m.group(1) if m else ""
+          # Print masks AFTER env append so GitHub runner registers them going forward
+          for c in mask_cmds:
+              print(c)
 
-          for val in [runtime_pooled, owner_direct, pw_of(runtime_pooled), pw_of(owner_direct)]:
-              if val:
-                  with open(os.environ["GITHUB_ENV"], "a") as f:
-                      pass
-                  print(f"::add-mask::{val}")
+          print("[step0] URIs resolved; runtime_pooled + owner_direct written to GITHUB_ENV and masked", flush=True)
           PY
 
-          echo "step0 uris derived; runtime_url and unpooled_url masked via ::add-mask::"
+          echo "step0 uris derived; DATABASE_URL pooled and DATABASE_URL_UNPOOLED direct stored in env (masked)"
 
       - name: "STEP 0 — Verify + GRANT sequence permissions; min tx ROLLBACK smoke"
         if: ${{ !inputs.run_smoke_only && inputs.step0_db_role_verify }}
