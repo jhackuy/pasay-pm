@@ -539,7 +539,7 @@ jobs:
                       if len(parts) >= 3:
                           # heuristic: pattern is the 2nd or 3rd column; try pattern looks URL-ish
                           for candidate in parts:
-                              if candidate.startswith("http") or (candidate.startswith("*") or ".workers.dev" in candidate or candidate.startswith("https://") or candidate.count(".") >= 2:
+                              if candidate.startswith("http") or candidate.startswith("*") or ".workers.dev" in candidate or candidate.startswith("https://") or candidate.count(".") >= 2:
                                   if "github" not in candidate.lower() and "cloudflare" not in candidate.lower()[:8] and not candidate.lower().endswith(".md"):
                                       routes.append({"script": worker, "pattern": candidate})
                               break
