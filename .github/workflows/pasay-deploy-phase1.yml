@@ -1280,6 +1280,7 @@ jobs:
               req = urllib.request.Request(webhook_url, data=raw_update, method="POST", headers={
                   "Content-Type": "application/json",
                   "Accept": "application/json",
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                   "X-Telegram-Bot-Api-Secret-Token": secret,
               })
               t0 = time.time()
