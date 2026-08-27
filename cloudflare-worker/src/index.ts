@@ -118,6 +118,139 @@ export class PasayContainer extends Container {
     if (error instanceof Error) throw error;
     throw new Error(safe_msg || "PasayContainer unknown error");
   }
+
+  // ── OWNER DECISION 5441773538: Container runtime diagnostic snapshot ──
+  // Uses official this.ctx.container.exec() to cut the v22 state=running +
+  // :8000 never-connects fault plane into four exact classes.
+  // Bounded 10s total; output strictly <4KB after mask_sensitive; NEVER reads
+  // environ or any secret-bearing files.
+  async diagnosticSnapshot(): Promise<Record<string, unknown>> {
+    const snapshot: Record<string, unknown> = {
+      collected_at: now_iso(),
+      container_running_before: false,
+      exec_timeout_ms: 10_000,
+      output_bytes_cap: 4096,
+    };
+    type ContainerRuntimeCtx = {
+      running?: boolean;
+      start?: () => Promise<void>;
+      exec?: (cmd: string[], opts?: unknown) => Promise<{
+        pid?: number;
+        exitCode: Promise<number>;
+        output: () => Promise<{ stdout: ArrayBuffer; stderr: ArrayBuffer; exitCode: number }>;
+      }>;
+    };
+    try {
+      const containerCtx = (this.ctx as unknown as { container?: ContainerRuntimeCtx }).container;
+      // exec() does not auto-start a stopped container; start explicitly if needed
+      if (containerCtx && !containerCtx.running && typeof containerCtx.start === "function") {
+        try {
+          await containerCtx.start();
+        } catch (startErr) {
+          snapshot["container_start_error"] = mask_sensitive(
+            startErr instanceof Error ? startErr.message : String(startErr),
+          ).slice(0, 200);
+        }
+      }
+      snapshot["container_running_before"] = Boolean(containerCtx?.running);
+
+      const execApi = containerCtx?.exec;
+      if (typeof execApi !== "function") {
+        snapshot["exec_api_unavailable"] = true;
+        return snapshot;
+      }
+
+      const decoder = new TextDecoder("utf-8", { fatal: false });
+      const safe_read = (ab: ArrayBuffer, cap: number = 2048): string => {
+        try {
+          const raw = decoder.decode(ab.slice(0, cap * 2)).slice(0, cap);
+          return mask_sensitive(raw);
+        } catch {
+          return "<decode-error>";
+        }
+      };
+
+      // ── (1) PID / process tree: PID1 cmdline + full ps listing ──────────
+      try {
+        const proc = await execApi.call(
+          containerCtx,
+          [
+            "sh", "-c",
+            "echo '=== PID1 /proc/1/cmdline ==='; cat /proc/1/cmdline 2>/dev/null | tr '\\0' ' '; echo; echo '=== /proc/*/cmdline (pid:argv, sanitized) ==='; for p in /proc/[0-9]*; do pid=\"$(basename \"$p\")\"; cl=$(cat \"$p/cmdline\" 2>/dev/null | tr '\\0' ' '); if [ -n \"$cl\" ]; then echo \"$pid: $cl\"; fi; done | head -n 40; echo '=== ps auxwwf (top 40 lines) ==='; ps auxwwf 2>/dev/null | head -n 40 || ps -eo pid,ppid,stat,time,args 2>/dev/null | head -n 40",
+          ],
+        );
+        const out = await Promise.race([
+          proc.output(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("snapshot_cmd1_timeout")), 5000)),
+        ]);
+        snapshot["proc_tree"] = {
+          exit_code: out.exitCode,
+          stdout_head: safe_read(out.stdout, 2500),
+          stderr_head: safe_read(out.stderr, 500),
+        };
+      } catch (e1) {
+        snapshot["proc_tree"] = { error: mask_sensitive(e1 instanceof Error ? e1.message : String(e1)).slice(0, 200) };
+      }
+
+      // ── (2) Listening ports: /proc/net/tcp{,6} + ss fallback ───────────
+      try {
+        const proc = await execApi.call(
+          containerCtx,
+          [
+            "sh", "-c",
+            "echo '=== /proc/net/tcp (hex: local_address=IP:PORT) ==='; cat /proc/net/tcp 2>/dev/null | head -n 20; echo; echo '=== /proc/net/tcp6 (hex) ==='; cat /proc/net/tcp6 2>/dev/null | head -n 20; echo; echo '=== ss -tlnp or netstat -tlnp (fallback) ==='; (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | head -n 20; echo; echo '=== python connect_ex 127.0.0.1:8000 + [::1]:8000 ==='; python3 -c \"import socket; print('v4_8000_ex='+str(socket.socket(socket.AF_INET,socket.SOCK_STREAM).connect_ex(('127.0.0.1',8000)))); s6=socket.socket(socket.AF_INET6,socket.SOCK_STREAM); print('v6_8000_ex='+str(s6.connect_ex(('::1',8000,0,0))));\" 2>&1",
+          ],
+        );
+        const out = await Promise.race([
+          proc.output(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("snapshot_cmd2_timeout")), 5000)),
+        ]);
+        snapshot["listening_ports"] = {
+          exit_code: out.exitCode,
+          stdout_head: safe_read(out.stdout, 2500),
+          stderr_head: safe_read(out.stderr, 500),
+        };
+      } catch (e2) {
+        snapshot["listening_ports"] = { error: mask_sensitive(e2 instanceof Error ? e2.message : String(e2)).slice(0, 200) };
+      }
+
+      // ── (3) localhost:8000/health internal curl (if listener up) ────────
+      try {
+        const proc = await execApi.call(
+          containerCtx,
+          [
+            "sh", "-c",
+            "echo '=== curl -m 3 http://127.0.0.1:8000/health ==='; curl -s -m 3 --max-time 3 http://127.0.0.1:8000/health 2>&1 | head -c 1500; echo; echo; echo '=== curl exit_code: ' $?",
+          ],
+        );
+        const out = await Promise.race([
+          proc.output(),
+          new Promise<never>((_, rej) => setTimeout(() => rej(new Error("snapshot_cmd3_timeout")), 4500)),
+        ]);
+        snapshot["local_8000_health"] = {
+          exit_code: out.exitCode,
+          stdout_head: safe_read(out.stdout, 1600),
+          stderr_head: safe_read(out.stderr, 400),
+        };
+      } catch (e3) {
+        snapshot["local_8000_health"] = { error: mask_sensitive(e3 instanceof Error ? e3.message : String(e3)).slice(0, 200) };
+      }
+
+      snapshot["snapshot_bytes"] = JSON.stringify(snapshot).length;
+    } catch (topErr) {
+      snapshot["snapshot_fatal_error"] = mask_sensitive(
+        topErr instanceof Error ? topErr.message : String(topErr),
+      ).slice(0, 200);
+    }
+    // Final hard cap: entire JSON must not exceed 4KB as required.
+    let raw = JSON.stringify(snapshot);
+    if (raw.length > 4096) {
+      (snapshot as any)["_truncated_to_4KB"] = true;
+      raw = JSON.stringify(snapshot).slice(0, 4096);
+      try { return JSON.parse(raw); } catch { return { truncated: raw.length, head: raw.slice(0, 1024) }; }
+    }
+    return snapshot;
+  }
 }
 
 type IngestAckResult = "ack" | "retry" | "terminal";
@@ -463,11 +596,14 @@ export default {
           };
           startOptions?: any;
         }) => Promise<void>;
+        diagnosticSnapshot?: () => Promise<Record<string, unknown>>;
       };
       const handleFull = handle as ContainerHandleFull;
+      let startFailed = false;
+      let startErrDetail = "";
+      const instanceGetTimeoutMs = 30_000;
+      const portReadyTimeoutMs = 120_000;
       if (typeof handleFull.startAndWaitForPorts === "function") {
-        const instanceGetTimeoutMs = 30_000;
-        const portReadyTimeoutMs = 120_000;
         try {
           await handleFull.startAndWaitForPorts({
             ports: [8000],
@@ -478,18 +614,39 @@ export default {
             },
           });
         } catch (startErr) {
-          const msg = mask_sensitive(startErr instanceof Error ? startErr.message : String(startErr)).slice(0, 240);
-          return new Response(
-            JSON.stringify({
-              ok: false,
-              error: "container_start_timeout",
-              detail: msg,
-              instance_get_timeout_ms: instanceGetTimeoutMs,
-              port_ready_timeout_ms: portReadyTimeoutMs,
-            }),
-            { status: 503, headers: { "Content-Type": "application/json" } },
-          );
+          startFailed = true;
+          startErrDetail = mask_sensitive(startErr instanceof Error ? startErr.message : String(startErr)).slice(0, 240);
         }
+      }
+      // ── OWNER DECISION 5441773538: After startAndWaitForPorts FAIL, call  ──
+      // the PasayContainer.diagnosticSnapshot() RPC exactly ONCE to get the
+      // real in-container PID/process-listening state before returning 503.
+      let container_runtime_snapshot: Record<string, unknown> | null = null;
+      if (startFailed && typeof handleFull.diagnosticSnapshot === "function") {
+        try {
+          container_runtime_snapshot = await Promise.race([
+            handleFull.diagnosticSnapshot(),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error("snapshot_rpc_timeout_12s")), 12_000)),
+          ]);
+        } catch (snapErr) {
+          container_runtime_snapshot = {
+            snapshot_rpc_error: mask_sensitive(snapErr instanceof Error ? snapErr.message : String(snapErr)).slice(0, 200),
+          };
+        }
+      }
+      if (startFailed) {
+        const body: Record<string, unknown> = {
+          ok: false,
+          error: "container_start_timeout",
+          detail: startErrDetail,
+          instance_get_timeout_ms: instanceGetTimeoutMs,
+          port_ready_timeout_ms: portReadyTimeoutMs,
+        };
+        if (container_runtime_snapshot) body["container_runtime_snapshot"] = container_runtime_snapshot;
+        return new Response(
+          JSON.stringify(body),
+          { status: 503, headers: { "Content-Type": "application/json" } },
+        );
       }
 
       const absoluteUrl = `${PASAY_CONTAINER_ORIGIN}/health`;
