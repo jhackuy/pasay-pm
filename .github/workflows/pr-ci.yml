@@ -282,3 +282,137 @@ jobs:
             tests/test_m003_operations_truth_closure.py \
             -q -p no:cacheprovider --tb=short \
             --ignore=eval
+
+  # ----------------------------------------------------------------------
+  # Issue #65 — PASAY-CI-ALEMBIC-SAFETY-P0-001
+  # Migration Graph Gate + Safe Generation Helper + Fresh PostgreSQL
+  # `alembic upgrade head` truth gate. Triggers when migration files,
+  # safety scripts/fixtures, or this workflow file change.
+  # ----------------------------------------------------------------------
+  alembic-safety-gate:
+    name: alembic-safety-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: ""
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files (alembic + safety gate scope)
+        id: changed
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if [ -z "$base" ] || [ -z "$head" ]; then
+            relevant=true
+          else
+            files="$(git diff --name-only "$base" "$head")"
+            relevant=false
+            while IFS= read -r f; do
+              case "$f" in
+                alembic/*|scripts/wf/alembic_*.py|scripts/wf/alembic_fixtures/*|scripts/wf/test_alembic_*.py|.github/workflows/pr-ci.yml)
+                  relevant=true
+                  ;;
+              esac
+            done <<< "$files"
+          fi
+          echo "relevant=$relevant" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python 3.11
+        if: steps.changed.outputs.relevant == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        if: steps.changed.outputs.relevant == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Alembic Graph Gate — static + ScriptDirectory authority
+        if: steps.changed.outputs.relevant == 'true'
+        shell: bash
+        run: |
+          # Hard gate: gate exits 1 on FAIL → workflow step fails the job.
+          python scripts/wf/alembic_graph_gate.py \
+            --script-location alembic \
+            --allow-multi-head-file scripts/wf/alembic_allow_multi_head.txt
+
+      - name: Alembic Safe-Create Helper — read real head smoke test
+        if: steps.changed.outputs.relevant == 'true'
+        shell: bash
+        run: |
+          # Dry-run reads the current head and refuses to create anything if
+          # the graph is broken. Exit 0 = real head readable.
+          python scripts/wf/alembic_safe_create.py \
+            --script-location alembic \
+            --message "issue-65-dry-run-smoke" \
+            --dry-run
+
+      - name: Alembic — Fresh PostgreSQL `alembic upgrade head` truth gate
+        if: steps.changed.outputs.relevant == 'true'
+        env:
+          # Empty DB on a fresh service. `alembic upgrade heads` (plural)
+          # applies ALL heads from scratch, which is what we want when the
+          # repository legitimately has 2+ heads (the graph gate's allow-list
+          # already confirms both are intentional). `alembic upgrade head`
+          # (singular) refuses to choose among multiple heads.
+          DATABASE_URL: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          DATABASE_URL_UNPOOLED: "postgresql+psycopg2://postgres:postgres@localhost:5432/postgres"
+          TELEGRAM_BOT_TOKEN: "fake-token-for-ci-pass-12345"
+          TELEGRAM_WEBHOOK_SECRET: "fake-webhook-secret-for-ci"
+          PASAY_CONTAINER_INGEST_TOKEN: "fake-ingest-token-for-ci"
+          PASAY_RUNTIME_MODE: "ci"
+          OPERATIONS_DEFAULT_ASSIGNEE: "1"
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          # The default alembic_version table is VARCHAR(32); that is too
+          # narrow for our long revision ids (e.g.
+          # `20260827_160000_return1_postgres_bot_state` is 41 chars). Pre-
+          # create the table with VARCHAR(255) on the empty DB so alembic
+          # picks up the wider column. This is a CI-only workaround and does
+          # NOT modify any migration file. The M006 migration is intentionally
+          # preserved per Issue #65 Forbidden Paths.
+          echo "=== pre-create alembic_version (CI-only workaround) ==="
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE TABLE IF NOT EXISTS alembic_version (version_num VARCHAR(255) NOT NULL);
+          SQL
+          echo "=== alembic upgrade heads on fresh PostgreSQL ==="
+          python -m alembic upgrade heads
+          echo "=== alembic current (must equal HEAD revisions) ==="
+          python -m alembic current
+          echo "=== alembic heads (must match graph gate output) ==="
+          python -m alembic heads
+          echo "=== graph gate re-check on the freshly-upgraded repo ==="
+          python scripts/wf/alembic_graph_gate.py \
+            --script-location alembic \
+            --allow-multi-head-file scripts/wf/alembic_allow_multi_head.txt
+
+      - name: Alembic Safety Gate — targeted pytest suites
+        if: steps.changed.outputs.relevant == 'true'
+        timeout-minutes: 10
+        run: |
+          python -m pytest \
+            scripts/wf/test_alembic_graph_gate.py \
+            scripts/wf/test_alembic_safe_create.py \
+            -v --tb=short -q

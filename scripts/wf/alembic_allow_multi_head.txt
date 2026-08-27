@@ -1,0 +1,24 @@
+# PASAY Alembic multi-head allow-list (Issue #65).
+#
+# Each line is a revision id that is recognised as a legitimate additional
+# Alembic head in this repository. The Migration Graph Gate refuses any head
+# not listed here when the graph has 2+ heads. This file is the
+# EXPLICIT acknowledgement of every legitimate multi-head deployment.
+#
+# Current entries (as of fb95639):
+#
+#   20260827_160000_return1_postgres_bot_state
+#       Branched off f1a2b3c4d5e6 (the Telegram webhook migration) for the
+#       PASAY-DEPLOY-PHASE1-RETURN1 deployment. Adds 9 Neon/Postgres tables
+#       mirroring the SQLite StateStore so PASAY_RUNTIME_MODE=cloudflare-container
+#       can use durable Postgres state while Windows/dev keeps the local
+#       SQLite store. Documented in the migration's docstring.
+#
+#   m4d000000001
+#       The PASAY-MILESTONE-004 closeout chain (final M004 migration).
+#
+# Both heads are reachable from a single base (0f9a2e554ec6_initial_schema).
+# The graph is otherwise valid: no dangling predecessors, no orphans, no
+# duplicate revisions. See scripts/wf/alembic_graph_gate.py and Issue #65.
+20260827_160000_return1_postgres_bot_state
+m4d000000001
