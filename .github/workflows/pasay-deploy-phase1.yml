@@ -456,24 +456,41 @@ jobs:
           headers = {
               "Authorization": f"Bearer {token}",
               "Content-Type":  "application/json",
+              "Accept":        "application/json",
           }
 
           def cf(method, path, body=None):
               data = json.dumps(body).encode() if body is not None else None
               req  = urllib.request.Request(f"{base}{path}", data=data, method=method, headers=headers)
-              with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
-                  return json.loads(r.read().decode())
+              try:
+                  with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
+                      resp = r.read().decode()
+                      return json.loads(resp) if resp else {"success": True}
+              except urllib.error.HTTPError as e:
+                  msg = e.read().decode()
+                  print(f"[step6-cf] HTTP {e.code} {method} {path}: {msg[:400]}", flush=True)
+                  try:
+                      parsed = json.loads(msg) if msg else {"success": False}
+                      if isinstance(parsed, dict) and "success" not in parsed:
+                          parsed["success"] = False
+                      return parsed if isinstance(parsed, dict) else {"success": False, "raw": msg[:300]}
+                  except Exception:
+                      return {"success": False, "raw": msg[:300]}
 
-          # get workers.dev route for this worker via workers/scripts/<name>/subdomain
-          r = cf("GET", f"/workers/scripts/{worker}/subdomain")
-          subdomain_enabled = bool(r.get("result", {}).get("enabled", False))
+          # Attempt to get workers.dev subdomain; FREE plan may return 4xx (requires Paid) — fall through silently.
+          subdomain_enabled = False
+          try:
+              r = cf("GET", f"/workers/scripts/{worker}/subdomain")
+              subdomain_enabled = bool((r.get("result") or {}).get("enabled", False))
+          except Exception as e:
+              print(f"[step6] subdomain query skipped (non-fatal): {type(e).__name__}", flush=True)
           # if there is a custom route, use that instead; fallback list routes
-          routes_r = cf("GET", f"/workers/routes")
-          routes = routes_r.get("result", [])
+          routes_r = cf("GET", "/workers/routes")
+          routes = routes_r.get("result", []) if isinstance(routes_r, dict) else []
           worker_route = None
           for rt in routes:
-              if rt.get("script") == worker:
-                  worker_route = rt["pattern"]
+              if isinstance(rt, dict) and rt.get("script") == worker:
+                  worker_route = rt.get("pattern")
                   break
           # derive fetchable URL
           fetch_base = None
@@ -483,23 +500,34 @@ jobs:
               if not p.startswith("http"):
                   p = "https://" + p
               fetch_base = p
+              print(f"[step6] derived worker URL from CF API routes: {fetch_base}", flush=True)
           elif subdomain_enabled:
-              # workers.dev subdomain name is <account>-<something>? query account settings; fallback by trying GET route via wrangler routes list
-              pass
+              print(f"[step6] workers.dev subdomain enabled but auto-derivation not implemented; using wrangler route fallback", flush=True)
 
-          # If we still do not have a clear fetch URL, use wrangler to get the deployed route
+          # If we still do not have a clear fetch URL, use wrangler routes list / deploy --dry-run output
           if not fetch_base:
               import subprocess
+              print("[step6] no CF-API-derived URL found; query wrangler routes list", flush=True)
               out = subprocess.run(
-                  ["npx", "wrangler", "deploy"],
-                  cwd=".", capture_output=True, text=True, timeout=180,
-                  env={**os.environ, "WRANGLER_DEPLOY_OUTPUT_ROUTE": "1"},
+                  ["npx", "wrangler", "routes", "list"],
+                  cwd=".", capture_output=True, text=True, timeout=120,
               )
               combined = (out.stdout or "") + "\n" + (out.stderr or "")
               m = re.search(r"https?://[^\s'\"<>)]+", combined)
               if m:
                   fetch_base = m.group(0).rstrip("/")
-                  print(f"[step6] derived worker URL from wrangler output: {fetch_base}", flush=True)
+                  print(f"[step6] derived worker URL from wrangler routes list: {fetch_base}", flush=True)
+              else:
+                  out2 = subprocess.run(
+                      ["npx", "wrangler", "deploy", "--dry-run"],
+                      cwd=".", capture_output=True, text=True, timeout=180,
+                      env={**os.environ, "WRANGLER_SEND_METRICS": "false"},
+                  )
+                  combined2 = (out2.stdout or "") + "\n" + (out2.stderr or "")
+                  m2 = re.search(r"https?://[^\s'\"<>)]+", combined2)
+                  if m2:
+                      fetch_base = m2.group(0).rstrip("/")
+                      print(f"[step6] derived worker URL from wrangler deploy --dry-run: {fetch_base}", flush=True)
 
           if not fetch_base:
               print("[step6] WARN: could not auto-derive public worker route; fetch smoke skipped", flush=True)
