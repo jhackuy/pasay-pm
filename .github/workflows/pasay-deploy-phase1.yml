@@ -753,38 +753,79 @@ jobs:
         run: |
           set -euo pipefail
           # STEP 0/STEP 6 both import psycopg2 and pass, but STEP 7 historically cannot find psycopg2
-          # because PATH was modified by npx wrangler invocations and we picked the wrong python binary.
-          # Strategy: probe a list of candidate pythons and use THE FIRST one that can actually import psycopg2.
-          # This matches whatever python STEP 6 / INSTALL Python deps step used without guessing.
+          # because PATH / PYTHONPATH / npx wrangler invocations can cause interpreter drift, AND the
+          # classic "pip show X says installed, but python import X says not found" happens when the
+          # GLOBAL pip used for install != the python binary used for import.
+          #
+          # Strategy:
+          #   1) Enumerate hostedtoolcache + PATH candidates (deduped)
+          #   2) For EACH candidate, check BOTH:
+          #        a) "$c -c 'import psycopg2'"   -- real import (truth)
+          #        b) "$c -m pip show psycopg2"  -- self-consistent pip view (same interpreter)
+          #   3) Priority: pick the FIRST candidate where (a) passes.
+          #   4) FALLBACK (if ALL candidates fail import): pick the FIRST hostedtoolcache candidate
+          #      that can self-"$c -m pip install --quiet psycopg2-binary" (runner user-writable, ~5s).
+          #      This is safe because it only fixes the CI runner env (pure runtime dependency,
+          #      never touches production data / business rules).
           PYTHON_BIN=""
-          candidates=(
-            "${Python3_ROOT_DIR:+${Python3_ROOT_DIR}/bin/python}"
-            "${Python3_ROOT_DIR:+${Python3_ROOT_DIR}/bin/python3}"
-            "${pythonLocation:+${pythonLocation}/bin/python}"
-            "${pythonLocation:+${pythonLocation}/bin/python3}"
-            "$(command -v python3 2>/dev/null || true)"
-            "$(command -v python 2>/dev/null || true)"
-          )
-          echo "step7 python candidates (will use the first one that can import psycopg2):"
+          _seen=""
+          candidates=()
+          for raw in \
+            "${Python3_ROOT_DIR:+${Python3_ROOT_DIR}/bin/python}" \
+            "${Python3_ROOT_DIR:+${Python3_ROOT_DIR}/bin/python3}" \
+            "${pythonLocation:+${pythonLocation}/bin/python}" \
+            "${pythonLocation:+${pythonLocation}/bin/python3}" \
+            "$(command -v python3 2>/dev/null || true)" \
+            "$(command -v python 2>/dev/null || true)"; do
+            [[ -z "${raw:-}" ]] && continue
+            if [[ " $_seen " != *" $raw "* ]]; then
+              candidates+=("$raw")
+              _seen="$_seen $raw"
+            fi
+          done
+          echo "step7 python candidates (deduped; priority = hostedtoolcache then PATH):"
           for c in "${candidates[@]}"; do
-            if [[ -z "${c:-}" ]]; then continue; fi
-            if [[ ! -x "$c" ]]; then continue; fi
-            echo "  probe: $c"
-            if "$c" -c "import psycopg2; pass" 2>/dev/null; then
+            if [[ ! -x "$c" ]]; then echo "  skip (not exec): $c"; continue; fi
+            _import_ok=false
+            _pip_sees=false
+            if "$c" -c "import psycopg2; pass" 2>/dev/null; then _import_ok=true; fi
+            if "$c" -m pip show psycopg2 >/dev/null 2>&1; then _pip_sees=true; fi
+            echo "  probe: $c  (import_ok=$_import_ok, self_pip_sees=$_pip_sees)"
+            if $_import_ok; then
               PYTHON_BIN="$c"
-              echo "  -> SELECTED (psycopg2 is importable)."
+              echo "    -> SELECTED (psycopg2 is importable via SAME interpreter)."
               break
             fi
           done
           if [[ -z "$PYTHON_BIN" ]]; then
-            echo "FATAL: none of the candidate python interpreters can import psycopg2 (INSTALL Python deps step should have installed it into one)."
-            echo "Debug dump:"
-            command -v python3 || true
-            command -v python  || true
-            (command -v pip3 >/dev/null 2>&1)  && pip3 show psycopg2 2>&1 || echo "no pip3"
-            (command -v pip  >/dev/null 2>&1)  && pip  show psycopg2 2>&1 || echo "no pip"
-            (command -v python3 >/dev/null 2>&1) && python3 -c "import sys; print('python3 executable =', sys.executable); print('python3 sys.path ='); [print('  ', p) for p in sys.path]" 2>&1 || true
-            (command -v python  >/dev/null 2>&1) && python  -c "import sys; print('python executable =',  sys.executable); print('python sys.path =');  [print('  ', p) for p in sys.path]" 2>&1 || true
+            echo "step7: no candidate could import psycopg2 directly. Attempting self-install fallback on FIRST hostedtoolcache candidate..."
+            for c in "${candidates[@]}"; do
+              [[ ! -x "$c" ]] && continue
+              case "$c" in
+                *hostedtoolcache*|*Python3_ROOT_DIR*|*pythonLocation*) ;;
+                *) continue ;;
+              esac
+              echo "  fallback install try: $c -m pip install --quiet psycopg2-binary"
+              if "$c" -m pip install --quiet psycopg2-binary 2>&1; then
+                if "$c" -c "import psycopg2; pass" 2>/dev/null; then
+                  PYTHON_BIN="$c"
+                  echo "    -> SELECTED after self-install psycopg2-binary."
+                  break
+                fi
+              fi
+            done
+          fi
+          if [[ -z "$PYTHON_BIN" ]]; then
+            echo "FATAL: none of the candidate python interpreters could import psycopg2, even after self-install fallback."
+            echo "Per-candidate debug dump (sys.path / self-pip list | grep -i psy / site):"
+            for c in "${candidates[@]}"; do
+              [[ ! -x "$c" ]] && continue
+              echo "--- $c ---"
+              "$c" --version 2>&1 || true
+              "$c" -c "import sys; print('executable =', sys.executable); print('sys.path ='); [print('  ', p) for p in sys.path]" 2>&1 || true
+              "$c" -m site 2>&1 || true
+              "$c" -m pip list --format=freeze 2>/dev/null | grep -i "psy\|pg" || echo "  (no psy/pg entries in self-pip list)"
+            done
             exit 1
           fi
           "$PYTHON_BIN" --version
