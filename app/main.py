@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -106,6 +107,8 @@ app.include_router(internal_ingest.router)
 # must catch it immediately.
 # ---------------------------------------------------------------------------
 _PRODUCTION_POLLING_EXIT_GATE_OK: bool = True
+
+_HEALTH_FIRST_CALL_AT: str | None = None
 
 
 def _webhook_health_snapshot(db: Session) -> dict:
@@ -215,6 +218,11 @@ def health(db: Session = Depends(get_db)):
         return JSONResponse(status_code=503, content={"status": "unavailable",
                                                       "db_error_type": err_class})
     body: dict = {"status": "ok"}
+    body["build_sha"] = os.environ.get("PASAY_BUILD_SHA", "") or os.environ.get("GITHUB_SHA_ARG", "")
+    global _HEALTH_FIRST_CALL_AT
+    if _HEALTH_FIRST_CALL_AT is None:
+        _HEALTH_FIRST_CALL_AT = datetime.now(timezone.utc).isoformat()
+    body["started_at"] = os.environ.get("PASAY_STARTED_AT", "") or _HEALTH_FIRST_CALL_AT
     body["telegram_webhook"] = _webhook_health_snapshot(db)
     # ── PASAY-TASK-011 / Scope G ──────────────────────────────────────────
     body["architecture"] = _architecture_health_snapshot()

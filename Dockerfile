@@ -13,13 +13,21 @@
 
 FROM python:3.11-slim
 
+ARG GITHUB_SHA=""
+ENV GITHUB_SHA_ARG=${GITHUB_SHA}
+
 WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # Canonical production runtime mode. Hard-coded in the image so a
     # forgotten env var cannot silently fall back to dev behaviour.
-    PASAY_RUNTIME_MODE=cloudflare-container
+    PASAY_RUNTIME_MODE=cloudflare-container \
+    # Build identity (Cloudflare Container runtime constructor may override
+    # PASAY_BUILD_SHA at boot; Docker-level ARG fallback is set HERE so the
+    # container can always report a build identity to /health even when the
+    # constructor injection misses.)
+    PASAY_BUILD_SHA=${GITHUB_SHA}
 
 # ── System deps (psycopg2 build-time only, minimal runtime) ──
 RUN apt-get update \

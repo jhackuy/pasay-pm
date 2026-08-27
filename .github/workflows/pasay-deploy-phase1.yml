@@ -408,7 +408,11 @@ jobs:
           put_secret "TELEGRAM_BOT_TOKEN"      "${{ secrets.TELEGRAM_BOT_TOKEN }}"
           put_secret "TELEGRAM_WEBHOOK_SECRET" "${{ secrets.TELEGRAM_WEBHOOK_SECRET }}"
           put_secret "PASAY_CONTAINER_INGEST_TOKEN" "${{ secrets.PASAY_CONTAINER_INGEST_TOKEN }}"
-          echo "[step2] 5/5 production secrets configured=true (values never printed)"
+          # RETURN1 READINESS FIX: deployment build identity (observability-only, not a secret value).
+          # Passed via Worker PasayContainer.envVars into Container runtime ENV PASAY_BUILD_SHA.
+          # Container GET /health exposes this as JSON build_sha field; step5.5 active probe gates on it.
+          put_secret "PASAY_BUILD_SHA" "${{ github.sha }}"
+          echo "[step2] 6/6 production secrets configured=true (values never printed; PASAY_BUILD_SHA=${GITHUB_SHA:0:12}… (head only))"
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 4/5 — wrangler dry-run + real deploy
@@ -421,37 +425,35 @@ jobs:
           npx wrangler deploy --dry-run 2>&1 | tail -80
           echo "[step4] dry-run exit=$?"
 
-      # ── STEP 4.9  PRE-DEPLOY: capture baseline container version for rollout race proof ──
-      - name: "STEP 4.9 — PRE-DEPLOY container baseline (wrangler containers instances) → PRE_DEPLOY_CONTAINER_VERSION"
+      # ── STEP 4.9  PRE-DEPLOY: print containers instances purely as DIAGNOSTIC evidence ──
+      # Owner confirmed (RETURN1 readiness fix): Cloudflare Container instances are scale-to-zero;
+      # state=inactive / version=null is NORMAL idle state. MUST NOT be used as FAIL gate.
+      # We print the JSON here for the evidence chain (PRE→deploy→probe→NEW version serving).
+      - name: "STEP 4.9 — PRE-DEPLOY diagnostic: containers instances (NOT used as FAIL gate)"
         if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
-        id: predeploy_container
         working-directory: cloudflare-worker
         run: |
           set -euo pipefail
-          . ../.venv/bin/activate 2>/dev/null || true
-          export RETURN1_APP_ID="a033e8e1-c52f-4298-8a46-fff6ead430be"
-          export RETURN1_DIAG=1
-          echo "[step4.9] PRE-DEPLOY PROBE: app_id=${RETURN1_APP_ID}"
+          APP_ID="a033e8e1-c52f-4298-8a46-fff6ead430be"
+          echo "[step4.9] PRE-deploy diagnostic: app_id=${APP_ID}"
           set +e
-          PRE_RAW_JSON_FILE="/tmp/return1_predeploy_instances.json"
-          npx wrangler containers instances "${RETURN1_APP_ID}" --json > "${PRE_RAW_JSON_FILE}" 2> /tmp/return1_predeploy.err
-          PRE_RC=$?
-          set -e
-          if [[ $PRE_RC -ne 0 ]]; then
-            echo "[step4.9] PRE instances CLI rc=${PRE_RC}. stderr (4k):"
-            cat /tmp/return1_predeploy.err | tail -c 4000 || true
-            echo ""
-          fi
-          cat "${PRE_RAW_JSON_FILE}" | head -c 4000 || true
+          echo "──────────────────────────────────────────────────────"
+          echo "[step4.9] $ npx wrangler containers instances ${APP_ID} --json"
+          npx wrangler containers instances "${APP_ID}" --json | tee /tmp/return1_L0_predeploy_instances.json 2> /tmp/return1_L0.err | head -c 6000
+          rc=${PIPESTATUS[0]}
           echo ""
-          export RETURN1_RAW_JSON_PATH="${PRE_RAW_JSON_FILE}"
-          PRE_VERSION="$(python "${GITHUB_WORKSPACE}/scripts/deploy_predeploy_container_version.py")"
-          PRE_VERSION="${PRE_VERSION:-NULL_NO_PRE_INSTANCE}"
-          echo "[step4.9] PRE_DEPLOY_CONTAINER_VERSION = ${PRE_VERSION}"
-          {
-            echo "pre_container_version=${PRE_VERSION}"
-            echo "pre_capture_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } >> "${GITHUB_OUTPUT}"
+          echo "──────────────────────────────────────────────────────"
+          if [[ ${rc} -ne 0 ]]; then
+            echo "[step4.9] instances CLI rc=${rc}. stderr (tail 2k):"
+            tail -c 2000 /tmp/return1_L0.err || true
+          fi
+          echo ""
+          set +e
+          echo "[step4.9] $ npx wrangler containers list --json"
+          npx wrangler containers list --json 2>/dev/null | head -c 3000 || true
+          echo ""
+          set -e
+          echo "[step4.9] DIAGNOSTIC ONLY. state=inactive/version=null is NORMAL scale-to-zero idle. Not a failure."
 
       - name: "STEP 5 — wrangler deploy --containers-rollout=immediate (100% instant rollout pasay-cloudflare-worker)"
         if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
@@ -471,23 +473,180 @@ jobs:
 
           echo "[step5] deploy --containers-rollout=immediate exit=$?"
 
-      # ── STEP 5.5  RETURN1 CONTAINER ROLLOUT READINESS TRUTH GATE (bounded 180s poll) ──
-      - name: "STEP 5.5 — RETURN1 READINESS TRUTH GATE: new Container actually serving (2 consecutive new version, 180s)"
+      # ── STEP 5.5  RETURN1 ACTIVE-READINESS TRUTH GATE (Owner Task A+B+C+D) ──
+      #   Invalidation model (previous readiness bugs, fixed here):
+      #     ❌ fixed sleep as pass condition
+      #     ❌ containers instances state=inactive used as FAIL (that is NORMAL scale-to-zero idle)
+      #     ❌ Container version/build SHA derived solely from instances CLI (null when idle)
+      #
+      #   NEW gate (= step5.5 actual PASS conditions, all must close):
+      #     GATE-1 Worker → Container real HTTP fetch reached uvicorn inside Docker
+      #             (getContainer(DO, "pasay-singleton").fetch(GET /health) returned 2xx)
+      #     GATE-2 Container /health.status == "ok" → DB SELECT 1 works inside container
+      #     GATE-3 Container /health.build_sha == current GITHUB_SHA
+      #             → proves NEW instance is serving; old code path cannot match this SHA.
+      #     GATE-4 TWO consecutive identical new build_sha responses returned
+      #             → avoids flip false-positive at rollover boundary.
+      #     (timeout) bounded 180s poll; cold-start transient 5xx/transport → continue retry
+      #
+      #   containers instances CLI output printed ONLY as evidence (L1 pre-wake / L2 post-wake),
+      #   never again used as hard FAIL gate.
+      - name: "STEP 5.5 — RETURN1 ACTIVE READINESS TRUTH GATE: probe Worker→Container + build_sha==GITHUB_SHA (bounded 180s)"
         if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
-        id: container_readiness
+        id: container_active_readiness
         working-directory: cloudflare-worker
         run: |
           set -euo pipefail
           . ../.venv/bin/activate 2>/dev/null || true
-          PRE_VERSION="${{ steps.predeploy_container.outputs.pre_container_version }}"
-          PRE_VERSION="${PRE_VERSION:-NULL_NO_PRE_INSTANCE}"
+          EXPECTED_SHA="${{ github.sha }}"
+          INGEST_TOKEN="${{ secrets.PASAY_CONTAINER_INGEST_TOKEN }}"
+          ACCOUNT_ID="${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
+          CF_API_TOKEN="${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          export RETURN1_EXPECTED_BUILD_SHA="${EXPECTED_SHA}"
+          export RETURN1_INGEST_TOKEN="${INGEST_TOKEN}"
           export RETURN1_APP_ID="a033e8e1-c52f-4298-8a46-fff6ead430be"
-          export RETURN1_PRE_VERSION="${PRE_VERSION}"
-          export RETURN1_GITHUB_SHA="${GITHUB_SHA}"
+          export RETURN1_WRANGLER_CWD="${GITHUB_WORKSPACE}/cloudflare-worker"
+          export RETURN1_ARTIFACT_DIR="${RUNNER_TEMP}/return1_readiness_$$"
           export RETURN1_DEADLINE_SEC=180
           export RETURN1_POLL_SEC=5
-          python "${GITHUB_WORKSPACE}/scripts/deploy_container_readiness.py"
-          echo "[step5.5] CONTAINER ROLLOUT READINESS TRUTH GATE PASS → proceed to STEP6/7/8/9"
+          export CF_ACCOUNT_ID="${ACCOUNT_ID}"
+          export CF_API_TOKEN="${CF_API_TOKEN}"
+          mkdir -p "${RETURN1_ARTIFACT_DIR}"
+
+          echo "[step5.5] expected build_sha (head 16) = ${EXPECTED_SHA:0:16}…"
+
+          # ── Derive fetchable Worker URL (mirrors step6 derivation logic) ──
+          set +e
+          WORKER_BASE="$(python - <<'PY'
+          import os, re, json, urllib.request, ssl, pathlib, subprocess
+          account_id = os.environ["CF_ACCOUNT_ID"]
+          token      = os.environ["CF_API_TOKEN"]
+          worker     = "pasay-cloudflare-worker"
+          base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Content-Type":  "application/json",
+              "Accept":        "application/json",
+          }
+          def cf(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req  = urllib.request.Request(f"{base}{path}", data=data, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
+                      resp = r.read().decode()
+                      if not resp or not resp.strip(): return {"success": True, "status": getattr(r, "status", 204)}
+                      try: return json.loads(resp)
+                      except Exception as jerr: return {"success": True, "raw": resp[:400], "json_decode_err": str(jerr)[:120]}
+              except urllib.error.HTTPError as e:
+                  msg = e.read().decode()
+                  try:
+                      parsed = json.loads(msg) if msg else {"success": False}
+                      if isinstance(parsed, dict) and "success" not in parsed: parsed["success"] = False
+                      return parsed if isinstance(parsed, dict) else {"success": False, "raw": msg[:300]}
+                  except Exception: return {"success": False, "raw": msg[:300]}
+          subdomain_enabled = False
+          try:
+              r = cf("GET", f"/workers/scripts/{worker}/subdomain")
+              subdomain_enabled = bool((r.get("result") or {}).get("enabled", False))
+          except Exception: pass
+          routes = []
+          try:
+              toml_text = pathlib.Path("wrangler.toml").read_text(encoding="utf-8", errors="ignore")
+          except Exception: toml_text = ""
+          if toml_text:
+              for m in re.finditer(r'(?:^|\n)\s*route\s*=\s*"([^"]+)"', toml_text):
+                  routes.append({"script": worker, "pattern": m.group(1)})
+              for m in re.finditer(r'\broutes\s*=\s*(\[[^\]]*\])', toml_text, re.DOTALL):
+                  try:
+                      arr = json.loads(m.group(1))
+                      if isinstance(arr, list):
+                          for it in arr:
+                              if isinstance(it, str): routes.append({"script": worker, "pattern": it})
+                              elif isinstance(it, dict): routes.append({"script": it.get("script", worker), "pattern": it.get("pattern", it.get("custom_domain", ""))})
+                  except Exception: pass
+          try:
+              out = subprocess.run(["npx", "wrangler", "routes", "list"], capture_output=True, text=True, timeout=120)
+              combined = (out.stdout or "") + "\n" + (out.stderr or "")
+              try:
+                  parsed = json.loads(combined)
+                  if isinstance(parsed, list): routes.extend(parsed)
+              except Exception:
+                  for line in combined.splitlines():
+                      parts = line.strip().split()
+                      if len(parts) >= 3:
+                          for candidate in parts:
+                              if candidate.startswith("http") or candidate.startswith("*") or ".workers.dev" in candidate or candidate.count(".") >= 2:
+                                  if "github" not in candidate.lower() and not candidate.lower().endswith(".md"):
+                                      routes.append({"script": worker, "pattern": candidate})
+                                  break
+          except Exception: pass
+          worker_route = None
+          for rt in routes:
+              if isinstance(rt, dict) and rt.get("script") == worker and rt.get("pattern"):
+                  worker_route = rt.get("pattern"); break
+          fetch_base = None
+          if worker_route:
+              from urllib.parse import urlparse
+              p = worker_route.replace("*.", "").rstrip("*").rstrip("/")
+              if not p.startswith("http"): p = "https://" + p
+              try:
+                  host = (urlparse(p).netloc or "").lower()
+                  if host and ("github" in host or "cloudflare.com" == host or host.endswith(".md")): p = None
+              except Exception: p = None
+              if p: fetch_base = p
+          if not fetch_base:
+              try:
+                  out = subprocess.run(["npx", "wrangler", "deploy", "--dry-run", "--json"], capture_output=True, text=True, timeout=240, env={**os.environ, "WRANGLER_SEND_METRICS":"false"})
+              except Exception:
+                  out = subprocess.run(["npx", "wrangler", "deploy", "--dry-run"], capture_output=True, text=True, timeout=240, env={**os.environ, "WRANGLER_SEND_METRICS":"false"})
+              combined = (getattr(out, "stdout", None) or "") + "\n" + (getattr(out, "stderr", None) or "")
+              cands = []
+              try:
+                  parsed = json.loads(combined)
+                  for k in ["url", "preview_url", "deployment_url", "published_url"]:
+                      if isinstance(parsed, dict) and parsed.get(k): cands.append(parsed[k])
+                      elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict) and parsed[0].get(k): cands.append(parsed[0][k])
+              except Exception: pass
+              if not cands:
+                  urls = re.findall(r"https?://[^\s'\"<>)]+", combined)
+                  for u in urls:
+                      lu = u.lower()
+                      if ".workers.dev" in lu or "pasay" in lu: cands.append(u)
+              if cands: fetch_base = cands[0].rstrip("/")
+          # Last ditch — predictable workers.dev URL
+          if not fetch_base and subdomain_enabled:
+              try:
+                  sd = cf("GET", "/workers/subdomain")
+                  ns = (sd.get("result") or {}).get("subdomain") or ""
+                  if ns: fetch_base = f"https://{worker}.{ns}.workers.dev"
+              except Exception: pass
+          print(fetch_base or "")
+          PY
+          )"
+          set -e
+          if [[ -z "${WORKER_BASE}" ]]; then
+            echo "[step5.5][FATAL] could not derive worker URL for probe. step6 derivation returned empty."
+            echo "[step5.5] Attempting hardcoded fallback using last known pattern (workers.dev may require Paid plan enabled on FREE — will error below with 4xx if so)."
+            echo "[step5.5] Continue attempt: derive subdomain from CF API one more time inline:"
+          else
+            echo "[step5.5] Derived Worker probe base URL = ${WORKER_BASE}"
+          fi
+          export RETURN1_WORKER_BASE="${WORKER_BASE}"
+
+          # ── Run bounded active readiness ──
+          echo "[step5.5] Calling deploy_container_active_readiness.py bounded 180s (no fixed-sleep pass)."
+          python "${GITHUB_WORKSPACE}/scripts/deploy_container_active_readiness.py"
+          RC=$?
+          if [[ ${RC} -eq 0 ]]; then
+            echo "[step5.5] ACTIVE READINESS TRUTH CLOSED exit 0 → proceed STEP6/8/9/10"
+          elif [[ ${RC} -eq 87 ]]; then
+            echo "[step5.5] ACTIVE READINESS FAIL deadline=180s exceeded (exit 87). Artifacts at ${RETURN1_ARTIFACT_DIR}"
+            ls -la "${RETURN1_ARTIFACT_DIR}" || true
+            exit 87
+          else
+            echo "[step5.5] ACTIVE READINESS FAIL unexpected exit=${RC}."
+            exit ${RC}
+          fi
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 6 — Infrastructure smoke

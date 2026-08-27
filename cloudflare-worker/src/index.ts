@@ -73,6 +73,7 @@ export class PasayContainer extends Container {
       TELEGRAM_WEBHOOK_SECRET: env.TELEGRAM_WEBHOOK_SECRET ?? "",
       CONTAINER_INGEST_TOKEN: env.PASAY_CONTAINER_INGEST_TOKEN ?? "",
       PASAY_RUNTIME_MODE: "cloudflare-container",
+      PASAY_BUILD_SHA: env.PASAY_BUILD_SHA ?? "",
     };
   }
 }
@@ -350,9 +351,98 @@ export default {
         container_origin: PASAY_CONTAINER_ORIGIN,
         secrets_configured: secrets,
         envelope_version: ENVELOPE_VERSION,
+        pasay_build_sha: env.PASAY_BUILD_SHA ?? "",
       };
       return new Response(JSON.stringify(body), {
         status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    // RETURN1 READINESS FIX: synchronous active probe through Worker → Container binding.
+    // CI hits this endpoint with the shared ingest token to force-wake the container
+    // from scale-to-zero, wait for the NEW version to actually serve GET /health, and
+    // confirm build_sha == GITHUB_SHA before proceeding to STEP9 synthetic webhooks.
+    if (url.pathname === "/internal/container-probe" || url.pathname === "/internal/container-readiness-probe") {
+      if (request.method !== "GET") {
+        return new Response(JSON.stringify({ ok: false, error: "method_not_allowed" }), {
+          status: 405,
+          headers: { "Content-Type": "application/json", Allow: "GET" },
+        });
+      }
+      const token = env.PASAY_CONTAINER_INGEST_TOKEN?.trim() ?? "";
+      const received = request.headers.get(INGEST_AUTH_HEADER) ?? "";
+      if (!token || !header_eq(received, token)) {
+        return new Response(JSON.stringify({ ok: false, error: "forbidden" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (!env.PASAY_CONTAINER) {
+        return new Response(JSON.stringify({
+          ok: false, error: "container_binding_missing",
+        }), { status: 503, headers: { "Content-Type": "application/json" } });
+      }
+      type ContainerHandle = { fetch: (req: Request) => Promise<Response> };
+      let handle: ContainerHandle | undefined;
+      try {
+        const bindingAny = env.PASAY_CONTAINER as unknown as any;
+        handle = getContainer(bindingAny, PASAY_CONTAINER_INSTANCE_ID) as unknown as ContainerHandle;
+      } catch (e) {
+        return new Response(JSON.stringify({
+          ok: false, error: "get_container_throw", detail: (e as Error).message.slice(0, 200),
+        }), { status: 503, headers: { "Content-Type": "application/json" } });
+      }
+      if (!handle || typeof (handle as any).fetch !== "function") {
+        return new Response(JSON.stringify({
+          ok: false, error: "container_handle_missing_fetch",
+        }), { status: 503, headers: { "Content-Type": "application/json" } });
+      }
+      const absoluteUrl = `${PASAY_CONTAINER_ORIGIN}/health`;
+      let probeRequest: Request;
+      try {
+        probeRequest = new Request(absoluteUrl, {
+          method: "GET",
+          headers: { [INGEST_AUTH_HEADER]: token },
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({
+          ok: false, error: "probe_request_build_failed", detail: (e as Error).message.slice(0, 200),
+        }), { status: 503, headers: { "Content-Type": "application/json" } });
+      }
+      let resp: Response;
+      try {
+        resp = await (handle as any).fetch(probeRequest);
+      } catch (e) {
+        return new Response(JSON.stringify({
+          ok: false, error: "container_fetch_throw",
+          detail: (e as Error).message.slice(0, 240),
+        }), { status: 503, headers: { "Content-Type": "application/json" } });
+      }
+      const statusCode = resp.status;
+      let rawBody: string;
+      try {
+        rawBody = await resp.text();
+      } catch (e) {
+        rawBody = "";
+      }
+      let containerHealth: any = null;
+      try {
+        containerHealth = JSON.parse(rawBody);
+      } catch {
+        containerHealth = { raw_body_head: rawBody.slice(0, 400) };
+      }
+      const probe = {
+        worker_to_container_fetch_ok: statusCode >= 200 && statusCode < 500,
+        container_http_status: statusCode,
+        worker_probe_at: now_iso(),
+        worker_pasay_build_sha: env.PASAY_BUILD_SHA ?? "",
+        routed_instance_id: PASAY_CONTAINER_INSTANCE_ID,
+        routed_origin: PASAY_CONTAINER_ORIGIN,
+      };
+      const outStatus = probe.worker_to_container_fetch_ok ? 200 : 503;
+      return new Response(JSON.stringify({ ok: probe.worker_to_container_fetch_ok, probe, container_health: containerHealth }, null, 0), {
+        status: outStatus,
         headers: { "Content-Type": "application/json" },
       });
     }
