@@ -16,7 +16,10 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision = "20260827_160000_return1_postgres_bot_state"
+# NOTE: revision id must be <= 32 chars. The stock alembic_version table uses
+# `version_num character varying(32) NOT NULL` (non-upgradable without a
+# pre-bootstrap migration which we cannot run before alembic itself boots).
+revision = "ret1_postgres_bot_state_20260828"
 down_revision = "m4d000000001"
 branch_labels = None
 depends_on = None
