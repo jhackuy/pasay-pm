@@ -16,17 +16,29 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
     steps:
+      - name: Create PASAY OpenCode GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.PASAY_OPENCODE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PASAY_OPENCODE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
           persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Run opencode
         uses: anomalyco/opencode/github@latest
         env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
         with:
+          use_github_token: true
           model: minimax/MiniMax-M3
