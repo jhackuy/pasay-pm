@@ -67,6 +67,8 @@ if [ -z \"${DATABASE_URL_UNPOOLED}\" ]; then \
 fi; \
 export ALEMBIC_DATABASE_URL=\"${DATABASE_URL_UNPOOLED}\"; \
 alembic upgrade head; \
+unset DATABASE_URL_UNPOOLED; \
+unset ALEMBIC_DATABASE_URL; \
 exec \"$@\"\
 ", "entrypoint"]
 

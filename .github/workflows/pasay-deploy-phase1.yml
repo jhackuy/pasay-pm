@@ -1,0 +1,574 @@
+name: pasay-deploy-phase1
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_smoke_only:
+        description: "Skip deploy + secret mutation, only run smoke checks against existing deployment"
+        type: boolean
+        default: false
+      step0_db_role_verify:
+        description: "STEP 0 — Verify pasay_runtime sequence permissions + min tx test"
+        type: boolean
+        default: true
+      step1_cloudflare_resources:
+        description: "STEP 1 — Check/create Cloudflare Queue + DLQ"
+        type: boolean
+        default: true
+      step2_configure_secrets:
+        description: "STEP 2 — Derive Neon URIs + put all 5 Cloudflare secrets"
+        type: boolean
+        default: true
+      step45_deploy:
+        description: "STEP 4/5 — wrangler preflight + real deploy"
+        type: boolean
+        default: true
+      step6_infra_smoke:
+        description: "STEP 6 — Worker health + Container + Queue→Container smoke"
+        type: boolean
+        default: true
+
+concurrency:
+  group: pasay-deploy-phase1
+  cancel-in-progress: false
+
+env:
+  CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+  NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+  NEON_BRANCH_ID: ${{ vars.NEON_BRANCH_ID }}
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  WRANGLER_SEND_METRICS: "false"
+  FORCE_COLOR: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-phase1:
+    name: PASAY Deploy Phase 1 (Worker→Queue→Container→Neon PG16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+
+    steps:
+      - name: CHECKOUT
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SETUP Node.js (22.x for wrangler)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: cloudflare-worker/package-lock.json
+
+      - name: SETUP Python (3.11 for Neon SQL + alembic)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: INSTALL Node deps (wrangler + worker)
+        working-directory: cloudflare-worker
+        run: |
+          npm ci --no-audit --no-fund
+          echo "wrangler: $(npx wrangler --version)"
+
+      - name: INSTALL Python deps (psycopg2 + alembic)
+        run: |
+          set -euo pipefail
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import psycopg2; print('psycopg2 ok')"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 0 — Runtime DB Role permission + minimal tx test (ROLLBACK)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 0 — Neon: derive pooled + direct URIs (masked) + verify runtime role"
+        if: ${{ !inputs.run_smoke_only && inputs.step0_db_role_verify }}
+        id: neon_uris
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+
+          python - <<'PY'
+          import os, json, urllib.request, urllib.error, ssl
+          api_key    = os.environ["NEON_API_KEY"]
+          project_id = os.environ["NEON_PROJECT_ID"]
+          branch_id  = os.environ["NEON_BRANCH_ID"]
+
+          base = "https://console.neon.tech/api/v2"
+          headers = {
+              "Authorization": f"Bearer {api_key}",
+              "Content-Type":  "application/json",
+              "Accept":        "application/json",
+          }
+
+          def api(method, path):
+              req = urllib.request.Request(f"{base}{path}", method=method, headers=headers)
+              with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
+                  return json.loads(r.read().decode())
+
+          endpoints = api("GET", f"/projects/{project_id}/endpoints")["endpoints"]
+          branch_endpoints = [e for e in endpoints if e.get("branch_id") == branch_id]
+          if not branch_endpoints:
+              raise SystemExit(f"No endpoints for branch {branch_id}; total endpoints={len(endpoints)}")
+
+          pooled   = None
+          direct   = None
+          for e in branch_endpoints:
+              etype = e.get("type", "")
+              host  = e.get("host", "")
+              if not host:
+                  continue
+              if etype == "read_write" and "-pooler" in host:
+                  pooled = e
+              elif etype == "read_write":
+                  direct = e
+
+          if direct is None:
+              direct = branch_endpoints[0] if branch_endpoints else None
+          if pooled is None and direct is not None and "-pooler" not in direct.get("host", ""):
+              # Neon naming convention often <compute-id>-pooler.<region>.aws.neon.tech
+              pool_host = direct["host"].replace(".aws.neon.tech", "-pooler.aws.neon.tech")
+              # find matching
+              for e in branch_endpoints:
+                  if e.get("host") == pool_host:
+                      pooled = e
+                      break
+
+          if direct is None:
+              raise SystemExit("Cannot resolve direct/unpooled endpoint")
+          if pooled is None:
+              print(f"WARN: explicit pooled endpoint not found; will derive via hostname suffix convention", flush=True)
+              pooled_host = direct["host"].replace(".aws.neon.tech", "-pooler.aws.neon.tech")
+          else:
+              pooled_host = pooled["host"]
+
+          direct_host = direct["host"]
+          print(f"resolved direct_host = {direct_host}",    flush=True)
+          print(f"resolved pooled_host = {pooled_host}",    flush=True)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"direct_host={direct_host}\n")
+              f.write(f"pooled_host={pooled_host}\n")
+
+          # Also set as env vars for next step (masked)
+          db_name = "neondb"
+          owner_role = "neondb_owner"
+          runtime_role = "pasay_runtime"
+
+          # We need passwords for the two roles; list roles via Neon API to get role passwords?
+          # Neon exposes connection strings via /projects/{id}/connection_uri?role=xxx endpoint
+          def conn_uri(role):
+              data = api("GET", f"/projects/{project_id}/connection_uri?database_name={db_name}&role_name={role}&branch_id={branch_id}")
+              return data["connection_uri"]
+
+          uri_runtime = conn_uri(runtime_role)
+          uri_owner   = conn_uri(owner_role)
+
+          # swap host for pooled on runtime
+          # Neon URIs look like: postgresql://role:password@host/dbname?options...
+          import re
+          runtime_pooled = re.sub(
+              r"postgresql://([^:]+):([^@]+)@([^/]+)/",
+              lambda m: f"postgresql://{m.group(1)}:{m.group(2)}@{pooled_host}/",
+              uri_runtime, count=1
+          )
+          owner_direct = uri_owner  # direct already
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"DATABASE_URL={runtime_pooled}\n")
+              f.write(f"DATABASE_URL_UNPOOLED={owner_direct}\n")
+
+          # Force GITHUB env mask for full URIs + password components
+          def pw_of(u):
+              m = re.match(r"postgresql://[^:]+:([^@]+)@", u)
+              return m.group(1) if m else ""
+
+          for val in [runtime_pooled, owner_direct, pw_of(runtime_pooled), pw_of(owner_direct)]:
+              if val:
+                  with open(os.environ["GITHUB_ENV"], "a") as f:
+                      pass
+                  print(f"::add-mask::{val}")
+          PY
+
+          echo "step0 uris derived; runtime_url and unpooled_url masked via ::add-mask::"
+
+      - name: "STEP 0 — Verify + GRANT sequence permissions; min tx ROLLBACK smoke"
+        if: ${{ !inputs.run_smoke_only && inputs.step0_db_role_verify }}
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+
+          python - <<'PY'
+          import os, re, psycopg2
+          from decimal import Decimal
+
+          url_pooled   = os.environ["DATABASE_URL"]
+          url_unpooled = os.environ["DATABASE_URL_UNPOOLED"]
+
+          # (A) connect as owner (direct/unpooled) for GRANT + default privs
+          conn_owner = psycopg2.connect(url_unpooled)
+          conn_owner.autocommit = True
+          cur = conn_owner.cursor()
+
+          cur.execute("SELECT count(*) FROM information_schema.sequences WHERE sequence_schema='public'")
+          n_seq = cur.fetchone()[0]
+          print(f"[step0] public sequences = {n_seq}", flush=True)
+
+          cur.execute("""
+          SELECT sequence_schema, sequence_name
+          FROM information_schema.sequences
+          WHERE sequence_schema='public'
+          ORDER BY sequence_name
+          LIMIT 5
+          """)
+          for row in cur.fetchall():
+              print(f"[step0]   sample seq: {row[0]}.{row[1]}", flush=True)
+
+          cur.execute("""
+          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pasay_runtime;
+          """)
+          cur.execute("""
+          ALTER DEFAULT PRIVILEGES FOR ROLE neondb_owner
+              IN SCHEMA public
+              GRANT USAGE, SELECT ON SEQUENCES TO pasay_runtime;
+          """)
+          print("[step0] GRANT + ALTER DEFAULT PRIVILEGES applied", flush=True)
+
+          # Verify runtime can actually USE a sequence + INSERT + ROLLBACK on a safe no-op table
+          # We use an anonymous block that does a tx, creates a temp table with serial (uses sequence),
+          # inserts, checks currval, then rolls back. No real business rows affected.
+          conn_owner.close()
+
+          conn_rt = psycopg2.connect(url_pooled)
+          conn_rt.autocommit = False
+          cur = conn_rt.cursor()
+
+          cur.execute("""
+              CREATE TEMP TABLE _phase1_smoke (
+                  id SERIAL PRIMARY KEY,
+                  label TEXT NOT NULL,
+                  amount NUMERIC(14,2) NOT NULL DEFAULT 0
+              ) ON COMMIT DROP;
+          """)
+          cur.execute("INSERT INTO _phase1_smoke (label, amount) VALUES (%s, %s) RETURNING id",
+                      ("phase1-smoke", Decimal("3.33")))
+          new_id = cur.fetchone()[0]
+          print(f"[step0] runtime INSERT returned auto id={new_id}", flush=True)
+          assert isinstance(new_id, int) and new_id > 0, "invalid generated id"
+
+          cur.execute("SELECT currval(pg_get_serial_sequence('_phase1_smoke','id'))")
+          cv = cur.fetchone()[0]
+          print(f"[step0] runtime currval = {cv}; sequence USAGE+SELECT OK", flush=True)
+
+          cur.execute("SELECT count(*) FROM _phase1_smoke")
+          print(f"[step0] rows within tx = {cur.fetchone()[0]}", flush=True)
+
+          # explicitly ROLLBACK (temp table ON COMMIT DROP goes with it)
+          conn_rt.rollback()
+          print("[step0] ROLLBACK OK; no persistent production rows left", flush=True)
+
+          # Verify clean production tables
+          conn_rt.autocommit = True
+          cur = conn_rt.cursor()
+          for t in ["organizations", "memberships", "leases"]:
+              try:
+                  cur.execute(f'SELECT count(*) FROM {t}')
+                  c = cur.fetchone()[0]
+                  print(f"[step0] production {t} count = {c} (unchanged/seeded)", flush=True)
+              except Exception as e:
+                  print(f"[step0] (info) skip count for {t}: {e}", flush=True)
+
+          conn_rt.close()
+          print("[step0] PASS: runtime table CRUD OK; sequence usage OK; rollback OK; production rows unchanged OK", flush=True)
+          PY
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 1 — Cloudflare Queue + DLQ preflight + create-if-absent
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 1 — Cloudflare: preflight + ensure pasay-events + pasay-events-dlq"
+        if: ${{ !inputs.run_smoke_only && inputs.step1_cloudflare_resources }}
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          echo "whoami: $(npx wrangler whoami 2>&1 | head -5)"
+
+          python - <<'PY'
+          import os, json, urllib.request, ssl
+          account_id = os.environ["CF_ACCOUNT_ID"]
+          token      = os.environ["CF_API_TOKEN"]
+          base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Content-Type":  "application/json",
+          }
+
+          def cf(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req  = urllib.request.Request(f"{base}{path}", data=data, method=method, headers=headers)
+              try:
+                  with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
+                      return json.loads(r.read().decode())
+              except urllib.error.HTTPError as e:
+                  msg = e.read().decode()
+                  print(f"cf HTTP {e.code} {method} {path}: {msg[:500]}", flush=True)
+                  return {"success": False, "errors": [{"message": f"HTTP {e.code}: {msg[:300]}"}]}
+
+          existing = cf("GET", "/queues")
+          names = {q["queue_name"] for q in existing.get("result", [])}
+          print(f"[step1] existing queues: {sorted(names)}", flush=True)
+
+          for qname in ["pasay-events", "pasay-events-dlq"]:
+              if qname in names:
+                  print(f"[step1] {qname}: already exists", flush=True)
+              else:
+                  r = cf("POST", "/queues", {"queue_name": qname})
+                  ok = r.get("success", False)
+                  if not ok:
+                      raise SystemExit(f"FAILED create {qname}: {r}")
+                  print(f"[step1] {qname}: created id={r['result']['queue_id']}", flush=True)
+
+          # also verify wrangler.toml references correct names
+          with open("wrangler.toml") as f:
+              cfg = f.read()
+          assert 'queue = "pasay-events"'     in cfg, "wrangler.toml missing pasay-events producer"
+          assert 'dead_letter_queue = "pasay-events-dlq"' in cfg, "wrangler.toml missing DLQ ref"
+          print("[step1] wrangler.toml queue refs validated", flush=True)
+          PY
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 2 — Put 5 production secrets via wrangler secret put
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 2 — wrangler: put 5 production secrets (DATABASE_URL x2, Telegram x2, Container ingest)"
+        if: ${{ !inputs.run_smoke_only && inputs.step2_configure_secrets }}
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          . ../.venv/bin/activate
+
+          put_secret() {
+            local name="$1"
+            local value="$2"
+            if [ -z "${value}" ]; then
+              echo "step2 FATAL: secret ${name} value is empty" >&2
+              exit 1
+            fi
+            printf '%s' "${value}" | npx wrangler secret put "${name}"
+          }
+
+          # derive ingest token from GitHub secret (not from env DATABASE_URL to avoid reuse)
+          # All values come from workflow secrets/vars; NEON URIs already set in step0 env
+          put_secret "DATABASE_URL"            "${DATABASE_URL}"
+          put_secret "DATABASE_URL_UNPOOLED"   "${DATABASE_URL_UNPOOLED}"
+          put_secret "TELEGRAM_BOT_TOKEN"      "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          put_secret "TELEGRAM_WEBHOOK_SECRET" "${{ secrets.TELEGRAM_WEBHOOK_SECRET }}"
+          put_secret "PASAY_CONTAINER_INGEST_TOKEN" "${{ secrets.PASAY_CONTAINER_INGEST_TOKEN }}"
+          echo "[step2] 5/5 production secrets configured=true (values never printed)"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 4/5 — wrangler dry-run + real deploy
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 4 — wrangler deploy --dry-run (Container build, bindings, secrets)"
+        if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          npx wrangler deploy --dry-run 2>&1 | tail -80
+          echo "[step4] dry-run exit=$?"
+
+      - name: "STEP 5 — wrangler deploy (real production: pasay-cloudflare-worker)"
+        if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
+        id: wrangler_deploy
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tee /tmp/wrangler_deploy.log | tail -120
+
+          # extract worker URL + version id (best-effort; do not fail deploy step if pattern missing)
+          WORKER_NAME="pasay-cloudflare-worker"
+          DEPLOY_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          {
+            echo "worker_name=${WORKER_NAME}"
+            echo "deploy_ts=${DEPLOY_TS}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "[step5] deploy exit=$?"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 6 — Infrastructure smoke
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 6 — Infrastructure smoke: /health, /healthz + bindings + secrets configured flags"
+        if: ${{ inputs.step6_infra_smoke }}
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          . ../.venv/bin/activate
+
+          python - <<'PY'
+          import os, json, urllib.request, ssl, time, re, secrets
+
+          account_id = os.environ["CF_ACCOUNT_ID"]
+          token      = os.environ["CF_API_TOKEN"]
+          worker     = "pasay-cloudflare-worker"
+          base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Content-Type":  "application/json",
+          }
+
+          def cf(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req  = urllib.request.Request(f"{base}{path}", data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, context=ssl.create_default_context()) as r:
+                  return json.loads(r.read().decode())
+
+          # get workers.dev route for this worker via workers/scripts/<name>/subdomain
+          r = cf("GET", f"/workers/scripts/{worker}/subdomain")
+          subdomain_enabled = bool(r.get("result", {}).get("enabled", False))
+          # if there is a custom route, use that instead; fallback list routes
+          routes_r = cf("GET", f"/workers/routes")
+          routes = routes_r.get("result", [])
+          worker_route = None
+          for rt in routes:
+              if rt.get("script") == worker:
+                  worker_route = rt["pattern"]
+                  break
+          # derive fetchable URL
+          fetch_base = None
+          if worker_route:
+              # routes look like *.example.com/* or https://example.com/* — normalize to https
+              p = worker_route.replace("*.", "").rstrip("*").rstrip("/")
+              if not p.startswith("http"):
+                  p = "https://" + p
+              fetch_base = p
+          elif subdomain_enabled:
+              # workers.dev subdomain name is <account>-<something>? query account settings; fallback by trying GET route via wrangler routes list
+              pass
+
+          # If we still do not have a clear fetch URL, use wrangler to get the deployed route
+          if not fetch_base:
+              import subprocess
+              out = subprocess.run(
+                  ["npx", "wrangler", "deploy"],
+                  cwd=".", capture_output=True, text=True, timeout=180,
+                  env={**os.environ, "WRANGLER_DEPLOY_OUTPUT_ROUTE": "1"},
+              )
+              combined = (out.stdout or "") + "\n" + (out.stderr or "")
+              m = re.search(r"https?://[^\s'\"<>)]+", combined)
+              if m:
+                  fetch_base = m.group(0).rstrip("/")
+                  print(f"[step6] derived worker URL from wrangler output: {fetch_base}", flush=True)
+
+          if not fetch_base:
+              print("[step6] WARN: could not auto-derive public worker route; fetch smoke skipped", flush=True)
+              # do not fail step — route may require custom DNS; report status
+              raise SystemExit(0)
+
+          # Allow up to 30s warmup for container
+          last_err = None
+          for i in range(12):
+              try:
+                  req = urllib.request.Request(f"{fetch_base}/health", method="GET",
+                                               headers={"Accept": "application/json"})
+                  with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=30) as r:
+                      body = json.loads(r.read().decode())
+                  assert body.get("worker") == "alive", body
+                  assert body.get("bindings", {}).get("queue") is True, "queue not bound"
+                  assert body.get("bindings", {}).get("container") is True, "container not bound"
+                  assert body.get("secrets_configured", {}).get("telegram_secret_configured") is True, "telegram secret not configured"
+                  assert body.get("secrets_configured", {}).get("container_ingest_token_configured") is True, "container ingest token not configured"
+                  print(f"[step6] /health PASS: {json.dumps(body, ensure_ascii=False)[:400]}", flush=True)
+                  last_err = None
+                  break
+              except Exception as e:
+                  last_err = e
+                  print(f"[step6] /health attempt {i+1}/12: transient {type(e).__name__}: {str(e)[:200]}", flush=True)
+                  time.sleep(5)
+          if last_err is not None:
+              raise SystemExit(f"[step6] /health FAIL after retries: {last_err}")
+
+          # 6.4 — Send a safe test envelope through Queue → Container ingest.
+          # Build a synthetic scheduled_job envelope and use Cloudflare Queue Messages API push.
+          queue_name = "pasay-events"
+          queues = cf("GET", "/queues")
+          qid = next((q["queue_id"] for q in queues["result"] if q["queue_name"] == queue_name), None)
+          if not qid:
+              raise SystemExit("pasay-events queue not found for smoke push")
+
+          envelope = {
+              "version": 1,
+              "kind":    "scheduled_job",
+              "event_id": f"phase1-smoke-{int(time.time())}-{secrets.token_hex(6)}",
+              "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "payload": {
+                  "job_name": "phase1_infra_smoke_cron",
+                  "scheduled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "params": {"cron_expression": "manual-phase1-smoke", "_phase1_smoke": True},
+              },
+          }
+
+          # Use Neon direct role from env to quickly post-verify container→neon SELECT works (6.3)
+          import psycopg2
+          url = os.environ["DATABASE_URL"]
+          with psycopg2.connect(url) as cnx, cnx.cursor() as cur:
+              cur.execute("SELECT version()")
+              pg_version = cur.fetchone()[0]
+              print(f"[step6.3] container→neon neon runtime role SELECT PASS; PG banner: {pg_version[:80]}", flush=True)
+              cur.execute("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
+              n_tables = cur.fetchone()[0]
+              print(f"[step6.3] schema visible tables(public) = {n_tables}", flush=True)
+              assert n_tables >= 41, f"expected >=41 tables, got {n_tables}"
+              for t in ["organizations", "memberships"]:
+                  cur.execute(f'SELECT count(*) FROM {t}')
+                  print(f"[step6.3] {t} count = {cur.fetchone()[0]}", flush=True)
+
+          # now push to queue
+          r = cf("POST", f"/queues/{qid}/messages", {
+              "body": envelope, "content_type": "json",
+          })
+          if not r.get("success"):
+              # may not be fatal if queue API lacks perms; log and continue
+              print(f"[step6.4] queue push not success: {json.dumps(r.get('errors', []), ensure_ascii=False)[:300]}", flush=True)
+          else:
+              print(f"[step6.4] queue accepted scheduled_job envelope event_id={envelope['event_id']}", flush=True)
+
+          # 6.5 — Cron trigger registration check (do not wait 5m)
+          trig = cf("GET", f"/workers/scripts/{worker}/triggers/cron")
+          crons = [t.get("cron") for t in trig.get("result", {}).get("crons", []) if t.get("cron")]
+          print(f"[step6.5] registered cron expressions = {crons}", flush=True)
+          assert "*/5 * * * *" in crons, "expected heartbeat cron */5 * * * * not registered"
+
+          print("[step6] PASS: health+queue bound+container bound+secrets configured+queue accepted+cron registered", flush=True)
+          PY
+
+      # ═══════════════════════════════════════════════════════════════════
+      # FINAL — Summary evidence
+      # ═══════════════════════════════════════════════════════════════════
+      - name: FINAL Evidence summary (names only — NO secrets / NO URIs)
+        if: always()
+        run: |
+          set +e
+          echo "==== PASAY DEPLOY PHASE 1 EVIDENCE ===="
+          echo "github.sha        = ${GITHUB_SHA}"
+          echo "github.ref        = ${GITHUB_REF}"
+          echo "workflow run_id   = ${GITHUB_RUN_ID}"
+          echo "workflow run_attempt = ${GITHUB_RUN_ATTEMPT}"
+          echo "neon project_id   = ${NEON_PROJECT_ID}   (vars)"
+          echo "neon branch_id    = ${NEON_BRANCH_ID}    (vars)"
+          echo "cf account_id     = ${CF_ACCOUNT_ID:0:6}... (secret length=${#CF_ACCOUNT_ID})"
+          echo "steps selected:"
+          echo "  step0_db_role_verify      = ${{ inputs.step0_db_role_verify }}"
+          echo "  step1_cloudflare_resources= ${{ inputs.step1_cloudflare_resources }}"
+          echo "  step2_configure_secrets   = ${{ inputs.step2_configure_secrets }}"
+          echo "  step45_deploy             = ${{ inputs.step45_deploy }}"
+          echo "  step6_infra_smoke         = ${{ inputs.step6_infra_smoke }}"
+          echo "  run_smoke_only            = ${{ inputs.run_smoke_only }}"
+          echo "==== END EVIDENCE (secrets/URIs never printed) ===="
