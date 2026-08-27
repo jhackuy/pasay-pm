@@ -65,6 +65,8 @@ export class PasayContainer extends Container {
   sleepAfter = "15m";
   envVars: Record<string, string>;
 
+  _lifecycle_events: Array<Record<string, unknown>> = [];
+
   constructor(ctx: any = {}, env: Env = {} as Env, options?: any) {
     super(ctx, env, options);
     this.envVars = {
@@ -78,43 +80,55 @@ export class PasayContainer extends Container {
     };
   }
 
+  _recordLifecycle(kind: string, payload: Record<string, unknown>): void {
+    try {
+      const ev: Record<string, unknown> = { kind, at: now_iso() };
+      for (const [k, v] of Object.entries(payload)) ev[k] = v;
+      this._lifecycle_events.push(ev);
+      if (this._lifecycle_events.length > 64) {
+        this._lifecycle_events = this._lifecycle_events.slice(-64);
+      }
+    } catch {
+      /* ignore OOM or seal issues */
+    }
+  }
+
+  async lifecycleEvents(): Promise<{ captured_at: string; events: Array<Record<string, unknown>>; count: number }> {
+    return {
+      captured_at: now_iso(),
+      events: this._lifecycle_events.map((e) => JSON.parse(JSON.stringify(e))),
+      count: this._lifecycle_events.length,
+    };
+  }
+
   // ── RETURN2 STEP A: Official lifecycle hooks (evidence, never secrets) ──
   // Ref: https://developers.cloudflare.com/containers/examples/status-hooks/
   async onStart(): Promise<void> {
-    console.log(
-      "[PasayContainer onStart]",
-      JSON.stringify({
-        at: now_iso(),
-        default_port: this.defaultPort,
-        sleep_after: this.sleepAfter,
-        mode: this.envVars.PASAY_RUNTIME_MODE,
-        build_sha_head: (this.envVars.PASAY_BUILD_SHA || "").slice(0, 12) + "…",
-      }),
-    );
+    const payload = {
+      default_port: this.defaultPort,
+      sleep_after: this.sleepAfter,
+      mode: this.envVars.PASAY_RUNTIME_MODE,
+      build_sha_head: (this.envVars.PASAY_BUILD_SHA || "").slice(0, 12) + "…",
+    };
+    this._recordLifecycle("onStart", payload);
+    console.log("[PasayContainer onStart]", JSON.stringify({ at: now_iso(), ...payload }));
   }
 
   async onStop(params: { exitCode?: number; reason?: string } = {}): Promise<void> {
     const safe_reason = mask_sensitive(String(params.reason ?? "N/A")).slice(0, 240);
-    console.log(
-      "[PasayContainer onStop]",
-      JSON.stringify({
-        at: now_iso(),
-        exit_code: params.exitCode ?? null,
-        reason: safe_reason,
-      }),
-    );
+    const payload = { exit_code: params.exitCode ?? null, reason: safe_reason };
+    this._recordLifecycle("onStop", payload);
+    console.log("[PasayContainer onStop]", JSON.stringify({ at: now_iso(), ...payload }));
   }
 
   async onError(error: unknown): Promise<void> {
     const safe_msg = mask_sensitive(error instanceof Error ? error.message : String(error)).slice(0, 200);
-    console.log(
-      "[PasayContainer onError]",
-      JSON.stringify({
-        at: now_iso(),
-        type: error instanceof Error ? error.name : typeof error,
-        msg_head: safe_msg,
-      }),
-    );
+    const payload = {
+      type: error instanceof Error ? error.name : typeof error,
+      msg_head: safe_msg,
+    };
+    this._recordLifecycle("onError", payload);
+    console.log("[PasayContainer onError]", JSON.stringify({ at: now_iso(), ...payload }));
     if (error instanceof Error) throw error;
     throw new Error(safe_msg || "PasayContainer unknown error");
   }
@@ -597,6 +611,7 @@ export default {
           startOptions?: any;
         }) => Promise<void>;
         diagnosticSnapshot?: () => Promise<Record<string, unknown>>;
+        lifecycleEvents?: () => Promise<Record<string, unknown>>;
       };
       const handleFull = handle as ContainerHandleFull;
       let startFailed = false;
@@ -618,10 +633,25 @@ export default {
           startErrDetail = mask_sensitive(startErr instanceof Error ? startErr.message : String(startErr)).slice(0, 240);
         }
       }
-      // ── OWNER DECISION 5441773538: After startAndWaitForPorts FAIL, call  ──
-      // the PasayContainer.diagnosticSnapshot() RPC exactly ONCE to get the
-      // real in-container PID/process-listening state before returning 503.
+      // ── RETURN3 STEP A-After-start-fail: First collect DO lifecycle events,
+      // then try in-container exec snapshot.  Lifecycle events are buffered in
+      // the Durable Object memory and survive the container process exiting
+      // (unlike exec() which strictly requires container.running==true).  This
+      // reliably captures onStop.exit_code and onStop.reason for PID1 crashes.
+      let lifecycle_snapshot: Record<string, unknown> | null = null;
       let container_runtime_snapshot: Record<string, unknown> | null = null;
+      if (startFailed && typeof handleFull.lifecycleEvents === "function") {
+        try {
+          lifecycle_snapshot = await Promise.race([
+            handleFull.lifecycleEvents(),
+            new Promise<never>((_, rej) => setTimeout(() => rej(new Error("lifecycle_rpc_timeout_8s")), 8_000)),
+          ]);
+        } catch (lifeErr) {
+          lifecycle_snapshot = {
+            lifecycle_rpc_error: mask_sensitive(lifeErr instanceof Error ? lifeErr.message : String(lifeErr)).slice(0, 200),
+          };
+        }
+      }
       if (startFailed && typeof handleFull.diagnosticSnapshot === "function") {
         try {
           container_runtime_snapshot = await Promise.race([
@@ -642,6 +672,7 @@ export default {
           instance_get_timeout_ms: instanceGetTimeoutMs,
           port_ready_timeout_ms: portReadyTimeoutMs,
         };
+        if (lifecycle_snapshot) body["container_lifecycle_events"] = lifecycle_snapshot;
         if (container_runtime_snapshot) body["container_runtime_snapshot"] = container_runtime_snapshot;
         return new Response(
           JSON.stringify(body),
