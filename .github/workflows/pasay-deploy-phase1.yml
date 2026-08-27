@@ -506,7 +506,8 @@ jobs:
           export RETURN1_INGEST_TOKEN="${INGEST_TOKEN}"
           export RETURN1_APP_ID="a033e8e1-c52f-4298-8a46-fff6ead430be"
           export RETURN1_WRANGLER_CWD="${GITHUB_WORKSPACE}/cloudflare-worker"
-          export RETURN1_ARTIFACT_DIR="${RUNNER_TEMP}/return1_readiness_$$"
+          RETURN1_ARTIFACT_DIR="${RUNNER_TEMP}/return1_readiness_run${GITHUB_RUN_ID}_att${GITHUB_RUN_ATTEMPT:-1}"
+          export RETURN1_ARTIFACT_DIR
           export RETURN1_DEADLINE_SEC=180
           export RETURN1_POLL_SEC=5
           export CF_ACCOUNT_ID="${ACCOUNT_ID}"
@@ -635,18 +636,40 @@ jobs:
 
           # ── Run bounded active readiness ──
           echo "[step5.5] Calling deploy_container_active_readiness.py bounded 180s (no fixed-sleep pass)."
+          set +e
           python "${GITHUB_WORKSPACE}/scripts/deploy_container_active_readiness.py"
           RC=$?
+          set -e
+          echo "[step5.5] deploy_container_active_readiness.py exit=${RC}"
+          echo "artifact_dir_path=${RETURN1_ARTIFACT_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "readiness_exit_code=${RC}" >> "${GITHUB_OUTPUT}"
+          ls -la "${RETURN1_ARTIFACT_DIR}" || true
+          if [[ -f "${RETURN1_ARTIFACT_DIR}/readiness_result.json" ]]; then
+            echo "readiness_result_json_head=$(head -c 600 "${RETURN1_ARTIFACT_DIR}/readiness_result.json" | tr '\n' ' ')" >> "${GITHUB_OUTPUT}" || true
+          fi
           if [[ ${RC} -eq 0 ]]; then
             echo "[step5.5] ACTIVE READINESS TRUTH CLOSED exit 0 → proceed STEP6/8/9/10"
           elif [[ ${RC} -eq 87 ]]; then
             echo "[step5.5] ACTIVE READINESS FAIL deadline=180s exceeded (exit 87). Artifacts at ${RETURN1_ARTIFACT_DIR}"
-            ls -la "${RETURN1_ARTIFACT_DIR}" || true
             exit 87
           else
             echo "[step5.5] ACTIVE READINESS FAIL unexpected exit=${RC}."
             exit ${RC}
           fi
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 5.6 — Readiness evidence artifact (UPLOAD ALWAYS, even on failure)
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 5.6 — Upload readiness evidence artifact (pass/fail always)"
+        if: ${{ always() && !inputs.run_smoke_only && inputs.step45_deploy }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pasay-return1-readiness-evidence
+          path: |
+            ${{ steps.container_active_readiness.outputs.artifact_dir_path }}
+          if-no-files-found: warn
+          retention-days: 30
+          overwrite: true
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 6 — Infrastructure smoke
@@ -660,6 +683,11 @@ jobs:
 
           python - <<'PY'
           import os, json, urllib.request, ssl, time, re, secrets
+
+          UA_BROWSER = (
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+          )
 
           account_id = os.environ["CF_ACCOUNT_ID"]
           token      = os.environ["CF_API_TOKEN"]
@@ -921,7 +949,7 @@ jobs:
               for i in range(12):
                   try:
                       req = urllib.request.Request(f"{fetch_base}/health", method="GET",
-                                                   headers={"Accept": "application/json"})
+                                                   headers={"Accept": "application/json", "User-Agent": UA_BROWSER})
                       with urllib.request.urlopen(req, context=ssl.create_default_context(), timeout=30) as r:
                           body = json.loads(r.read().decode())
                       assert body.get("worker") == "alive", body

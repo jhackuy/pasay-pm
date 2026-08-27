@@ -39,6 +39,7 @@ Exit codes:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -61,6 +62,10 @@ WORKDIR = os.environ.get("RETURN1_WRANGLER_CWD", "/github/workspace/cloudflare-w
 RAW_DIR = os.environ.get("RETURN1_ARTIFACT_DIR", "/tmp/return1_readiness")
 PROBE_PATH = "/internal/container-readiness-probe"
 AUTH_HEADER = "X-Pasay-Ingest-Token"
+UA_BROWSER = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 
 
 def log(msg: str) -> None:
@@ -136,26 +141,62 @@ def dump_containers_list(tag: str) -> dict[str, Any]:
     return result
 
 
-def http_probe() -> tuple[int, dict[str, Any]]:
+def http_probe() -> tuple[int, dict[str, Any], dict[str, Any]]:
     url = f"{WORKER_BASE}{PROBE_PATH}"
     req = urllib.request.Request(
         url, method="GET",
-        headers={AUTH_HEADER: INGEST_TOKEN, "Accept": "application/json"},
+        headers={
+            AUTH_HEADER: INGEST_TOKEN,
+            "Accept": "application/json",
+            "User-Agent": UA_BROWSER,
+        },
     )
+    meta: dict[str, Any] = {"probe_url": url}
+    resp_obj: Any = None
+    is_http_error = False
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read().decode("utf-8", errors="replace")
             status = getattr(r, "status", 200)
+            resp_obj = r
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace")
         status = e.code
+        resp_obj = e
+        is_http_error = True
     except Exception as exc:  # noqa: BLE001
-        return 0, {"ok": False, "transport_error": type(exc).__name__, "detail": str(exc)[:300]}
+        meta["transport_error"] = type(exc).__name__
+        meta["transport_detail"] = str(exc)[:300]
+        return 0, {"ok": False, "transport_error": type(exc).__name__, "detail": str(exc)[:300]}, meta
+    if resp_obj is not None:
+        hdrs = resp_obj.headers
+        meta["content_type"] = hdrs.get("Content-Type", "")
+        meta["server"] = hdrs.get("Server", "")
+        cf_ray = hdrs.get("CF-Ray", "")
+        meta["cf_ray_present"] = bool(cf_ray)
+        if cf_ray:
+            try:
+                meta["cf_ray_hash"] = hashlib.sha256(cf_ray.encode()).hexdigest()[:16]
+            except Exception:
+                meta["cf_ray_hash"] = None
+        meta["final_url"] = getattr(resp_obj, "url", url) or url
+        meta["redirected"] = meta["final_url"] != url
+        is_json = "json" in (meta["content_type"] or "").lower()
+        is_html = "html" in (meta["content_type"] or "").lower()
+        meta["is_json"] = is_json
+        meta["is_html"] = is_html
+        meta["body_len"] = len(raw)
+        meta["contains_code_1010"] = "1010" in raw
+        meta["contains_text_forbidden"] = "forbidden" in raw.lower()
+        try:
+            meta["body_md5_head"] = hashlib.md5(raw.encode("utf-8")).hexdigest()[:12]
+        except Exception:
+            meta["body_md5_head"] = None
     try:
         parsed = json.loads(raw) if raw else {}
     except Exception:
         parsed = {"raw_head": raw[:400]}
-    return status, parsed
+    return status, parsed, meta
 
 
 def gates_closed(status: int, body: dict[str, Any]) -> tuple[bool, str, str]:
@@ -190,21 +231,52 @@ def main() -> None:
     consecutive = 0
     last_build_sha_seen = ""
     it = 0
+    last_meta: dict[str, Any] = {}
     log(f"[readiness] START active readiness; deadline={DEADLINE_SEC}s  poll={POLL_SEC}s  expected_sha_head={EXPECTED_SHA[:12] if EXPECTED_SHA else '(none)'}")
     log(f"[readiness] worker probe URL = {WORKER_BASE}{PROBE_PATH}")
     # ── (STEP D-1) DIAGNOSTIC ONLY: instances BEFORE any wake-up traffic ──
     log("[readiness] DIAGNOSTIC (L1 pre-wake) containers instances (NOT used as gate):")
     dump_containers_instances("L1_prewake")
     dump_containers_list("L1_prewake")
+    # ── (STEP D-2) Probe-level environment summary (no secrets) ──
+    summary: dict[str, Any] = {
+        "started_at": time.time(),
+        "deadline_sec": DEADLINE_SEC,
+        "poll_sec": POLL_SEC,
+        "expected_build_sha_head": EXPECTED_SHA[:16] if EXPECTED_SHA else "",
+        "expected_build_sha_empty": not bool(EXPECTED_SHA),
+        "worker_base": WORKER_BASE,
+        "probe_path": PROBE_PATH,
+        "auth_header_name": AUTH_HEADER,
+        "ingest_token_len": len(INGEST_TOKEN),
+        "ingest_token_empty": not bool(INGEST_TOKEN),
+        "app_id_tail": APP_ID[-8:] if APP_ID else "",
+        "wrangler_cwd": WORKDIR,
+        "artifact_dir": RAW_DIR,
+        "user_agent_used": UA_BROWSER,
+    }
+    try:
+        (Path(RAW_DIR) / "probe_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
     while time.time() < deadline:
         it += 1
         remaining = int(deadline - time.time())
-        status, body = http_probe()
+        status, body, meta = http_probe()
+        last_meta = meta
         ok, reason, sha = gates_closed(status, body)
         log(
             f"  [iter {it:03d} t-remain={remaining:>4d}s] http={status} ok={ok} reason={reason} sha_head={sha[:12] or 'N/A'}"
         )
+        if it == 1:
+            try:
+                (Path(RAW_DIR) / "iter001_first_probe.json").write_text(
+                    json.dumps({"iter": it, "status": status, "body": body, "meta": meta}, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
         if ok:
             if sha == last_build_sha_seen and sha:
                 consecutive += 1
@@ -217,9 +289,27 @@ def main() -> None:
                 log("[readiness] DIAGNOSTIC (L2 post-wake PASS) containers instances (NOT gate):")
                 dump_containers_instances("L2_postwake_pass")
                 dump_containers_list("L2_postwake_pass")
-                # Always dump final probe response as evidence
                 final_path = Path(RAW_DIR) / "final_probe_response.json"
-                final_path.write_text(json.dumps({"iter": it, "status": status, "body": body}, indent=2), encoding="utf-8")
+                final_path.write_text(
+                    json.dumps({"iter": it, "status": status, "body": body, "meta": meta}, indent=2, default=str),
+                    encoding="utf-8",
+                )
+                try:
+                    ev = {
+                        "result": "PASS",
+                        "exit_code": 0,
+                        "iterations_total": it,
+                        "final_build_sha": sha,
+                        "final_http_status": status,
+                        "worker_to_container_fetch_ok": bool(((body.get("probe") or {}).get("worker_to_container_fetch_ok")) if isinstance(body, dict) else False),
+                        "container_status_ok": (((body.get("container_health") or {}).get("status")) if isinstance(body, dict) else None) == "ok",
+                        "worker_pasay_build_sha": ((body.get("probe") or {}).get("worker_pasay_build_sha")) if isinstance(body, dict) else None,
+                        "consecutive_stable_required": 2,
+                        "meta": meta,
+                    }
+                    (Path(RAW_DIR) / "readiness_result.json").write_text(json.dumps(ev, indent=2, default=str), encoding="utf-8")
+                except Exception:
+                    pass
                 log(f"[readiness] evidence final_probe_response at {final_path}")
                 log(f"[readiness] container_health.build_sha = {sha}")
                 log(f"[readiness] worker side probe.worker_pasay_build_sha = {(body.get('probe') or {}).get('worker_pasay_build_sha') if isinstance(body, dict) else 'N/A'}")
@@ -236,8 +326,24 @@ def main() -> None:
     dump_containers_instances("L3_deadline_timeout")
     dump_containers_list("L3_deadline_timeout")
     last_probe_path = Path(RAW_DIR) / "deadline_last_probe.json"
-    last_status, last_body = http_probe()
-    last_probe_path.write_text(json.dumps({"status": last_status, "body": last_body}, indent=2), encoding="utf-8")
+    last_status, last_body, last_meta_dead = http_probe()
+    last_probe_path.write_text(
+        json.dumps({"status": last_status, "body": last_body, "meta": last_meta_dead}, indent=2, default=str),
+        encoding="utf-8",
+    )
+    try:
+        ev = {
+            "result": "FAIL",
+            "fail_reason": "DEADLINE_EXCEEDED",
+            "exit_code": 87,
+            "iterations_total": it,
+            "deadline_sec": DEADLINE_SEC,
+            "last_http_status": last_status,
+            "last_meta": last_meta_dead,
+        }
+        (Path(RAW_DIR) / "readiness_result.json").write_text(json.dumps(ev, indent=2, default=str), encoding="utf-8")
+    except Exception:
+        pass
     log(f"[readiness] last probe http={last_status}; body written {last_probe_path}")
     sys.exit(87)
 
