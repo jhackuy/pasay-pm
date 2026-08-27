@@ -2,6 +2,12 @@ name = "pasay-cloudflare-worker"
 main = "src/index.ts"
 compatibility_date = "2026-08-20"
 
+# Low-volume production service: retain complete Worker + Container logs so
+# queue, cron, container startup, and Neon failures are diagnosable.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # ── Cloudflare Containers — OFFICIAL native binding (ND_RETURN FIX2 #1) ──
 # Container class is declared in src/index.ts as "export class PasayContainer extends Container"
 # with defaultPort=8000 matching Dockerfile CMD "uvicorn ... --port 8000".
@@ -10,8 +16,13 @@ compatibility_date = "2026-08-20"
 [[containers]]
 class_name = "PasayContainer"
 image = "../Dockerfile"
-max_instances = 5
+max_instances = 1
 instance_type = "basic"
+
+# Neon production is in Singapore. Keep the singleton Container in APAC to
+# avoid a cold start placing the long-lived process far from PostgreSQL.
+[containers.constraints]
+regions = ["APAC"]
 
 # Container env vars: provisioned via wrangler secret put BEFORE deploy.
 # Cloudflare 2025 Containers auto-inject secret values into the container
