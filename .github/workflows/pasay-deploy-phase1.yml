@@ -421,16 +421,47 @@ jobs:
           npx wrangler deploy --dry-run 2>&1 | tail -80
           echo "[step4] dry-run exit=$?"
 
-      - name: "STEP 5 — wrangler deploy (real production: pasay-cloudflare-worker)"
+      # ── STEP 4.9  PRE-DEPLOY: capture baseline container version for rollout race proof ──
+      - name: "STEP 4.9 — PRE-DEPLOY container baseline (wrangler containers instances) → PRE_DEPLOY_CONTAINER_VERSION"
+        if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
+        id: predeploy_container
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          . ../.venv/bin/activate 2>/dev/null || true
+          export RETURN1_APP_ID="a033e8e1-c52f-4298-8a46-fff6ead430be"
+          export RETURN1_DIAG=1
+          echo "[step4.9] PRE-DEPLOY PROBE: app_id=${RETURN1_APP_ID}"
+          set +e
+          PRE_RAW_JSON_FILE="/tmp/return1_predeploy_instances.json"
+          npx wrangler containers instances "${RETURN1_APP_ID}" --json > "${PRE_RAW_JSON_FILE}" 2> /tmp/return1_predeploy.err
+          PRE_RC=$?
+          set -e
+          if [[ $PRE_RC -ne 0 ]]; then
+            echo "[step4.9] PRE instances CLI rc=${PRE_RC}. stderr (4k):"
+            cat /tmp/return1_predeploy.err | tail -c 4000 || true
+            echo ""
+          fi
+          cat "${PRE_RAW_JSON_FILE}" | head -c 4000 || true
+          echo ""
+          export RETURN1_RAW_JSON_PATH="${PRE_RAW_JSON_FILE}"
+          PRE_VERSION="$(python "${GITHUB_WORKSPACE}/scripts/deploy_predeploy_container_version.py")"
+          PRE_VERSION="${PRE_VERSION:-NULL_NO_PRE_INSTANCE}"
+          echo "[step4.9] PRE_DEPLOY_CONTAINER_VERSION = ${PRE_VERSION}"
+          {
+            echo "pre_container_version=${PRE_VERSION}"
+            echo "pre_capture_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: "STEP 5 — wrangler deploy --containers-rollout=immediate (100% instant rollout pasay-cloudflare-worker)"
         if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
         id: wrangler_deploy
         working-directory: cloudflare-worker
         run: |
           set -euo pipefail
           set -o pipefail
-          npx wrangler deploy 2>&1 | tee /tmp/wrangler_deploy.log | tail -120
+          npx wrangler deploy --containers-rollout=immediate 2>&1 | tee /tmp/wrangler_deploy.log | tail -160
 
-          # extract worker URL + version id (best-effort; do not fail deploy step if pattern missing)
           WORKER_NAME="pasay-cloudflare-worker"
           DEPLOY_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           {
@@ -438,7 +469,25 @@ jobs:
             echo "deploy_ts=${DEPLOY_TS}"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "[step5] deploy exit=$?"
+          echo "[step5] deploy --containers-rollout=immediate exit=$?"
+
+      # ── STEP 5.5  RETURN1 CONTAINER ROLLOUT READINESS TRUTH GATE (bounded 180s poll) ──
+      - name: "STEP 5.5 — RETURN1 READINESS TRUTH GATE: new Container actually serving (2 consecutive new version, 180s)"
+        if: ${{ !inputs.run_smoke_only && inputs.step45_deploy }}
+        id: container_readiness
+        working-directory: cloudflare-worker
+        run: |
+          set -euo pipefail
+          . ../.venv/bin/activate 2>/dev/null || true
+          PRE_VERSION="${{ steps.predeploy_container.outputs.pre_container_version }}"
+          PRE_VERSION="${PRE_VERSION:-NULL_NO_PRE_INSTANCE}"
+          export RETURN1_APP_ID="a033e8e1-c52f-4298-8a46-fff6ead430be"
+          export RETURN1_PRE_VERSION="${PRE_VERSION}"
+          export RETURN1_GITHUB_SHA="${GITHUB_SHA}"
+          export RETURN1_DEADLINE_SEC=180
+          export RETURN1_POLL_SEC=5
+          python "${GITHUB_WORKSPACE}/scripts/deploy_container_readiness.py"
+          echo "[step5.5] CONTAINER ROLLOUT READINESS TRUTH GATE PASS → proceed to STEP6/7/8/9"
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 6 — Infrastructure smoke
