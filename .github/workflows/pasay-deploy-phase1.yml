@@ -1231,7 +1231,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
           set -euo pipefail
-          echo "::group::STEP 9.1-2 — Synthetic Owner /start double POST (validate idempotency + no-dup DB row)"
+          echo "::group::STEP 9.1-3 — Synthetic Owner /start + bounded 90s poll TRUTH gate + idempotency replay"
           python - <<'PY'
           import os, json, time, ssl, urllib.request, hashlib, hmac, secrets, re
           webhook_url = os.environ["WEBHOOK_URL"].strip()
@@ -1245,11 +1245,14 @@ jobs:
               raise SystemExit("[step9] FAIL: PASAY_OWNER_TG_USER_ID must be numeric Telegram user_id len 3-20; actual=%s" % len(owner_uid_raw))
           owner_uid = int(owner_uid_raw)
           bot_token = os.environ["BOT_TOKEN"].strip()
-          # Extract bot id from token prefix "12345:ABC..."
           bot_id = int(bot_token.split(":", 1)[0]) if ":" in bot_token else 0
           if not bot_id: raise SystemExit("cannot parse bot id from token prefix")
 
-          UPDATE_ID_BASE = 900_000_000 + int(time.time() % 100_000_000)
+          # RETURN1 FIX A: GLOBALLY UNIQUE synthetic update_id (never reuse stale 987820324)
+          # Base offset shifted to 8_000_000_000 range + time component ensures uniqueness across runs.
+          UPDATE_ID_BASE = 8_000_000_000 + int((time.time() * 1000) % 1_000_000_000)
+          print(f"[step9.0] RETURN1 NEW synthetic update_id = {UPDATE_ID_BASE}  (never reused; ≠ 987820324 stale)", flush=True)
+
           def make_update(uid, uname, text="/start"):
               return {
                   "update_id": UPDATE_ID_BASE,
@@ -1264,18 +1267,6 @@ jobs:
               }
 
           def post(upd, label):
-              # Build Pasay envelope version=1 kind=telegram_update exactly as Worker ingress does.
-              envelope = {
-                  "version": 1,
-                  "kind": "telegram_update",
-                  "event_id": f"phase1-tg-smoke-{int(time.time())}-{secrets.token_hex(6)}-{label}",
-                  "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                  "payload": upd,
-              }
-              body = json.dumps(envelope).encode("utf-8")
-              # We POST the envelope DIRECTLY to Worker /telegram/webhook — same code path as real ingress (but we supply the final envelope shape).
-              # The Worker's /telegram/webhook endpoint expects raw Telegram update + secret header, and internally wraps to envelope.
-              # For maximal fidelity, we instead send the raw Telegram update body with X-Telegram-Bot-Api-Secret-Token header (real ingress path).
               raw_update = json.dumps(upd).encode("utf-8")
               req = urllib.request.Request(webhook_url, data=raw_update, method="POST", headers={
                   "Content-Type": "application/json",
@@ -1295,70 +1286,169 @@ jobs:
                   status = 0
                   resp_body = f"transport err: {type(e).__name__}: {str(e)[:300]}"
               elapsed_ms = int((time.time() - t0) * 1000)
-              # Never leak secret. Truncate long responses.
               safe = resp_body
               if len(safe) > 1000: safe = safe[:1000] + "…[TRUNC]"
               print(f"[step9.1] POST [{label}] status={status} elapsed_ms={elapsed_ms} body(≤1000chars)={safe}", flush=True)
               return status, resp_body
 
           upd = make_update(owner_uid, owner_name, "/start")
-          # First send — should return 200/202.
           st1, rb1 = post(upd, "first")
-          # Second send — exact same update_id (idempotency key) → should 2xx or 200 but NOT insert duplicate inbound.
-          time.sleep(3)
-          st2, rb2 = post(upd, "idempotency_retry")
-
-          # Report — MUST not fail workflow based on Telegram sendMessage success (since Telegram Bot firewall may return 429 transient);
-          # ONLY fail if the Worker itself failed to accept (not 2xx 1st try).
           if st1 not in (200, 201, 202, 204):
               raise SystemExit(f"[step9.1] FAIL: first Worker ingress status={st1} (expected 2xx). STOP.")
-          print(f"[step9.1] PASS: first accept=2xx ({st1}); idempotency_retry status={st2}", flush=True)
+          print(f"[step9.1] PASS: first accept=2xx ({st1})", flush=True)
 
-          # 9.2 — Wait ~15s for container to drain queue, then count telegram_webhook_updates in production DB (should be 1 row, not 2).
-          print("[step9.2] sleep 15s to allow Queue→Container→PG drain…", flush=True)
-          time.sleep(15)
+          # ====================================================================
+          # RETURN1 FIX A: STEP9.2 BOUNDED POLL TRUTH GATE (replaces old count<=1 false-positive)
+          # Rules:
+          #   * poll deadline = 90s from now
+          #   * fast-fail: count>1 (duplicate) | state=failed | done+processed_at NULL | done+error_notnull
+          #   * continue poll: count==0 (not yet) | state in (claimed, retryable)
+          #   * PASS only: count==1 AND state=='done' AND processed_at IS NOT NULL
+          #                    AND last_error_type IS NULL AND last_error IS NULL AND user_id==owner_uid
+          #   * deadline reached without PASS → FAIL timeout
+          # ====================================================================
           import psycopg2
-          url = os.environ["DATABASE_URL"]  # pooled pasay_runtime (masked); READ access
-          with psycopg2.connect(url) as cnx, cnx.cursor() as cur:
-              # Idempotency table: telegram_webhook_updates (PK = update_id)
-              cur.execute("SELECT count(*) FROM telegram_webhook_updates WHERE update_id = %s", (UPDATE_ID_BASE,))
-              n_updates = cur.fetchone()[0]
-              print(f"[step9.2] telegram_webhook_updates rows for update_id={UPDATE_ID_BASE} = {n_updates}", flush=True)
-              if n_updates == 0:
-                  # Try other likely idempotency tables (safety soft fallback)
-                  for tbl in ("inbound_updates","telegram_inbound_updates","webhook_inbound_updates"):
-                      try:
-                          cur.execute(f"SELECT count(*) FROM {tbl} LIMIT 1")
-                          print(f"[step9.2] fallback count({tbl}) = {cur.fetchone()[0]}", flush=True)
-                      except Exception:
-                          pass
-              # idempotency: fail loudly if 2 actual rows share update_id
-              assert n_updates <= 1, f"idempotency FAIL: update_id count = {n_updates} expected ≤ 1"
-              # Also assert total inbound count is tiny (no queue storm).
+          url = os.environ["DATABASE_URL"]
+          print("[step9.2] RETURN1 TRUTH GATE: bounded 90s poll for state=done + processed_at NOT NULL + error NULL", flush=True)
+          deadline = time.time() + 90.0
+          POLL_INTERVAL = 3.0
+          iteration = 0
+          truth_passed = False
+          final_row = None
+          final_count = 0
+
+          while time.time() < deadline:
+              iteration += 1
               try:
-                  cur.execute("SELECT count(*) FROM telegram_webhook_updates")
-                  tot = cur.fetchone()[0]
-                  print(f"[step9.2] telegram_webhook_updates total rows = {tot}", flush=True)
+                  with psycopg2.connect(url) as cnx, cnx.cursor() as cur:
+                      cur.execute(
+                          "SELECT state, processed_at, user_id, delivery_count, attempt_count, last_error_type, last_error "
+                          "FROM telegram_webhook_updates WHERE update_id = %s",
+                          (UPDATE_ID_BASE,),
+                      )
+                      rows = cur.fetchall()
               except Exception as e:
-                  print(f"[step9.2] count(telegram_webhook_updates) skip: {type(e).__name__}", flush=True)
-          print("[step9] Real Telegram smoke (synthetic Owner /start) + idempotency = PASS", flush=True)
+                  print(f"[step9.2][iter={iteration}] DB connect/read transient: {type(e).__name__}. Will retry…", flush=True)
+                  time.sleep(POLL_INTERVAL)
+                  continue
+              final_count = len(rows)
+              if final_count == 0:
+                  elapsed = int(time.time() - (deadline - 90.0))
+                  print(f"[step9.2][iter={iteration}] count=0 (not yet delivered to Container). Continue poll… (elapsed={elapsed}s)", flush=True)
+                  time.sleep(POLL_INTERVAL)
+                  continue
+              if final_count > 1:
+                  raise SystemExit(
+                      f"[step9.2][iter={iteration}] FAIL DUPLICATE: count({UPDATE_ID_BASE})={final_count} > 1. "
+                      "Two DB rows share same update_id — idempotency broken. STOP."
+                  )
+              # count == 1 exactly
+              row = rows[0]
+              state, processed_at, row_uid, dc, ac, le_type, le_msg = row
+              final_row = row
+              remaining = int(deadline - time.time())
+              print(
+                  f"[step9.2][iter={iteration}] state={state} user_id={row_uid} processed_at={'SET' if processed_at else 'NULL'} "
+                  f"delivery_count={dc} attempt={ac} last_error_type={le_type or 'NULL'} remaining_s={remaining}",
+                  flush=True
+              )
+              # FAST FAIL conditions
+              if state == "failed":
+                  le_safe = (le_msg or "")[:400] + ("…" if le_msg and len(le_msg) > 400 else "")
+                  raise SystemExit(
+                      f"[step9.2][iter={iteration}] FAIL state=failed (terminal). last_error_type={le_type} last_error={le_safe}"
+                  )
+              if state == "done":
+                  if processed_at is None:
+                      raise SystemExit(
+                          f"[step9.2][iter={iteration}] FAIL contradiction: state=done but processed_at=NULL."
+                      )
+                  if le_type is not None and le_type.strip():
+                      raise SystemExit(
+                          f"[step9.2][iter={iteration}] FAIL: state=done but last_error_type={le_type!r} (terminal error present)."
+                      )
+                  if le_msg is not None and str(le_msg).strip():
+                      le_safe = str(le_msg)[:400] + ("…" if len(str(le_msg)) > 400 else "")
+                      raise SystemExit(
+                          f"[step9.2][iter={iteration}] FAIL: state=done but last_error present. msg_head={le_safe}"
+                      )
+                  if row_uid != owner_uid:
+                      raise SystemExit(
+                          f"[step9.2][iter={iteration}] FAIL: state=done but user_id mismatch row={row_uid} expected owner={owner_uid}"
+                      )
+                  # ALL truth conditions satisfied → PASS
+                  truth_passed = True
+                  print(f"[step9.2][iter={iteration}] ✅ TRUTH GATE PASS: state=done processed_at=SET last_error=NULL user_id=owner match", flush=True)
+                  break
+              # state in (claimed, retryable) → continue polling within deadline
+              if state in ("claimed", "retryable"):
+                  time.sleep(POLL_INTERVAL)
+                  continue
+              # Unknown state → continue (don't hard fail fast; wait for eventual done/failed)
+              print(f"[step9.2][iter={iteration}] WARN: unknown state={state!r}. Continue poll until deadline.", flush=True)
+              time.sleep(POLL_INTERVAL)
+
+          if not truth_passed:
+              # Deadline reached without passing
+              elapsed_total = int(time.time() - (deadline - 90.0))
+              raise SystemExit(
+                  f"[step9.2] FAIL: 90s deadline reached but update_id={UPDATE_ID_BASE} NOT state=done truth gate. "
+                  f"last_count={final_count} last_state={(final_row[0] if final_row else 'NONE')} "
+                  f"processed_at={'SET' if (final_row and final_row[1]) else 'NULL'}. "
+                  "PTB handler did not complete within 90s bounded window. STOP."
+              )
+
+          # 9.3 — Idempotency replay: second POST same update_id → count still exactly 1.
+          print("[step9.3] Idempotency replay: POST same update_id second time…", flush=True)
+          time.sleep(2)
+          st2, rb2 = post(upd, "idempotency_replay")
+          time.sleep(3)
+          with psycopg2.connect(url) as cnx, cnx.cursor() as cur:
+              cur.execute(
+                  "SELECT count(*) FROM telegram_webhook_updates WHERE update_id = %s",
+                  (UPDATE_ID_BASE,),
+              )
+              n_after = cur.fetchone()[0]
+              print(f"[step9.3] AFTER idempotency replay count({UPDATE_ID_BASE}) = {n_after}", flush=True)
+              if n_after != 1:
+                  raise SystemExit(
+                      f"[step9.3] FAIL IDEMPOTENCY: replay caused count to become {n_after} (expected exactly 1). Duplicate inserted."
+                  )
+              # Final evidence re-read
+              cur.execute(
+                  "SELECT state, processed_at, user_id, delivery_count, attempt_count, last_error_type, last_error "
+                  "FROM telegram_webhook_updates WHERE update_id = %s",
+                  (UPDATE_ID_BASE,),
+              )
+              ev = cur.fetchone()
+              print(f"[step9.3] FINAL EVIDENCE for update_id={UPDATE_ID_BASE}:", flush=True)
+              print(f"  state            = {ev[0]}", flush=True)
+              print(f"  processed_at     = {ev[1]}  (IS NOT NULL = {ev[1] is not None})", flush=True)
+              print(f"  user_id          = {ev[2]}  (== Owner = {ev[2] == owner_uid})", flush=True)
+              print(f"  delivery_count   = {ev[3]}", flush=True)
+              print(f"  attempt_count    = {ev[4]}", flush=True)
+              print(f"  last_error_type  = {ev[5] or 'NULL'}", flush=True)
+              print(f"  last_error       = {'NULL' if (ev[6] is None or not str(ev[6]).strip()) else 'PRESENT (not printed)'}", flush=True)
+
+          print(f"[step9] RETURN1: Internal Synthetic E2E = PASS (update_id={UPDATE_ID_BASE}, state=done, truth gate closed)", flush=True)
           PY
           echo "::endgroup::"
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 10 — Final PASAY_DEPLOY_PHASE1_COMPLETE banner
       # ═══════════════════════════════════════════════════════════════════
-      - name: STEP 10 — PASAY_DEPLOY_PHASE1_COMPLETE + REAL_PRODUCTION_SMOKE=PASS
+      - name: STEP 10 — PASAY_DEPLOY_PHASE1_COMPLETE (RETURN1 — Synthetic Truth Closure)
         if: inputs.step78910_owner_bootstrap_and_tg_smoke
         shell: bash
         run: |
           set +e
           echo ""
           echo "╔══════════════════════════════════════════════════════════════════════╗"
-          echo "║                  PASAY DEPLOY PHASE 1 — COMPLETE                    ║"
+          echo "║           PASAY DEPLOY PHASE 1 RETURN1 — COMPLETE              ║"
           echo "╚══════════════════════════════════════════════════════════════════════╝"
           echo ""
-          echo "github.sha           = ${GITHUB_SHA}"
+          echo "BASE HEAD (RETURN1)  = 747107e669a8a95b79e5c39bdf1cde166f8c1310"
+          echo "github.sha (final)  = ${GITHUB_SHA}"
           echo "github.ref           = ${GITHUB_REF}"
           echo "workflow run_id      = ${GITHUB_RUN_ID}"
           echo "neon project_id      = ${NEON_PROJECT_ID}   (vars)"
@@ -1368,9 +1458,20 @@ jobs:
           echo "CF queues            = pasay-events + pasay-events-dlq (id from step1 verified)"
           echo "CF cron              = */5 * * * *   (wrangler.toml declared, step1 deploy syncs)"
           echo "Secrets (count=5)    = DATABASE_URL, DATABASE_URL_UNPOOLED, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, PASAY_CONTAINER_INGEST_TOKEN"
-          echo "REAL_PRODUCTION_SMOKE = PASS"
+          echo ""
+          echo "─── INTERNAL_SYNTHETIC_E2E = PASS ───"
+          echo "  (Worker→Queue→Container→PTB→handler→Neon truth chain      "
+          echo "  state=done + processed_at IS NOT NULL + last_error=NULL verified)"
+          echo "  new unique update_id (Neon evidence above STEP9.3)"
+          echo "  idempotency replay: second POST → count still 1"
+          echo ""
+          echo "─── REAL_TELEGRAM_SERVER_DELIVERY = NOT_YET_VERIFIED ───"
+          echo "  Internal synthetic POST only. Next step: Owner real Telegram"
+          echo "  bot /start click for official delivery verification."
+          echo "  STOP here. AWAITING Owner real /start before REAL_TELEGRAM_SERVER_DELIVERY=PASS."
           echo ""
           echo "CREDENTIALS NOTE: all tokens, DB URIs, passwords are masked and never printed or committed."
+          echo "PASAY_DEPLOY_PHASE1_COMPLETE for RETURN1 scope only; awaiting Owner REAL_TELEGRAM click next."
           echo ""
 
       # ═══════════════════════════════════════════════════════════════════
