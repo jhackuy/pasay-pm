@@ -1,3 +1,4 @@
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -15,7 +16,11 @@ _x_db_url = context.get_x_argument(as_dictionary=True).get("db_url")
 if _x_db_url:
     config.set_main_option("sqlalchemy.url", _x_db_url)
 else:
-    config.set_main_option("sqlalchemy.url", settings.database_url)
+    _env_alembic_url = os.environ.get("ALEMBIC_DATABASE_URL")
+    if _env_alembic_url:
+        config.set_main_option("sqlalchemy.url", _env_alembic_url)
+    else:
+        config.set_main_option("sqlalchemy.url", settings.database_url)
 
 _isolated_test_metadata = config.attributes.get("pasay.test.target_metadata", None)
 if _isolated_test_metadata is not None:
