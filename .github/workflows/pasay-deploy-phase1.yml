@@ -19,6 +19,10 @@ on:
         description: "STEP 2 — Derive Neon URIs + put all 5 Cloudflare secrets"
         type: boolean
         default: true
+      step3_production_migration:
+        description: "STEP 3 — Run production Alembic migration gate (DATABASE_URL_UNPOOLED) BEFORE deploy"
+        type: boolean
+        default: true
       step45_deploy:
         description: "STEP 4/5 — wrangler preflight + real deploy"
         type: boolean
@@ -413,6 +417,146 @@ jobs:
           # Container GET /health exposes this as JSON build_sha field; step5.5 active probe gates on it.
           put_secret "PASAY_BUILD_SHA" "${{ github.sha }}"
           echo "[step2] 6/6 production secrets configured=true (values never printed; PASAY_BUILD_SHA=${GITHUB_SHA:0:12}… (head only))"
+
+      # ═══════════════════════════════════════════════════════════════════
+      # STEP 3 — RETURN3-B Production Migration Gate (BEFORE Worker/Container deploy)
+      # Owner Contract (M006 RETURN3-B comment 5442384156):
+      #   Production migrations MUST run outside the Cloudflare Container lifecycle
+      #   in GitHub Actions, bounded with revision bookkeeping. The Container no
+      #   longer calls alembic at boot (Dockerfile entrypoint stripped).
+      #
+      # Truth gates (all must be EXIT 0, or abort as BLOCKED_PRODUCTION_MIGRATION):
+      #   1. Record current production DB revision (sanitized id only).
+      #   2. `alembic upgrade head` using DATABASE_URL_UNPOOLED -> ALEMBIC_DATABASE_URL.
+      #   3. Record post-upgrade DB revision.
+      #   4. Query repo `alembic current / heads` from checked-out code.
+      #   5. Verify post_rev == repo_head_rev; if not -> BLOCKED_PRODUCTION_MIGRATION.
+      # NEVER print URI / password / token; any real migration failure stops here.
+      # ═══════════════════════════════════════════════════════════════════
+      - name: "STEP 3 — RETURN3-B PRODUCTION MIGRATION GATE: Alembic upgrade head on Neon (owner direct unpooled) + rev before/after/head verify"
+        if: ${{ !inputs.run_smoke_only && inputs.step3_production_migration }}
+        id: step3_migration_gate
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+
+          if [ -z "${DATABASE_URL_UNPOOLED:-}" ]; then
+            echo "[step3][FATAL] DATABASE_URL_UNPOOLED env missing (step0 should have written GITHUB_ENV). Abort BLOCKED_PRODUCTION_MIGRATION." >&2
+            exit 77
+          fi
+
+          echo "[step3] === REPO ALembic heads (truth reference from GITHUB_SHA ${GITHUB_SHA:0:12}) ==="
+          set +e
+          REPO_HEADS=$(python -m alembic heads 2>&1)
+          HEADS_RC=$?
+          set -e
+          echo "[step3] alembic heads (rc=${HEADS_RC}) output_lines=[$(echo "${REPO_HEADS}" | wc -l)] first 2000 chars: $(echo "${REPO_HEADS}" | tr '\n' '|' | head -c 2000)"
+          if [ ${HEADS_RC} -ne 0 ]; then
+            echo "[step3][FATAL] repo alembic heads returned rc=${HEADS_RC}. Abort BLOCKED_PRODUCTION_MIGRATION_BAD_REPO_HEADS." >&2
+            exit 78
+          fi
+          # Extract the leading revision id hex (first contiguous [0-9a-f]+ token of len 8+ on non-empty line)
+          REPO_HEAD_REV=$(echo "${REPO_HEADS}" | awk '{for(i=1;i<=NF;i++){tok=$i; gsub(/[^0-9a-f]/,"",tok); if(length(tok)>=8){print toupper(tok); exit}}}' 2>/dev/null || true)
+          # Also try `alembic current --verbose` fallback via python for deterministic HEAD rev
+          set +e
+          REPO_CURRENT_LINE=$(python - <<'PYHEADS'
+          import subprocess, os, re
+          try:
+              out = subprocess.run(
+                  ["python", "-m", "alembic", "heads"],
+                  capture_output=True, text=True, timeout=120,
+              )
+              combined = (out.stdout or "") + "\n" + (out.stderr or "")
+          except Exception as e:
+              combined = f"error: {e}"
+          m = re.search(r"\b([0-9a-f]{8,})\b", combined or "")
+          rev = m.group(1).upper() if m else ""
+          print(rev)
+          PYHEADS
+          )
+          set -e
+          if [ -n "${REPO_CURRENT_LINE:-}" ] && [ ${#REPO_CURRENT_LINE} -ge 8 ]; then
+            REPO_HEAD_REV="${REPO_CURRENT_LINE}"
+          fi
+          REPO_HEAD_REV="${REPO_HEAD_REV:-UNKNOWN}"
+          echo "[step3] repo_alembic_head_rev=${REPO_HEAD_REV}"
+
+          export ALEMBIC_DATABASE_URL="${DATABASE_URL_UNPOOLED}"
+
+          echo "[step3] === PRODUCTION DB REV BEFORE upgrade ==="
+          set +e
+          BEFORE_OUT=$(python -m alembic current 2>&1)
+          BEFORE_RC=$?
+          set -e
+          BEFORE_REV=$(echo "${BEFORE_OUT}" | python - <<'PYREV'
+          import sys, re
+          txt = sys.stdin.read()
+          # alembic current prints e.g. "<hex> (head)" or "(empty)" for fresh
+          candidates = re.findall(r"\b([0-9a-f]{8,})\b", txt, flags=re.I)
+          if candidates:
+              print(candidates[-1].upper())
+          else:
+              print("BASE")
+          PYREV
+          )
+          echo "[step3] alembic current exit=${BEFORE_RC}; before_rev=${BEFORE_REV} raw_snippet=[$(echo "${BEFORE_OUT}" | tr '\n' '|' | head -c 600)]"
+
+          echo "[step3] === PRODUCTION alembic upgrade head ==="
+          set +e
+          UPGRADE_START_TS=$(date -u +%s)
+          ALEMBIC_OUT=$(python -m alembic upgrade head 2>&1)
+          UPGRADE_RC=$?
+          UPGRADE_END_TS=$(date -u +%s)
+          UPGRADE_DUR=$((UPGRADE_END_TS - UPGRADE_START_TS))
+          set -e
+          # NEVER print ALEMBIC_OUT in full: it might include env/args/connection strings
+          echo "[step3] alembic upgrade head exit=${UPGRADE_RC}; duration_s=${UPGRADE_DUR}; output_chars=$(echo -n "${ALEMBIC_OUT}" | wc -m); output_lines=$(echo "${ALEMBIC_OUT}" | wc -l); sanitized_head_800=$(echo "${ALEMBIC_OUT}" | tr '\n' '|' | sed 's/postgresql:[^|]*postgresql:/<redacted-postgres-uri>/g; s/pass=[^| ]*/pass=<redacted>/g; s/password=[^| ]*/password=<redacted>/g; s/token=[^| ]*/token=<redacted>/g' | head -c 800)"
+
+          if [ ${UPGRADE_RC} -ne 0 ]; then
+            echo "[step3][FATAL] alembic upgrade head returned rc=${UPGRADE_RC}. Abort BLOCKED_PRODUCTION_MIGRATION_UPGRADE_FAILED." >&2
+            echo "[step3] sanitized_tail_800=$(echo "${ALEMBIC_OUT}" | tail -n 80 | tr '\n' '|' | sed 's/postgresql:[^|]*postgresql:/<redacted-postgres-uri>/g; s/pass=[^| ]*/pass=<redacted>/g; s/password=[^| ]*/password=<redacted>/g; s/token=[^| ]*/token=<redacted>/g' | tail -c 800)" >&2
+            exit 80
+          fi
+
+          echo "[step3] === PRODUCTION DB REV AFTER upgrade ==="
+          set +e
+          AFTER_OUT=$(python -m alembic current 2>&1)
+          AFTER_RC=$?
+          set -e
+          AFTER_REV=$(echo "${AFTER_OUT}" | python - <<'PYREV'
+          import sys, re
+          txt = sys.stdin.read()
+          candidates = re.findall(r"\b([0-9a-f]{8,})\b", txt, flags=re.I)
+          if candidates:
+              print(candidates[-1].upper())
+          else:
+              print("BASE")
+          PYREV
+          )
+          echo "[step3] alembic current exit=${AFTER_RC}; after_rev=${AFTER_REV} raw_snippet=[$(echo "${AFTER_OUT}" | tr '\n' '|' | head -c 600)]"
+
+          # Truth gate: after_rev == repo_head_rev (case-insensitive)
+          BEFORE_CMP=$(echo "${BEFORE_REV}" | tr '[:lower:]' '[:upper:]')
+          AFTER_CMP=$(echo "${AFTER_REV}"  | tr '[:lower:]' '[:upper:]')
+          HEAD_CMP=$(echo "${REPO_HEAD_REV}" | tr '[:lower:]' '[:upper:]')
+          if [ "${AFTER_CMP}" != "${HEAD_CMP}" ]; then
+            echo "[step3][FATAL] TRUTH GATE FAILED: after_rev=${AFTER_CMP} != repo_head_rev=${HEAD_CMP}. Abort BLOCKED_PRODUCTION_MIGRATION_HEAD_MISMATCH." >&2
+            exit 81
+          fi
+
+          echo "[step3] === Migration gate PASS: before_rev=${BEFORE_REV} -> after_rev=${AFTER_REV} == repo_head_rev=${REPO_HEAD_REV}; duration_s=${UPGRADE_DUR}s ==="
+
+          # Emit outputs for artifact / issue report
+          {
+            echo "before_rev=${BEFORE_REV}"
+            echo "after_rev=${AFTER_REV}"
+            echo "repo_head_rev=${REPO_HEAD_REV}"
+            echo "upgrade_exit_code=${UPGRADE_RC}"
+            echo "upgrade_duration_s=${UPGRADE_DUR}"
+          } >> "${GITHUB_OUTPUT}"
+
+          unset ALEMBIC_DATABASE_URL
+          echo "[step3] BLOCKED_PRODUCTION_MIGRATION gates all closed. Proceed to STEP 4/5 deploy."
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 4/5 — wrangler dry-run + real deploy

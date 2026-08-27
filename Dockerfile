@@ -58,26 +58,26 @@ RUN groupadd --system --gid 10001 appgroup \
 USER appuser:appgroup
 
 # ── Startup ────────────────────────────────────────────────────────────────
-# Step ordering per Scope D + ND_RETURN FIX1 blocker #4 fail-fast contract:
-#   1. REQUIRE DATABASE_URL_UNPOOLED — NO silent fallback to DATABASE_URL.
-#      Missing env → container startup fails IMMEDIATELY with a clear error.
-#      (Scope E: migrations use direct/unpooled; Scope D: fail-fast on missing
-#      required env; ND_RETURN FIX1 blocker #4 explicitly forbids fallback.)
-#   2. alembic upgrade head using the direct/unpooled Neon URL.
-#   3. exec uvicorn app.main:app — HTTP-only, NO polling loops.
+# M006 RETURN3-B fix: container no longer runs alembic at boot.
+# Production migrations are run EXCLUSIVELY as a gated CI step before Worker
+# deploy (pasay-deploy-phase1.yml STEP 3 — production migration gate).
+# This removes the slow pre-port startup window that triggered the Cloudflare
+# containers upstream #232 lifecycle false-negative during readiness probing.
 #
-# If migrations fail the whole container fails immediately (entrypoint is
-# `sh -e` by default; non-zero alembic exit propagates).
+# Fail-fast contract preserved here:
+#   1. DATABASE_URL_UNPOOLED env presence is still required at container boot.
+#      (Worker injects this secret; missing env -> exit 1 immediately.)
+#   2. exec uvicorn app.main:app — HTTP-only, NO polling loops.
+#
+# The Container runtime NEVER calls alembic; migration truth must be proven in
+# CI BEFORE deploy; `BLOCKED_PRODUCTION_MIGRATION` aborts the whole workflow.
 ENTRYPOINT ["sh", "-c", "\
 set -e; \
 if [ -z \"${DATABASE_URL_UNPOOLED}\" ]; then \
-  echo '[pasay][fatal] DATABASE_URL_UNPOOLED is required for alembic migrations (Scope E direct/unpooled + ND_RETURN FIX1 blocker #4: NO fallback). Container cannot start.' >&2; \
+  echo '[pasay][fatal] DATABASE_URL_UNPOOLED is required (Scope E direct/unpooled secret presence gate). Container cannot start.' >&2; \
   exit 1; \
 fi; \
-export ALEMBIC_DATABASE_URL=\"${DATABASE_URL_UNPOOLED}\"; \
-alembic upgrade head; \
 unset DATABASE_URL_UNPOOLED; \
-unset ALEMBIC_DATABASE_URL; \
 exec \"$@\"\
 ", "entrypoint"]
 
