@@ -1,0 +1,73 @@
+name: opencode-review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened]
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Run opencode reviewer
+        uses: anomalyco/opencode/github@latest
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          model: minimax/MiniMax-M3
+          use_github_token: "true"
+          prompt: |
+            You are the independent OpenCode PR Reviewer for jhackuy/pasay-pm.
+            READ-ONLY: never edit files, never commit, never push, never create
+            another PR, never reveal any secret or env value, never print the
+            contents of MINIMAX_API_KEY or GITHUB_TOKEN.
+
+            Source material (only):
+            - This PR's diff and PR conversation.
+            - The originating Issue and the latest OWNER contract when identifiable
+              from the PR body or linked issues.
+            - Directly relevant context reachable from this checkout.
+
+            Required checks (only against the PR diff and directly relevant context):
+            1. Acceptance criteria from the originating Issue / latest OWNER contract
+               when identifiable.
+            2. Forbidden paths / scope creep:
+               - business code under app/, migrations/, Mini App
+               - Cloudflare / Neon / Telegram production deployment
+               - AGENTS.md (project or global)
+               - custom runners, watchers, pollers, daemons, orchestrators
+               - label automation beyond the contract
+               - any change to production secrets, auth, or provider/model config
+            3. Correctness and regressions.
+            4. Security, concurrency, data integrity when applicable.
+            5. Missing tests for the changed behaviour.
+
+            Ignore purely stylistic preferences, speculative refactors, and
+            unrelated legacy debt. Do not request out-of-scope refactors.
+
+            Do not mention or trigger the existing /oc or /opencode comment path
+            in any output text. Do not request re-review by posting /oc.
+
+            Output exactly one of the two deterministic verdicts on its own line,
+            then either nothing else (for REVIEW_PASS) or 1..N finding lines
+            (for BLOCKING_FINDINGS):
+
+              REVIEW_PASS
+            or
+              BLOCKING_FINDINGS
+            then for each finding a single line of the form:
+              SEVERITY | file:line | concrete evidence | minimum fix
+
+            SEVERITY values: blocker | high | medium
+            Do not output any other text. Do not output greetings, summaries,
+            or closing remarks.
