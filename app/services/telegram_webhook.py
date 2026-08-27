@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -91,15 +92,52 @@ def _import_pasay_bot_subtree() -> None:
 def _build_bot_settings_overlay() -> Any:
     """Translate backend env vars into pasay_bot Settings.
 
-    The bot reads ``PASSAY_TG_BOT_TOKEN``/etc via :func:`pasay_bot.config.get_settings`.
-    If the operator provided tokens through the backend env var names we still
-    honour them; the bot's own loader falls back to process-env, so forwarding
-    is not required. Returning the result of ``get_settings()`` keeps the single
-    source of truth.
+    RETURN1-FIX E — Production credential bridge (NO new secrets):
+      * TELEGRAM_BOT_TOKEN is the SoT (GitHub Secret). STEP 7 hashes it with
+        sha256 and stores it under ApiCredential(principal=native-bot,
+        purpose=telegram_bot). The matching raw bearer value for backend API
+        auth is therefore the raw token itself.
+      * The bot's own Telegram API client also needs the same token as
+        pasay_tg_bot_token.
+      * pasay_api_base defaults to container loopback (http://127.0.0.1:8000/api/v1)
+        so the bot calls its co-located FastAPI server inside the same Container.
+      * Any explicit PASSAY_* / STATE_DB env still wins (dev overlays).
     """
-    from pasay_bot.config import get_settings  # type: ignore
+    import os as _os
+    from pasay_bot.config import Settings, get_settings  # type: ignore
 
-    return get_settings()
+    bot_token = (_os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    api_base = (_os.environ.get("PASAY_API_BASE") or "").strip() or "http://127.0.0.1:8000/api/v1"
+    state_db_override = (_os.environ.get("STATE_DB") or "").strip()
+
+    runtime_mode = (_os.environ.get("PASAY_RUNTIME_MODE")
+                    or getattr(_backend_settings, "pasay_runtime_mode", "")
+                    or "").strip()
+
+    if bot_token:
+        _os.environ.setdefault("PASSAY_TG_BOT_TOKEN", bot_token)
+        _os.environ.setdefault("PASSAY_API_KEY", bot_token)
+    if api_base and "PASSAY_API_BASE" not in _os.environ:
+        _os.environ["PASSAY_API_BASE"] = api_base
+    if runtime_mode and "PASAY_RUNTIME_MODE" not in _os.environ:
+        _os.environ["PASAY_RUNTIME_MODE"] = runtime_mode
+    if state_db_override:
+        _os.environ.setdefault("STATE_DB", state_db_override)
+
+    base = get_settings()
+    overrides: dict = {}
+    if bot_token and not base.pasay_tg_bot_token:
+        overrides["pasay_tg_bot_token"] = bot_token
+    if bot_token and not base.pasay_api_key:
+        overrides["pasay_api_key"] = bot_token
+    if api_base and base.pasay_api_base.startswith("http://127.0.0.1") and not _os.environ.get("PASSAY_API_BASE_OVERRIDE"):
+        overrides["pasay_api_base"] = api_base
+    if state_db_override:
+        overrides["state_db"] = state_db_override
+    if overrides:
+        merged = base.model_copy(update=overrides)
+        return merged
+    return base
 
 
 def _classify_ptb_boot_exception(exc: BaseException) -> tuple[bool, str, str]:
@@ -210,15 +248,13 @@ async def get_ptb_application():
             from pasay_bot.state.store import StateStore  # type: ignore
 
             bot_settings = _build_bot_settings_overlay()
+            _ptb_runtime_mode = (
+                (os.environ.get("PASAY_RUNTIME_MODE") or "").strip()
+                or (getattr(_backend_settings, "pasay_runtime_mode", None) or "").strip()
+                or None
+            )
 
-            # build_application() returns an *uninitialized* Application. We need
-            # the store + api clients so handlers reach the backend; we do NOT call
-            # run_polling() here — inbound updates come from the HTTP webhook.
-            store = StateStore(bot_settings.state_db)
-            store.init()
-            # Recovery: any stale in-flight idempotency marks in the bot's OWN
-            # idempotency table (conversation/daily marks) are reset on startup so
-            # crashes do not permanently pin a conversation key.
+            store = StateStore(bot_settings.state_db, runtime_mode=_ptb_runtime_mode)
             try:
                 store.recover_stale_in_flight()
             except Exception as exc:  # noqa: BLE001
