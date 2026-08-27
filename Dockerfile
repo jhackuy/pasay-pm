@@ -44,7 +44,8 @@ RUN mkdir -p /app/uploads
 # The rest of /app stays root-owned (read-only for the app user).
 RUN groupadd --system --gid 10001 appgroup \
  && useradd  --system --uid 10000 --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
- && chown -R appuser:appgroup /app/uploads
+ && mkdir -p /app/state \
+ && chown -R appuser:appgroup /app/uploads /app/state
 
 USER appuser:appgroup
 

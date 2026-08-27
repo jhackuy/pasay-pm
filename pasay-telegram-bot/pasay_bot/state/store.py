@@ -1,11 +1,21 @@
-"""Local SQLite state: conversations (TTL) + idempotency keys.
+"""StateStore — runtime-conditional backend.
 
-Standard-library sqlite3 only (zero extra deps). This is bot-local state —
-never PostgreSQL, never through the API.
+RETURN1-FIX B+C: Cloudflare Container disk is EPHEMERAL; local SQLite loses
+daily_marks / reminder_deliveries / followup_deliveries truths after sleep.
+
+Two backends, same public interface, zero handler changes:
+
+  * development/local (default or runtime_mode != "cloudflare-container")
+    → SQLiteStateStore (original file-backed store)
+  * PASAY_RUNTIME_MODE=cloudflare-container
+    → PostgresStateStore (durable Neon/Postgres tables bs_*)
+
+No new deps beyond psycopg2 which is already required by the backend.
 """
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -14,16 +24,18 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-# CONVERGENCE-003 §1.6: the daily dedupe boundary is the PHILIPPINES
-# operational date (Asia/Manila, UTC+8, no DST), never the UTC date — a UTC
-# date flip must not cause two sends on one PH day.
 PH_TZ = ZoneInfo("Asia/Manila")
 
 
 def ph_local_date(now: datetime | None = None) -> str:
-    """'YYYY-MM-DD' of the Philippines operational day."""
     now = now or datetime.now(PH_TZ)
     return now.astimezone(PH_TZ).date().isoformat()
+
+
+DEFAULT_CONVERSATION_TTL = 900
+DEFAULT_V2_CONTEXT_TTL = 3600
+DEFAULT_IDEMPOTENCY_TTL = 7 * 86400
+DEFAULT_IN_FLIGHT_TTL = 120
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -71,19 +83,10 @@ CREATE TABLE IF NOT EXISTS known_groups (
   title        TEXT NOT NULL DEFAULT '',
   first_seen   TEXT NOT NULL
 );
--- CONVERGENCE-003: persistent same-day action marks (remind owner / rent
--- follow-up / next_check reminders). SQLite PRIMARY KEY makes the mark
--- atomic; the key embeds the PH local date so a restart can never re-fire.
 CREATE TABLE IF NOT EXISTS daily_marks (
   key        TEXT PRIMARY KEY,
   created_at TEXT NOT NULL
 );
--- WINDOWS-RUNTIME-REBOOT-RECOVERY-002 (PHASE C fix): delivery-truth record
--- for Remind-Owner. PRIMARY KEY (expense_id, date) makes the same-day gate
--- atomic AND stores the proven Telegram delivery facts (target, destination,
--- sent_at, message_id). A row is written ONLY after send_message returns a
--- confirmed message_id; a failed delivery writes no row, so the daily limit is
--- NOT consumed and a retry stays allowed. Survives process restart (SQLite).
 CREATE TABLE IF NOT EXISTS reminder_deliveries (
   expense_id   TEXT NOT NULL,
   date         TEXT NOT NULL,
@@ -93,10 +96,6 @@ CREATE TABLE IF NOT EXISTS reminder_deliveries (
   message_id   TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (expense_id, date)
 );
--- PASAY-VNEXT-FOLLOWUP-FEEDBACK-005A: delivery-truth record for rent follow-up
--- assignment DM to the Secretary. This is NOT domain completion, but it is
--- the non-repeatable proof that the bot already delivered the notification.
--- Stored as Telegram message_id so we don't rely on message text.
 CREATE TABLE IF NOT EXISTS followup_deliveries (
   task_id      TEXT PRIMARY KEY,
   unit_id      TEXT NOT NULL DEFAULT '',
@@ -108,43 +107,127 @@ CREATE TABLE IF NOT EXISTS followup_deliveries (
 );
 """
 
-DEFAULT_CONVERSATION_TTL = 900        # 15 minutes
-DEFAULT_V2_CONTEXT_TTL = 3600         # 60 minutes (short-term conversation)
-DEFAULT_IDEMPOTENCY_TTL = 7 * 86400   # 7 days (longer than card TTL)
-DEFAULT_IN_FLIGHT_TTL = 120           # in_flight stale window (crash recovery)
+
+class _StateStoreBase:
+    """Shared public interface for both backends.
+
+    Each concrete subclass implements the exact same method signatures so
+    no handler code needs to change when switching runtime modes.
+    """
+
+    # ---- override points --------------------------------------------------
+    def migrate(self) -> None:
+        raise NotImplementedError
+
+    def recover_stale_in_flight(self, max_age_seconds: int = DEFAULT_IN_FLIGHT_TTL) -> int:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+    # ---- user defaults ----------------------------------------------------
+    def get_user_default_method(self, user_id: Any) -> str:
+        raise NotImplementedError
+
+    def set_user_default_method(self, user_id: Any, method: str) -> None:
+        raise NotImplementedError
+
+    # ---- conversations ----------------------------------------------------
+    def save_conversation(self, chat_id, user_id, state, payload=None, nonce="", ttl_seconds=DEFAULT_CONVERSATION_TTL):
+        raise NotImplementedError
+
+    def get_conversation(self, chat_id, user_id) -> Optional[dict]:
+        raise NotImplementedError
+
+    def delete_conversation(self, chat_id, user_id) -> None:
+        raise NotImplementedError
+
+    # ---- v2 conversation context ------------------------------------------
+    def save_v2_context(self, chat_id, user_id, payload=None, ttl_seconds=DEFAULT_V2_CONTEXT_TTL):
+        raise NotImplementedError
+
+    def get_v2_context(self, chat_id, user_id) -> Optional[dict]:
+        raise NotImplementedError
+
+    def clear_v2_context(self, chat_id, user_id) -> None:
+        raise NotImplementedError
+
+    # ---- daily marks ------------------------------------------------------
+    def mark_daily(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def is_marked_daily(self, key: str) -> bool:
+        raise NotImplementedError
+
+    # ---- reminder deliveries ----------------------------------------------
+    def record_reminder_delivery(self, expense_id, date, *, target_user="", destination="", message_id="") -> bool:
+        raise NotImplementedError
+
+    def get_reminder_delivery(self, expense_id, date) -> Optional[dict]:
+        raise NotImplementedError
+
+    # ---- followup deliveries ----------------------------------------------
+    def record_followup_delivery(self, task_id, *, unit_id="", date="", target_user="", destination="", message_id="") -> bool:
+        raise NotImplementedError
+
+    def get_followup_delivery(self, task_id) -> Optional[dict]:
+        raise NotImplementedError
+
+    # ---- known groups -----------------------------------------------------
+    def remember_group(self, chat_id, title="") -> None:
+        raise NotImplementedError
+
+    def list_known_groups(self) -> list[dict]:
+        raise NotImplementedError
+
+    # ---- rent status selectors --------------------------------------------
+    def save_rent_status_selector(self, nonce, chat_id, user_id, payload: list, ttl_seconds=DEFAULT_CONVERSATION_TTL):
+        raise NotImplementedError
+
+    def get_rent_status_selector(self, nonce, chat_id, user_id) -> Optional[list]:
+        raise NotImplementedError
+
+    # ---- idempotency keys -------------------------------------------------
+    def get_idempotency(self, key: str) -> Optional[dict]:
+        raise NotImplementedError
+
+    def insert_idempotency_if_absent(self, key, kind, resource="", status="in_flight", ttl_seconds=DEFAULT_IDEMPOTENCY_TTL) -> bool:
+        raise NotImplementedError
+
+    def update_idempotency(self, key, status, resource=None, result=None) -> None:
+        raise NotImplementedError
 
 
-class StateStore:
+class SQLiteStateStore(_StateStoreBase):
     def __init__(self, db_path: str = ":memory:"):
         self.db_path = db_path
         if db_path != ":memory:":
-            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            parent = Path(db_path).parent
+            try:
+                parent.mkdir(parents=True, exist_ok=True)
+            except (OSError, PermissionError):
+                pass
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            pass
         self.migrate()
 
     def migrate(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
-            # Startup recovery (F3): leftover in_flight rows from a crashed
-            # process must not lock a card for the full 7-day TTL. Stale rows
-            # become failed, so the next click is allowed to retry.
             self.recover_stale_in_flight()
             self._conn.commit()
 
     def recover_stale_in_flight(self, max_age_seconds: int = DEFAULT_IN_FLIGHT_TTL) -> int:
-        """Mark in_flight idempotency keys older than ``max_age_seconds`` as
-        failed so retries are possible after a crash/restart."""
         now = int(time.time())
         with self._lock:
             cur = self._conn.execute(
-                """
-                UPDATE idempotency_keys
-                SET status='failed'
-                WHERE status='in_flight' AND ? - CAST(created_at AS INTEGER) > ?
-                """,
+                "UPDATE idempotency_keys SET status='failed' "
+                "WHERE status='in_flight' AND ? - CAST(created_at AS INTEGER) > ?",
                 (now, max_age_seconds),
             )
             self._conn.commit()
@@ -154,7 +237,6 @@ class StateStore:
         with self._lock:
             self._conn.close()
 
-    # --- user defaults (e.g. last-used payment method) ---
     def get_user_default_method(self, user_id: Any) -> str:
         with self._lock:
             row = self._conn.execute(
@@ -169,51 +251,32 @@ class StateStore:
         now = int(time.time())
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO user_defaults (user_id, payment_method, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                  payment_method=excluded.payment_method, updated_at=excluded.updated_at
-                """,
+                "INSERT INTO user_defaults (user_id, payment_method, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "payment_method=excluded.payment_method, updated_at=excluded.updated_at",
                 (str(user_id), method, str(now)),
             )
             self._conn.commit()
 
-    # --- conversations ---
-    def save_conversation(
-        self,
-        chat_id: Any,
-        user_id: Any,
-        state: str,
-        payload: Optional[dict] = None,
-        nonce: str = "",
-        ttl_seconds: int = DEFAULT_CONVERSATION_TTL,
-    ) -> None:
+    def save_conversation(self, chat_id, user_id, state, payload=None, nonce="", ttl_seconds=DEFAULT_CONVERSATION_TTL):
         now = int(time.time())
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO conversations
-                  (chat_id, user_id, state, payload_json, nonce, updated_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                  state=excluded.state, payload_json=excluded.payload_json,
-                  nonce=excluded.nonce, updated_at=excluded.updated_at,
-                  expires_at=excluded.expires_at
-                """,
+                "INSERT INTO conversations "
+                "(chat_id, user_id, state, payload_json, nonce, updated_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+                "state=excluded.state, payload_json=excluded.payload_json, "
+                "nonce=excluded.nonce, updated_at=excluded.updated_at, expires_at=excluded.expires_at",
                 (
-                    str(chat_id),
-                    str(user_id),
-                    state,
+                    str(chat_id), str(user_id), state,
                     json.dumps(payload or {}, ensure_ascii=False),
-                    nonce,
-                    str(now),
-                    str(now + ttl_seconds),
+                    nonce, str(now), str(now + ttl_seconds),
                 ),
             )
             self._conn.commit()
 
-    def get_conversation(self, chat_id: Any, user_id: Any) -> Optional[dict]:
+    def get_conversation(self, chat_id, user_id) -> Optional[dict]:
         now = int(time.time())
         with self._lock:
             row = self._conn.execute(
@@ -234,14 +297,11 @@ class StateStore:
             except json.JSONDecodeError:
                 payload = {}
             return {
-                "state": row["state"],
-                "payload": payload,
-                "nonce": row["nonce"],
-                "updated_at": row["updated_at"],
-                "expires_at": row["expires_at"],
+                "state": row["state"], "payload": payload, "nonce": row["nonce"],
+                "updated_at": row["updated_at"], "expires_at": row["expires_at"],
             }
 
-    def delete_conversation(self, chat_id: Any, user_id: Any) -> None:
+    def delete_conversation(self, chat_id, user_id) -> None:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM conversations WHERE chat_id=? AND user_id=?",
@@ -249,40 +309,22 @@ class StateStore:
             )
             self._conn.commit()
 
-    # --- PASAY-V2-FOUNDATION-001: short-term conversation context -----------
-    # (chat_id, user_id) -> {task_ref, property_ref, intent, ...} so follow-up
-    # messages ("coming tomorrow") attach to the active event without re-asking
-    # which property. TTL is 60 minutes; context never holds secrets.
-    def save_v2_context(
-        self,
-        chat_id: Any,
-        user_id: Any,
-        payload: Optional[dict] = None,
-        ttl_seconds: int = DEFAULT_V2_CONTEXT_TTL,
-    ) -> None:
+    def save_v2_context(self, chat_id, user_id, payload=None, ttl_seconds=DEFAULT_V2_CONTEXT_TTL):
         now = int(time.time())
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO v2_context
-                  (chat_id, user_id, payload_json, updated_at, expires_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, user_id) DO UPDATE SET
-                  payload_json=excluded.payload_json,
-                  updated_at=excluded.updated_at,
-                  expires_at=excluded.expires_at
-                """,
-                (
-                    str(chat_id),
-                    str(user_id),
-                    json.dumps(payload or {}, ensure_ascii=False),
-                    str(now),
-                    str(now + ttl_seconds),
-                ),
+                "INSERT INTO v2_context "
+                "(chat_id, user_id, payload_json, updated_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+                "payload_json=excluded.payload_json, updated_at=excluded.updated_at, expires_at=excluded.expires_at",
+                (str(chat_id), str(user_id),
+                 json.dumps(payload or {}, ensure_ascii=False),
+                 str(now), str(now + ttl_seconds)),
             )
             self._conn.commit()
 
-    def get_v2_context(self, chat_id: Any, user_id: Any) -> Optional[dict]:
+    def get_v2_context(self, chat_id, user_id) -> Optional[dict]:
         now = int(time.time())
         with self._lock:
             row = self._conn.execute(
@@ -304,11 +346,10 @@ class StateStore:
                 payload = {}
             return {
                 "payload": payload,
-                "updated_at": row["updated_at"],
-                "expires_at": row["expires_at"],
+                "updated_at": row["updated_at"], "expires_at": row["expires_at"],
             }
 
-    def clear_v2_context(self, chat_id: Any, user_id: Any) -> None:
+    def clear_v2_context(self, chat_id, user_id) -> None:
         with self._lock:
             self._conn.execute(
                 "DELETE FROM v2_context WHERE chat_id=? AND user_id=?",
@@ -316,15 +357,7 @@ class StateStore:
             )
             self._conn.commit()
 
-    # --- PASAY-V2-FOUNDATION-001: known group registry (daily digest) --------
-    # --- CONVERGENCE-003: persistent same-day marks -------------------------
     def mark_daily(self, key: str) -> bool:
-        """Atomically claim a same-day mark; True = first time today.
-
-        The caller embeds the Philippines local date in ``key`` (e.g.
-        ``remind_owner:12:2026-08-17``). The SQLite PRIMARY KEY makes the
-        insert atomic — a restart or a second tap cannot re-fire.
-        """
         now = int(time.time())
         with self._lock:
             try:
@@ -344,16 +377,7 @@ class StateStore:
             ).fetchone()
         return row is not None
 
-    def record_reminder_delivery(
-        self, expense_id: Any, date: str, *, target_user: str = "",
-        destination: str = "", message_id: str = "",
-    ) -> bool:
-        """Persist a CONFIRMED Remind-Owner delivery for ``(expense_id, date)``.
-
-        True = first (and only) successful delivery today for this expense; a
-        later attempt the same day returns False (daily gate, persisted).
-        Only call this AFTER ``send_message`` returned a confirmed message.
-        """
+    def record_reminder_delivery(self, expense_id, date, *, target_user="", destination="", message_id="") -> bool:
         now = datetime.now(PH_TZ).astimezone(PH_TZ).isoformat()
         with self._lock:
             try:
@@ -369,8 +393,7 @@ class StateStore:
             except sqlite3.IntegrityError:
                 return False
 
-    def get_reminder_delivery(self, expense_id: Any, date: str) -> Optional[dict]:
-        """Return the persisted delivery record or None (not delivered today)."""
+    def get_reminder_delivery(self, expense_id, date) -> Optional[dict]:
         with self._lock:
             row = self._conn.execute(
                 "SELECT expense_id, date, target_user, destination, sent_at, message_id "
@@ -380,30 +403,12 @@ class StateStore:
         if row is None:
             return None
         return {
-            "expense_id": row["expense_id"],
-            "date": row["date"],
-            "target_user": row["target_user"],
-            "destination": row["destination"],
-            "sent_at": row["sent_at"],
-            "message_id": row["message_id"],
+            "expense_id": row["expense_id"], "date": row["date"],
+            "target_user": row["target_user"], "destination": row["destination"],
+            "sent_at": row["sent_at"], "message_id": row["message_id"],
         }
 
-    def record_followup_delivery(
-        self,
-        task_id: Any,
-        *,
-        unit_id: Any = "",
-        date: str = "",
-        target_user: str = "",
-        destination: str = "",
-        message_id: str = "",
-    ) -> bool:
-        """Persist a CONFIRMED rent follow-up DM delivery for a task id.
-
-        True = first successful delivery for this task; later attempts return
-        False (idempotent non-repeatability). Only call this AFTER
-        ``send_message`` returned a confirmed message_id.
-        """
+    def record_followup_delivery(self, task_id, *, unit_id="", date="", target_user="", destination="", message_id="") -> bool:
         now = datetime.now(PH_TZ).astimezone(PH_TZ).isoformat()
         with self._lock:
             try:
@@ -411,23 +416,16 @@ class StateStore:
                     "INSERT INTO followup_deliveries "
                     "(task_id, unit_id, date, target_user, destination, sent_at, message_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        str(task_id),
-                        str(unit_id or ""),
-                        str(date or ""),
-                        str(target_user or ""),
-                        str(destination or ""),
-                        str(now),
-                        str(message_id or ""),
-                    ),
+                    (str(task_id), str(unit_id or ""), str(date or ""),
+                     str(target_user or ""), str(destination or ""),
+                     str(now), str(message_id or "")),
                 )
                 self._conn.commit()
                 return True
             except sqlite3.IntegrityError:
                 return False
 
-    def get_followup_delivery(self, task_id: Any) -> Optional[dict]:
-        """Return the persisted follow-up delivery record or None."""
+    def get_followup_delivery(self, task_id) -> Optional[dict]:
         with self._lock:
             row = self._conn.execute(
                 "SELECT task_id, unit_id, date, target_user, destination, sent_at, message_id "
@@ -437,24 +435,17 @@ class StateStore:
         if row is None:
             return None
         return {
-            "task_id": row["task_id"],
-            "unit_id": row["unit_id"],
-            "date": row["date"],
-            "target_user": row["target_user"],
-            "destination": row["destination"],
-            "sent_at": row["sent_at"],
-            "message_id": row["message_id"],
+            "task_id": row["task_id"], "unit_id": row["unit_id"], "date": row["date"],
+            "target_user": row["target_user"], "destination": row["destination"],
+            "sent_at": row["sent_at"], "message_id": row["message_id"],
         }
 
-    def remember_group(self, chat_id: Any, title: str = "") -> None:
+    def remember_group(self, chat_id, title="") -> None:
         now = int(time.time())
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO known_groups (chat_id, title, first_seen)
-                VALUES (?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title
-                """,
+                "INSERT INTO known_groups (chat_id, title, first_seen) "
+                "VALUES (?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title",
                 (str(chat_id), title, str(now)),
             )
             self._conn.commit()
@@ -465,54 +456,28 @@ class StateStore:
                 "SELECT chat_id, title, first_seen FROM known_groups ORDER BY first_seen"
             ).fetchall()
             return [
-                {"chat_id": row["chat_id"], "title": row["title"] or "",
-                 "first_seen": row["first_seen"]}
+                {"chat_id": row["chat_id"], "title": row["title"] or "", "first_seen": row["first_seen"]}
                 for row in rows
             ]
 
-    # --- read-only rent status selectors (V1.3 Slice 2, Entry D) ------------
-    # Each multi-match candidate card stores its candidate rows under a
-    # per-card nonce so clicking a button only ever re-renders that card's own
-    # candidates (a newer query in the same chat cannot hijack an older card).
-    # The payload is the JSON-safe candidate list; internal ids are never
-    # stored here (the rows are display-only fields).
-    def save_rent_status_selector(
-        self,
-        nonce: Any,
-        chat_id: Any,
-        user_id: Any,
-        payload: list,
-        ttl_seconds: int = DEFAULT_CONVERSATION_TTL,
-    ) -> None:
+    def save_rent_status_selector(self, nonce, chat_id, user_id, payload: list, ttl_seconds=DEFAULT_CONVERSATION_TTL):
         now = int(time.time())
         with self._lock:
             self._conn.execute(
-                """
-                INSERT INTO rent_status_selectors
-                  (nonce, chat_id, user_id, payload_json, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(nonce) DO UPDATE SET
-                  chat_id=excluded.chat_id, user_id=excluded.user_id,
-                  payload_json=excluded.payload_json, created_at=excluded.created_at,
-                  expires_at=excluded.expires_at
-                """,
-                (
-                    str(nonce),
-                    str(chat_id),
-                    str(user_id),
-                    json.dumps(payload, ensure_ascii=False),
-                    str(now),
-                    str(now + ttl_seconds),
-                ),
+                "INSERT INTO rent_status_selectors "
+                "(nonce, chat_id, user_id, payload_json, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(nonce) DO UPDATE SET "
+                "chat_id=excluded.chat_id, user_id=excluded.user_id, "
+                "payload_json=excluded.payload_json, created_at=excluded.created_at, "
+                "expires_at=excluded.expires_at",
+                (str(nonce), str(chat_id), str(user_id),
+                 json.dumps(payload, ensure_ascii=False),
+                 str(now), str(now + ttl_seconds)),
             )
             self._conn.commit()
 
-    def get_rent_status_selector(
-        self, nonce: Any, chat_id: Any, user_id: Any
-    ) -> Optional[list]:
-        """Return the candidate rows only when the nonce exists, is owned by
-        this chat+user, and is still inside its TTL; otherwise drop the row
-        and return None (caller shows the friendly expired copy)."""
+    def get_rent_status_selector(self, nonce, chat_id, user_id) -> Optional[list]:
         now = int(time.time())
         with self._lock:
             row = self._conn.execute(
@@ -521,11 +486,8 @@ class StateStore:
             ).fetchone()
             if row is None:
                 return None
-            if (
-                str(row["chat_id"]) != str(chat_id)
-                or str(row["user_id"]) != str(user_id)
-                or int(row["expires_at"]) < now
-            ):
+            if (str(row["chat_id"]) != str(chat_id) or str(row["user_id"]) != str(user_id)
+                    or int(row["expires_at"]) < now):
                 self._conn.execute(
                     "DELETE FROM rent_status_selectors WHERE nonce=?",
                     (str(nonce),),
@@ -538,7 +500,6 @@ class StateStore:
                 payload = None
             return payload if isinstance(payload, list) else None
 
-    # --- idempotency keys ---
     def get_idempotency(self, key: str) -> Optional[dict]:
         now = int(time.time())
         with self._lock:
@@ -558,60 +519,517 @@ class StateStore:
             except json.JSONDecodeError:
                 result = None
             return {
-                "key": row["key"],
-                "kind": row["kind"],
-                "resource": row["resource"],
-                "status": row["status"],
+                "key": row["key"], "kind": row["kind"],
+                "resource": row["resource"], "status": row["status"],
                 "result": result,
-                "created_at": row["created_at"],
-                "expires_at": row["expires_at"],
+                "created_at": row["created_at"], "expires_at": row["expires_at"],
             }
 
-    def insert_idempotency_if_absent(
-        self,
-        key: str,
-        kind: str,
-        resource: str = "",
-        status: str = "in_flight",
-        ttl_seconds: int = DEFAULT_IDEMPOTENCY_TTL,
-    ) -> bool:
-        """Atomically insert if missing. Returns True when newly inserted."""
+    def insert_idempotency_if_absent(self, key, kind, resource="", status="in_flight", ttl_seconds=DEFAULT_IDEMPOTENCY_TTL) -> bool:
         now = int(time.time())
         with self._lock:
             cur = self._conn.execute(
-                """
-                INSERT OR IGNORE INTO idempotency_keys
-                  (key, kind, resource, status, result_json, created_at, expires_at)
-                VALUES (?, ?, ?, ?, NULL, ?, ?)
-                """,
+                "INSERT OR IGNORE INTO idempotency_keys "
+                "(key, kind, resource, status, result_json, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?, NULL, ?, ?)",
                 (key, kind, resource, status, str(now), str(now + ttl_seconds)),
             )
             self._conn.commit()
             return cur.rowcount > 0
 
-    def update_idempotency(
-        self,
-        key: str,
-        status: str,
-        resource: Optional[str] = None,
-        result: Optional[Any] = None,
-    ) -> None:
+    def update_idempotency(self, key, status, resource=None, result=None) -> None:
         now = int(time.time())
         with self._lock:
             row = self._conn.execute(
                 "SELECT expires_at FROM idempotency_keys WHERE key=?", (key,)
             ).fetchone()
-            if row is None:
-                expires = str(now + DEFAULT_IDEMPOTENCY_TTL)
-            else:
-                expires = row["expires_at"]
+            expires = str(now + DEFAULT_IDEMPOTENCY_TTL) if row is None else row["expires_at"]
             self._conn.execute(
-                """
-                UPDATE idempotency_keys
-                SET status=?, resource=COALESCE(NULLIF(?, ''), resource), result_json=?, expires_at=?
-                WHERE key=?
-                """,
-                (status, resource, json.dumps(result) if result is not None else None,
+                "UPDATE idempotency_keys "
+                "SET status=?, resource=COALESCE(NULLIF(?, ''), resource), result_json=?, expires_at=? "
+                "WHERE key=?",
+                (status, resource,
+                 json.dumps(result) if result is not None else None,
                  expires, key),
             )
             self._conn.commit()
+
+
+class PostgresStateStore(_StateStoreBase):
+    """Durable Postgres-backed StateStore.
+
+    Uses existing ``DATABASE_URL`` env (pooled Neon connection, already
+    available inside the Container). Table names prefix ``bs_*`` to avoid
+    collisions with business tables (migration ``bs_conversations`` etc.).
+    """
+
+    def __init__(self, _db_path: str = ""):
+        import psycopg2
+        self._lock = threading.RLock()
+        self._dburl = (os.environ.get("DATABASE_URL")
+                       or os.environ.get("POSTGRES_URL")
+                       or "").strip()
+        if not self._dburl:
+            raise RuntimeError(
+                "PostgresStateStore requires DATABASE_URL env (PASAY_RUNTIME_MODE=cloudflare-container)."
+            )
+        self._conn = psycopg2.connect(self._dburl)
+        self._conn.autocommit = False
+        self.migrate()
+
+    def _cursor(self):
+        # Best-effort auto-reconnect for transient connection loss.
+        try:
+            self._conn.rollback()
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        except Exception:
+            import psycopg2
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = psycopg2.connect(self._dburl)
+            self._conn.autocommit = False
+        return self._conn.cursor()
+
+    def migrate(self) -> None:
+        with self._lock:
+            cur = self._cursor()
+            for tbl_sql in [
+                "CREATE TABLE IF NOT EXISTS bs_conversations ("
+                " chat_id TEXT NOT NULL, user_id TEXT NOT NULL, state TEXT NOT NULL,"
+                " payload_json TEXT NOT NULL DEFAULT '{}', nonce TEXT NOT NULL DEFAULT '',"
+                " updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,"
+                " PRIMARY KEY (chat_id, user_id))",
+                "CREATE TABLE IF NOT EXISTS bs_idempotency_keys ("
+                " key TEXT PRIMARY KEY, kind TEXT NOT NULL, resource TEXT NOT NULL DEFAULT '',"
+                " status TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS bs_user_defaults ("
+                " user_id TEXT PRIMARY KEY, payment_method TEXT NOT NULL DEFAULT 'Bank', updated_at TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS bs_rent_status_selectors ("
+                " nonce TEXT PRIMARY KEY, chat_id TEXT NOT NULL, user_id TEXT NOT NULL,"
+                " payload_json TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS bs_v2_context ("
+                " chat_id TEXT NOT NULL, user_id TEXT NOT NULL,"
+                " payload_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,"
+                " PRIMARY KEY (chat_id, user_id))",
+                "CREATE TABLE IF NOT EXISTS bs_known_groups ("
+                " chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', first_seen TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS bs_daily_marks ("
+                " key TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS bs_reminder_deliveries ("
+                " expense_id TEXT NOT NULL, date TEXT NOT NULL,"
+                " target_user TEXT NOT NULL DEFAULT '', destination TEXT NOT NULL DEFAULT '',"
+                " sent_at TEXT NOT NULL, message_id TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY (expense_id, date))",
+                "CREATE TABLE IF NOT EXISTS bs_followup_deliveries ("
+                " task_id TEXT PRIMARY KEY, unit_id TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '',"
+                " target_user TEXT NOT NULL DEFAULT '', destination TEXT NOT NULL DEFAULT '',"
+                " sent_at TEXT NOT NULL, message_id TEXT NOT NULL DEFAULT '')",
+            ]:
+                cur.execute(tbl_sql)
+            self._conn.commit()
+            self.recover_stale_in_flight()
+
+    def recover_stale_in_flight(self, max_age_seconds: int = DEFAULT_IN_FLIGHT_TTL) -> int:
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "UPDATE bs_idempotency_keys SET status='failed' "
+                "WHERE status='in_flight' AND %s - CAST(created_at AS BIGINT) > %s",
+                (now, max_age_seconds),
+            )
+            n = cur.rowcount or 0
+            self._conn.commit()
+            return n
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+
+    def _one(self, cur) -> Optional[Any]:
+        try:
+            return cur.fetchone()
+        except Exception:
+            return None
+
+    def get_user_default_method(self, user_id: Any) -> str:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT payment_method FROM bs_user_defaults WHERE user_id=%s",
+                (str(user_id),),
+            )
+            row = self._one(cur)
+        if row is None:
+            return "Bank"
+        return (row[0] or "Bank")
+
+    def set_user_default_method(self, user_id: Any, method: str) -> None:
+        now = str(int(time.time()))
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "INSERT INTO bs_user_defaults (user_id, payment_method, updated_at) VALUES (%s, %s, %s) "
+                "ON CONFLICT (user_id) DO UPDATE SET payment_method=EXCLUDED.payment_method, updated_at=EXCLUDED.updated_at",
+                (str(user_id), method, now),
+            )
+            self._conn.commit()
+
+    def save_conversation(self, chat_id, user_id, state, payload=None, nonce="", ttl_seconds=DEFAULT_CONVERSATION_TTL):
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "INSERT INTO bs_conversations (chat_id, user_id, state, payload_json, nonce, updated_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (chat_id, user_id) DO UPDATE SET "
+                "state=EXCLUDED.state, payload_json=EXCLUDED.payload_json, "
+                "nonce=EXCLUDED.nonce, updated_at=EXCLUDED.updated_at, expires_at=EXCLUDED.expires_at",
+                (str(chat_id), str(user_id), state,
+                 json.dumps(payload or {}, ensure_ascii=False), nonce,
+                 str(now), str(now + ttl_seconds)),
+            )
+            self._conn.commit()
+
+    def get_conversation(self, chat_id, user_id) -> Optional[dict]:
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT state, payload_json, nonce, updated_at, expires_at "
+                "FROM bs_conversations WHERE chat_id=%s AND user_id=%s",
+                (str(chat_id), str(user_id)),
+            )
+            row = self._one(cur)
+            if row is None:
+                return None
+            state, payload_json, nonce, updated_at, expires_at = row
+            if int(expires_at) < now:
+                cur.execute(
+                    "DELETE FROM bs_conversations WHERE chat_id=%s AND user_id=%s",
+                    (str(chat_id), str(user_id)),
+                )
+                self._conn.commit()
+                return None
+            try:
+                payload = json.loads(payload_json or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            return {"state": state, "payload": payload, "nonce": nonce,
+                    "updated_at": updated_at, "expires_at": expires_at}
+
+    def delete_conversation(self, chat_id, user_id) -> None:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "DELETE FROM bs_conversations WHERE chat_id=%s AND user_id=%s",
+                (str(chat_id), str(user_id)),
+            )
+            self._conn.commit()
+
+    def save_v2_context(self, chat_id, user_id, payload=None, ttl_seconds=DEFAULT_V2_CONTEXT_TTL):
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "INSERT INTO bs_v2_context (chat_id, user_id, payload_json, updated_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT (chat_id, user_id) DO UPDATE SET "
+                "payload_json=EXCLUDED.payload_json, updated_at=EXCLUDED.updated_at, expires_at=EXCLUDED.expires_at",
+                (str(chat_id), str(user_id),
+                 json.dumps(payload or {}, ensure_ascii=False),
+                 str(now), str(now + ttl_seconds)),
+            )
+            self._conn.commit()
+
+    def get_v2_context(self, chat_id, user_id) -> Optional[dict]:
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT payload_json, updated_at, expires_at FROM bs_v2_context "
+                "WHERE chat_id=%s AND user_id=%s",
+                (str(chat_id), str(user_id)),
+            )
+            row = self._one(cur)
+            if row is None:
+                return None
+            payload_json, updated_at, expires_at = row
+            if int(expires_at) < now:
+                cur.execute(
+                    "DELETE FROM bs_v2_context WHERE chat_id=%s AND user_id=%s",
+                    (str(chat_id), str(user_id)),
+                )
+                self._conn.commit()
+                return None
+            try:
+                payload = json.loads(payload_json or "{}")
+            except json.JSONDecodeError:
+                payload = {}
+            return {"payload": payload, "updated_at": updated_at, "expires_at": expires_at}
+
+    def clear_v2_context(self, chat_id, user_id) -> None:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "DELETE FROM bs_v2_context WHERE chat_id=%s AND user_id=%s",
+                (str(chat_id), str(user_id)),
+            )
+            self._conn.commit()
+
+    def mark_daily(self, key: str) -> bool:
+        now = str(int(time.time()))
+        with self._lock:
+            cur = self._cursor()
+            try:
+                cur.execute(
+                    "INSERT INTO bs_daily_marks (key, created_at) VALUES (%s, %s)",
+                    (key, now),
+                )
+                self._conn.commit()
+                return True
+            except Exception as exc:
+                cls = type(exc).__name__
+                if "unique" in cls.lower() or "UniqueViolation" in cls or "Integrity" in cls:
+                    self._conn.rollback()
+                    return False
+                self._conn.rollback()
+                raise
+
+    def is_marked_daily(self, key: str) -> bool:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute("SELECT 1 FROM bs_daily_marks WHERE key=%s", (key,))
+            return self._one(cur) is not None
+
+    def record_reminder_delivery(self, expense_id, date, *, target_user="", destination="", message_id="") -> bool:
+        now = datetime.now(PH_TZ).astimezone(PH_TZ).isoformat()
+        with self._lock:
+            cur = self._cursor()
+            try:
+                cur.execute(
+                    "INSERT INTO bs_reminder_deliveries "
+                    "(expense_id, date, target_user, destination, sent_at, message_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (str(expense_id), str(date), str(target_user or ""),
+                     str(destination or ""), str(now), str(message_id or "")),
+                )
+                self._conn.commit()
+                return True
+            except Exception as exc:
+                cls = type(exc).__name__
+                if "unique" in cls.lower() or "UniqueViolation" in cls or "Integrity" in cls:
+                    self._conn.rollback()
+                    return False
+                self._conn.rollback()
+                raise
+
+    def get_reminder_delivery(self, expense_id, date) -> Optional[dict]:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT expense_id, date, target_user, destination, sent_at, message_id "
+                "FROM bs_reminder_deliveries WHERE expense_id=%s AND date=%s",
+                (str(expense_id), str(date)),
+            )
+            row = self._one(cur)
+        if row is None:
+            return None
+        e_id, dt, tu, dest, sa, mid = row
+        return {"expense_id": e_id, "date": dt, "target_user": tu,
+                "destination": dest, "sent_at": sa, "message_id": mid}
+
+    def record_followup_delivery(self, task_id, *, unit_id="", date="", target_user="", destination="", message_id="") -> bool:
+        now = datetime.now(PH_TZ).astimezone(PH_TZ).isoformat()
+        with self._lock:
+            cur = self._cursor()
+            try:
+                cur.execute(
+                    "INSERT INTO bs_followup_deliveries "
+                    "(task_id, unit_id, date, target_user, destination, sent_at, message_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (str(task_id), str(unit_id or ""), str(date or ""),
+                     str(target_user or ""), str(destination or ""),
+                     str(now), str(message_id or "")),
+                )
+                self._conn.commit()
+                return True
+            except Exception as exc:
+                cls = type(exc).__name__
+                if "unique" in cls.lower() or "UniqueViolation" in cls or "Integrity" in cls:
+                    self._conn.rollback()
+                    return False
+                self._conn.rollback()
+                raise
+
+    def get_followup_delivery(self, task_id) -> Optional[dict]:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT task_id, unit_id, date, target_user, destination, sent_at, message_id "
+                "FROM bs_followup_deliveries WHERE task_id=%s",
+                (str(task_id),),
+            )
+            row = self._one(cur)
+        if row is None:
+            return None
+        tid, uid, dt, tu, dest, sa, mid = row
+        return {"task_id": tid, "unit_id": uid, "date": dt, "target_user": tu,
+                "destination": dest, "sent_at": sa, "message_id": mid}
+
+    def remember_group(self, chat_id, title="") -> None:
+        now = str(int(time.time()))
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "INSERT INTO bs_known_groups (chat_id, title, first_seen) VALUES (%s, %s, %s) "
+                "ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title",
+                (str(chat_id), title, now),
+            )
+            self._conn.commit()
+
+    def list_known_groups(self) -> list[dict]:
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT chat_id, title, first_seen FROM bs_known_groups ORDER BY first_seen"
+            )
+            rows = cur.fetchall()
+            return [
+                {"chat_id": c, "title": t or "", "first_seen": f}
+                for (c, t, f) in rows
+            ]
+
+    def save_rent_status_selector(self, nonce, chat_id, user_id, payload: list, ttl_seconds=DEFAULT_CONVERSATION_TTL):
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "INSERT INTO bs_rent_status_selectors "
+                "(nonce, chat_id, user_id, payload_json, created_at, expires_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (nonce) DO UPDATE SET "
+                "chat_id=EXCLUDED.chat_id, user_id=EXCLUDED.user_id, "
+                "payload_json=EXCLUDED.payload_json, created_at=EXCLUDED.created_at, "
+                "expires_at=EXCLUDED.expires_at",
+                (str(nonce), str(chat_id), str(user_id),
+                 json.dumps(payload, ensure_ascii=False),
+                 str(now), str(now + ttl_seconds)),
+            )
+            self._conn.commit()
+
+    def get_rent_status_selector(self, nonce, chat_id, user_id) -> Optional[list]:
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT chat_id, user_id, payload_json, expires_at FROM bs_rent_status_selectors WHERE nonce=%s",
+                (str(nonce),),
+            )
+            row = self._one(cur)
+            if row is None:
+                return None
+            rcid, ruid, payload_json, expires_at = row
+            if (str(rcid) != str(chat_id) or str(ruid) != str(user_id)
+                    or int(expires_at) < now):
+                cur.execute(
+                    "DELETE FROM bs_rent_status_selectors WHERE nonce=%s",
+                    (str(nonce),),
+                )
+                self._conn.commit()
+                return None
+            try:
+                payload = json.loads(payload_json or "[]")
+            except json.JSONDecodeError:
+                payload = None
+            return payload if isinstance(payload, list) else None
+
+    def get_idempotency(self, key: str) -> Optional[dict]:
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT key, kind, resource, status, result_json, created_at, expires_at "
+                "FROM bs_idempotency_keys WHERE key=%s",
+                (key,),
+            )
+            row = self._one(cur)
+            if row is None:
+                return None
+            k, kind, resource, status, result_json, created_at, expires_at = row
+            if int(expires_at) < now:
+                cur.execute("DELETE FROM bs_idempotency_keys WHERE key=%s", (key,))
+                self._conn.commit()
+                return None
+            try:
+                result = json.loads(result_json) if result_json else None
+            except json.JSONDecodeError:
+                result = None
+            return {"key": k, "kind": kind, "resource": resource,
+                    "status": status, "result": result,
+                    "created_at": created_at, "expires_at": expires_at}
+
+    def insert_idempotency_if_absent(self, key, kind, resource="", status="in_flight", ttl_seconds=DEFAULT_IDEMPOTENCY_TTL) -> bool:
+        now = str(int(time.time()))
+        expires = str(int(time.time()) + ttl_seconds)
+        with self._lock:
+            cur = self._cursor()
+            try:
+                cur.execute(
+                    "INSERT INTO bs_idempotency_keys "
+                    "(key, kind, resource, status, result_json, created_at, expires_at) "
+                    "VALUES (%s, %s, %s, %s, NULL, %s, %s) "
+                    "ON CONFLICT (key) DO NOTHING",
+                    (key, kind, resource, status, now, expires),
+                )
+                self._conn.commit()
+                return (cur.rowcount or 0) > 0
+            except Exception:
+                self._conn.rollback()
+                return False
+
+    def update_idempotency(self, key, status, resource=None, result=None) -> None:
+        now = int(time.time())
+        with self._lock:
+            cur = self._cursor()
+            cur.execute(
+                "SELECT expires_at FROM bs_idempotency_keys WHERE key=%s",
+                (key,),
+            )
+            row = self._one(cur)
+            expires = str(now + DEFAULT_IDEMPOTENCY_TTL) if row is None else row[0]
+            cur.execute(
+                "UPDATE bs_idempotency_keys "
+                "SET status=%s, resource=COALESCE(NULLIF(%s, ''), resource), "
+                "result_json=%s, expires_at=%s WHERE key=%s",
+                (status, resource or "",
+                 json.dumps(result) if result is not None else None,
+                 expires, key),
+            )
+            self._conn.commit()
+
+
+class StateStore:
+    """Public factory — returns SQLiteStateStore or PostgresStateStore.
+
+    Selection rule:
+      * runtime_mode == "cloudflare-container" → PostgresStateStore (durable Neon)
+      * anything else (including default empty string) → SQLiteStateStore (dev/local)
+    """
+
+    def __new__(cls, db_path: str = ":memory:", *, runtime_mode: str | None = None):
+        mode = (runtime_mode or "").strip()
+        if mode == "cloudflare-container":
+            inst = object.__new__(PostgresStateStore)
+            inst.__init__(db_path)
+            return inst
+        inst = object.__new__(SQLiteStateStore)
+        inst.__init__(db_path)
+        return inst
