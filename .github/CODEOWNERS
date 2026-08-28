@@ -1,0 +1,6 @@
+# PASAY governance control plane — Owner review required.
+/.github/** @jhackuy
+/opencode.json @jhackuy
+/.opencode/** @jhackuy
+/AGENTS.md @jhackuy
+/.github/CODEOWNERS @jhackuy
