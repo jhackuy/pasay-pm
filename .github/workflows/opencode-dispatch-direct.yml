@@ -73,8 +73,63 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" --json number,title,body,url,comments > /tmp/opencode-issue.json
+          gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" --json number,title,body,url,comments > /tmp/opencode-issue-all.json
+          jq '{number,title,body,url,comments:[.comments[] | select(.authorAssociation == "OWNER")]}' /tmp/opencode-issue-all.json > /tmp/opencode-issue.json
           test -s /tmp/opencode-issue.json
+
+      - name: Recover immutable historical deploy contract evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          LAST_GOOD_SHA: '044c9c63dbacca08727e95ab22184ff7ffc521c4'
+          LAST_GOOD_BLOB_SHA: 'df1640e19ea75dee5c4350136141168354cd3665'
+        run: |
+          set -euo pipefail
+          contract=/tmp/pasay-deploy-phase1.last-good.yml
+          context=/tmp/opencode-dispatch-context.md
+          api_path="repos/${REPOSITORY}/contents/.github/workflows/pasay-deploy-phase1.yml?ref=${LAST_GOOD_SHA}"
+
+          actual_blob_sha="$(gh api "$api_path" --jq .sha)"
+          test "$actual_blob_sha" = "$LAST_GOOD_BLOB_SHA"
+          gh api -H 'Accept: application/vnd.github.raw' "$api_path" > "$contract"
+          test -s "$contract"
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('/tmp/pasay-deploy-phase1.last-good.yml')
+          data = p.read_bytes()
+          if data.startswith(b'\xef\xbb\xbf'):
+              data = data[3:]
+          data = data.replace(b'\r\n', b'\n').replace(b'\r', b'\n')
+          p.write_bytes(data)
+          PY
+
+          grep -Fq 'name: pasay-deploy-phase1' "$contract"
+          grep -Fq 'environment: production' "$contract"
+          grep -Fq 'cancel-in-progress: false' "$contract"
+          grep -Fq 'CLOUDFLARE_API_TOKEN' "$contract"
+          grep -Fq 'NEON_API_KEY' "$contract"
+
+          cp "$contract" .github/workflows/pasay-deploy-phase1.yml
+
+          {
+            printf '# PASAY OpenCode authoritative dispatch context\n\n'
+            printf '## GitHub Issue JSON — OWNER comments only\n```json\n'
+            cat /tmp/opencode-issue.json
+            printf '\n```\n\n'
+            printf '## Immutable historical deployment evidence\n'
+            printf 'Source commit SHA: `%s`\n' "$LAST_GOOD_SHA"
+            printf 'Source Git blob SHA: `%s`\n' "$LAST_GOOD_BLOB_SHA"
+            printf 'Source path: `.github/workflows/pasay-deploy-phase1.yml`\n\n'
+            printf 'The deterministic workflow has already restored this byte-normalized historical YAML into the worktree. Treat it as authoritative historical evidence for Issue #78; do not rewrite or transcribe that file. Other genuinely unproven evidence must still stop BLOCKED.\n\n```yaml\n'
+            cat "$contract"
+            printf '\n```\n'
+          } > "$context"
+          test -s "$context"
+          echo "LAST_GOOD_SHA=$LAST_GOOD_SHA"
+          echo "LAST_GOOD_BLOB_SHA=$LAST_GOOD_BLOB_SHA"
+          echo "LAST_GOOD_BYTES=$(wc -c < "$contract")"
 
       - name: Verify effective PASAY Lead routing
         shell: bash
@@ -115,8 +170,8 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          prompt="Execute GitHub Issue #${ISSUE_NUMBER} exactly as written. Treat the attached issue body and latest OWNER comments as the authoritative contract. Work only in this checkout. Do not merge, do not production-deploy, do not reveal secrets. Stop BLOCKED rather than inventing missing infrastructure or credentials."
-          opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-issue.json
+          prompt="Execute GitHub Issue #${ISSUE_NUMBER} exactly as written. The attached context contains the current Issue body, OWNER comments only, and immutable last-good deployment evidence from commit 044c9c63dbacca08727e95ab22184ff7ffc521c4. The deterministic workflow has already restored .github/workflows/pasay-deploy-phase1.yml from that evidence; do not rewrite or transcribe that file. Git history for that exact file/version is therefore already proven. Other genuinely unproven credential/environment boundaries must still stop BLOCKED with exact evidence. Work only in this checkout. Do not merge, do not production-deploy, do not reveal secrets."
+          opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-dispatch-context.md
 
       - name: Validate bounded change and publish PR
         shell: bash
@@ -129,6 +184,11 @@ jobs:
         run: |
           set -euo pipefail
           git diff --check
+          test -s /tmp/pasay-deploy-phase1.last-good.yml
+          cmp -s .github/workflows/pasay-deploy-phase1.yml /tmp/pasay-deploy-phase1.last-good.yml || {
+            echo 'HARD_BOUNDARY_FAIL: recovered production deploy workflow changed after deterministic restore.' >&2
+            exit 86
+          }
           if [ -z "$(git status --porcelain)" ]; then
             gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" --body 'OPENCODE_DISPATCH_BLOCKED: execution completed without a repository change. Review the issue/run evidence; no PR was created.'
             exit 1
