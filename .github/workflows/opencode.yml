@@ -6,8 +6,18 @@ on:
   pull_request_review_comment:
     types: [created]
 
+# Only a new actionable human /oc or /opencode command for the same issue/PR
+# may supersede an earlier actionable run. Bot and non-command comments get a
+# run-unique group, so they cannot cancel or replace legitimate work.
 concurrency:
-  group: opencode-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  group: >-
+    ${{ github.event.comment.user.type != 'Bot' &&
+        (contains(github.event.comment.body, ' /oc') ||
+         startsWith(github.event.comment.body, '/oc') ||
+         contains(github.event.comment.body, ' /opencode') ||
+         startsWith(github.event.comment.body, '/opencode')) &&
+        format('opencode-{0}', github.event.issue.number || github.event.pull_request.number || github.run_id) ||
+        format('opencode-ignored-{0}', github.run_id) }}
   cancel-in-progress: true
 
 jobs:
