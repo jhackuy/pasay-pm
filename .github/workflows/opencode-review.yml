@@ -67,6 +67,8 @@ jobs:
           OPENCODE_CONFIG_CONTENT: '{"permission":{"edit":"deny","bash":"deny","task":"deny","webfetch":"deny","websearch":"deny"}}'
         run: |
           set -euo pipefail
+          mkdir -p "$HOME/.config/opencode"
+          printf '%s' "$OPENCODE_CONFIG_CONTENT" > "$HOME/.config/opencode/opencode.json"
           prompt=$(cat <<'EOF'
           You are the independent OpenCode PR Reviewer for jhackuy/pasay-pm.
           READ-ONLY: never edit files, never commit, never push, never create another PR,
