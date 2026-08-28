@@ -1,4 +1,9 @@
 name: pasay-deploy-phase1
+# PROVENANCE / REPAIR NOTE:
+# Restored from historical-good commit 044c9c63dbacca08727e95ab22184ff7ffc521c4,
+# source blob df1640e19ea75dee5c4350136141168354cd3665. This repair keeps the
+# deterministic production topology while removing deploy-time privilege mutation,
+# credential value logging, and smoke-only production writes.
 
 on:
   workflow_dispatch:
@@ -16,7 +21,7 @@ on:
         type: boolean
         default: true
       step2_configure_secrets:
-        description: "STEP 2 — Derive Neon URIs + put all 5 Cloudflare secrets"
+        description: "STEP 2 — Derive Neon URIs + put 6 Cloudflare secrets/config values"
         type: boolean
         default: true
       step3_production_migration:
@@ -35,6 +40,11 @@ on:
         description: "STEP 7/8/9/10 — Bootstrap Owner+Sec, TG setWebhook+smoke+Final banner (identities from GitHub Repository Variables PASAY_OWNER_* / PASAY_SECRETARY1_*)"
         type: boolean
         default: true
+      expected_target_sha:
+        description: "Optional exact commit SHA expected for this production workflow run"
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: pasay-deploy-phase1
@@ -65,6 +75,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: TARGET SHA truth gate
+        env:
+          EXPECTED_TARGET_SHA: ${{ inputs.expected_target_sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="${GITHUB_SHA}"
+          EXPECTED_SHA="${EXPECTED_TARGET_SHA:-}"
+          if [ -n "${EXPECTED_SHA}" ] && [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+            echo "[truth-gate][FATAL] GITHUB_SHA does not match expected_target_sha. actual=${ACTUAL_SHA} expected=${EXPECTED_SHA}" >&2
+            exit 82
+          fi
+          echo "[truth-gate] target_sha=${ACTUAL_SHA}"
 
       - name: SETUP Node.js (22.x for wrangler)
         uses: actions/setup-node@v4
@@ -98,7 +121,7 @@ jobs:
       # STEP 0 — Runtime DB Role permission + minimal tx test (ROLLBACK)
       # ═══════════════════════════════════════════════════════════════════
       - name: "STEP 0 — Neon: derive pooled + direct URIs (masked) + verify runtime role"
-        if: ${{ !inputs.run_smoke_only && inputs.step0_db_role_verify }}
+        if: ${{ inputs.run_smoke_only || inputs.step0_db_role_verify }}
         id: neon_uris
         run: |
           set -euo pipefail
@@ -132,20 +155,20 @@ jobs:
           owner_role  = "neondb_owner"
           runtime_role = "pasay_runtime"
 
-          # List roles so we can detect if pasay_runtime is missing (needs create)
+          # Read-only role verification. Production deploy must never create DB roles.
           roles_resp = api("GET", f"/projects/{project_id}/branches/{branch_id}/roles")
           roles = roles_resp.get("roles", [])
           role_names = {r.get("name") for r in roles}
           print(f"[step0] existing neon roles on branch: {sorted(role_names)}", flush=True)
 
           if runtime_role not in role_names:
-              print(f"[step0] creating missing neon role '{runtime_role}' via Neon API", flush=True)
-              created = api("POST", f"/projects/{project_id}/branches/{branch_id}/roles",
-                            body=json.dumps({"role": {"name": runtime_role}}))
-              new_role = created.get("role") or created.get("roles") or {}
-              if isinstance(new_role, list):
-                  new_role = new_role[0]
-              print(f"[step0] role {runtime_role} created (name={new_role.get('name')})", flush=True)
+              raise SystemExit(
+                  f"[step0] FAIL_CLOSED_PASAY_RUNTIME_ROLE_MISSING: role '{runtime_role}' "
+                  f"is not provisioned on Neon branch {branch_id}. This workflow does not "
+                  f"auto-create roles. Provision it via a separate explicit migration/permission task "
+                  f"before retrying this deploy."
+              )
+          print("[step0] pasay_runtime role present (verified; no role mutation performed)", flush=True)
 
           # Use Neon connection_uri endpoint with official pooled=true param
           def conn_uri(role, pooled=False):
@@ -219,51 +242,54 @@ jobs:
 
           echo "step0 uris derived; DATABASE_URL pooled and DATABASE_URL_UNPOOLED direct stored in env (masked)"
 
-      - name: "STEP 0 — Verify + GRANT sequence permissions; min tx ROLLBACK smoke"
+      - name: "STEP 0 — Verify sequence permissions; min tx ROLLBACK smoke"
         if: ${{ !inputs.run_smoke_only && inputs.step0_db_role_verify }}
         run: |
           set -euo pipefail
           . .venv/bin/activate
 
           python - <<'PY'
-          import os, re, psycopg2
+          import os, psycopg2
           from decimal import Decimal
 
           url_pooled   = os.environ["DATABASE_URL"]
           url_unpooled = os.environ["DATABASE_URL_UNPOOLED"]
 
-          # (A) connect as owner (direct/unpooled) for GRANT + default privs
+          # (A) connect as owner (direct/unpooled) for READ-ONLY privilege verification.
+          # NO DCL: privilege remediation belongs in a separate explicit permission migration/task.
           conn_owner = psycopg2.connect(url_unpooled)
           conn_owner.autocommit = True
           cur = conn_owner.cursor()
-
-          cur.execute("SELECT count(*) FROM information_schema.sequences WHERE sequence_schema='public'")
-          n_seq = cur.fetchone()[0]
-          print(f"[step0] public sequences = {n_seq}", flush=True)
 
           cur.execute("""
           SELECT sequence_schema, sequence_name
           FROM information_schema.sequences
           WHERE sequence_schema='public'
           ORDER BY sequence_name
-          LIMIT 5
           """)
-          for row in cur.fetchall():
-              print(f"[step0]   sample seq: {row[0]}.{row[1]}", flush=True)
+          sequences = cur.fetchall()
+          print(f"[step0] public sequences = {len(sequences)}", flush=True)
 
-          cur.execute("""
-          GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pasay_runtime;
-          """)
-          cur.execute("""
-          ALTER DEFAULT PRIVILEGES FOR ROLE neondb_owner
-              IN SCHEMA public
-              GRANT USAGE, SELECT ON SEQUENCES TO pasay_runtime;
-          """)
-          print("[step0] GRANT + ALTER DEFAULT PRIVILEGES applied", flush=True)
+          missing = []
+          for schema_name, sequence_name in sequences:
+              qualified = f"{schema_name}.{sequence_name}"
+              cur.execute(
+                  "SELECT has_sequence_privilege(%s, %s, 'USAGE'), has_sequence_privilege(%s, %s, 'SELECT')",
+                  ("pasay_runtime", qualified, "pasay_runtime", qualified),
+              )
+              has_usage, has_select = cur.fetchone()
+              if not (has_usage and has_select):
+                  missing.append(qualified)
 
-          # Verify runtime can actually USE a sequence + INSERT + ROLLBACK on a safe no-op table
-          # We use an anonymous block that does a tx, creates a temp table with serial (uses sequence),
-          # inserts, checks currval, then rolls back. No real business rows affected.
+          if missing:
+              raise SystemExit(
+                  f"[step0] FAIL_CLOSED_SEQUENCE_PRIVILEGES: pasay_runtime lacks USAGE/SELECT "
+                  f"on {len(missing)} public sequence(s). No GRANT was executed. "
+                  f"Repair privileges via a separate explicit migration/permission task before deploy."
+              )
+          print("[step0] sequence privilege verification PASS; no GRANT/ALTER DEFAULT PRIVILEGES executed", flush=True)
+
+          # Verify runtime can actually USE a sequence + INSERT + ROLLBACK on a safe no-op table.
           conn_owner.close()
 
           conn_rt = psycopg2.connect(url_pooled)
@@ -318,23 +344,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          # === Safe credential diagnostics (NO values — only length/hex-pattern) ===
-          echo "[step1-diag] CF_ACCOUNT_ID length=${#CF_ACCOUNT_ID}"
-          if [ "${#CF_ACCOUNT_ID}" -ge 10 ]; then
-            echo "[step1-diag] CF_ACCOUNT_ID prefix=${CF_ACCOUNT_ID:0:6}... suffix=...${CF_ACCOUNT_ID: -4}"
-          fi
-          echo "[step1-diag] CF_API_TOKEN length=${#CF_API_TOKEN}"
-          if [ "${#CF_API_TOKEN}" -ge 8 ]; then
-            echo "[step1-diag] CF_API_TOKEN prefix=${CF_API_TOKEN:0:6}..."
-          fi
-          echo "[step1-diag] CLOUDFLARE_API_TOKEN length=${#CLOUDFLARE_API_TOKEN}"
-          # wrangler whoami raw (capture exit code)
+          # === Credential presence checks (NO values — length/boolean only) ===
+          echo "[step1-diag] CF_ACCOUNT_ID present=$( [ -n "${CF_ACCOUNT_ID}" ] && echo true || echo false ) length=${#CF_ACCOUNT_ID}"
+          echo "[step1-diag] CF_API_TOKEN present=$( [ -n "${CF_API_TOKEN}" ] && echo true || echo false ) length=${#CF_API_TOKEN}"
+          echo "[step1-diag] CLOUDFLARE_API_TOKEN present=$( [ -n "${CLOUDFLARE_API_TOKEN}" ] && echo true || echo false ) length=${#CLOUDFLARE_API_TOKEN}"
           set +e
-          WRANGLER_OUT=$(npx wrangler whoami 2>&1)
+          npx wrangler whoami >/dev/null 2>&1
           WRANGLER_RC=$?
           set -e
-          echo "[step1-diag] wrangler whoami exit=${WRANGLER_RC}"
-          echo "whoami-tail: $(echo "${WRANGLER_OUT}" | tail -10)"
+          echo "[step1-diag] wrangler whoami exit=${WRANGLER_RC} (raw output never logged)"
 
           python - <<'PY'
           import os, json, re, urllib.request, ssl
@@ -386,9 +404,9 @@ jobs:
           PY
 
       # ═══════════════════════════════════════════════════════════════════
-      # STEP 2 — Put 5 production secrets via wrangler secret put
+      # STEP 2 — Put 6 production secrets/config values via wrangler secret put
       # ═══════════════════════════════════════════════════════════════════
-      - name: "STEP 2 — wrangler: put 5 production secrets (DATABASE_URL x2, Telegram x2, Container ingest)"
+      - name: "STEP 2 — wrangler: put 6 production secrets/config values (DATABASE_URL x2, Telegram x2, Container ingest, build SHA)"
         if: ${{ !inputs.run_smoke_only && inputs.step2_configure_secrets }}
         working-directory: cloudflare-worker
         run: |
@@ -416,7 +434,7 @@ jobs:
           # Passed via Worker PasayContainer.envVars into Container runtime ENV PASAY_BUILD_SHA.
           # Container GET /health exposes this as JSON build_sha field; step5.5 active probe gates on it.
           put_secret "PASAY_BUILD_SHA" "${{ github.sha }}"
-          echo "[step2] 6/6 production secrets configured=true (values never printed; PASAY_BUILD_SHA=${GITHUB_SHA:0:12}… (head only))"
+          echo "[step2] 6/6 production secrets/config values configured=true (values never printed)"
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 3 — RETURN3-D Production Migration Gate (BEFORE Worker/Container deploy)
@@ -668,9 +686,10 @@ jobs:
           {
             echo "worker_name=${WORKER_NAME}"
             echo "deploy_ts=${DEPLOY_TS}"
+            echo "deployed_sha=${GITHUB_SHA}"
           } >> "${GITHUB_OUTPUT}"
 
-          echo "[step5] deploy --containers-rollout=immediate exit=$?"
+          echo "[step5] deploy --containers-rollout=immediate exit=$?; deployed_sha=${GITHUB_SHA}"
 
       # ── STEP 5.5  RETURN1 ACTIVE-READINESS TRUTH GATE (Owner Task A+B+C+D) ──
       #   Invalidation model (previous readiness bugs, fixed here):
@@ -713,7 +732,7 @@ jobs:
           export CF_API_TOKEN="${CF_API_TOKEN}"
           mkdir -p "${RETURN1_ARTIFACT_DIR}"
 
-          echo "[step5.5] expected build_sha (head 16) = ${EXPECTED_SHA:0:16}…"
+          echo "[step5.5] expected build_sha = ${EXPECTED_SHA}"
 
           # ── Derive fetchable Worker URL (mirrors step6 derivation logic) ──
           set +e
@@ -876,6 +895,8 @@ jobs:
       - name: "STEP 6 — Infrastructure smoke: /health, /healthz + bindings + secrets configured flags"
         if: ${{ inputs.step6_infra_smoke }}
         working-directory: cloudflare-worker
+        env:
+          PASAY_RUN_SMOKE_ONLY: ${{ inputs.run_smoke_only }}
         run: |
           set -euo pipefail
           . ../.venv/bin/activate
@@ -890,6 +911,7 @@ jobs:
 
           account_id = os.environ["CF_ACCOUNT_ID"]
           token      = os.environ["CF_API_TOKEN"]
+          smoke_only = os.environ.get("PASAY_RUN_SMOKE_ONLY", "false").strip().lower() == "true"
           worker     = "pasay-cloudflare-worker"
           base = f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
           headers = {
@@ -1075,13 +1097,17 @@ jobs:
                   cur.execute(f'SELECT count(*) FROM {t}')
                   print(f"[step6.3] {t} count = {cur.fetchone()[0]}", flush=True)
 
-          # 6.4 — Send a safe test envelope through Queue → Container ingest.
+          # 6.4 — Queue smoke is disabled in smoke-only mode because it mutates production.
           queue_name = "pasay-events"
           queues = cf("GET", "/queues")
           queues_result = queues.get("result") if isinstance(queues, dict) else None
           queues_list = queues_result if isinstance(queues_result, list) else []
           qid = next((q["queue_id"] for q in queues_list if isinstance(q, dict) and q.get("queue_name") == queue_name), None)
-          if not qid:
+          queue_push_status = "SKIPPED_SMOKE_ONLY" if smoke_only else "NOT_RUN"
+          if smoke_only:
+              print("[step6.4] smoke-only=true: queue discovery completed; production queue push intentionally skipped", flush=True)
+          elif not qid:
+              queue_push_status = "WARN_NO_QID_SKIP"
               print("[step6.4] WARN: pasay-events queue not found for smoke push; queue may have been created in step1 but CF API list returned empty (perms?). Skipping queue push (non-fatal)", flush=True)
           else:
               envelope = {
@@ -1099,8 +1125,10 @@ jobs:
                   "body": envelope, "content_type": "json",
               })
               if not r.get("success"):
+                  queue_push_status = "WARN_PUSH_FAILED"
                   print(f"[step6.4] queue push not success: {json.dumps(r.get('errors', []), ensure_ascii=False)[:300]}", flush=True)
               else:
+                  queue_push_status = "PASS"
                   print(f"[step6.4] queue accepted scheduled_job envelope event_id={envelope['event_id']}", flush=True)
 
           # 6.5 — Cron trigger registration check (do not wait 5m)
@@ -1170,14 +1198,14 @@ jobs:
               print("[step6] /health WARN (non-fatal): no public fetchable route/URL derived; skip /health HTTP fetch", flush=True)
 
           # --- Core pass ---
-          print(f"[step6] PASS: neon_41_tables=True, queue_accepted_smoke={'PASS' if qid else 'WARN_NO_QID_SKIP'}, cron_heartbeat_*/5={'PASS' if cron_configured_ok else 'WARN_INFERRED_FROM_TOML'}, health_endpoint_fetched={'PASS' if health_fetched_ok else 'SKIP_NO_ROUTE_OR_WARN'}", flush=True)
+          print(f"[step6] PASS: neon_41_tables=True, queue_smoke={queue_push_status}, cron_heartbeat_*/5={'PASS' if cron_configured_ok else 'WARN_INFERRED_FROM_TOML'}, health_endpoint_fetched={'PASS' if health_fetched_ok else 'SKIP_NO_ROUTE_OR_WARN'}", flush=True)
           PY
 
       # ═══════════════════════════════════════════════════════════════════
       # STEP 7 — Bootstrap Production Identity (Org + Owner + Secretary)
       # ═══════════════════════════════════════════════════════════════════
       - name: STEP 7 — Bootstrap Production Identity (Owner + Sec1) — Idempotent (NO secrets/IDs printed)
-        if: inputs.step78910_owner_bootstrap_and_tg_smoke
+        if: ${{ !inputs.run_smoke_only && inputs.step78910_owner_bootstrap_and_tg_smoke }}
         env:
           OWNER_TG_USER_ID:   ${{ vars.PASAY_OWNER_TG_USER_ID }}
           OWNER_TG_USERNAME:  ${{ vars.PASAY_OWNER_TG_USERNAME }}
@@ -1554,7 +1582,7 @@ jobs:
       # STEP 8 — Telegram setWebhook + getWebhookInfo (uses workers.dev URL)
       # ═══════════════════════════════════════════════════════════════════
       - name: STEP 8 — Telegram setWebhook + getWebhookInfo
-        if: inputs.step78910_owner_bootstrap_and_tg_smoke
+        if: ${{ !inputs.run_smoke_only && inputs.step78910_owner_bootstrap_and_tg_smoke }}
         shell: bash
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -1587,7 +1615,7 @@ jobs:
               # fallback: use CF_ACCOUNT_ID raw (since subdomain equals that in our earlier observation)
               SUB="${CF_ACCOUNT_ID_}"
           fi
-          echo "CF workers subdomain namespace configured = ${SUB:0:6}… (len=${#SUB})"
+          echo "CF workers subdomain namespace configured=true (len=${#SUB}; value not logged)"
           export WEBHOOK_URL="https://${WORKER_NAME}.${SUB}.workers.dev/telegram/webhook"
           # mask the full URL (it's semi-secret; Owner knows but we don't print in public logs)
           echo "::add-mask::${WEBHOOK_URL}"
@@ -1657,7 +1685,7 @@ jobs:
       #   Then POST to Worker /telegram/webhook twice (first = process; second = idempotency no-dup).
       # ═══════════════════════════════════════════════════════════════════
       - name: STEP 9 — Real Worker Webhook smoke + idempotency (Owner /start synthetic)
-        if: inputs.step78910_owner_bootstrap_and_tg_smoke
+        if: ${{ !inputs.run_smoke_only && inputs.step78910_owner_bootstrap_and_tg_smoke }}
         shell: bash
         env:
           TG_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
@@ -1873,17 +1901,19 @@ jobs:
       # STEP 10 — Final PASAY_DEPLOY_PHASE1_COMPLETE banner
       # ═══════════════════════════════════════════════════════════════════
       - name: STEP 10 — PASAY_DEPLOY_PHASE1_COMPLETE (RETURN1 — Synthetic Truth Closure)
-        if: inputs.step78910_owner_bootstrap_and_tg_smoke
+        if: ${{ !inputs.run_smoke_only && inputs.step78910_owner_bootstrap_and_tg_smoke }}
         shell: bash
         run: |
           set +e
+          DEPLOYED_SHA="${{ steps.wrangler_deploy.outputs.deployed_sha }}"
+          if [ -z "${DEPLOYED_SHA}" ]; then DEPLOYED_SHA="NOT_DEPLOYED_IN_THIS_RUN"; fi
           echo ""
           echo "╔══════════════════════════════════════════════════════════════════════╗"
           echo "║           PASAY DEPLOY PHASE 1 RETURN1 — COMPLETE              ║"
           echo "╚══════════════════════════════════════════════════════════════════════╝"
           echo ""
-          echo "BASE HEAD (RETURN1)  = 747107e669a8a95b79e5c39bdf1cde166f8c1310"
-          echo "github.sha (final)  = ${GITHUB_SHA}"
+          echo "target_sha          = ${GITHUB_SHA}"
+          echo "deployed_sha        = ${DEPLOYED_SHA}"
           echo "github.ref           = ${GITHUB_REF}"
           echo "workflow run_id      = ${GITHUB_RUN_ID}"
           echo "neon project_id      = ${NEON_PROJECT_ID}   (vars)"
@@ -1892,7 +1922,7 @@ jobs:
           echo "CF worker name       = pasay-cloudflare-worker"
           echo "CF queues            = pasay-events + pasay-events-dlq (id from step1 verified)"
           echo "CF cron              = */5 * * * *   (wrangler.toml declared, step1 deploy syncs)"
-          echo "Secrets (count=5)    = DATABASE_URL, DATABASE_URL_UNPOOLED, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, PASAY_CONTAINER_INGEST_TOKEN"
+          echo "Secrets/config count = 6 names: DATABASE_URL, DATABASE_URL_UNPOOLED, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, PASAY_CONTAINER_INGEST_TOKEN, PASAY_BUILD_SHA"
           echo ""
           echo "─── INTERNAL_SYNTHETIC_E2E = PASS ───"
           echo "  (Worker→Queue→Container→PTB→handler→Neon truth chain      "
@@ -1916,20 +1946,25 @@ jobs:
         if: always()
         run: |
           set +e
+          DEPLOYED_SHA="${{ steps.wrangler_deploy.outputs.deployed_sha }}"
+          if [ -z "${DEPLOYED_SHA}" ]; then DEPLOYED_SHA="NOT_DEPLOYED_IN_THIS_RUN"; fi
           echo "==== PASAY DEPLOY PHASE 1 EVIDENCE ===="
-          echo "github.sha        = ${GITHUB_SHA}"
+          echo "target_sha        = ${GITHUB_SHA}"
+          echo "deployed_sha      = ${DEPLOYED_SHA}"
           echo "github.ref        = ${GITHUB_REF}"
           echo "workflow run_id   = ${GITHUB_RUN_ID}"
           echo "workflow run_attempt = ${GITHUB_RUN_ATTEMPT}"
           echo "neon project_id   = ${NEON_PROJECT_ID}   (vars)"
           echo "neon branch_id    = ${NEON_BRANCH_ID}    (vars)"
-          echo "cf account_id     = ${CF_ACCOUNT_ID:0:6}... (secret length=${#CF_ACCOUNT_ID})"
+          echo "cf account_id present=$( [ -n "${CF_ACCOUNT_ID}" ] && echo true || echo false ) length=${#CF_ACCOUNT_ID} (value not logged)"
           echo "steps selected:"
           echo "  step0_db_role_verify      = ${{ inputs.step0_db_role_verify }}"
           echo "  step1_cloudflare_resources= ${{ inputs.step1_cloudflare_resources }}"
           echo "  step2_configure_secrets   = ${{ inputs.step2_configure_secrets }}"
+          echo "  step3_production_migration= ${{ inputs.step3_production_migration }}"
           echo "  step45_deploy             = ${{ inputs.step45_deploy }}"
           echo "  step6_infra_smoke         = ${{ inputs.step6_infra_smoke }}"
           echo "  step78910_owner_bootstrap_and_tg_smoke = ${{ inputs.step78910_owner_bootstrap_and_tg_smoke }}"
           echo "  run_smoke_only            = ${{ inputs.run_smoke_only }}"
+          echo "  expected_target_sha set   = $( [ -n "${{ inputs.expected_target_sha }}" ] && echo true || echo false )"
           echo "==== END EVIDENCE (secrets/URIs never printed) ===="
