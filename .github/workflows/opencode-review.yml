@@ -103,7 +103,9 @@ jobs:
           first="$(head -n 1 /tmp/opencode-review.txt)"
           if [ "$first" = 'REVIEW_PASS' ] && [ "$(wc -l < /tmp/opencode-review.txt)" -eq 1 ]; then
             echo 'verdict=pass' >> "$GITHUB_OUTPUT"
-          elif [ "$first" = 'BLOCKING_FINDINGS' ] && tail -n +2 /tmp/opencode-review.txt | grep -Eq '^(blocker|high|medium) \| [^|]+ \| [^|]+ \| [^|]+$'; then
+          elif [ "$first" = 'BLOCKING_FINDINGS' ] \
+            && [ "$(wc -l < /tmp/opencode-review.txt)" -ge 2 ] \
+            && ! tail -n +2 /tmp/opencode-review.txt | grep -Evq '^(blocker|high|medium) \| [^|]+ \| [^|]+ \| [^|]+$'; then
             echo 'verdict=block' >> "$GITHUB_OUTPUT"
           else
             echo 'Reviewer output did not match the deterministic verdict contract.' >&2
