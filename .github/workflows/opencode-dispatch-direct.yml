@@ -1,0 +1,158 @@
+name: opencode-dispatch-direct
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-dispatch-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: github.event.label.name == 'opencode-dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Create PASAY OpenCode GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PASAY_OPENCODE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PASAY_OPENCODE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Checkout protected default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: feature/telegram-ui-v2
+          fetch-depth: 1
+          persist-credentials: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Verify required secret and clean worktree
+        shell: bash
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${MINIMAX_API_KEY:-}"
+          test -z "$(git status --porcelain)"
+
+      - name: Install verified OpenCode V1 runtime
+        shell: bash
+        env:
+          OPENCODE_VERSION: '1.18.24'
+          OPENCODE_ASSET_SHA256: '573e48cd095670bf87dd834442077800b4bc979d0ad7d8b19802ec2b73e90c54'
+        run: |
+          set -euo pipefail
+          archive="/tmp/opencode-linux-x64.tar.gz"
+          dist="/tmp/opencode-dist"
+          curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o "$archive"
+          printf '%s  %s\n' "$OPENCODE_ASSET_SHA256" "$archive" | sha256sum -c -
+          rm -rf "$dist"
+          mkdir -p "$dist" "$HOME/.opencode/bin"
+          tar -xzf "$archive" -C "$dist"
+          bin="$(find "$dist" -type f -name opencode -print -quit)"
+          test -n "$bin"
+          install -m 0755 "$bin" "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          "$HOME/.opencode/bin/opencode" --version
+          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = "$OPENCODE_VERSION"
+
+      - name: Build authoritative issue context
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" --json number,title,body,url,comments > /tmp/opencode-issue.json
+          test -s /tmp/opencode-issue.json
+
+      - name: Verify effective PASAY Lead routing
+        shell: bash
+        env:
+          OPENCODE_CONFIG_CONTENT: '{"default_agent":"pasay-lead"}'
+        run: |
+          set -euo pipefail
+          opencode debug config > /tmp/opencode-effective-config.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          cfg = json.loads(Path('/tmp/opencode-effective-config.json').read_text())
+          assert cfg.get('default_agent') == 'pasay-lead'
+          assert cfg.get('share') == 'disabled'
+          assert cfg.get('subagent_depth') == 1
+          assert (cfg.get('agent') or {}).get('pasay-lead', {}).get('mode') == 'primary'
+          PY
+
+      - name: Create isolated implementation branch
+        id: branch
+        shell: bash
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          branch="opencode/issue${ISSUE_NUMBER}-${RUN_ID}"
+          git switch -c "$branch"
+          git config --local user.name "pasay-opencode-bot"
+          git config --local user.email "pasay-opencode-bot@users.noreply.github.com"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Execute issue with qualified PASAY Lead
+        shell: bash
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          OPENCODE_CONFIG_CONTENT: '{"default_agent":"pasay-lead"}'
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          prompt="Execute GitHub Issue #${ISSUE_NUMBER} exactly as written. Treat the attached issue body and latest OWNER comments as the authoritative contract. Work only in this checkout. Do not merge, do not production-deploy, do not reveal secrets. Stop BLOCKED rather than inventing missing infrastructure or credentials."
+          opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-issue.json
+
+      - name: Validate bounded change and publish PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          set -euo pipefail
+          git diff --check
+          if [ -z "$(git status --porcelain)" ]; then
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" --body 'OPENCODE_DISPATCH_BLOCKED: execution completed without a repository change. Review the issue/run evidence; no PR was created.'
+            exit 1
+          fi
+          git add -A
+          git commit -m "ci: execute issue #${ISSUE_NUMBER} via OpenCode"
+          git push --set-upstream origin "$BRANCH"
+          gh pr create --repo "$REPOSITORY" --base feature/telegram-ui-v2 --head "$BRANCH" --title "$ISSUE_TITLE" --body "Closes #${ISSUE_NUMBER}\n\nCreated by PASAY native OpenCode dispatch. No auto-merge and no production deploy."
+
+      - name: Reset dispatch label
+        if: always() && steps.app-token.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          gh api --method DELETE "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/labels/opencode-dispatch" || true
+
+      - name: Record exact OpenCode runtime
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v opencode
+          opencode --version
