@@ -37,54 +37,70 @@ jobs:
           persist-credentials: true
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Probe default and feature branch write boundaries
+      - name: Verify effective GitHub server-side boundary
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
           DEFAULT_BRANCH: feature/telegram-ui-v2
+          RULESET_NAME: protect-default
           PROBE_BRANCH: chore/pasay-gov-77-server-probe-target
         run: |
           set -euo pipefail
           mkdir -p artifacts/gov-77
-          git config --local user.name "pasay-opencode-bot"
-          git config --local user.email "pasay-opencode-bot@users.noreply.github.com"
 
-          # Build a synthetic fast-forward commit directly on the current remote default tip.
-          # This removes non-fast-forward rejection as a confounder; --dry-run guarantees no ref is changed.
-          git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-          remote_tip="$(git rev-parse "refs/remotes/origin/${DEFAULT_BRANCH}")"
-          git checkout --detach "$remote_tip"
-          git commit --allow-empty -m "gov-77 synthetic fast-forward authorization probe"
-          probe_commit="$(git rev-parse HEAD)"
-          printf 'REMOTE_TIP=%s\nPROBE_COMMIT=%s\n' "$remote_tip" "$probe_commit" | tee artifacts/gov-77/identity.txt
+          api="https://api.github.com/repos/${REPOSITORY}"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
 
+          curl --fail-with-body -sS "${auth[@]}" \
+            "${api}/rulesets" > artifacts/gov-77/rulesets.json
+
+          ruleset_id="$(jq -r --arg name "$RULESET_NAME" '.[] | select(.name == $name and .enforcement == "active") | .id' artifacts/gov-77/rulesets.json | head -n1)"
+          test -n "$ruleset_id"
+
+          curl --fail-with-body -sS "${auth[@]}" \
+            "${api}/rulesets/${ruleset_id}" > artifacts/gov-77/ruleset-detail.json
+
+          curl --fail-with-body -sS "${auth[@]}" \
+            "${api}/rules/branches/${DEFAULT_BRANCH}" > artifacts/gov-77/effective-rules.json
+
+          # Assert the same OpenCode App identity cannot bypass this active default-branch ruleset.
+          jq -e '
+            .enforcement == "active" and
+            .target == "branch" and
+            (.conditions.ref_name.include | index("~DEFAULT_BRANCH")) != null and
+            (.bypass_actors | length) == 0 and
+            .current_user_can_bypass == "never"
+          ' artifacts/gov-77/ruleset-detail.json >/dev/null
+
+          # Assert the default branch is effectively governed by PR-only, deletion protection,
+          # non-fast-forward protection, and the two deterministic required checks.
+          jq -e '
+            ([.[].type] | index("deletion")) != null and
+            ([.[].type] | index("non_fast_forward")) != null and
+            ([.[].type] | index("pull_request")) != null and
+            ([.[].type] | index("required_status_checks")) != null
+          ' artifacts/gov-77/effective-rules.json >/dev/null
+
+          jq -e '
+            [ .[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context ] as $checks |
+            ($checks | index("pasay-gate")) != null and
+            ($checks | index("backend-freeze-gate (17 doors, 4 stages)")) != null
+          ' artifacts/gov-77/effective-rules.json >/dev/null
+
+          # Preserve normal OpenCode implementation capability on a non-protected feature ref.
           set +e
-          git push --dry-run origin "HEAD:refs/heads/${DEFAULT_BRANCH}" > artifacts/gov-77/default-branch.txt 2>&1
-          default_rc=$?
           git push --dry-run origin "HEAD:refs/heads/${PROBE_BRANCH}" > artifacts/gov-77/feature-branch.txt 2>&1
           feature_rc=$?
           set -e
-
-          printf 'DEFAULT_BRANCH_RC=%s\nFEATURE_BRANCH_RC=%s\n' "$default_rc" "$feature_rc" | tee artifacts/gov-77/result.txt
-          sed -E 's#https://x-access-token:[^@]+@github.com/#https://github.com/#g' artifacts/gov-77/default-branch.txt | tee artifacts/gov-77/default-branch-sanitized.txt
-          sed -E 's#https://x-access-token:[^@]+@github.com/#https://github.com/#g' artifacts/gov-77/feature-branch.txt | tee artifacts/gov-77/feature-branch-sanitized.txt
-
-          if [ "$default_rc" -eq 0 ]; then
-            echo 'HARD_BOUNDARY_FAIL: GitHub accepted a fast-forward dry-run push to the default/integration branch using the OpenCode App identity.' >&2
-            exit 1
-          fi
+          printf 'RULESET_ID=%s\nFEATURE_BRANCH_RC=%s\n' "$ruleset_id" "$feature_rc" | tee artifacts/gov-77/result.txt
 
           if [ "$feature_rc" -ne 0 ]; then
-            echo 'FEATURE_BRANCH_FAIL: OpenCode App could not dry-run push the same synthetic commit to a normal feature branch.' >&2
+            echo 'FEATURE_BRANCH_FAIL: OpenCode App cannot write a normal feature branch.' >&2
             exit 1
           fi
 
-          # The default rejection must be policy/authz-related, not topology-related.
-          if grep -Eqi 'fetch first|non-fast-forward|rejected.*non-fast-forward' artifacts/gov-77/default-branch.txt; then
-            echo 'PROBE_INVALID: default branch rejection was topological, not server-side policy/authz.' >&2
-            exit 1
-          fi
-
-          echo 'HARD_BOUNDARY_PASS: fast-forward default-branch dry-run rejected by server-side policy/authz; feature branch allowed.' | tee -a artifacts/gov-77/result.txt
+          echo 'HARD_BOUNDARY_PASS: GitHub reports active effective PR-only/default-branch rules, required checks, and no App bypass; normal feature branch remains writable.' | tee -a artifacts/gov-77/result.txt
 
       - name: Upload governance evidence
         if: always()
