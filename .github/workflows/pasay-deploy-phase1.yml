@@ -419,21 +419,40 @@ jobs:
           echo "[step2] 6/6 production secrets configured=true (values never printed; PASAY_BUILD_SHA=${GITHUB_SHA:0:12}… (head only))"
 
       # ═══════════════════════════════════════════════════════════════════
-      # STEP 3 — RETURN3-B Production Migration Gate (BEFORE Worker/Container deploy)
-      # Owner Contract (M006 RETURN3-B comment 5442384156):
+      # STEP 3 — RETURN3-D Production Migration Gate (BEFORE Worker/Container deploy)
+      # Owner Contract (M006 RETURN3-B / RETURN3-D comment 5442384156 / 5447818561):
       #   Production migrations MUST run outside the Cloudflare Container lifecycle
-      #   in GitHub Actions, bounded with revision bookkeeping. The Container no
-      #   longer calls alembic at boot (Dockerfile entrypoint stripped).
+      #   in GitHub Actions, bounded with revision bookkeeping. The Container never
+      #   calls alembic at boot (Dockerfile entrypoint stripped by RETURN3-B).
       #
+      # RETURN3-D PARSER CONTRACT — the previous shell/hex-only revision extractors had two
+      # irreducible bugs:
+      #   Bug 1 — awk `gsub(/[^0-9a-f]/...)` strips non-hex chars, so valid
+      #       revision IDs like `ret1_postgres_bot_state_20260828 get mangled.
+      #   Bug 2 — regex `\b[0-9a-f]{8,}\b` matches only pure-hex word boundaries only,
+      #       misses mixed alnum+underscore revision IDs always.
+      #   Bug 3 — `echo "$OUT" | python - <<'PY'` heredoc steals stdin FROM the pipe,
+      #       so the python heredoc never reads the piped alembic output text;
+      #       BEFORE_REV/AFTER_REV always resolved to BASE even after a successful
+      #       alembic upgrade head.
+      # All three cause STEP 3 exit 81 BLOCKED_PRODUCTION_MIGRATION_HEAD_MISMATCH
+      # on 33125181985 even though the real DB upgrade actually succeeded.
+      #
+      # RETURN3-D FIX — use ONLY direct Alembic Python APIs, NO intermediate
+      # shell-text parsing, NO heredocs on pipes:
+      #   repo_head_rev   → Alembic ScriptDirectory.get_heads() (truth reference).
+      #   before_rev     → Alembic MigrationContext.get_current_heads()
+      #                      via real Neon engine connected with ALEMBIC_DATABASE_URL.
+      #   after_rev      → same MigrationContext after idempotent alembic upgrade head.
+      #   final gate     → after_rev == repo_head_rev case-insensitive exact string.
       # Truth gates (all must be EXIT 0, or abort as BLOCKED_PRODUCTION_MIGRATION):
-      #   1. Record current production DB revision (sanitized id only).
-      #   2. `alembic upgrade head` using DATABASE_URL_UNPOOLED -> ALEMBIC_DATABASE_URL.
-      #   3. Record post-upgrade DB revision.
-      #   4. Query repo `alembic current / heads` from checked-out code.
-      #   5. Verify post_rev == repo_head_rev; if not -> BLOCKED_PRODUCTION_MIGRATION.
+      #   77 — DATABASE_URL_UNPOOLED missing
+      #   78 — ScriptDirectory split-heads / bad repo heads
+      #   80 — real alembic upgrade head failure (rc != 0)
+      #   81 — after_rev != repo_head_rev
       # NEVER print URI / password / token; any real migration failure stops here.
       # ═══════════════════════════════════════════════════════════════════
-      - name: "STEP 3 — RETURN3-B PRODUCTION MIGRATION GATE: Alembic upgrade head on Neon (owner direct unpooled) + rev before/after/head verify"
+      - name: "STEP 3 — RETURN3-D PRODUCTION MIGRATION GATE: Alembic upgrade head on Neon + rev before/after/head (Python API, no hex parsing)"
         if: ${{ !inputs.run_smoke_only && inputs.step3_production_migration }}
         id: step3_migration_gate
         run: |
@@ -445,62 +464,77 @@ jobs:
             exit 77
           fi
 
+          # ── 1. repo_head_rev via direct Alembic ScriptDirectory Python API ──
           echo "[step3] === REPO ALembic heads (truth reference from GITHUB_SHA ${GITHUB_SHA:0:12}) ==="
+          cat > /tmp/step3_repo_heads.py << 'PYEOF'
+          import sys
+          from alembic.script import ScriptDirectory
+          from alembic.config import Config
+          cfg = Config('alembic.ini')
+          if not cfg.get_main_option('script_location'):
+              cfg.set_main_option('script_location', 'alembic')
+          sd = ScriptDirectory.from_config(cfg)
+          heads = list(sd.get_heads())
+          if len(heads) != 1:
+              sys.stderr.write('split_heads_count=%d\n' % len(heads))
+              for h in heads:
+                  sys.stderr.write('  repo_head=%s\n' % h)
+              sys.exit(78)
+          sys.stdout.write(heads[0])
+          sys.stdout.flush()
+          PYEOF
+          sed -i -e 's/^          //' /tmp/step3_repo_heads.py
           set +e
-          REPO_HEADS=$(python -m alembic heads 2>&1)
+          REPO_HEAD_REV=$(python /tmp/step3_repo_heads.py 2> /tmp/step3_repo_heads.stderr)
           HEADS_RC=$?
           set -e
-          echo "[step3] alembic heads (rc=${HEADS_RC}) output_lines=[$(echo "${REPO_HEADS}" | wc -l)] first 2000 chars: $(echo "${REPO_HEADS}" | tr '\n' '|' | head -c 2000)"
+          HEADS_STDERR=$(cat /tmp/step3_repo_heads.stderr 2>/dev/null || true)
           if [ ${HEADS_RC} -ne 0 ]; then
-            echo "[step3][FATAL] repo alembic heads returned rc=${HEADS_RC}. Abort BLOCKED_PRODUCTION_MIGRATION_BAD_REPO_HEADS." >&2
+            echo "[step3][FATAL] repo alembic ScriptDirectory heads rc=${HEADS_RC}; stderr=$(printf '%s' "${HEADS_STDERR}" | tr '\n' '|' | head -c 600). Abort BLOCKED_PRODUCTION_MIGRATION_BAD_REPO_HEADS." >&2
             exit 78
           fi
-          # Extract the leading revision id hex (first contiguous [0-9a-f]+ token of len 8+ on non-empty line)
-          REPO_HEAD_REV=$(echo "${REPO_HEADS}" | awk '{for(i=1;i<=NF;i++){tok=$i; gsub(/[^0-9a-f]/,"",tok); if(length(tok)>=8){print toupper(tok); exit}}}' 2>/dev/null || true)
-          # Also try `alembic current --verbose` fallback via python for deterministic HEAD rev
-          set +e
-          REPO_CURRENT_LINE=$(python - <<'PYHEADS'
-          import subprocess, os, re
-          try:
-              out = subprocess.run(
-                  ["python", "-m", "alembic", "heads"],
-                  capture_output=True, text=True, timeout=120,
-              )
-              combined = (out.stdout or "") + "\n" + (out.stderr or "")
-          except Exception as e:
-              combined = f"error: {e}"
-          m = re.search(r"\b([0-9a-f]{8,})\b", combined or "")
-          rev = m.group(1).upper() if m else ""
-          print(rev)
-          PYHEADS
-          )
-          set -e
-          if [ -n "${REPO_CURRENT_LINE:-}" ] && [ ${#REPO_CURRENT_LINE} -ge 8 ]; then
-            REPO_HEAD_REV="${REPO_CURRENT_LINE}"
-          fi
-          REPO_HEAD_REV="${REPO_HEAD_REV:-UNKNOWN}"
-          echo "[step3] repo_alembic_head_rev=${REPO_HEAD_REV}"
+          echo "[step3] repo_alembic_head_rev=${REPO_HEAD_REV} len=${#REPO_HEAD_REV} ok32=$([ ${#REPO_HEAD_REV} -le 32 ] && echo yes || echo no)"
 
           export ALEMBIC_DATABASE_URL="${DATABASE_URL_UNPOOLED}"
 
+          # ── 2. before_rev via Alembic MigrationContext direct SQL-less call ──
           echo "[step3] === PRODUCTION DB REV BEFORE upgrade ==="
+          cat > /tmp/step3_before.py << 'PYEOF'
+          import sys, os
+          from sqlalchemy import create_engine
+          from alembic.runtime.migration import MigrationContext
+          url = os.environ.get('ALEMBIC_DATABASE_URL', '')
+          if not url:
+              sys.stderr.write('ALEMBIC_DATABASE_URL env missing\n')
+              sys.exit(77)
+          engine = create_engine(url)
+          with engine.connect() as conn:
+              ctx = MigrationContext.configure(conn)
+              heads = list(ctx.get_current_heads())
+          if len(heads) == 1:
+              sys.stdout.write(heads[0])
+          elif len(heads) == 0:
+              sys.stdout.write('BASE')
+          else:
+              sys.stderr.write('split_heads_count=%d\n' % len(heads))
+              for h in heads:
+                  sys.stderr.write('  db_head=%s\n' % h)
+              sys.exit(11)
+          sys.stdout.flush()
+          PYEOF
+          sed -i -e 's/^          //' /tmp/step3_before.py
           set +e
-          BEFORE_OUT=$(python -m alembic current 2>&1)
+          BEFORE_REV=$(python /tmp/step3_before.py 2> /tmp/step3_before.stderr)
           BEFORE_RC=$?
           set -e
-          BEFORE_REV=$(echo "${BEFORE_OUT}" | python - <<'PYREV'
-          import sys, re
-          txt = sys.stdin.read()
-          # alembic current prints e.g. "<hex> (head)" or "(empty)" for fresh
-          candidates = re.findall(r"\b([0-9a-f]{8,})\b", txt, flags=re.I)
-          if candidates:
-              print(candidates[-1].upper())
-          else:
-              print("BASE")
-          PYREV
-          )
-          echo "[step3] alembic current exit=${BEFORE_RC}; before_rev=${BEFORE_REV} raw_snippet=[$(echo "${BEFORE_OUT}" | tr '\n' '|' | head -c 600)]"
+          BEFORE_STDERR=$(cat /tmp/step3_before.stderr 2>/dev/null || true)
+          if [ ${BEFORE_RC} -ne 0 ]; then
+            echo "[step3][FATAL] production DB current (before) rc=${BEFORE_RC}; stderr=$(printf '%s' "${BEFORE_STDERR}" | tr '\n' '|' | head -c 600). Abort BLOCKED_PRODUCTION_MIGRATION." >&2
+            exit 79
+          fi
+          echo "[step3] before_rev=${BEFORE_REV}"
 
+          # ── 3. Idempotent alembic upgrade head ──
           echo "[step3] === PRODUCTION alembic upgrade head ==="
           set +e
           UPGRADE_START_TS=$(date -u +%s)
@@ -510,32 +544,53 @@ jobs:
           UPGRADE_DUR=$((UPGRADE_END_TS - UPGRADE_START_TS))
           set -e
           # NEVER print ALEMBIC_OUT in full: it might include env/args/connection strings
-          echo "[step3] alembic upgrade head exit=${UPGRADE_RC}; duration_s=${UPGRADE_DUR}; output_chars=$(echo -n "${ALEMBIC_OUT}" | wc -m); output_lines=$(echo "${ALEMBIC_OUT}" | wc -l); sanitized_head_800=$(echo "${ALEMBIC_OUT}" | tr '\n' '|' | sed 's/postgresql:[^|]*postgresql:/<redacted-postgres-uri>/g; s/pass=[^| ]*/pass=<redacted>/g; s/password=[^| ]*/password=<redacted>/g; s/token=[^| ]*/token=<redacted>/g' | head -c 800)"
+          ALEMBIC_SANITIZED=$(echo "${ALEMBIC_OUT}" | tr '\n' '|' | sed 's#postgresql:[^|]*postgresql:#<redacted-postgres-uri>#g; s#postgresql://[^| ]*#<redacted-postgres-uri>#g; s#pass=[^| ]*#pass=<redacted>#g; s#password=[^| ]*#password=<redacted>#g; s#token=[^| ]*#token=<redacted>#g')
+          echo "[step3] alembic upgrade head exit=${UPGRADE_RC}; duration_s=${UPGRADE_DUR}; output_chars=$(echo -n "${ALEMBIC_OUT}" | wc -m); output_lines=$(echo "${ALEMBIC_OUT}" | wc -l); sanitized_head_800=$(echo "${ALEMBIC_SANITIZED}" | head -c 800)"
 
           if [ ${UPGRADE_RC} -ne 0 ]; then
             echo "[step3][FATAL] alembic upgrade head returned rc=${UPGRADE_RC}. Abort BLOCKED_PRODUCTION_MIGRATION_UPGRADE_FAILED." >&2
-            echo "[step3] sanitized_tail_800=$(echo "${ALEMBIC_OUT}" | tail -n 80 | tr '\n' '|' | sed 's/postgresql:[^|]*postgresql:/<redacted-postgres-uri>/g; s/pass=[^| ]*/pass=<redacted>/g; s/password=[^| ]*/password=<redacted>/g; s/token=[^| ]*/token=<redacted>/g' | tail -c 800)" >&2
+            echo "[step3] sanitized_tail_800=$(echo "${ALEMBIC_SANITIZED}" | tail -c 800)" >&2
             exit 80
           fi
 
+          # ── 4. after_rev via same MigrationContext direct call ──
           echo "[step3] === PRODUCTION DB REV AFTER upgrade ==="
+          cat > /tmp/step3_after.py << 'PYEOF'
+          import sys, os
+          from sqlalchemy import create_engine
+          from alembic.runtime.migration import MigrationContext
+          url = os.environ.get('ALEMBIC_DATABASE_URL', '')
+          if not url:
+              sys.stderr.write('ALEMBIC_DATABASE_URL env missing\n')
+              sys.exit(77)
+          engine = create_engine(url)
+          with engine.connect() as conn:
+              ctx = MigrationContext.configure(conn)
+              heads = list(ctx.get_current_heads())
+          if len(heads) == 1:
+              sys.stdout.write(heads[0])
+          elif len(heads) == 0:
+              sys.stdout.write('BASE')
+          else:
+              sys.stderr.write('split_heads_count=%d\n' % len(heads))
+              for h in heads:
+                  sys.stderr.write('  db_head=%s\n' % h)
+              sys.exit(11)
+          sys.stdout.flush()
+          PYEOF
+          sed -i -e 's/^          //' /tmp/step3_after.py
           set +e
-          AFTER_OUT=$(python -m alembic current 2>&1)
+          AFTER_REV=$(python /tmp/step3_after.py 2> /tmp/step3_after.stderr)
           AFTER_RC=$?
           set -e
-          AFTER_REV=$(echo "${AFTER_OUT}" | python - <<'PYREV'
-          import sys, re
-          txt = sys.stdin.read()
-          candidates = re.findall(r"\b([0-9a-f]{8,})\b", txt, flags=re.I)
-          if candidates:
-              print(candidates[-1].upper())
-          else:
-              print("BASE")
-          PYREV
-          )
-          echo "[step3] alembic current exit=${AFTER_RC}; after_rev=${AFTER_REV} raw_snippet=[$(echo "${AFTER_OUT}" | tr '\n' '|' | head -c 600)]"
+          AFTER_STDERR=$(cat /tmp/step3_after.stderr 2>/dev/null || true)
+          if [ ${AFTER_RC} -ne 0 ]; then
+            echo "[step3][FATAL] production DB current (after) rc=${AFTER_RC}; stderr=$(printf '%s' "${AFTER_STDERR}" | tr '\n' '|' | head -c 600). Abort BLOCKED_PRODUCTION_MIGRATION." >&2
+            exit 79
+          fi
+          echo "[step3] after_rev=${AFTER_REV}"
 
-          # Truth gate: after_rev == repo_head_rev (case-insensitive)
+          # ── 5. TRUTH GATE: after_rev == repo_head_rev case-insensitive ──
           BEFORE_CMP=$(echo "${BEFORE_REV}" | tr '[:lower:]' '[:upper:]')
           AFTER_CMP=$(echo "${AFTER_REV}"  | tr '[:lower:]' '[:upper:]')
           HEAD_CMP=$(echo "${REPO_HEAD_REV}" | tr '[:lower:]' '[:upper:]')
