@@ -31,7 +31,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "r3_grant_runtime_all_public_objects_20260828"
+revision = "r3_grant_all_public_20260828"
 down_revision = "r2_grant_runtime_tables_20260828"
 branch_labels = None
 depends_on = None
