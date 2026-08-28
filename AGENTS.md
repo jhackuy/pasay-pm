@@ -57,3 +57,12 @@ SOLO 会话启动时按以下顺序加载上下文（**本文件 = 最高权威�
 - Agent self-report is never enough to claim success; independent GitHub checks, reviews, and human acceptance remain authoritative.
 - Final Owner-facing reports default to Chinese unless the task explicitly says otherwise.
 - All delivery goes through PR; never modify authority or base-branch business code directly.
+
+## 6. Production Permission-Incident Guardrails（永久权限故障刹车线）
+
+1. An SQLSTATE / exception class alone is never a root cause. Before any repair, preserve a sanitized exact failing operation, object type/name, `current_user`, and `current_database`.
+2. A green side-channel probe does not prove the deployed runtime path. Reproduce the same role, connection mode, and startup/request path before diagnosing a production permission incident.
+3. Do not broaden privilege as a first response. Until the exact missing privilege is proven, prohibit `GRANT ... ON ALL TABLES`, `GRANT CREATE ON SCHEMA public`, connection termination, pool resets, and blind reruns.
+4. Runtime application roles are DML-only. Schema DDL is owned by migrations run under the migration owner; production runtime must not issue `CREATE`, `ALTER`, or `DROP`.
+5. Every permission repair must add a focused regression: the production runtime role has no schema CREATE privilege, while the affected deployed startup/request path succeeds.
+6. Reports must label **raw evidence**, **verified facts**, **hypotheses**, and **proposed repair** separately. A hypothesis must not be reported or acted on as a root cause.
