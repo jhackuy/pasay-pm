@@ -56,8 +56,10 @@ jobs:
           set -euo pipefail
           gh pr view "$PR_NUMBER" --json number,title,body,url,baseRefName,headRefName,author,comments > /tmp/opencode-pr.json
           gh pr diff "$PR_NUMBER" > /tmp/opencode-pr.diff
+          gh repo view --json nameWithOwner,defaultBranchRef > /tmp/opencode-repo.json
           test -s /tmp/opencode-pr.json
           test -s /tmp/opencode-pr.diff
+          test -s /tmp/opencode-repo.json
 
       - name: Run independent OpenCode reviewer
         id: reviewer
@@ -72,18 +74,28 @@ jobs:
           prompt=$(cat <<'EOF'
           You are the independent OpenCode PR Reviewer for jhackuy/pasay-pm.
           READ-ONLY: never edit files, never commit, never push, never create another PR,
-          never reveal any secret or environment value.
+          never execute a deployment, and never reveal any secret or environment value.
 
-          Review only the attached PR metadata/conversation and PR diff.
+          Review only the attached repository metadata, PR metadata/conversation, and PR diff.
           Check acceptance intent identifiable from the PR body/conversation, scope creep,
           correctness/regressions, security/concurrency/data integrity when applicable,
           and missing tests for changed behavior. Ignore stylistic preferences, speculative
           refactors, and unrelated legacy debt.
 
-          Forbidden scope includes business code under app/, migrations/, Mini App,
-          Cloudflare/Neon/Telegram production deployment, AGENTS.md, custom runners/watchers/
+          Reviewing code that defines a Cloudflare/Neon/Telegram production deployment workflow
+          is allowed when the PR itself does not execute production deployment or mutate production
+          resources/secrets. Treat such workflow changes as ordinary code-review scope and scrutinize
+          their triggers, permissions, environment boundary, secret handling, concurrency, migration,
+          deploy, smoke, evidence, and fail-closed behavior.
+
+          Forbidden scope includes business code under app/, migrations/, Mini App, actual
+          Cloudflare/Neon/Telegram production execution or mutation, AGENTS.md, custom runners/watchers/
           pollers/daemons/orchestrators, label automation beyond contract, and production
           secrets/auth/provider-model changes.
+
+          Use the attached repository metadata as the source of truth for the current default branch.
+          Do not claim a PR bypasses the protected default branch merely because the branch name looks
+          feature-like; compare baseRefName against defaultBranchRef.name from that metadata.
 
           Output exactly one of:
           REVIEW_PASS
@@ -96,7 +108,7 @@ jobs:
           EOF
           )
 
-          output="$(opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-pr.json --file /tmp/opencode-pr.diff)"
+          output="$(opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-repo.json --file /tmp/opencode-pr.json --file /tmp/opencode-pr.diff)"
           printf '%s\n' "$output" | sed -r 's/\x1B\[[0-9;]*[mK]//g' > /tmp/opencode-review.txt
           cat /tmp/opencode-review.txt
 
