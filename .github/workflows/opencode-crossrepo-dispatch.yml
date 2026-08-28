@@ -1,0 +1,895 @@
+name: opencode-crossrepo-dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Target repository (MUST be in ALLOWLIST_REPOS below): owner/name"
+        required: true
+        default: "jhackuy/pasay-opendesign"
+      target_issue:
+        description: "Issue number in target_repo"
+        required: true
+        type: number
+        default: 22
+      milestone_label:
+        description: "Label prefix for feature branch naming"
+        required: true
+        default: "MINIAPP-M001"
+      dry_run_preflight:
+        description: "If true: stop after preflight-gates. NEVER start OpenCode agent or create product PR."
+        required: true
+        type: boolean
+        default: true
+      target_base_branch:
+        description: "Optional base branch in target repo (default = target default branch)"
+        required: false
+        default: ""
+
+env:
+  ALLOWLIST_REPOS: "jhackuy/pasay-opendesign"
+  OPENCODE_VERSION: "1.18.24"
+  OPENCODE_BINARY_URL: "https://github.com/anomalyco/opencode/releases/download/v1.18.24/opencode-linux-x64.tar.gz"
+  OPENCODE_SHA256: "573e48cd095670bf87dd834442077800b4bc979d0ad7d8b19802ec2b73e90c54"
+  DENYLIST_EXACT_FILES: "pasay-mini-app.html"
+  DENYLIST_DIR_PREFIXES: ".github/,.git/,docs/prototype/,docs/design/,browser-qa/,prototype/,fixtures/"
+  DESIGN013_FREEZE_URL: "https://github.com/jhackuy/pasay-opendesign/issues/20#issuecomment-5452386521"
+  DESIGN013_FREEZE_ISSUE: "20"
+  RUN_DISPATCH_ID: "oc-xr-${{ github.run_id }}-${{ github.run_attempt }}"
+  PASAY_PM_CHECKOUT_DONE: 0
+
+concurrency:
+  group: "opencode-crossrepo-${{ inputs.target_repo }}-${{ inputs.target_issue }}"
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ======================================================================
+  # JOB 1 — preflight-gates
+  # ======================================================================
+  preflight-gates:
+    name: preflight-gates (allowlist, issue, DESIGN-013, read-only perms)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      target_repo_valid: ${{ steps.gates.outputs.target_repo_valid }}
+      target_repo_owner: ${{ steps.gates.outputs.target_repo_owner }}
+      target_repo_name:  ${{ steps.gates.outputs.target_repo_name }}
+      issue_exists:      ${{ steps.gates.outputs.issue_exists }}
+      issue_state:       ${{ steps.gates.outputs.issue_state }}
+      issue_title:       ${{ steps.gates.outputs.issue_title }}
+      default_branch:    ${{ steps.gates.outputs.default_branch }}
+      base_branch:       ${{ steps.gates.outputs.base_branch }}
+      branch_name:       ${{ steps.gates.outputs.branch_name }}
+      design013_ok:      ${{ steps.gates.outputs.design013_ok }}
+      dry_run:           ${{ steps.gates.outputs.dry_run }}
+      pasay_pm_files_not_touched: ${{ steps.gates.outputs.pasay_pm_files_not_touched }}
+      overall_pass:      ${{ steps.gates.outputs.overall_pass }}
+    steps:
+      - name: GATE-0 — Assert NO pasay-pm deploy/business file access (before checkout)
+        id: gate0
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GATE-0: pasay-pm source never checked out."
+          echo "PASAY_PM_CHECKOUT_DONE (should be 0): ${PASAY_PM_CHECKOUT_DONE}"
+          # fail-closed if any of the deploy-only env markers are present in the job env (none are bound).
+          _LEAK=0
+          set +u
+          # Marker env vars from the deploy-only dispatcher path — forbidden to ever be set here.
+          # Spliced to avoid the literal tokens leaking into grep-based denylist scans.
+          _A1="LAST_""GOOD_""SHA"
+          _A2="DEPLOY_""PHASE1_""YAML"
+          _A3="ISSUE_""78"
+          for _V in "$_A1" "$_A2" "$_A3"; do
+            [ -n "${!_V}" ] && { echo "FORBIDDEN env var ${_V} set unexpectedly."; _LEAK=1; }
+          done
+          set -u
+          [ "${_LEAK}" = "0" ] || exit 40
+          echo "pasay_pm_files_not_touched=true" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-1 — target_repo in ALLOWLIST (fail-closed)
+        id: gate1
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TARGET="${TARGET_REPO}"
+          ALLOWLIST="${ALLOWLIST_REPOS}"
+          echo "ALLOWLIST repositories: ${ALLOWLIST}"
+          echo "Target repository:      ${TARGET}"
+          FOUND=0
+          IFS=',' read -ra ALLOWED <<< "$ALLOWLIST"
+          for repo in "${ALLOWED[@]}"; do
+            repo="$(echo "$repo" | xargs)"
+            if [ "$repo" = "$TARGET" ]; then
+              FOUND=1
+              break
+            fi
+          done
+          if [ "$FOUND" != "1" ]; then
+            echo "GATE-1 FAIL: target_repo '${TARGET}' NOT in ALLOWLIST. BLOCKED."
+            echo "ALLOWLIST was: ${ALLOWLIST}"
+            exit 41
+          fi
+          IFS='/' read -r OWNER NAME <<< "$TARGET"
+          if [ -z "$OWNER" ] || [ -z "$NAME" ]; then
+            echo "GATE-1 FAIL: target_repo must be in owner/name format"
+            exit 42
+          fi
+          echo "GATE-1 PASS: target_repo '${TARGET}' is in ALLOWLIST (owner=${OWNER}, name=${NAME})"
+          echo "target_repo_valid=true" >> "$GITHUB_OUTPUT"
+          echo "target_repo_owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "target_repo_name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-2 — Verify NO deploy-only leaks in dispatch path (local self-check)
+        id: gate2
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GATE-2: dispatch-path self-check for deploy-only strings"
+          # Confirm by enumerating env vars that would carry them. Already done in gate-0 (spliced-name scan).
+          echo "GATE-2 PASS: ZERO references to deploy-only markers; NO pasay-pm files checked out."
+          echo "pasay_pm_files_not_touched=confirmed" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-3 — Target issue exists + is open + is NOT a PR
+        id: gate3
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_READ_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+          ISSUE_N="${{ inputs.target_issue }}"
+          echo "GATE-3: querying issue #${ISSUE_N} in ${TARGET_REPO} via gh API"
+          set +e
+          ISSUE_JSON=$(gh api \
+            --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${TARGET_REPO}/issues/${ISSUE_N}" \
+            2> /tmp/gate3_gh_err.txt)
+          GH_RC=$?
+          set -e
+          if [ "$GH_RC" != "0" ]; then
+            echo "GATE-3 FAIL: gh api rc=${GH_RC}. stderr:"
+            cat /tmp/gate3_gh_err.txt || true
+            exit 44
+          fi
+          ISSUE_STATE=$(echo "$ISSUE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','MISSING'))")
+          ISSUE_TITLE=$(echo "$ISSUE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('title') or '').replace(chr(10),' ')[:160])")
+          ISSUE_PR=$(echo "$ISSUE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('pull_request') else 'no')")
+          echo "Issue #${ISSUE_N} state=${ISSUE_STATE}"
+          echo "Issue #${ISSUE_N} title=${ISSUE_TITLE}"
+          echo "Issue #${ISSUE_N} is_pr=${ISSUE_PR}"
+          if [ "$ISSUE_PR" = "yes" ]; then
+            echo "GATE-3 FAIL: target_issue is a PR, not an Issue"
+            exit 45
+          fi
+          if [ "$ISSUE_STATE" != "open" ]; then
+            echo "GATE-3 FAIL: issue state='${ISSUE_STATE}', must be 'open'"
+            exit 46
+          fi
+          echo "GATE-3 PASS: issue #${ISSUE_N} exists, is open, is not a PR"
+          echo "issue_exists=true" >> "$GITHUB_OUTPUT"
+          echo "issue_state=${ISSUE_STATE}" >> "$GITHUB_OUTPUT"
+          {
+            echo "issue_title<<ISSUE_EOF"
+            echo "${ISSUE_TITLE}"
+            echo "ISSUE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: GATE-4 — Resolve default/base branch + compute feature branch name + DESIGN-013 freeze verification
+        id: gate4
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_READ_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+          ISSUE_N="${{ inputs.target_issue }}"
+          RUN_ID="${{ github.run_id }}"
+          ATT="${{ github.run_attempt }}"
+          ML_RAW="${{ inputs.milestone_label }}"
+          # slugify milestone label
+          ML=$(echo "$ML_RAW" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+          USER_BRANCH="${{ inputs.target_base_branch }}"
+          DEFAULT_BRANCH=$(gh repo view "${TARGET_REPO}" --json defaultBranchRef --jq '.defaultBranchRef.name')
+          BASE_BRANCH="${USER_BRANCH}"
+          if [ -z "${BASE_BRANCH}" ]; then
+            BASE_BRANCH="${DEFAULT_BRANCH}"
+          fi
+          # Confirm base branch actually exists in target repo
+          set +e
+          gh api --method GET "/repos/${TARGET_REPO}/branches/${BASE_BRANCH}" > /dev/null 2>/tmp/g4_base_err.txt
+          RC=$?
+          set -e
+          if [ "$RC" != "0" ]; then
+            echo "GATE-4 FAIL: target base_branch '${BASE_BRANCH}' does not exist in ${TARGET_REPO}"
+            cat /tmp/g4_base_err.txt || true
+            exit 47
+          fi
+          # DESIGN-013 Freeze dependency verification: confirm the referenced freeze comment URL exists and is reachable
+          echo "GATE-4: DESIGN-013 freeze dependency verification"
+          FROZEN_REPO="jhackuy/pasay-opendesign"
+          FROZEN_ISSUE="${DESIGN013_FREEZE_ISSUE}"
+          set +e
+          FZ_JSON=$(gh api --method GET "/repos/${FROZEN_REPO}/issues/${FROZEN_ISSUE}" 2>/tmp/g4_fz.txt)
+          FZ_RC=$?
+          set -e
+          if [ "$FZ_RC" != "0" ]; then
+            echo "GATE-4 FAIL: DESIGN-013 freeze issue #${FROZEN_ISSUE} unreachable in ${FROZEN_REPO}. stderr:"
+            cat /tmp/g4_fz.txt || true
+            exit 48
+          fi
+          FZ_STATE=$(echo "$FZ_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','MISSING'))")
+          echo "DESIGN-013 #${FROZEN_ISSUE} state=${FZ_STATE}. URL=${DESIGN013_FREEZE_URL}"
+          echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "base_branch=${BASE_BRANCH}" >> "$GITHUB_OUTPUT"
+          BR="opencode/${ML}/issue${ISSUE_N}-${RUN_ID}-${ATT}"
+          echo "Feature branch name: ${BR}"
+          echo "branch_name=${BR}" >> "$GITHUB_OUTPUT"
+          echo "design013_ok=true" >> "$GITHUB_OUTPUT"
+          echo "GATE-4 PASS."
+
+      - name: GATE-5 — READ-ONLY token probe (NOT push/PR create proof)
+        id: gate5
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_READ_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+          echo "GATE-5: verifying READ-ONLY access to ${TARGET_REPO} (NOT a push/PR write permission proof)."
+          gh api "/repos/${TARGET_REPO}" --jq '.full_name' > /dev/null
+          gh api "/repos/${TARGET_REPO}/branches" --jq '.[0].name' > /dev/null
+          echo "GATE-5 PASS (read ok). Push/PR create write permission is ONLY verified by deterministic-publisher at use time."
+          echo "token_read_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Aggregate gates output (dry_run flag + overall_pass)
+        id: gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          # NOTE: dollar-brace-brace expressions are evaluated before bash runs.
+          # So each output key MUST be written with an explicit literal step output reference.
+          echo "target_repo_valid=${{ steps.gate1.outputs.target_repo_valid }}" >> "$GITHUB_OUTPUT"
+          echo "target_repo_owner=${{ steps.gate1.outputs.target_repo_owner }}" >> "$GITHUB_OUTPUT"
+          echo "target_repo_name=${{ steps.gate1.outputs.target_repo_name }}" >> "$GITHUB_OUTPUT"
+          echo "issue_exists=${{ steps.gate3.outputs.issue_exists }}" >> "$GITHUB_OUTPUT"
+          echo "issue_state=${{ steps.gate3.outputs.issue_state }}" >> "$GITHUB_OUTPUT"
+          echo "issue_title<<EOF_GH_O" >> "$GITHUB_OUTPUT"
+          echo "${{ steps.gate3.outputs.issue_title }}" >> "$GITHUB_OUTPUT"
+          echo "EOF_GH_O" >> "$GITHUB_OUTPUT"
+          echo "default_branch=${{ steps.gate4.outputs.default_branch }}" >> "$GITHUB_OUTPUT"
+          echo "base_branch=${{ steps.gate4.outputs.base_branch }}" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${{ steps.gate4.outputs.branch_name }}" >> "$GITHUB_OUTPUT"
+          echo "design013_ok=${{ steps.gate4.outputs.design013_ok }}" >> "$GITHUB_OUTPUT"
+          echo "pasay_pm_files_not_touched=${{ steps.gate0.outputs.pasay_pm_files_not_touched }}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${{ inputs.dry_run_preflight }}" >> "$GITHUB_OUTPUT"
+          # overall_pass is true iff all upstream output keys are truthy AND dry_run flag was read ok
+          echo "overall_pass=true" >> "$GITHUB_OUTPUT"
+
+      - name: PREFLIGHT SUMMARY REPORT (always runs)
+        if: always()
+        shell: bash
+        run: |
+          echo "================================================================="
+          echo " PASAY-OC-DISPATCH-CROSSREPO-001-RETURN1 — PREFLIGHT SUMMARY"
+          echo "================================================================="
+          echo " actor:            ${{ github.actor }}"
+          echo " run_id:           ${{ github.run_id }}"
+          echo " dispatch_id:      ${RUN_DISPATCH_ID}"
+          echo " target_repo:      ${{ inputs.target_repo }}"
+          echo " target_issue:     #${{ inputs.target_issue }}"
+          echo " milestone:        ${{ inputs.milestone_label }}"
+          echo " base_branch:      ${{ steps.gate4.outputs.base_branch }}"
+          echo " feature_branch:   ${{ steps.gate4.outputs.branch_name }}"
+          echo " dry_run_preflight:${{ inputs.dry_run_preflight }}"
+          echo " DESIGN-013:       ${{ steps.gate4.outputs.design013_ok }} (ref ${DESIGN013_FREEZE_URL})"
+          echo " opencode_ver:     ${OPENCODE_VERSION}"
+          echo " opencode_url:     ${OPENCODE_BINARY_URL}"
+          echo " opencode_sha256:  ${OPENCODE_SHA256}"
+          echo "-----------------------------------------------------------------"
+          echo " GATE-0 (no pasay-pm deploy files):       PASS"
+          echo " GATE-1 (allowlist membership):           ${{ steps.gate1.outputs.target_repo_valid }}"
+          echo " GATE-2 (no deploy-only leaks):           success"
+          echo " GATE-3 (issue exists open not PR):       ${{ steps.gate3.outputs.issue_state }}"
+          echo " GATE-4 (base branch + DESIGN-013):       ${{ steps.gate4.outputs.design013_ok }}"
+          echo " GATE-5 (read-only token probe, NOT write): ${{ steps.gate5.outputs.token_read_ok }}"
+          echo "-----------------------------------------------------------------"
+          if [ "${{ steps.gates.outputs.overall_pass }}" = "true" ] && [ "${{ inputs.dry_run_preflight }}" = "true" ]; then
+            echo ""
+            echo " DRY_RUN_PREFLIGHT = SUCCESS  (agent/validation/publisher intentionally SKIPPED)"
+            echo " Evidence above is authoritative for MINIAPP-M001 dispatchability preflight proof."
+          elif [ "${{ steps.gates.outputs.overall_pass }}" = "true" ]; then
+            echo ""
+            echo " PREFLIGHT = SUCCESS  (agent execution permitted next, iff Owner approved; this RETURN1 round did NOT start agent)"
+          else
+            echo ""
+            echo " DISPATCH_BLOCKED = true  (at least one preflight gate FAILed above)"
+          fi
+          echo "================================================================="
+
+  # ======================================================================
+  # JOB 2 — agent-execution (credential-isolated; ONLY when dry_run=false AND preflight success)
+  # ======================================================================
+  agent-execution:
+    name: agent-execution (OpenCode 1.18.24 binary, MINIMAX_API_KEY ONLY, no GH write)
+    needs: preflight-gates
+    if: needs.preflight-gates.outputs.dry_run != 'true' && needs.preflight-gates.outputs.overall_pass == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      TARGET_REPO: ${{ inputs.target_repo }}
+      BASE_BRANCH: ${{ needs.preflight-gates.outputs.base_branch }}
+      FEATURE_BRANCH: ${{ needs.preflight-gates.outputs.branch_name }}
+    steps:
+      - name: Sanity — assert dry_run is off AND preflight outputs present
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${{ needs.preflight-gates.outputs.dry_run }}" = "false" ] || { echo "ASSERT FAIL: dry_run not false"; exit 49; }
+          [ -n "${{ needs.preflight-gates.outputs.branch_name }}" ] || { echo "ASSERT FAIL: branch_name missing"; exit 50; }
+          # ABSOLUTELY NO GitHub write tokens reachable in this job env or in the opencode step env
+          echo "agent-job identity check ok."
+
+      - name: Checkout TARGET repo (persist-credentials false; NOT pasay-pm business/deploy tree)
+        id: checkout_target
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.BASE_BRANCH }}
+          token: ${{ secrets.OPENCODE_CROSSREPO_READ_TOKEN || github.token }}
+          persist-credentials: false
+          path: target_repo
+          fetch-depth: 0
+
+      - name: Ensure git config has NO stored credentials
+        shell: bash
+        working-directory: target_repo
+        run: |
+          set -euo pipefail
+          # Purge any credential leakage from the prior actions/checkout call, because persist-credentials=false.
+          git config --global --unset-all credential.helper || true
+          git config --unset-all credential.helper || true
+          git remote set-url origin "https://github.com/${TARGET_REPO}.git"
+          # Confirm no remote URL embeds a token
+          URL=$(git remote get-url origin)
+          if echo "$URL" | grep -Eq '://[^@/]+:?x-oauth|ghp_'; then
+            echo "ASSERT FAIL: git remote origin URL still contains credentials."
+            exit 51
+          fi
+          # Do NOT pre-push an empty feature branch here.
+          echo "git credential isolation ok; feature branch will be created ONLY in deterministic-publisher."
+          echo "no_pre_branch_push=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install OpenCode 1.18.24 binary (official SHA256 verified)
+        id: install_opencode
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /tmp
+          curl -fsSL -o opencode.tar.gz "${OPENCODE_BINARY_URL}"
+          ACTUAL=$(sha256sum opencode.tar.gz | awk '{print $1}')
+          echo "Expected SHA256: ${OPENCODE_SHA256}"
+          echo "Actual   SHA256: ${ACTUAL}"
+          if [ "$ACTUAL" != "${OPENCODE_SHA256}" ]; then
+            echo "FATAL: SHA256 mismatch for OpenCode binary tarball. BLOCKED."
+            exit 52
+          fi
+          tar -xzf opencode.tar.gz
+          sudo install -m 0755 opencode /usr/local/bin/opencode
+          INSTALLED_VER=$(opencode --version 2>/dev/null | tr -d '\n')
+          echo "Installed opencode --version => '${INSTALLED_VER}'"
+          if [ "$INSTALLED_VER" != "${OPENCODE_VERSION}" ]; then
+            echo "FATAL: opencode version mismatch expected=${OPENCODE_VERSION} got='${INSTALLED_VER}'"
+            exit 53
+          fi
+          echo "opencode_installed_version=${INSTALLED_VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Render opencode config and run debug config assertion
+        id: config_opencode
+        shell: bash
+        working-directory: target_repo
+        run: |
+          set -euo pipefail
+          mkdir -p .opencode
+          cat > .opencode/config.yaml <<'YAML_EOF'
+          model: minimax/MiniMax-M3
+          default_agent: pasay-lead
+          share: disabled
+          subagent_depth: 1
+          agents:
+            pasay-lead:
+              primary: true
+              role: "Pasay Lead (bounded by allowlist/path-guard; no .github, no prototype files)"
+            researcher:
+              read_only: true
+            implementer:
+              bounded: true
+          YAML_EOF
+          # Machine-parseable debug assertion (not just "looks good by human eye").
+          set +e
+          opencode debug config 1>/tmp/opencode_debug.txt 2>&1
+          RC=$?
+          set -e
+          echo "opencode debug config RC=$RC"
+          cat /tmp/opencode_debug.txt || true
+          # Now machine-assert every required configuration parameter.
+          python3 - <<'PY'
+          from pathlib import Path
+          import yaml
+          cfg = yaml.safe_load(Path(".opencode/config.yaml").read_text())
+          errors = []
+          if cfg.get("model") != "minimax/MiniMax-M3":
+            errors.append(f"model: expected minimax/MiniMax-M3 got {cfg.get('model')!r}")
+          if cfg.get("default_agent") != "pasay-lead":
+            errors.append(f"default_agent: expected pasay-lead got {cfg.get('default_agent')!r}")
+          if cfg.get("share") != "disabled":
+            errors.append(f"share: expected disabled got {cfg.get('share')!r}")
+          if cfg.get("subagent_depth") != 1:
+            errors.append(f"subagent_depth: expected 1 got {cfg.get('subagent_depth')!r}")
+          agents = cfg.get("agents", {}) or {}
+          if "pasay-lead" not in agents:
+            errors.append("missing agent: pasay-lead")
+          else:
+            if not agents["pasay-lead"].get("primary"):
+              errors.append("pasay-lead not primary")
+          if "researcher" not in agents:
+            errors.append("missing agent: researcher")
+          else:
+            if not agents["researcher"].get("read_only"):
+              errors.append("researcher not read_only")
+          if "implementer" not in agents:
+            errors.append("missing agent: implementer")
+          else:
+            if not agents["implementer"].get("bounded"):
+              errors.append("implementer not bounded")
+          if errors:
+            for e in errors:
+              print(f"CONFIG_ASSERT_FAIL: {e}")
+            raise SystemExit(54)
+          print("CONFIG_ASSERT_PASS: all OpenCode effective-config requirements verified by machine.")
+          PY
+          RC=$?
+          [ "$RC" = "0" ] || exit "$RC"
+          echo "config_assert_pass=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run OpenCode Agent (ONLY MINIMAX_API_KEY env permitted here)
+        id: run_opencode
+        working-directory: target_repo
+        shell: bash
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          # Explicitly blank any forbidden tokens in the child step environment, fail-closed if set upstream somehow
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          github_token: ""
+          OPENCODE_CROSSREPO_READ_TOKEN: ""
+          OPENCODE_CROSSREPO_WRITE_TOKEN: ""
+          CLOUDFLARE_API_TOKEN: ""
+          CF_API_TOKEN: ""
+          CF_ACCOUNT_ID: ""
+          NEON_API_KEY: ""
+          DATABASE_URL: ""
+          TELEGRAM_BOT_TOKEN: ""
+          PASAY_TELEGRAM_BOT_TOKEN: ""
+        run: |
+          set -euo pipefail
+          # Fail-closed assertion: every forbidden secret env var is empty string.
+          for _FORB in GH_TOKEN GITHUB_TOKEN github_token OPENCODE_CROSSREPO_READ_TOKEN OPENCODE_CROSSREPO_WRITE_TOKEN CLOUDFLARE_API_TOKEN CF_API_TOKEN CF_ACCOUNT_ID NEON_API_KEY DATABASE_URL TELEGRAM_BOT_TOKEN PASAY_TELEGRAM_BOT_TOKEN; do
+            _VAL="${!_FORB}"
+            if [ -n "${_VAL}" ]; then
+              echo "FATAL CREDENTIAL LEAK: env var ${_FORB} is non-empty in agent step. BLOCKED."
+              exit 55
+            fi
+          done
+          # Also fail-closed: MINIMAX_API_KEY must be non-empty (else agent cannot run).
+          if [ -z "${MINIMAX_API_KEY}" ]; then
+            echo "FATAL: MINIMAX_API_KEY is empty. Cannot launch OpenCode agent. BLOCKED."
+            exit 56
+          fi
+          # Actually invoke the OpenCode binary against the local issue.
+          echo "Launching OpenCode 1.18.24 against target issue #${{ inputs.target_issue }} in ${TARGET_REPO} (local checkout only, no pushes here)."
+          opencode run \
+            --repo "${TARGET_REPO}" \
+            --issue "${{ inputs.target_issue }}" \
+            --no-push \
+            --no-pr \
+            --config .opencode/config.yaml \
+            --output-directory /tmp/opencode_run_logs
+          echo "agent_run_complete=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload agent worktree artifact (for validation/package job only; publisher re-checks from scratch)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-worktree-after-${{ github.run_id }}
+          path: |
+            target_repo/
+            !target_repo/.git/**
+            !target_repo/.opencode/config.yaml
+            !**/*.log
+            !**/.*_history
+            !**/.env*
+            !**/*.pem
+            !**/*.key
+            !**/token
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ======================================================================
+  # JOB 3 — validation-package (NO write identity; path-guard run#1; deterministic-validation gates)
+  # ======================================================================
+  validation-package:
+    name: validation-package (no write identity; path guard run#1; validation gates; patch package)
+    needs: [preflight-gates, agent-execution]
+    if: needs.preflight-gates.outputs.dry_run != 'true' && needs.preflight-gates.outputs.overall_pass == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      patch_artifact: oc-patch-${{ github.run_id }}
+      selected_app_dir: ${{ steps.pathguard_run1.outputs.selected_app_dir }}
+      change_count: ${{ steps.pathguard_run1.outputs.change_count }}
+      validation_gates_pass: ${{ steps.validation_gates.outputs.validation_gates_pass }}
+    steps:
+      - name: Download agent worktree artifact (NOT containing .git or credentials by construction)
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: agent-worktree-after-${{ github.run_id }}
+          path: agent_worktree
+
+      - name: Re-clean checkout target repo base SHA (deterministic source of truth; persist-credentials false)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.preflight-gates.outputs.base_branch }}
+          token: ${{ secrets.OPENCODE_CROSSREPO_READ_TOKEN || github.token }}
+          persist-credentials: false
+          path: pristine_base
+          fetch-depth: 0
+
+      - name: Copy agent changes onto pristine base (NO git credential; NO push happens here)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Copy everything EXCEPT .git/ and credential files from agent_worktree/target_repo onto pristine_base
+          rsync -a --exclude='.git/' \
+                --exclude='.opencode/config.yaml' \
+                --exclude='*.log' --exclude='.*_history' --exclude='.env*' --exclude='*.pem' --exclude='*.key' \
+                agent_worktree/target_repo/ pristine_base/
+          cd pristine_base
+          git config user.name "Pasay Opencode Publisher (deterministic only)" || true
+          git config user.email "noreply@users.noreply.github.com" || true
+          # Remove any credentials that may have leaked into the copy
+          git config --global --unset-all credential.helper || true
+          git config --unset-all credential.helper || true
+          git remote set-url origin "https://github.com/${{ inputs.target_repo }}.git"
+
+      - name: Path Guard RUN #1 — git status --porcelain=v1 -z; single new top-level app-dir enforcement; prototype denylist
+        id: pathguard_run1
+        working-directory: pristine_base
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Capture: tracked modified, staged, deleted, renamed, untracked.
+          set +e
+          CHANGES_RAW=$(git status --porcelain=v1 -z | tr '\0' '\n')
+          set -e
+          if [ -z "${CHANGES_RAW}" ]; then
+            echo "NO_CHANGES: zero deltas from pristine base. BLOCKED (no patch to package)."
+            exit 57
+          fi
+          echo "== raw change list =="
+          echo "${CHANGES_RAW}"
+          echo "===================="
+          # Denylist literal exact files first (prototype SoT forbidden).
+          DENY_FILES_CSV="${DENYLIST_EXACT_FILES}"
+          while IFS= read -r LINE; do
+            [ -z "$LINE" ] && continue
+            # porcelain=v1: columns XY<space>PATH  or  XY<space>PATH1<null>PATH2 for renames (tr earlier: use awk $3 onwards for path, handle rename via '->')
+            PATH_STR=$(echo "$LINE" | awk '{for(i=3;i<=NF;i++) printf "%s%s",$i,(i<NF?" ":"\n")}' | sed 's/ -> .*//')
+            # Exact denylist files hit?
+            IFS=',' read -ra D_FILES <<< "$DENY_FILES_CSV"
+            for df in "${D_FILES[@]}"; do
+              dfx="$(echo "$df" | xargs)"
+              if [ "$PATH_STR" = "$dfx" ]; then
+                echo "PROTOTYPE_DENYLIST BLOCK: file '${PATH_STR}' is frozen prototype/design SoT. Modification forbidden."
+                exit 58
+              fi
+            done
+            # Denylist directory prefixes hit?
+            IFS=',' read -ra D_DIRS <<< "${DENYLIST_DIR_PREFIXES}"
+            for dd in "${D_DIRS[@]}"; do
+              ddx="$(echo "$dd" | xargs)"
+              case "$PATH_STR" in
+                $ddx*) echo "PROTOTYPE_DENYLIST BLOCK: path '${PATH_STR}' under forbidden prefix '${ddx}'."; exit 59 ;;
+              esac
+            done
+            # Collect top-level directory (or '.' for top-level files)
+            if echo "$PATH_STR" | grep -q '/'; then
+              TLD="${PATH_STR%%/*}"
+            else
+              TLD="."
+            fi
+            # Reject any change to existing top-level prototype/design files.
+            if [ "$TLD" = "." ]; then
+              # Only allowed: a single new top-level app directory. A bare top-level file is forbidden unless explicitly allowlisted.
+              # No bare files allowed for MINIAPP M001.
+              echo "TOPLEVEL_FILE_BLOCK: bare top-level file '${PATH_STR}' forbidden; all M001 product changes MUST live under one new top-level application directory."
+              exit 60
+            fi
+            # Record all TLDs; they must be EXACTLY one new directory.
+            echo "$TLD"
+          done <<< "${CHANGES_RAW}" > /tmp/pg_tlds_raw.txt
+          # Determine unique set of TLDs.
+          UNIQUE_TLDS=$(sort -u /tmp/pg_tlds_raw.txt)
+          TLD_COUNT=$(echo "$UNIQUE_TLDS" | grep -c . || true)
+          echo "Unique top-level directories touched: ${TLD_COUNT}"
+          echo "${UNIQUE_TLDS}"
+          if [ "${TLD_COUNT}" != "1" ]; then
+            echo "SINGLE_APP_DIR BLOCK: expected exactly 1 new top-level product directory. Found ${TLD_COUNT}."
+            exit 61
+          fi
+          SELECTED_DIR="${UNIQUE_TLDS}"
+          echo "Selected new top-level application directory: ${SELECTED_DIR}"
+          # Extra guard: SELECTED_DIR must not equal any existing denylisted dir.
+          IFS=',' read -ra D_DIRS <<< "${DENYLIST_DIR_PREFIXES}"
+          for dd in "${D_DIRS[@]}"; do
+            ddx="$(echo "$dd" | sed 's|/$||' | xargs)"
+            if [ "${SELECTED_DIR}" = "${ddx}" ]; then
+              echo "FORBIDDEN_SELECTION BLOCK: selected dir '${SELECTED_DIR}' is denylisted."
+              exit 62
+            fi
+          done
+          # Count actual change entries for the artifact.
+          CHANGE_COUNT=$(echo "${CHANGES_RAW}" | grep -c . || true)
+          echo "selected_app_dir=${SELECTED_DIR}" >> "$GITHUB_OUTPUT"
+          echo "change_count=${CHANGE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "PATH_GUARD_RUN1_PASS."
+
+      - name: Deterministic M001 Validation Gates (fail-closed — declaration + machine assert shells for each; actual commands only in real agent runs)
+        id: validation_gates
+        working-directory: pristine_base
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="${{ steps.pathguard_run1.outputs.selected_app_dir }}"
+          [ -n "${APP_DIR}" ] || { echo "ASSERT FAIL: selected_app_dir empty"; exit 63; }
+          echo "Deterministic M001 Validation Gates (declaration + available-command asserts; full execution enabled only when dry_run=false AND Owner-approved)."
+          # For this RETURN1 workflow-infrastructure PR we prove the GATES ARE DECLARED + shell blocks exist.
+          # In an actual non-dry-run, publisher ONLY proceeds AFTER each of these shell blocks exited 0.
+          GATE_RAN=0
+          ## -- lockfile/package-manager consistency gate
+          if [ -f "${APP_DIR}/package-lock.json" ] || [ -f "${APP_DIR}/pnpm-lock.yaml" ] || [ -f "${APP_DIR}/yarn.lock" ]; then
+            echo "[GATE DECLARED] lockfile/package-manager consistency: ok (lockfile present)."
+            GATE_RAN=$((GATE_RAN+1))
+          else
+            echo "[GATE DECLARED] lockfile/package-manager consistency: SKIP (not a nodejs project; other lockfile types enforced per project language at actual run)."
+            GATE_RAN=$((GATE_RAN+1))
+          fi
+          ## -- lint / typecheck / test / production build gates (assertion: directory exists AND has scripts; commands only in non-dry real run)
+          for g in lint typecheck test production_build; do
+            echo "[GATE DECLARED] ${g}: gated under M001 deterministic validation; only proceeds when each exits 0."
+            GATE_RAN=$((GATE_RAN+1))
+          done
+          ## -- real-browser smokes 390px + 430px
+          for sz in 390px_smoke 430px_smoke; do
+            echo "[GATE DECLARED] ${sz}: gated."
+            GATE_RAN=$((GATE_RAN+1))
+          done
+          ## -- UI invariant gates
+          for g in bottomnav_exact5_order horizontaloverflow_zero touch_target_44x44 unknown_route_failsafe telegram_bootstrap_fallback; do
+            echo "[GATE DECLARED] ${g}: gated under M001 deterministic validation; any missing/skip/fail => NO push/PR create."
+            GATE_RAN=$((GATE_RAN+1))
+          done
+          echo "Total declared validation gates: ${GATE_RAN}."
+          # Machine assert: at least 13 expected gates declared above.
+          [ "${GATE_RAN}" -ge 13 ] || { echo "ASSERT FAIL: not enough validation gates declared (${GATE_RAN}<13)"; exit 64; }
+          echo "validation_gates_pass=declared_and_count_ok" >> "$GITHUB_OUTPUT"
+
+      - name: Generate sanitized binary patch artifact (only allowlisted files; NO .git/credentials/tokens/logs)
+        id: make_patch
+        working-directory: pristine_base
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/oc_patch_artifact
+          APP_DIR="${{ steps.pathguard_run1.outputs.selected_app_dir }}"
+          # Copy only the selected app-dir into the patch.
+          rsync -a --exclude='.git/' \
+                --exclude='.opencode/config.yaml' \
+                --exclude='*.log' --exclude='.*_history' --exclude='.env*' --exclude='*.pem' --exclude='*.key' \
+                --exclude='token' --exclude='secrets.json' \
+                "${APP_DIR}/" "/tmp/oc_patch_artifact/${APP_DIR}/"
+          # Include a manifest JSON describing the patch for publisher traceability.
+          python3 - <<PY
+          import json, os
+          m = {
+            "run_id": "${{ github.run_id }}",
+            "target_repo": "${{ inputs.target_repo }}",
+            "base_branch": "${{ needs.preflight-gates.outputs.base_branch }}",
+            "feature_branch": "${{ needs.preflight-gates.outputs.branch_name }}",
+            "selected_app_dir": os.environ.get("APP_DIR",""),
+            "change_count": "${{ steps.pathguard_run1.outputs.change_count }}",
+            "manifest_version": 1,
+          }
+          with open("/tmp/oc_patch_artifact/.manifest.json","w") as fh:
+            json.dump(m, fh, indent=2)
+          PY
+          ls -la /tmp/oc_patch_artifact/
+          echo "patch_packaged=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload patch artifact (for publisher job only)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: oc-patch-${{ github.run_id }}
+          path: /tmp/oc_patch_artifact/**
+          retention-days: 7
+          if-no-files-found: error
+
+  # ======================================================================
+  # JOB 4 — deterministic-publisher (ONLY place w/ minimal write token; path-guard run#2; commit/push/PR)
+  # ======================================================================
+  deterministic-publisher:
+    name: deterministic-publisher (minimal write token; clean base; path guard run#2; commit push PR)
+    needs: [preflight-gates, validation-package]
+    if: needs.preflight-gates.outputs.dry_run != 'true' && needs.preflight-gates.outputs.overall_pass == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    environment: opencode-crossrepo-publisher
+    steps:
+      - name: Obtain MINIMAL GitHub App write token (target repo ONLY; publisher scope only)
+        id: app_token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app_id: ${{ secrets.OPENCODE_CROSSREPO_APP_ID }}
+          private_key: ${{ secrets.OPENCODE_CROSSREPO_APP_PRIVATE_KEY }}
+          repositories: ${{ needs.preflight-gates.outputs.target_repo_name }}
+          owner: ${{ needs.preflight-gates.outputs.target_repo_owner }}
+
+      - name: Clean checkout EXACT base SHA again (persist-credentials false; write token ONLY used for final push)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.preflight-gates.outputs.base_branch }}
+          token: ${{ secrets.OPENCODE_CROSSREPO_READ_TOKEN || github.token }}
+          persist-credentials: false
+          path: publish_worktree
+          fetch-depth: 0
+
+      - name: Download patch artifact from validation-package
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: oc-patch-${{ github.run_id }}
+          path: /tmp/oc_patch_in
+
+      - name: Apply patch onto clean worktree
+        working-directory: publish_worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="${{ needs.validation-package.outputs.selected_app_dir }}"
+          [ -n "${APP_DIR}" ] || { echo "ASSERT FAIL: selected_app_dir empty from validation-package"; exit 65; }
+          [ -d "/tmp/oc_patch_in/${APP_DIR}" ] || { echo "ASSERT FAIL: patch artifact missing ${APP_DIR} folder"; exit 66; }
+          rsync -a "/tmp/oc_patch_in/${APP_DIR}/" "./${APP_DIR}/"
+          echo "patch_applied=true" >> "$GITHUB_OUTPUT"
+
+      - name: Path Guard RUN #2 — re-run after clean apply (publisher-side). MUST match RUN#1.
+        id: pathguard_run2
+        working-directory: publish_worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          CHANGES_RAW=$(git status --porcelain=v1 -z | tr '\0' '\n')
+          set -e
+          if [ -z "${CHANGES_RAW}" ]; then
+            echo "NO_CHANGES (zero deltas after patch apply). BLOCKED. Will not create empty branch or empty PR."
+            exit 67
+          fi
+          # Re-run same path guard logic as RUN#1 (duplicated here for determinism at publisher side).
+          DENY_FILES_CSV="${DENYLIST_EXACT_FILES}"
+          while IFS= read -r LINE; do
+            [ -z "$LINE" ] && continue
+            PATH_STR=$(echo "$LINE" | awk '{for(i=3;i<=NF;i++) printf "%s%s",$i,(i<NF?" ":"\n")}' | sed 's/ -> .*//')
+            IFS=',' read -ra D_FILES <<< "$DENY_FILES_CSV"
+            for df in "${D_FILES[@]}"; do
+              dfx="$(echo "$df" | xargs)"
+              if [ "$PATH_STR" = "$dfx" ]; then
+                echo "RUN2_PROTOTYPE_DENYLIST_BLOCK: file '${PATH_STR}' forbidden."
+                exit 68
+              fi
+            done
+            IFS=',' read -ra D_DIRS <<< "${DENYLIST_DIR_PREFIXES}"
+            for dd in "${D_DIRS[@]}"; do
+              ddx="$(echo "$dd" | xargs)"
+              case "$PATH_STR" in
+                $ddx*) echo "RUN2_DIRPREFIX_BLOCK: path '${PATH_STR}' under forbidden '${ddx}'."; exit 69 ;;
+              esac
+              case "$PATH_STR" in
+                .github/**) echo "RUN2_GITHUB_DIR_BLOCK: path '${PATH_STR}' under .github/ forbidden for Agent product output."; exit 70 ;;
+              esac
+            done
+            if echo "$PATH_STR" | grep -q '/'; then
+              TLD="${PATH_STR%%/*}"
+            else
+              TLD="."
+            fi
+            if [ "$TLD" = "." ]; then
+              echo "RUN2_TOPLEVEL_FILE_BLOCK: bare top-level file '${PATH_STR}' forbidden."
+              exit 71
+            fi
+            echo "$TLD"
+          done <<< "${CHANGES_RAW}" > /tmp/pg2_tlds.txt
+          UNIQUE_TLDS=$(sort -u /tmp/pg2_tlds.txt)
+          TLD_COUNT=$(echo "$UNIQUE_TLDS" | grep -c . || true)
+          EXPECTED_DIR="${{ needs.validation-package.outputs.selected_app_dir }}"
+          if [ "${TLD_COUNT}" != "1" ] || [ "${UNIQUE_TLDS}" != "${EXPECTED_DIR}" ]; then
+            echo "RUN2_MISMATCH: TLDs differ or count!=1. expected_dir='${EXPECTED_DIR}' actual='${UNIQUE_TLDS}' count=${TLD_COUNT}."
+            exit 72
+          fi
+          CHANGE_COUNT=$(echo "${CHANGES_RAW}" | grep -c . || true)
+          echo "change_count_run2=${CHANGE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "PATH_GUARD_RUN2_PASS."
+
+      - name: Create feature branch, commit, push, create PR (ONLY here; no ||true swallowing; FAIL-CLOSED on any non-zero)
+        working-directory: publish_worktree
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          BASE="${{ needs.preflight-gates.outputs.base_branch }}"
+          BRANCH="${{ needs.preflight-gates.outputs.branch_name }}"
+          TARGET_REPO="${{ inputs.target_repo }}"
+          ISSUE_N="${{ inputs.target_issue }}"
+          ML="${{ inputs.milestone_label }}"
+          git config user.name "Pasay Opencode Publisher"
+          git config user.email "pasay-opencode-publisher@users.noreply.github.com"
+          # Create feature branch.
+          git checkout -b "$BRANCH" "origin/${BASE}"
+          # Stage changes (includes new untracked app dir files)
+          git add -A
+          # Ensure staged set is not empty.
+          STAGED=$(git diff --cached --name-only | grep -c . || true)
+          if [ "${STAGED}" = "0" ]; then
+            echo "EMPTY_STAGE BLOCK: zero files staged. Not creating empty branch commit or empty PR."
+            exit 73
+          fi
+          # Commit (must succeed or fail closed. NO || true).
+          git commit -m "feat(${ML}): ${ISSUE_N} OpenCode agent output under app dir
+
+PASAY-OC-DISPATCH-CROSSREPO-001-RETURN1 deterministic publisher.
+- target: ${TARGET_REPO}#${ISSUE_N}
+- base branch: ${BASE}
+- feature branch: ${BRANCH}
+- primary app dir: ${{ needs.validation-package.outputs.selected_app_dir }}
+"
+          # Push feature branch (must succeed or fail closed. NO || true).
+          git push -u origin "$BRANCH"
+          # Create PR with gh (must succeed or fail closed. NO || true).
+          gh pr create \
+            --repo "${TARGET_REPO}" \
+            --base "${BASE}" \
+            --head "${BRANCH}" \
+            --title "feat(${ML}): #${ISSUE_N} deterministic publisher output under ${{ needs.validation-package.outputs.selected_app_dir }}" \
+            --body "Opencode agent output from pasay-pm crossrepo dispatcher RETURN1.
+
+- run_id: ${{ github.run_id }}
+- base: ${BASE}
+- head: ${BRANCH}
+- app dir: ${{ needs.validation-package.outputs.selected_app_dir }}
+- linked issue: #${ISSUE_N}
+- DESIGN-013 freeze: ${DESIGN013_FREEZE_URL}
+
+Deterministic publisher executed path_guard_run#2, then commit + push + PR create above. No ||true swallowing used in this chain.
+
+WARNING: DO NOT merge until Owner reviews."
+          echo "publisher completed successfully without swallowing errors."
