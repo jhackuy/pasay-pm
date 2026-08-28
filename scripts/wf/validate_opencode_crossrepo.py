@@ -297,36 +297,41 @@ def _run_pathguard_on_paths(base_dir: Path, touched_files: list[str], init_git: 
     for rec in records:
         if len(rec) == 2:
             xy, p = rec  # type: ignore[assignment]
+            all_paths = [p]
         else:
-            xy, p, _ = rec  # type: ignore[assignment]
+            xy, p, rename_to = rec  # type: ignore[assignment]
+            all_paths = [p, rename_to]
         change_count += 1
-        # Exact denylist
-        if p in deny_exact:
-            exit_code = 58
-            block_reason = f"EXACT_DENYLIST: {p}"
-            break
-        # Prefix denylist
-        for pref in deny_prefix:
-            if p.startswith(pref) or p == pref.rstrip("/"):
-                exit_code = 59
-                block_reason = f"PREFIX_DENYLIST: {p} under {pref}"
+        blocked_for_rec = False
+        for path in all_paths:
+            if path in deny_exact:
+                exit_code = 58
+                block_reason = f"EXACT_DENYLIST: {path}"
+                blocked_for_rec = True
                 break
-        if exit_code:
+            for pref in deny_prefix:
+                if path.startswith(pref) or path == pref.rstrip("/"):
+                    exit_code = 59
+                    block_reason = f"PREFIX_DENYLIST: {path} under {pref}"
+                    blocked_for_rec = True
+                    break
+            if blocked_for_rec:
+                break
+            if "/" not in path:
+                exit_code = 60
+                block_reason = f"TOPLEVEL_FILE: {path}"
+                blocked_for_rec = True
+                break
+            tld = path.split("/", 1)[0]
+            tlds.add(tld)
+        if blocked_for_rec or exit_code:
             break
-        # Bare top-level file forbidden
-        if "/" not in p:
-            exit_code = 60
-            block_reason = f"TOPLEVEL_FILE: {p}"
-            break
-        tld = p.split("/", 1)[0]
-        tlds.add(tld)
-    else:
-        if change_count == 0:
-            exit_code = 57
-            block_reason = "NO_CHANGES"
-        elif len(tlds) != 1:
-            exit_code = 61
-            block_reason = f"TLD_COUNT != 1: {tlds}"
+    if exit_code == 0 and change_count == 0:
+        exit_code = 57
+        block_reason = "NO_CHANGES"
+    elif exit_code == 0 and len(tlds) != 1:
+        exit_code = 61
+        block_reason = f"TLD_COUNT != 1: {tlds}"
 
     info = {
         "change_count": change_count,
@@ -337,40 +342,82 @@ def _run_pathguard_on_paths(base_dir: Path, touched_files: list[str], init_git: 
     return exit_code, info
 
 
+def _run_rename_scenario_pathguard(base_dir: Path) -> tuple[int, dict]:
+    """Create base repo, commit a file under legitimate dir, then `git mv` it INTO .github denylist prefix; run same validator.
+    Returns (exit_code, info)."""
+    wd = base_dir
+    subprocess.run(["git", "init", "-q"], cwd=str(wd), check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=str(wd), check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=str(wd), check=True)
+    seed = wd / "myapp" / "safe.html"
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    seed.write_text("seed\n")
+    (wd / ".gitkeep").write_text("")
+    subprocess.run(["git", "add", "-A"], cwd=str(wd), check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=str(wd), check=True)
+    # Now create a legitimate new dir + file (to be renamed into .github denylist prefix).
+    newf = wd / "mynewapp" / "component.js"
+    newf.parent.mkdir(parents=True, exist_ok=True)
+    newf.write_text("console.log('ok')\n")
+    subprocess.run(["git", "add", "-A"], cwd=str(wd), check=True)
+    subprocess.run(["git", "commit", "-qm", "stage new app dir"], cwd=str(wd), check=True)
+    # Rename: move HEAD file TO .github prefix destination
+    (wd / ".github" / "workflows").mkdir(parents=True, exist_ok=True)
+    src = str(newf.relative_to(wd))
+    dst = str((wd / ".github" / "workflows" / "injected-miniapp.yml").relative_to(wd))
+    subprocess.run(["git", "mv", "--", src, dst], cwd=str(wd), check=True)
+    # Also leave it staged (git status --porcelain=v1 -z will show R100 mynewapp/component.js\0.github/workflows/injected-miniapp.yml\0.
+    return _run_pathguard_on_paths(wd, [], init_git=False)
+
+
 def gate4_path_guard_regressions() -> bool:
-    print("[GATE-4] Path-guard logic regression tests (4 required RETURN1 cases)")
+    print("[GATE-4] Path-guard logic regression tests (5 required RETURN1 cases)")
     ok = True
     cases = [
-        # name, touched_files list, expect_exit_nonzero, brief_label
+        # name, touched_files list, expect_exit_nonzero, brief_label, special_runner
         (
             "untracked-OOB-rejected",
             ["myapp/x.js", "oob_dir/sneaky.txt"],
             True,
             "untracked out-of-band second top-level dir MUST be rejected",
+            None,
         ),
         (
             "pasay-mini-app.html-rejected",
             ["pasay-mini-app.html"],
             True,
             "pasay-mini-app.html prototype MUST be rejected (exact denylist)",
+            None,
         ),
         (
             ".github/workflows-rejected",
             [".github/workflows/injected-miniapp.yml"],
             True,
             ".github/** CI/Workflow files MUST be rejected (Agent forbidden to touch)",
+            None,
         ),
         (
             "single-new-app-dir-accepted",
             ["pasay-miniapp/package.json", "pasay-miniapp/src/index.tsx", "pasay-miniapp/public/favicon.ico"],
             False,
             "Single new top-level pasay-miniapp/ directory (with 3 files) MUST be accepted",
+            None,
+        ),
+        (
+            "rename-to-.github-destination-rejected",
+            [],
+            True,
+            "Rename destination into .github/ denylist prefix MUST be rejected (rename→forbidden destination",
+            _run_rename_scenario_pathguard,
         ),
     ]
-    for name, files, expect_nonzero, brief in cases:
+    for name, files, expect_nonzero, brief, runner in cases:
         with tempfile.TemporaryDirectory() as td:
             wd = Path(td)
-            exit_code, info = _run_pathguard_on_paths(wd, files, init_git=True)
+            if runner is not None:
+                exit_code, info = runner(wd)
+            else:
+                exit_code, info = _run_pathguard_on_paths(wd, files, init_git=True)
         failed = expect_nonzero and exit_code == 0
         if not expect_nonzero and exit_code != 0:
             failed = True
