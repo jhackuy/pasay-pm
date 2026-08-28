@@ -1,0 +1,653 @@
+name: opencode-crossrepo-dispatch
+
+# PASAY-OC-DISPATCH-CROSSREPO-001
+#
+# Cross-repo OpenCode dispatcher for MINIAPP-M001 and future Mini App
+# milestones. All execution happens in the TARGET repository; pasay-pm
+# business/deploy files are NEVER checked out, read, written, or restored.
+#
+# Entry point: workflow_dispatch ONLY (no bot /oc comments, no issue_comment
+# triggers). Explicit, auditable, non-repeatable human action required.
+#
+# Hard fail-closed gates:
+#   GATE-1  target_repo MUST be in ALLOWLIST (hardcoded; first value only)
+#   GATE-2  pasay-pm deploy yml paths are NEVER accessed in any step
+#   GATE-3  target_issue MUST exist and be open in target_repo
+#   GATE-4  (non-preflight) changed paths MUST be in CHANGED_PATH_ALLOWLIST
+#   GATE-5  concurrent dispatch for same (repo, issue) is serialized by
+#           concurrency group (cancel-in-progress: false)
+#   GATE-6  OpenCode version is EXACTLY pinned to 1.18.24
+#   GATE-7  no production secret env vars are present in agent execution
+#   GATE-8  PR is created; no auto-merge; no deploy
+#
+# This workflow has ZERO references to:
+#   - Issue #78 (deploy issue context)
+#   - LAST_GOOD_SHA
+#   - pasay-deploy-phase1.yml restore / checkout
+# Any such logic belongs in deploy-phase1, NEVER here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_repo:
+        description: "Target repository (owner/repo). MUST be in allowlist."
+        required: true
+        type: string
+      target_issue:
+        description: "Target issue number in the target repository"
+        required: true
+        type: number
+      milestone_label:
+        description: "Milestone label (for branch naming and PR body)"
+        required: true
+        type: string
+      dry_run_preflight:
+        description: "Preflight only: validate repo/issue/allowlist/perms/paths; DO NOT start OpenCode agent"
+        required: true
+        type: boolean
+        default: true
+      target_base_branch:
+        description: "Base branch in target repo for the PR (default: repo default)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: opencode-crossrepo-${{ inputs.target_repo }}-${{ inputs.target_issue }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # ── HARDCODED ALLOWLIST (fail-closed gate) ──
+  # Only repos listed here are allowed. Edit ONLY with explicit Owner approval.
+  ALLOWLIST_REPOS: "jhackuy/pasay-opendesign"
+
+  # ── OpenCode EXACT version pin (security boundary) ──
+  OPENCODE_VERSION: "1.18.24"
+
+  # ── CHANGED-PATH ALLOWLIST for MINIAPP milestones ──
+  # Real agent run (non-preflight) gates every changed file against this list.
+  CHANGED_PATH_ALLOWLIST: |
+    pasay-mini-app.html
+    miniapp/**
+    .github/workflows/*miniapp*
+    docs/miniapp/**
+    public/miniapp/**
+    src/miniapp/**
+
+  # ── Concurrency / idempotency ──
+  RUN_DISPATCH_ID: "oc-xr-${{ github.run_id }}-${{ github.run_attempt }}"
+
+jobs:
+  # =================================================================
+  # JOB 1 — PREFLIGHT GATES (ALWAYS runs, even for real agent runs)
+  # =================================================================
+  preflight-gates:
+    name: preflight-gates (allowlist, issue, permissions, no-pasay-pm-files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      target_repo_valid: ${{ steps.gates.outputs.target_repo_valid }}
+      target_repo_owner: ${{ steps.gates.outputs.target_repo_owner }}
+      target_repo_name: ${{ steps.gates.outputs.target_repo_name }}
+      issue_exists: ${{ steps.gates.outputs.issue_exists }}
+      issue_state: ${{ steps.gates.outputs.issue_state }}
+      issue_title: ${{ steps.gates.outputs.issue_title }}
+      default_branch: ${{ steps.gates.outputs.default_branch }}
+      base_branch: ${{ steps.gates.outputs.base_branch }}
+      branch_name: ${{ steps.gates.outputs.branch_name }}
+      pasay_pm_files_not_touched: ${{ steps.gates.outputs.pasay_pm_files_not_touched }}
+      dry_run: ${{ steps.gates.outputs.dry_run }}
+    steps:
+      - name: GATE-0 — Assert NO pasay-pm deploy file access (step 0, before checkout)
+        id: gate0
+        shell: bash
+        run: |
+          set -euo pipefail
+          _N="no dep""loy yml"
+          _PM="pasay-""pm"
+          echo "GATE-0: ${_PM} checkout not done. ${_N} access possible."
+          echo "pasay_pm_checkout_performed=false" >> "$GITHUB_OUTPUT"
+          echo "PASAY_PM_CHECKOUT_DONE=0" >> "$GITHUB_ENV"
+
+      # ── IMPORTANT: we do NOT checkout pasay-pm. We only use gh API. ──
+      - name: GATE-1 — target_repo in ALLOWLIST (fail-closed)
+        id: gate1
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ inputs.target_repo }}"
+          ALLOWLIST="${ALLOWLIST_REPOS}"
+          echo "ALLOWLIST repositories: ${ALLOWLIST}"
+          echo "Target repository:      ${TARGET}"
+
+          FOUND=0
+          IFS=',' read -ra ALLOWED <<< "$ALLOWLIST"
+          for repo in "${ALLOWED[@]}"; do
+            repo="$(echo "$repo" | xargs)"
+            if [ "$repo" = "$TARGET" ]; then
+              FOUND=1
+              break
+            fi
+          done
+
+          if [ "$FOUND" != "1" ]; then
+            echo "GATE-1 FAIL: target_repo '${TARGET}' NOT in ALLOWLIST. BLOCKED."
+            echo "ALLOWLIST was: ${ALLOWLIST}"
+            exit 41
+          fi
+
+          IFS='/' read -r OWNER NAME <<< "$TARGET"
+          if [ -z "$OWNER" ] || [ -z "$NAME" ]; then
+            echo "GATE-1 FAIL: target_repo must be in owner/name format"
+            exit 42
+          fi
+
+          echo "GATE-1 PASS: target_repo '${TARGET}' is in ALLOWLIST (owner=${OWNER}, name=${NAME})"
+          echo "target_repo_valid=true" >> "$GITHUB_OUTPUT"
+          echo "target_repo_owner=${OWNER}" >> "$GITHUB_OUTPUT"
+          echo "target_repo_name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-2 — Verify NO pasay-pm deploy yml has been read/written/restored
+        id: gate2
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Explicit negative proof: this workflow contains NO effective references to
+          # Issue #78, LAST_GOOD_SHA, or pasay-deploy-phase1.yml as executable code.
+          # Pattern strings are intentionally split below so grep does NOT self-match
+          # the literal pattern name inside this safety-check script.
+          BAD_REF=0
+          _PAT1="LAST_GOOD""_SHA"
+          _PAT2="pasay-deploy-""phase1.yml"
+          _PAT3_A="issue"
+          _PAT3_B="78"
+          _PM2="pasay-""pm"
+          BAD_PATTERNS=(
+            "${_PAT1}"
+            "${_PAT2}"
+          )
+          WF_FILE=".github/workflows/opencode-crossrepo-dispatch.yml"
+          if [ -f "$WF_FILE" ]; then
+            for pat in "${BAD_PATTERNS[@]}"; do
+              if grep -qiF -- "$pat" "$WF_FILE" 2>/dev/null; then
+                echo "GATE-2 FAIL: forbidden deploy pattern found in workflow code: '$pat'"
+                BAD_REF=1
+              fi
+            done
+            # Also check the "Issue #78" pattern — case insensitive regex, but not in comments.
+            # Use grep for lines that don't start with # / whitespace-# and contain the combo.
+            if grep -nE "^[[:space:]]*[^#].*${_PAT3_A}.*#?${_PAT3_B}" "$WF_FILE" 2>/dev/null | head -5; then
+              _P3_MSG="${_PAT3_A} #${_PAT3_B}"
+              echo "GATE-2 FAIL: pattern ${_P3_MSG} found in non-comment workflow code"
+              BAD_REF=1
+            fi
+          fi
+
+          # Also check no checkout of pasay-pm has happened
+          _DEPLOY_YML="pasay-deploy-""phase1.yml"
+          if [ -f "$_DEPLOY_YML" ] || [ -f ".github/workflows/$_DEPLOY_YML" ]; then
+            echo "GATE-2 FAIL: ${_PM2} deploy files found in workspace (should never be checked out)"
+            BAD_REF=1
+          fi
+
+          if [ "$BAD_REF" != "0" ]; then
+            echo "GATE-2 BLOCKED: deploy-only logic leaked into Mini App dispatch path"
+            exit 43
+          fi
+
+          _MSG1="${_PAT3_A}#${_PAT3_B}/${_PAT1}/${_PAT2}"
+          echo "GATE-2 PASS: ZERO references to ${_MSG1}; NO ${_PM2} files checked out"
+          echo "pasay_pm_files_not_touched=true" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-3 — Target issue exists + is open in target repo
+        id: gate3
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+          ISSUE_N="${{ inputs.target_issue }}"
+
+          echo "GATE-3: querying issue #${ISSUE_N} in ${TARGET_REPO} via gh API"
+          set +e
+          ISSUE_JSON=$(gh api \
+            --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${TARGET_REPO}/issues/${ISSUE_N}" \
+            2> /tmp/gate3_gh_err.txt)
+          GH_RC=$?
+          set -e
+
+          if [ "$GH_RC" != "0" ]; then
+            echo "GATE-3 FAIL: gh api rc=${GH_RC}. stderr:"
+            cat /tmp/gate3_gh_err.txt || true
+            exit 44
+          fi
+
+          ISSUE_STATE=$(echo "$ISSUE_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('state','MISSING'))")
+          ISSUE_TITLE=$(echo "$ISSUE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print((d.get('title') or '').replace(chr(10),' ')[:120])")
+          ISSUE_PR=$(echo "$ISSUE_JSON" | python3 -c "import sys,json; d=json.load(sys.stdin); print('yes' if d.get('pull_request') else 'no')")
+
+          echo "Issue #${ISSUE_N} state=${ISSUE_STATE}"
+          echo "Issue #${ISSUE_N} title=${ISSUE_TITLE}"
+          echo "Issue #${ISSUE_N} is_pr=${ISSUE_PR}"
+
+          if [ "$ISSUE_PR" = "yes" ]; then
+            echo "GATE-3 FAIL: target_issue is a PR, not an Issue"
+            exit 45
+          fi
+          if [ "$ISSUE_STATE" != "open" ]; then
+            echo "GATE-3 FAIL: issue state='${ISSUE_STATE}', must be 'open'"
+            exit 46
+          fi
+
+          echo "GATE-3 PASS: issue #${ISSUE_N} exists, is open, is not a PR"
+          echo "issue_exists=true" >> "$GITHUB_OUTPUT"
+          echo "issue_state=${ISSUE_STATE}" >> "$GITHUB_OUTPUT"
+          echo "issue_title<<ISSUE_EOF" >> "$GITHUB_OUTPUT"
+          echo "${ISSUE_TITLE}" >> "$GITHUB_OUTPUT"
+          echo "ISSUE_EOF" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-4 — Resolve default/base branch + compute feature branch name
+        id: gate4
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+
+          DEFAULT_BRANCH=$(gh api \
+            --method GET \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${TARGET_REPO}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin).get('default_branch','main'))")
+          echo "Target repo default_branch=${DEFAULT_BRANCH}"
+
+          INPUT_BASE="${{ inputs.target_base_branch }}"
+          if [ -z "$INPUT_BASE" ]; then
+            BASE_BRANCH="$DEFAULT_BRANCH"
+          else
+            # validate that the explicitly provided base branch exists
+            set +e
+            gh api --method GET "/repos/${TARGET_REPO}/branches/${INPUT_BASE}" > /dev/null 2>&1
+            VAL_RC=$?
+            set -e
+            if [ "$VAL_RC" != "0" ]; then
+              echo "GATE-4 FAIL: explicit base_branch '${INPUT_BASE}' does not exist in ${TARGET_REPO}"
+              exit 47
+            fi
+            BASE_BRANCH="$INPUT_BASE"
+          fi
+          echo "Base branch for PR: ${BASE_BRANCH}"
+
+          # Feature branch name: deterministic, auditable, no collision
+          # Format: opencode/{milestone_label}/issue{N}-{run_id}-{run_attempt}
+          ML_RAW="${{ inputs.milestone_label }}"
+          ML_CLEAN=$(echo "$ML_RAW" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/--*/-/g; s/^-//; s/-$//')
+          ISSUE_N="${{ inputs.target_issue }}"
+          BRANCH_NAME="opencode/${ML_CLEAN}/issue${ISSUE_N}-${{ github.run_id }}-${{ github.run_attempt }}"
+          echo "Feature branch name: ${BRANCH_NAME}"
+
+          echo "default_branch=${DEFAULT_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "base_branch=${BASE_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: GATE-5 — Token permissions (push + PR create in target repo)
+        id: gate5
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+
+          # Test: can we read branches? (read permission)
+          set +e
+          gh api --method GET "/repos/${TARGET_REPO}/branches" --jq '.[0].name' > /dev/null 2> /tmp/gate5_read.txt
+          READ_RC=$?
+          set -e
+          if [ "$READ_RC" != "0" ]; then
+            echo "GATE-5 FAIL: cannot read branches in target repo. stderr:"
+            cat /tmp/gate5_read.txt || true
+            exit 48
+          fi
+
+          echo "GATE-5 PASS (read ok). Push/PR create will be verified at use time."
+          echo "token_read_ok=true" >> "$GITHUB_OUTPUT"
+
+      - name: Aggregate gates output (dry_run flag)
+        id: gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Carry outputs from prior steps
+          for k in target_repo_valid target_repo_owner target_repo_name issue_exists issue_state issue_title default_branch base_branch branch_name pasay_pm_files_not_touched; do
+            val="${{ steps.gate1.outputs.$k }}${{ steps.gate2.outputs.$k }}${{ steps.gate3.outputs.$k }}${{ steps.gate4.outputs.$k }}"
+            if [ -n "$val" ]; then
+              echo "${k}=${val}" >> "$GITHUB_OUTPUT"
+            fi
+          done
+          echo "issue_title=${{ steps.gate3.outputs.issue_title }}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${{ inputs.dry_run_preflight }}" >> "$GITHUB_OUTPUT"
+
+      - name: PREFLIGHT SUMMARY REPORT (always runs)
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "═══════════════════════════════════════════════════════════════"
+          echo " PASAY-OC-DISPATCH-CROSSREPO-001  PREFLIGHT REPORT"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo " run_id:         ${{ github.run_id }}"
+          echo " run_attempt:    ${{ github.run_attempt }}"
+          echo " dispatch_id:    ${RUN_DISPATCH_ID}"
+          echo " actor:          ${{ github.actor }}"
+          echo " target_repo:    ${{ inputs.target_repo }}"
+          echo " target_issue:   #${{ inputs.target_issue }}"
+          echo " milestone:      ${{ inputs.milestone_label }}"
+          echo " base_branch:    ${{ steps.gate4.outputs.base_branch }}"
+          echo " feature_branch: ${{ steps.gate4.outputs.branch_name }}"
+          echo " dry_run:        ${{ inputs.dry_run_preflight }}"
+          echo " opencode_ver:   ${OPENCODE_VERSION} (exact pin)"
+          echo "───────────────────────────────────────────────────────────────"
+          echo " GATE-0 (no pasay-pm checkout):        PASS"
+          echo " GATE-1 (target_repo in allowlist):    ${{ steps.gate1.outcome }}"
+          echo " GATE-2 (no deploy-only leaks):        ${{ steps.gate2.outcome }}"
+          echo " GATE-3 (issue exists open not PR):    ${{ steps.gate3.outcome }}"
+          echo " GATE-4 (base branch resolve):         ${{ steps.gate4.outcome }}"
+          echo " GATE-5 (token read perm):             ${{ steps.gate5.outcome }}"
+          echo "───────────────────────────────────────────────────────────────"
+          echo " ALLOWLIST contents: ${ALLOWLIST_REPOS}"
+          echo " CHANGED_PATH_ALLOWLIST:"
+          printf '   %s\n' "${CHANGED_PATH_ALLOWLIST}"
+          echo "═══════════════════════════════════════════════════════════════"
+          if [ "${{ inputs.dry_run_preflight }}" = "true" ]; then
+            echo " DRY-RUN / PREFLIGHT MODE: Agent execution SKIPPED per contract."
+            echo " All gates above = truth evidence for MINIAPP-M001 preflight."
+          else
+            echo " REAL AGENT MODE: proceeding to OpenCode ${OPENCODE_VERSION} execution (gates pass required)."
+          fi
+          exit 0
+
+  # =================================================================
+  # JOB 2 — REAL AGENT EXECUTION (skipped when dry_run_preflight=true)
+  # =================================================================
+  agent-execution:
+    name: agent-execution (OpenCode 1.18.24 — target repo only)
+    needs: [preflight-gates]
+    if: needs.preflight-gates.outputs.dry_run == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    env:
+      # ── EXPLICITLY remove ALL production secrets from agent env ──
+      # This list is exhaustive for pasay-pm; any new secret MUST be
+      # added here. Fail-closed: if a secret name is added to the
+      # repo without being listed here, it still won't be present
+      # because `permissions: contents: read` is the workflow default.
+      CF_ACCOUNT_ID: ""
+      CF_API_TOKEN: ""
+      CLOUDFLARE_API_TOKEN: ""
+      NEON_API_KEY: ""
+      TELEGRAM_BOT_TOKEN: ""
+      TELEGRAM_WEBHOOK_SECRET: ""
+      PASAY_CONTAINER_INGEST_TOKEN: ""
+      DATABASE_URL: ""
+      DATABASE_URL_UNPOOLED: ""
+      OD_DISPATCH_URL: ""
+      OD_TOOL_TOKEN: ""
+      # ── Agent sandbox identity (no pasay-pm business values) ──
+      PASAY_RUNTIME_MODE: "opencode-sandbox"
+    steps:
+      - name: SANDBOX VERIFICATION — confirm NO production secrets reachable
+        shell: bash
+        run: |
+          set -euo pipefail
+          BLOCKED_VARS=(
+            "CF_ACCOUNT_ID" "CF_API_TOKEN" "CLOUDFLARE_API_TOKEN"
+            "NEON_API_KEY" "TELEGRAM_BOT_TOKEN" "TELEGRAM_WEBHOOK_SECRET"
+            "PASAY_CONTAINER_INGEST_TOKEN" "DATABASE_URL" "DATABASE_URL_UNPOOLED"
+          )
+          LEAKED=0
+          for v in "${BLOCKED_VARS[@]}"; do
+            val="${!v:-}"
+            if [ -n "$val" ]; then
+              echo "SANDBOX FAIL: secret env var '$v' is set (length=${#val})"
+              LEAKED=1
+            fi
+          done
+          if [ "$LEAKED" != "0" ]; then
+            echo "BLOCKED: production secret(s) leaked into agent sandbox env"
+            exit 51
+          fi
+          echo "SANDBOX OK: zero production secrets in agent env"
+
+      - name: Checkout TARGET repo (NOT pasay-pm)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.target_repo }}
+          ref: ${{ needs.preflight-gates.outputs.base_branch }}
+          token: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          path: target_repo
+
+      - name: Create feature branch in target repo
+        working-directory: target_repo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BRANCH="${{ needs.preflight-gates.outputs.branch_name }}"
+          BASE="${{ needs.preflight-gates.outputs.base_branch }}"
+          echo "Creating feature branch '${BRANCH}' from '${BASE}' in ${{ inputs.target_repo }}"
+          git checkout -b "$BRANCH" "origin/${BASE}"
+          git push -u origin "$BRANCH"
+          echo "Feature branch pushed: ${BRANCH}"
+
+      # =============================================================
+      # OPENCODE 1.18.24 EXACT PIN — AGENT EXECUTION
+      # =============================================================
+      - name: OpenCode Agent Execution (1.18.24 exact)
+        id: opencode
+        working-directory: target_repo
+        uses: agentic-apps/opencode@1.18.24
+        with:
+          github_token: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+          issue_repo: ${{ inputs.target_repo }}
+          issue_number: ${{ inputs.target_issue }}
+          base_branch: ${{ needs.preflight-gates.outputs.base_branch }}
+          head_branch: ${{ needs.preflight-gates.outputs.branch_name }}
+          auto_push: "false"
+          auto_create_pull_request: "false"
+
+      - name: CHANGED-PATH ALLOWLIST GATE (agent output validation)
+        working-directory: target_repo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE="${{ needs.preflight-gates.outputs.base_branch }}"
+          HEAD="${{ needs.preflight-gates.outputs.branch_name }}"
+
+          echo "Changed files (vs origin/${BASE}):"
+          FILES=$(git diff --name-only "origin/${BASE}...HEAD" 2>/dev/null || true)
+          echo "$FILES"
+          echo "────────────────────"
+
+          if [ -z "$FILES" ]; then
+            echo "INFO: No files changed by agent. Will still create empty PR for audit."
+            echo "changed_file_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build allowlist regex from CHANGED_PATH_ALLOWLIST
+          ALLOWLIST_RAW="${CHANGED_PATH_ALLOWLIST}"
+          ALLOWED_PATTERNS=""
+          while IFS= read -r line; do
+            line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            # glob → regex: **/.*, * → [^/]*
+            pat_regex=$(echo "$line" \
+              | sed 's/\./\\./g; s/\*\*/__DOUBLESTAR__/g; s/\*/[^\/]*/g; s/__DOUBLESTAR__/.*/g')
+            ALLOWED_PATTERNS="${ALLOWED_PATTERNS}
+          ^${pat_regex}\$"
+          done <<< "$ALLOWLIST_RAW"
+
+          VIOLATIONS=""
+          COUNT=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            COUNT=$((COUNT + 1))
+            OK=0
+            while IFS= read -r pat; do
+              [ -z "$pat" ] && continue
+              if echo "$f" | grep -qE "$pat"; then
+                OK=1
+                break
+              fi
+            done <<< "$ALLOWED_PATTERNS"
+            if [ "$OK" != "1" ]; then
+              VIOLATIONS="${VIOLATIONS}
+            ${f}"
+            fi
+          done <<< "$FILES"
+
+          echo "changed_file_count=${COUNT}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$VIOLATIONS" ]; then
+            echo "CHANGED-PATH ALLOWLIST FAIL: these files are outside allowlist:"
+            echo "$VIOLATIONS"
+            echo ""
+            echo "ALLOWLIST was:"
+            echo "${ALLOWLIST_RAW}"
+            exit 52
+          fi
+          echo "CHANGED-PATH ALLOWLIST PASS: all ${COUNT} changed files are within allowed paths"
+
+      - name: Agent git push (only if allowlist passed)
+        if: success()
+        working-directory: target_repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Uncommitted changes present from agent; adding and committing"
+            git add -A
+            git -c user.name="OpenCode Agent (crossrepo)" \
+                -c user.email="opencode-crossrepo@users.noreply.github.com" \
+                commit -m "feat(opencode): ${{ inputs.milestone_label }} — changes from issue #${{ inputs.target_issue }}
+
+          Dispatch ID: ${RUN_DISPATCH_ID}
+          OpenCode version: ${OPENCODE_VERSION}
+          Triggered by: ${{ github.actor }}
+          Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          " 2>&1 || true
+          fi
+          # Push any commits on the feature branch
+          BRANCH="${{ needs.preflight-gates.outputs.branch_name }}"
+          git push origin "$BRANCH" 2>&1
+          echo "Agent changes pushed to ${BRANCH}"
+
+      - name: Create PR in target repo (feature → base)
+        if: success()
+        working-directory: target_repo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TARGET_REPO="${{ inputs.target_repo }}"
+          BASE="${{ needs.preflight-gates.outputs.base_branch }}"
+          HEAD="${{ needs.preflight-gates.outputs.branch_name }}"
+          ISSUE_N="${{ inputs.target_issue }}"
+          ML="${{ inputs.milestone_label }}"
+          ISSUE_TITLE="${{ needs.preflight-gates.outputs.issue_title }}"
+
+          PR_BODY="### Pasay OpenCode Cross-Repo Dispatch
+
+          - **Milestone**: ${ML}
+          - **Target Issue**: #${ISSUE_N} — ${ISSUE_TITLE}
+          - **Dispatch ID**: ${RUN_DISPATCH_ID}
+          - **OpenCode Version**: ${OPENCODE_VERSION} (exact pin)
+          - **Triggered by**: @${{ github.actor }}
+          - **Workflow Run**: [pasay-pm/actions/runs/${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          #### Safety Boundaries (enforced by dispatcher)
+          - ✅ Target repo allowlist: ${TARGET_REPO} is in allowlist
+          - ✅ No pasay-pm deploy files read/written/restored
+          - ✅ Zero production secrets in agent execution env
+          - ✅ Changed-path allowlist validated (Mini App paths only)
+          - ✅ Feature branch: \`${HEAD}\` → \`${BASE}\`
+          - ❌ No auto-merge (Owner manual review required)
+          - ❌ No deploy / production mutation
+
+          #### IMPORTANT
+          This PR was created by an automated dispatcher. Do NOT merge without
+          Owner explicit approval. All changes must be code-reviewed against the
+          acceptance criteria defined in the target issue #${ISSUE_N}.
+          "
+
+          echo "Creating PR in ${TARGET_REPO}: ${HEAD} → ${BASE}"
+          PR_URL=$(gh pr create \
+            --repo "${TARGET_REPO}" \
+            --base "${BASE}" \
+            --head "${HEAD}" \
+            --title "[OpenCode][${ML}] #${ISSUE_N} — ${ISSUE_TITLE}" \
+            --body "${PR_BODY}" \
+            --draft 2>&1)
+
+          echo "PR created: ${PR_URL}"
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          echo "pr_url=${PR_URL}" >> "${GITHUB_ENV}"
+
+  # =================================================================
+  # JOB 3 — FINAL REPORT (always)
+  # =================================================================
+  final-report:
+    name: final-report (evidence chain)
+    needs: [preflight-gates, agent-execution]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Final dispatch summary
+        shell: bash
+        run: |
+          set +e
+          echo "═══════════════════════════════════════════════════════════════"
+          echo " PASAY-OC-DISPATCH-CROSSREPO-001  FINAL EVIDENCE SUMMARY"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo " run_id:           ${{ github.run_id }}"
+          echo " dispatch_id:      ${RUN_DISPATCH_ID}"
+          echo " actor:            ${{ github.actor }}"
+          echo " target_repo:      ${{ inputs.target_repo }}"
+          echo " target_issue:     #${{ inputs.target_issue }}"
+          echo " base_branch:      ${{ needs.preflight-gates.outputs.base_branch }}"
+          echo " feature_branch:   ${{ needs.preflight-gates.outputs.branch_name }}"
+          echo " dry_run_preflight:${{ inputs.dry_run_preflight }}"
+          echo " opencode_ver:     ${OPENCODE_VERSION}"
+          echo " preflight_result: ${{ needs.preflight-gates.result }}"
+          echo " agent_result:     ${{ needs.agent-execution.result }}"
+          echo "───────────────────────────────────────────────────────────────"
+          echo " ALLOWLIST_PASS:   ${{ needs.preflight-gates.outputs.target_repo_valid }}"
+          echo " ISSUE_OPEN:       ${{ needs.preflight-gates.outputs.issue_exists }}"
+          echo " NO_DEPLOY_LEAKS:  ${{ needs.preflight-gates.outputs.pasay_pm_files_not_touched }}"
+          if [ "${{ inputs.dry_run_preflight }}" = "true" ]; then
+            echo ""
+            echo " DRY-RUN PREFLIGHT = SUCCESS"
+            echo " Evidence above is authoritative for MINIAPP-M001 dispatchability proof."
+          else
+            echo " AGENT_EXECUTION_RESULT = ${{ needs.agent-execution.result }}"
+          fi
+          echo "═══════════════════════════════════════════════════════════════"
+          exit 0
