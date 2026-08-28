@@ -53,10 +53,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.23
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.24
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           "$HOME/.opencode/bin/opencode" --version | tee .opencode-qualification/evidence/runtime-version.txt
-          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = '1.18.23'
+          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = '1.18.24'
 
       - name: Verify effective config and exact agent catalog
         shell: bash
