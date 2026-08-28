@@ -594,43 +594,45 @@ class PostgresStateStore(_StateStoreBase):
             self._conn.autocommit = False
         return self._conn.cursor()
 
+    _EXPECTED_BS_TABLES: tuple[str, ...] = (
+        "bs_conversations",
+        "bs_idempotency_keys",
+        "bs_user_defaults",
+        "bs_rent_status_selectors",
+        "bs_v2_context",
+        "bs_known_groups",
+        "bs_daily_marks",
+        "bs_reminder_deliveries",
+        "bs_followup_deliveries",
+    )
+
     def migrate(self) -> None:
         with self._lock:
             cur = self._cursor()
-            for tbl_sql in [
-                "CREATE TABLE IF NOT EXISTS bs_conversations ("
-                " chat_id TEXT NOT NULL, user_id TEXT NOT NULL, state TEXT NOT NULL,"
-                " payload_json TEXT NOT NULL DEFAULT '{}', nonce TEXT NOT NULL DEFAULT '',"
-                " updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,"
-                " PRIMARY KEY (chat_id, user_id))",
-                "CREATE TABLE IF NOT EXISTS bs_idempotency_keys ("
-                " key TEXT PRIMARY KEY, kind TEXT NOT NULL, resource TEXT NOT NULL DEFAULT '',"
-                " status TEXT NOT NULL, result_json TEXT, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS bs_user_defaults ("
-                " user_id TEXT PRIMARY KEY, payment_method TEXT NOT NULL DEFAULT 'Bank', updated_at TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS bs_rent_status_selectors ("
-                " nonce TEXT PRIMARY KEY, chat_id TEXT NOT NULL, user_id TEXT NOT NULL,"
-                " payload_json TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS bs_v2_context ("
-                " chat_id TEXT NOT NULL, user_id TEXT NOT NULL,"
-                " payload_json TEXT NOT NULL DEFAULT '{}', updated_at TEXT NOT NULL, expires_at TEXT NOT NULL,"
-                " PRIMARY KEY (chat_id, user_id))",
-                "CREATE TABLE IF NOT EXISTS bs_known_groups ("
-                " chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', first_seen TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS bs_daily_marks ("
-                " key TEXT PRIMARY KEY, created_at TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS bs_reminder_deliveries ("
-                " expense_id TEXT NOT NULL, date TEXT NOT NULL,"
-                " target_user TEXT NOT NULL DEFAULT '', destination TEXT NOT NULL DEFAULT '',"
-                " sent_at TEXT NOT NULL, message_id TEXT NOT NULL DEFAULT '',"
-                " PRIMARY KEY (expense_id, date))",
-                "CREATE TABLE IF NOT EXISTS bs_followup_deliveries ("
-                " task_id TEXT PRIMARY KEY, unit_id TEXT NOT NULL DEFAULT '', date TEXT NOT NULL DEFAULT '',"
-                " target_user TEXT NOT NULL DEFAULT '', destination TEXT NOT NULL DEFAULT '',"
-                " sent_at TEXT NOT NULL, message_id TEXT NOT NULL DEFAULT '')",
-            ]:
-                cur.execute(tbl_sql)
-            self._conn.commit()
+            missing: list[str] = []
+            for tbl in self._EXPECTED_BS_TABLES:
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = 'public' AND table_name = %s LIMIT 1",
+                        (tbl,),
+                    )
+                    if cur.fetchone() is None:
+                        missing.append(tbl)
+                except Exception as exc:
+                    self._conn.rollback()
+                    raise RuntimeError(
+                        f"PostgresStateStore: cannot verify existence of bs_* tables "
+                        f"(is DATABASE_URL role correct?): {type(exc).__name__}: {exc}"
+                    ) from exc
+            if missing:
+                raise RuntimeError(
+                    "PostgresStateStore: expected bs_* tables missing from public schema. "
+                    "These tables are created by alembic migration "
+                    "'ret1_postgres_bot_state_20260828' (runs as neondb_owner via STEP3). "
+                    "pasay_runtime MUST NOT issue CREATE TABLE DDL. "
+                    f"Missing tables: {sorted(missing)}"
+                )
             self.recover_stale_in_flight()
 
     def recover_stale_in_flight(self, max_age_seconds: int = DEFAULT_IN_FLIGHT_TTL) -> int:
