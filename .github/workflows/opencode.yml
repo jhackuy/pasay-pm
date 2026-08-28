@@ -6,12 +6,19 @@ on:
   pull_request_review_comment:
     types: [created]
 
-# Only a new actionable human /oc or /opencode command for the same issue/PR
-# may supersede an earlier actionable run. Bot and non-command comments get a
-# run-unique group, so they cannot cancel or replace legitimate work.
+# Only a new authorized Owner /oc or /opencode command for the same issue/PR
+# may supersede an earlier actionable run. Bots, unauthorized humans, and
+# non-command comments get a run-unique group, so they cannot cancel legitimate work.
+# Concurrency truth table with cancel-in-progress=true:
+# - Owner /oc on #N              -> opencode-N            -> actionable
+# - second Owner /oc on same #N  -> opencode-N            -> intentionally supersedes
+# - github-actions/CodeRabbit bot -> opencode-ignored-RUN  -> cannot cancel actionable run
+# - unauthorized human /oc       -> opencode-ignored-RUN  -> cannot cancel actionable run
+# - human non-command comment     -> opencode-ignored-RUN  -> cannot cancel actionable run
 concurrency:
   group: >-
     ${{ github.event.comment.user.type != 'Bot' &&
+        github.event.comment.author_association == 'OWNER' &&
         (contains(github.event.comment.body, ' /oc') ||
          startsWith(github.event.comment.body, '/oc') ||
          contains(github.event.comment.body, ' /opencode') ||
@@ -24,6 +31,7 @@ jobs:
   opencode:
     if: |
       github.event.comment.user.type != 'Bot' &&
+      github.event.comment.author_association == 'OWNER' &&
       (contains(github.event.comment.body, ' /oc') ||
        startsWith(github.event.comment.body, '/oc') ||
        contains(github.event.comment.body, ' /opencode') ||
