@@ -1,3 +1,4 @@
+
 name: opencode-crossrepo-dispatch (RETURN1)
 
 on:
@@ -47,7 +48,7 @@ permissions:
 
 jobs:
   # ======================================================================
-  # JOB 1 â€” preflight-gates
+  # JOB 1 â€?preflight-gates
   # ======================================================================
   preflight-gates:
     name: preflight-gates (allowlist, issue, DESIGN-013, read-only perms)
@@ -69,7 +70,7 @@ jobs:
       pasay_pm_files_not_touched: ${{ steps.gates.outputs.pasay_pm_files_not_touched }}
       overall_pass:      ${{ steps.gates.outputs.overall_pass }}
     steps:
-      - name: GATE-0 â€” Assert NO pasay-pm deploy/business file access (before checkout)
+      - name: GATE-0 â€?Assert NO pasay-pm deploy/business file access (before checkout)
         id: gate0
         shell: bash
         run: |
@@ -79,7 +80,7 @@ jobs:
           # fail-closed if any of the deploy-only env markers are present in the job env (none are bound).
           _LEAK=0
           set +u
-          # Marker env vars from the deploy-only dispatcher path â€” forbidden to ever be set here.
+          # Marker env vars from the deploy-only dispatcher path â€?forbidden to ever be set here.
           # Spliced to avoid the literal tokens leaking into grep-based denylist scans.
           _A1="LAST_""GOOD_""SHA"
           _A2="DEPLOY_""PHASE1_""YAML"
@@ -91,7 +92,7 @@ jobs:
           [ "${_LEAK}" = "0" ] || exit 40
           echo "pasay_pm_files_not_touched=true" >> "$GITHUB_OUTPUT"
 
-      - name: GATE-1 â€” target_repo in ALLOWLIST (fail-closed)
+      - name: GATE-1 â€?target_repo in ALLOWLIST (fail-closed)
         id: gate1
         shell: bash
         env:
@@ -126,7 +127,7 @@ jobs:
           echo "target_repo_owner=${OWNER}" >> "$GITHUB_OUTPUT"
           echo "target_repo_name=${NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: GATE-2 â€” Verify NO deploy-only leaks in dispatch path (local self-check)
+      - name: GATE-2 â€?Verify NO deploy-only leaks in dispatch path (local self-check)
         id: gate2
         shell: bash
         run: |
@@ -136,7 +137,7 @@ jobs:
           echo "GATE-2 PASS: ZERO references to deploy-only markers; NO pasay-pm files checked out."
           echo "pasay_pm_files_not_touched=confirmed" >> "$GITHUB_OUTPUT"
 
-      - name: GATE-3 â€” Target issue exists + is open + is NOT a PR
+      - name: GATE-3 â€?Target issue exists + is open + is NOT a PR
         id: gate3
         shell: bash
         env:
@@ -182,7 +183,7 @@ jobs:
             echo "ISSUE_EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: GATE-4 â€” Resolve default/base branch + compute feature branch name + DESIGN-013 freeze verification
+      - name: GATE-4 â€?Resolve default/base branch + compute feature branch name + DESIGN-013 freeze verification
         id: gate4
         shell: bash
         env:
@@ -235,7 +236,7 @@ jobs:
           echo "design013_ok=true" >> "$GITHUB_OUTPUT"
           echo "GATE-4 PASS."
 
-      - name: GATE-5 â€” READ-ONLY token probe (NOT push/PR create proof)
+      - name: GATE-5 â€?READ-ONLY token probe (NOT push/PR create proof)
         id: gate5
         shell: bash
         env:
@@ -278,7 +279,7 @@ jobs:
         shell: bash
         run: |
           echo "================================================================="
-          echo " PASAY-OC-DISPATCH-CROSSREPO-001-RETURN1 â€” PREFLIGHT SUMMARY"
+          echo " PASAY-OC-DISPATCH-CROSSREPO-001-RETURN1 â€?PREFLIGHT SUMMARY"
           echo "================================================================="
           echo " actor:            ${{ github.actor }}"
           echo " run_id:           ${{ github.run_id }}"
@@ -315,7 +316,7 @@ jobs:
           echo "================================================================="
 
   # ======================================================================
-  # JOB 2 â€” agent-execution (credential-isolated; ONLY when dry_run=false AND preflight success)
+  # JOB 2 â€?agent-execution (credential-isolated; ONLY when dry_run=false AND preflight success)
   # ======================================================================
   agent-execution:
     name: agent-execution (OpenCode 1.18.24 binary, MINIMAX_API_KEY ONLY, no GH write)
@@ -329,7 +330,7 @@ jobs:
       BASE_BRANCH: ${{ needs.preflight-gates.outputs.base_branch }}
       FEATURE_BRANCH: ${{ needs.preflight-gates.outputs.branch_name }}
     steps:
-      - name: Sanity â€” assert dry_run is off AND preflight outputs present
+      - name: Sanity â€?assert dry_run is off AND preflight outputs present
         shell: bash
         run: |
           set -euo pipefail
@@ -523,7 +524,7 @@ jobs:
           if-no-files-found: ignore
 
   # ======================================================================
-  # JOB 3 â€” validation-package (NO write identity; path-guard run#1; deterministic-validation gates)
+  # JOB 3 â€?validation-package (NO write identity; path-guard run#1; deterministic-validation gates)
   # ======================================================================
   validation-package:
     name: validation-package (no write identity; path guard run#1; validation gates; patch package)
@@ -571,7 +572,7 @@ jobs:
           git config --unset-all credential.helper || true
           git remote set-url origin "https://github.com/${{ inputs.target_repo }}.git"
 
-      - name: Path Guard RUN #1 â€” git status --porcelain=v1 -z; single new top-level app-dir enforcement; prototype denylist
+      - name: Path Guard RUN #1 â€?git status --porcelain=v1 -z; single new top-level app-dir enforcement; prototype denylist
         id: pathguard_run1
         working-directory: pristine_base
         shell: bash
@@ -653,7 +654,7 @@ jobs:
           echo "change_count=${CHANGE_COUNT}" >> "$GITHUB_OUTPUT"
           echo "PATH_GUARD_RUN1_PASS."
 
-      - name: Deterministic M001 Validation Gates (fail-closed â€” declaration + machine assert shells for each; actual commands only in real agent runs)
+      - name: Deterministic M001 Validation Gates (fail-closed â€?declaration + machine assert shells for each; actual commands only in real agent runs)
         id: validation_gates
         working-directory: pristine_base
         shell: bash
@@ -734,7 +735,7 @@ jobs:
           if-no-files-found: error
 
   # ======================================================================
-  # JOB 4 â€” deterministic-publisher (ONLY place w/ minimal write token; path-guard run#2; commit/push/PR)
+  # JOB 4 â€?deterministic-publisher (ONLY place w/ minimal write token; path-guard run#2; commit/push/PR)
   # ======================================================================
   deterministic-publisher:
     name: deterministic-publisher (minimal write token; clean base; path guard run#2; commit push PR)
@@ -781,7 +782,7 @@ jobs:
           rsync -a "/tmp/oc_patch_in/${APP_DIR}/" "./${APP_DIR}/"
           echo "patch_applied=true" >> "$GITHUB_OUTPUT"
 
-      - name: Path Guard RUN #2 â€” re-run after clean apply (publisher-side). MUST match RUN#1.
+      - name: Path Guard RUN #2 â€?re-run after clean apply (publisher-side). MUST match RUN#1.
         id: pathguard_run2
         working-directory: publish_worktree
         shell: bash
