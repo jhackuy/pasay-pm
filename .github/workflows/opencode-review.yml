@@ -94,16 +94,17 @@ jobs:
           EOF
           )
 
-          output="$(opencode run --model minimax/MiniMax-M3 --file /tmp/opencode-pr.json --file /tmp/opencode-pr.diff "$prompt")"
+          output="$(opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-pr.json --file /tmp/opencode-pr.diff)"
           printf '%s\n' "$output" | sed -r 's/\x1B\[[0-9;]*[mK]//g' > /tmp/opencode-review.txt
           cat /tmp/opencode-review.txt
 
-          if grep -qx 'REVIEW_PASS' /tmp/opencode-review.txt; then
+          first="$(head -n 1 /tmp/opencode-review.txt)"
+          if [ "$first" = 'REVIEW_PASS' ] && [ "$(wc -l < /tmp/opencode-review.txt)" -eq 1 ]; then
             echo 'verdict=pass' >> "$GITHUB_OUTPUT"
-          elif grep -qx 'BLOCKING_FINDINGS' /tmp/opencode-review.txt; then
+          elif [ "$first" = 'BLOCKING_FINDINGS' ] && tail -n +2 /tmp/opencode-review.txt | grep -Eq '^(blocker|high|medium) \| [^|]+ \| [^|]+ \| [^|]+$'; then
             echo 'verdict=block' >> "$GITHUB_OUTPUT"
           else
-            echo 'Reviewer output did not contain a deterministic verdict.' >&2
+            echo 'Reviewer output did not match the deterministic verdict contract.' >&2
             exit 2
           fi
 
