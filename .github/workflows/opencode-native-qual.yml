@@ -117,7 +117,7 @@ jobs:
             --model minimax/MiniMax-M3 \
             --format json \
             --title PASAY-OC-QUAL-001 \
-            "Qualification only. Complete all three delegations in order. (1) Use explore to inspect repository opencode.json and report the intended values for share, subagent_depth, and whether a Superpowers plugin entry exists. (2) Use pasay-researcher to inspect official OpenCode v1.18.24 release source/docs and report which ordinary built-in subagents are actually instantiated by the release agent service, noting any docs/runtime mismatch. (3) Then delegate to pasay-implementer to create exactly .opencode-qualification/native-positive.txt containing exactly one line followed by one LF: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not use general. Do not edit any other file." \
+            "Qualification only. Complete exactly three delegations in order and do not retry a completed delegation. (1) Use explore to inspect repository opencode.json and report the intended values for share, subagent_depth, and whether a Superpowers plugin entry exists. (2) Use pasay-researcher to inspect official OpenCode v1.18.24 release source/docs and report which ordinary built-in subagents are actually instantiated by the release agent service, noting any docs/runtime mismatch. (3) Use pasay-implementer exactly once to create .opencode-qualification/native-positive.txt whose visible text is exactly: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not include the two literal characters backslash+n in the file. A normal optional final LF is acceptable. Do not ask the implementer for byte-level or newline verification; deterministic CI verifies the output afterward. Do not use general. Do not edit any other file." \
             | tee .opencode-qualification/evidence/events.jsonl
 
       - name: Machine-verify real child task calls
@@ -128,8 +128,8 @@ jobs:
           import json
           from pathlib import Path
           p = Path('.opencode-qualification/evidence/events.jsonl')
-          names = set()
-          tool_events = 0
+          counts = {'explore': 0, 'pasay-researcher': 0, 'pasay-implementer': 0}
+          task_events = 0
           for raw in p.read_text().splitlines():
               try:
                   event = json.loads(raw)
@@ -140,23 +140,23 @@ jobs:
               part = event.get('part') or {}
               if part.get('tool') != 'task':
                   continue
-              tool_events += 1
-              blob = json.dumps(part, sort_keys=True).lower()
-              for name in ('explore', 'pasay-researcher', 'pasay-implementer'):
-                  if name in blob:
-                      names.add(name)
-          expected = {'explore', 'pasay-researcher', 'pasay-implementer'}
-          assert names == expected, f'task agents observed={sorted(names)} task_events={tool_events}'
-          Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + ','.join(sorted(names)) + '\n')
+              task_events += 1
+              state = part.get('state') or {}
+              subagent = ((state.get('input') or {}).get('subagent_type') or '').lower()
+              if subagent in counts:
+                  counts[subagent] += 1
+          assert counts == {'explore': 1, 'pasay-researcher': 1, 'pasay-implementer': 1}, f'task counts={counts} task_events={task_events}'
+          Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + json.dumps(counts, sort_keys=True) + '\n')
 
           output = Path('.opencode-qualification/native-positive.txt')
-          expected_bytes = (
+          expected = (
               b'QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, '
-              b'IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent\n'
+              b'IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent'
           )
           actual = output.read_bytes()
-          assert actual == expected_bytes, f'qualification output mismatch: {actual!r}'
-          Path('.opencode-qualification/evidence/output-byte-check.txt').write_text('PASS\n')
+          assert actual in (expected, expected + b'\n'), f'qualification output mismatch: {actual!r}'
+          assert b'\\n' not in actual, f'literal backslash-n is forbidden: {actual!r}'
+          Path('.opencode-qualification/evidence/output-content-check.txt').write_text('PASS\n')
           PY
           cat .opencode-qualification/native-positive.txt
 
