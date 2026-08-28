@@ -327,14 +327,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Carry outputs from prior steps
-          for k in target_repo_valid target_repo_owner target_repo_name issue_exists issue_state issue_title default_branch base_branch branch_name pasay_pm_files_not_touched; do
-            val="${{ steps.gate1.outputs.$k }}${{ steps.gate2.outputs.$k }}${{ steps.gate3.outputs.$k }}${{ steps.gate4.outputs.$k }}"
-            if [ -n "$val" ]; then
-              echo "${k}=${val}" >> "$GITHUB_OUTPUT"
-            fi
-          done
+          # Carry outputs from prior steps.
+          # Each output is explicitly listed because ${{ }} is evaluated BEFORE bash runs.
+          # gate1: target_repo_valid, target_repo_owner, target_repo_name
+          # gate2: pasay_pm_files_not_touched
+          # gate3: issue_exists, issue_state, issue_title
+          # gate4: default_branch, base_branch, branch_name
+          echo "target_repo_valid=${{ steps.gate1.outputs.target_repo_valid }}" >> "$GITHUB_OUTPUT"
+          echo "target_repo_owner=${{ steps.gate1.outputs.target_repo_owner }}" >> "$GITHUB_OUTPUT"
+          echo "target_repo_name=${{ steps.gate1.outputs.target_repo_name }}" >> "$GITHUB_OUTPUT"
+          echo "issue_exists=${{ steps.gate3.outputs.issue_exists }}" >> "$GITHUB_OUTPUT"
+          echo "issue_state=${{ steps.gate3.outputs.issue_state }}" >> "$GITHUB_OUTPUT"
           echo "issue_title=${{ steps.gate3.outputs.issue_title }}" >> "$GITHUB_OUTPUT"
+          echo "default_branch=${{ steps.gate4.outputs.default_branch }}" >> "$GITHUB_OUTPUT"
+          echo "base_branch=${{ steps.gate4.outputs.base_branch }}" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${{ steps.gate4.outputs.branch_name }}" >> "$GITHUB_OUTPUT"
+          echo "pasay_pm_files_not_touched=${{ steps.gate2.outputs.pasay_pm_files_not_touched }}" >> "$GITHUB_OUTPUT"
           echo "dry_run=${{ inputs.dry_run_preflight }}" >> "$GITHUB_OUTPUT"
 
       - name: PREFLIGHT SUMMARY REPORT (always runs)
@@ -458,7 +466,6 @@ jobs:
       # =============================================================
       - name: OpenCode Agent Execution (1.18.24 exact)
         id: opencode
-        working-directory: target_repo
         uses: agentic-apps/opencode@1.18.24
         with:
           github_token: ${{ secrets.OPENCODE_CROSSREPO_GH_TOKEN || secrets.GITHUB_TOKEN }}
