@@ -328,7 +328,8 @@ jobs:
         run: |
           set -euo pipefail
           # Carry outputs from prior steps.
-          # Each output is explicitly listed because ${{ }} is evaluated BEFORE bash runs.
+          # NOTE: dollar-brace-brace expressions are evaluated BEFORE bash runs,
+          # so we list each output explicitly (no dynamic bash key lookup).
           # gate1: target_repo_valid, target_repo_owner, target_repo_name
           # gate2: pasay_pm_files_not_touched
           # gate3: issue_exists, issue_state, issue_title
