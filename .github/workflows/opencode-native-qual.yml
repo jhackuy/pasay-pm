@@ -29,35 +29,64 @@ jobs:
 
       - name: Record immutable run identity
         shell: bash
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
           set -euo pipefail
           mkdir -p .opencode-qualification/evidence
           printf '%s\n' "MERGE_HEAD=$(git rev-parse HEAD)" | tee .opencode-qualification/evidence/identity.txt
-          printf '%s\n' "PR_HEAD=${{ github.event.pull_request.head.sha }}" | tee -a .opencode-qualification/evidence/identity.txt
-          printf '%s\n' "BASE=${{ github.base_ref }}" | tee -a .opencode-qualification/evidence/identity.txt
-          printf '%s\n' "HEAD_REF=${{ github.head_ref }}" | tee -a .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "PR_HEAD=${PR_HEAD}" | tee -a .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "BASE=${BASE_REF}" | tee -a .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "HEAD_REF=${HEAD_REF}" | tee -a .opencode-qualification/evidence/identity.txt
           printf '%s\n' "MODEL=minimax/MiniMax-M3" | tee -a .opencode-qualification/evidence/identity.txt
 
-      - name: Prove missing-provider-secret guard fails closed
+      - name: Install verified OpenCode V1 runtime
+        shell: bash
+        env:
+          OPENCODE_VERSION: '1.18.24'
+          OPENCODE_ASSET_SHA256: '573e48cd095670bf87dd834442077800b4bc979d0ad7d8b19802ec2b73e90c54'
+        run: |
+          set -euo pipefail
+          archive="/tmp/opencode-linux-x64.tar.gz"
+          dist="/tmp/opencode-dist"
+          curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o "$archive"
+          printf '%s  %s\n' "$OPENCODE_ASSET_SHA256" "$archive" | sha256sum -c -
+          rm -rf "$dist"
+          mkdir -p "$dist" "$HOME/.opencode/bin"
+          tar -xzf "$archive" -C "$dist"
+          bin="$(find "$dist" -type f -name opencode -print -quit)"
+          test -n "$bin"
+          install -m 0755 "$bin" "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          "$HOME/.opencode/bin/opencode" --version | tee .opencode-qualification/evidence/runtime-version.txt
+          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = "$OPENCODE_VERSION"
+          printf '%s\n' "ASSET=opencode-linux-x64.tar.gz" "SHA256=${OPENCODE_ASSET_SHA256}" | tee .opencode-qualification/evidence/runtime-asset.txt
+
+      - name: Prove missing-provider-secret fails closed at runtime
         shell: bash
         env:
           MINIMAX_API_KEY: ''
         run: |
           set -euo pipefail
-          if test -n "${MINIMAX_API_KEY:-}"; then
-            echo 'NEGATIVE_FAIL: empty provider secret unexpectedly passed preflight' >&2
+          test -z "${MINIMAX_API_KEY:-}"
+          set +e
+          timeout 30 opencode run \
+            --agent pasay-lead \
+            --model minimax/MiniMax-M3 \
+            --format json \
+            --title PASAY-OC-QUAL-MISSING-SECRET \
+            "Return exactly MISSING_SECRET_NEGATIVE_PROBE without delegating." \
+            > .opencode-qualification/evidence/missing-secret-negative.log 2>&1
+          rc=$?
+          set -e
+          cat .opencode-qualification/evidence/missing-secret-negative.log
+          if [ "$rc" -eq 0 ]; then
+            echo 'NEGATIVE_FAIL: OpenCode unexpectedly succeeded with empty MINIMAX_API_KEY' >&2
             exit 1
           fi
-          echo 'NEGATIVE_PASS: empty MINIMAX_API_KEY is rejected before OpenCode provider execution' | tee .opencode-qualification/evidence/missing-secret-negative.txt
-
-      - name: Install exact OpenCode V1 runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.24
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
-          "$HOME/.opencode/bin/opencode" --version | tee .opencode-qualification/evidence/runtime-version.txt
-          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = '1.18.24'
+          echo "NEGATIVE_PASS: OpenCode rejected empty MINIMAX_API_KEY rc=$rc" | tee .opencode-qualification/evidence/missing-secret-negative.txt
 
       - name: Verify effective config and exact agent catalog
         shell: bash
@@ -84,6 +113,8 @@ jobs:
           assert lead.get('mode') == 'primary'
           assert lead.get('model') == 'minimax/MiniMax-M3'
           assert lead.get('steps') == 12
+          assert (lead.get('permission') or {}).get('edit') == 'deny'
+          assert (lead.get('permission') or {}).get('bash') == 'deny'
           assert explore.get('mode') == 'subagent'
           assert explore.get('model') == 'minimax/MiniMax-M3'
           assert explore.get('steps') == 6
@@ -101,8 +132,48 @@ jobs:
           assert (explore.get('permission') or {}).get('bash') == 'deny'
           assert (researcher.get('permission') or {}).get('edit') == 'deny'
           assert (researcher.get('permission') or {}).get('bash') == 'deny'
+          assert (impl.get('permission') or {}).get('edit') == 'allow'
           assert (impl.get('permission') or {}).get('bash') == 'deny'
           Path('.opencode-qualification/evidence/effective-config-check.txt').write_text('PASS\n')
+          PY
+
+      - name: Capture pre-agent filesystem baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .opencode-qualification/native-positive.txt
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path('.')
+          excluded_roots = {'.git', '.opencode-qualification'}
+          snapshot = {}
+          for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+              rel_dir = Path(current).relative_to(root)
+              if rel_dir == Path('.'):
+                  dirs[:] = [d for d in dirs if d not in excluded_roots]
+              for d in dirs:
+                  p = Path(current) / d
+                  rel = p.relative_to(root).as_posix()
+                  if p.is_symlink():
+                      snapshot[rel] = {'type': 'symlink-dir', 'target': os.readlink(p)}
+                  else:
+                      snapshot[rel] = {'type': 'dir'}
+              for f in files:
+                  p = Path(current) / f
+                  rel = p.relative_to(root).as_posix()
+                  if p.is_symlink():
+                      snapshot[rel] = {'type': 'symlink', 'target': os.readlink(p)}
+                  else:
+                      h = hashlib.sha256()
+                      with p.open('rb') as fh:
+                          for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                              h.update(chunk)
+                      snapshot[rel] = {'type': 'file', 'sha256': h.hexdigest(), 'size': p.stat().st_size}
+          Path('.opencode-qualification/evidence/pre-agent-tree.json').write_text(json.dumps(snapshot, sort_keys=True, indent=2) + '\n')
           PY
 
       - name: Run Native Lead to Explore Researcher Implementer
@@ -117,10 +188,10 @@ jobs:
             --model minimax/MiniMax-M3 \
             --format json \
             --title PASAY-OC-QUAL-001 \
-            "Qualification only. Complete exactly three delegations in order and do not retry a completed delegation. (1) Use explore to inspect repository opencode.json and report the intended values for share, subagent_depth, and whether a Superpowers plugin entry exists. (2) Use pasay-researcher to inspect official OpenCode v1.18.24 release source/docs and report which ordinary built-in subagents are actually instantiated by the release agent service, noting any docs/runtime mismatch. (3) Use pasay-implementer exactly once to create .opencode-qualification/native-positive.txt whose visible text is exactly: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not include the two literal characters backslash+n in the file. A normal optional final LF is acceptable. Do not ask the implementer for byte-level or newline verification; deterministic CI verifies the output afterward. Do not use general. Do not edit any other file." \
+            "Qualification only. Complete exactly three delegations in this exact order and make no other task calls: (1) explore inspects repository opencode.json and reports share, subagent_depth, and whether a Superpowers plugin entry exists; (2) pasay-researcher inspects official OpenCode v1.18.24 release source/docs and reports the runtime built-in subagents and any docs/runtime mismatch; (3) pasay-implementer exactly once creates .opencode-qualification/native-positive.txt whose visible text is exactly: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not include the two literal characters backslash+n in the file. A normal optional final LF is acceptable. Do not retry any delegation, do not use general, and do not edit any other file." \
             | tee .opencode-qualification/evidence/events.jsonl
 
-      - name: Machine-verify real child task calls
+      - name: Machine-verify exact child task sequence and output
         shell: bash
         run: |
           set -euo pipefail
@@ -128,8 +199,7 @@ jobs:
           import json
           from pathlib import Path
           p = Path('.opencode-qualification/evidence/events.jsonl')
-          counts = {'explore': 0, 'pasay-researcher': 0, 'pasay-implementer': 0}
-          task_events = 0
+          task_sequence = []
           for raw in p.read_text().splitlines():
               try:
                   event = json.loads(raw)
@@ -140,15 +210,15 @@ jobs:
               part = event.get('part') or {}
               if part.get('tool') != 'task':
                   continue
-              task_events += 1
               state = part.get('state') or {}
               subagent = ((state.get('input') or {}).get('subagent_type') or '').lower()
-              if subagent in counts:
-                  counts[subagent] += 1
-          assert counts == {'explore': 1, 'pasay-researcher': 1, 'pasay-implementer': 1}, f'task counts={counts} task_events={task_events}'
-          Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + json.dumps(counts, sort_keys=True) + '\n')
+              task_sequence.append(subagent)
+          expected_sequence = ['explore', 'pasay-researcher', 'pasay-implementer']
+          assert task_sequence == expected_sequence, f'task sequence={task_sequence}'
+          Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + json.dumps(task_sequence) + '\n')
 
           output = Path('.opencode-qualification/native-positive.txt')
+          assert output.is_file(), 'qualification output was not created by the Agent run'
           expected = (
               b'QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, '
               b'IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent'
@@ -160,23 +230,49 @@ jobs:
           PY
           cat .opencode-qualification/native-positive.txt
 
-      - name: Enforce Agent write-scope guard
+      - name: Enforce Agent write-scope guard including ignored files
         shell: bash
         run: |
           set -euo pipefail
-          git status --porcelain | tee .opencode-qualification/evidence/git-status.txt
+          git status --porcelain --untracked-files=all | tee .opencode-qualification/evidence/git-status.txt
           python - <<'PY'
-          import subprocess
+          import hashlib
+          import json
+          import os
           from pathlib import Path
-          lines = subprocess.check_output(['git','status','--porcelain'], text=True).splitlines()
-          bad=[]
-          for line in lines:
-              path=line[3:]
-              if ' -> ' in path:
-                  path=path.split(' -> ',1)[1]
-              if not path.startswith('.opencode-qualification/'):
-                  bad.append(path)
-          assert not bad, f'Agent changed forbidden paths: {bad}'
+
+          root = Path('.')
+          excluded_roots = {'.git', '.opencode-qualification'}
+          before = json.loads(Path('.opencode-qualification/evidence/pre-agent-tree.json').read_text())
+          after = {}
+          for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
+              rel_dir = Path(current).relative_to(root)
+              if rel_dir == Path('.'):
+                  dirs[:] = [d for d in dirs if d not in excluded_roots]
+              for d in dirs:
+                  p = Path(current) / d
+                  rel = p.relative_to(root).as_posix()
+                  if p.is_symlink():
+                      after[rel] = {'type': 'symlink-dir', 'target': os.readlink(p)}
+                  else:
+                      after[rel] = {'type': 'dir'}
+              for f in files:
+                  p = Path(current) / f
+                  rel = p.relative_to(root).as_posix()
+                  if p.is_symlink():
+                      after[rel] = {'type': 'symlink', 'target': os.readlink(p)}
+                  else:
+                      h = hashlib.sha256()
+                      with p.open('rb') as fh:
+                          for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+                              h.update(chunk)
+                      after[rel] = {'type': 'file', 'sha256': h.hexdigest(), 'size': p.stat().st_size}
+          added = sorted(set(after) - set(before))
+          removed = sorted(set(before) - set(after))
+          changed = sorted(k for k in set(before) & set(after) if before[k] != after[k])
+          diff = {'added': added, 'removed': removed, 'changed': changed}
+          Path('.opencode-qualification/evidence/filesystem-diff.json').write_text(json.dumps(diff, sort_keys=True, indent=2) + '\n')
+          assert not added and not removed and not changed, f'Agent changed forbidden paths outside .opencode-qualification/: {diff}'
           Path('.opencode-qualification/evidence/path-guard.txt').write_text('PASS\n')
           PY
 
@@ -184,18 +280,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name pasay-oc-qual-probe
-          git config user.email pasay-oc-qual-probe@users.noreply.github.com
+          remote="$(git remote get-url origin)"
+          printf '%s\n' "REMOTE=${remote}" | tee .opencode-qualification/evidence/push-identity-preflight.txt
+          test "$remote" = 'https://github.com/jhackuy/pasay-pm'
+          if git config --local --get-regexp '^http\..*\.extraheader$' >> .opencode-qualification/evidence/push-identity-preflight.txt 2>&1; then
+            echo 'NEGATIVE_FAIL: checkout left a local HTTP authorization extraheader' >&2
+            exit 1
+          fi
           set +e
-          git push origin HEAD:refs/heads/feature/telegram-ui-v2 2> .opencode-qualification/evidence/default-push-negative.stderr
+          GIT_TERMINAL_PROMPT=0 git push --dry-run origin HEAD:refs/heads/feature/telegram-ui-v2 \
+            > .opencode-qualification/evidence/default-push-negative.stdout \
+            2> .opencode-qualification/evidence/default-push-negative.stderr
           rc=$?
           set -e
           cat .opencode-qualification/evidence/default-push-negative.stderr
           if [ "$rc" -eq 0 ]; then
-            echo 'NEGATIVE_FAIL: default branch push unexpectedly succeeded' >&2
+            echo 'NEGATIVE_FAIL: dry-run default branch push unexpectedly authenticated' >&2
             exit 1
           fi
-          echo "NEGATIVE_PASS: default branch push failed rc=$rc" | tee .opencode-qualification/evidence/default-push-negative.txt
+          if ! grep -Eqi 'could not read (Username|Password)|authentication failed|terminal prompts disabled|could not authenticate|permission denied' .opencode-qualification/evidence/default-push-negative.stderr; then
+            echo 'NEGATIVE_FAIL: push failed, but not for an identity/authentication reason' >&2
+            exit 1
+          fi
+          echo "NEGATIVE_PASS: dry-run push rejected for missing identity rc=$rc" | tee .opencode-qualification/evidence/default-push-negative.txt
 
       - name: Upload qualification evidence
         if: always()
