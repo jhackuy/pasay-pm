@@ -1,0 +1,65 @@
+name: opencode-dispatch-bridge
+
+on:
+  issues:
+    types: [labeled, assigned]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: |
+      (github.event.action == 'labeled' && github.event.label.name == 'opencode-dispatch') ||
+      (github.event.action == 'assigned' && github.event.issue.number == 78 && github.event.assignee.login == github.repository_owner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create PASAY OpenCode GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PASAY_OPENCODE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PASAY_OPENCODE_APP_PRIVATE_KEY }}
+          permission-issues: write
+
+      - name: Ensure native dispatch label exists
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/${REPOSITORY}/labels/opencode-dispatch" >/dev/null 2>&1; then
+            gh api --method POST "repos/${REPOSITORY}/labels" \
+              -f name='opencode-dispatch' \
+              -f color='1f6feb' \
+              -f description='Native GitHub dispatch entry for PASAY OpenCode'
+          fi
+
+      - name: Dispatch issue to existing OpenCode handler
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPOSITORY" --body $'/oc\n\nExecute this issue exactly as written. Treat the issue body and latest OWNER comments as the authoritative contract. Deliver by PR only; do not auto-merge or production-deploy unless the issue explicitly authorizes it.'
+
+      - name: Reset dispatch marker
+        if: always() && steps.app-token.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ACTION: ${{ github.event.action }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = 'labeled' ]; then
+            gh api --method DELETE "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/labels/opencode-dispatch" || true
+          elif [ "$ACTION" = 'assigned' ]; then
+            gh api --method DELETE "repos/${REPOSITORY}/issues/${ISSUE_NUMBER}/assignees" -f assignees[]="$OWNER" || true
+          fi
