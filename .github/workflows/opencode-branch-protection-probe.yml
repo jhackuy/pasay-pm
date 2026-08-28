@@ -45,6 +45,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/gov-77
+          git config --local user.name "pasay-opencode-bot"
+          git config --local user.email "pasay-opencode-bot@users.noreply.github.com"
+
+          # Build a synthetic fast-forward commit directly on the current remote default tip.
+          # This removes non-fast-forward rejection as a confounder; --dry-run guarantees no ref is changed.
+          git fetch --no-tags origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          remote_tip="$(git rev-parse "refs/remotes/origin/${DEFAULT_BRANCH}")"
+          git checkout --detach "$remote_tip"
+          git commit --allow-empty -m "gov-77 synthetic fast-forward authorization probe"
+          probe_commit="$(git rev-parse HEAD)"
+          printf 'REMOTE_TIP=%s\nPROBE_COMMIT=%s\n' "$remote_tip" "$probe_commit" | tee artifacts/gov-77/identity.txt
 
           set +e
           git push --dry-run origin "HEAD:refs/heads/${DEFAULT_BRANCH}" > artifacts/gov-77/default-branch.txt 2>&1
@@ -58,20 +69,26 @@ jobs:
           sed -E 's#https://x-access-token:[^@]+@github.com/#https://github.com/#g' artifacts/gov-77/feature-branch.txt | tee artifacts/gov-77/feature-branch-sanitized.txt
 
           if [ "$default_rc" -eq 0 ]; then
-            echo 'HARD_BOUNDARY_FAIL: OpenCode App dry-run push to default/integration branch was accepted by GitHub.' >&2
+            echo 'HARD_BOUNDARY_FAIL: GitHub accepted a fast-forward dry-run push to the default/integration branch using the OpenCode App identity.' >&2
             exit 1
           fi
 
           if [ "$feature_rc" -ne 0 ]; then
-            echo 'FEATURE_BRANCH_FAIL: OpenCode App could not dry-run push to a normal feature branch.' >&2
+            echo 'FEATURE_BRANCH_FAIL: OpenCode App could not dry-run push the same synthetic commit to a normal feature branch.' >&2
             exit 1
           fi
 
-          echo 'HARD_BOUNDARY_PASS: default branch rejected; feature branch allowed.' | tee -a artifacts/gov-77/result.txt
+          # The default rejection must be policy/authz-related, not topology-related.
+          if grep -Eqi 'fetch first|non-fast-forward|rejected.*non-fast-forward' artifacts/gov-77/default-branch.txt; then
+            echo 'PROBE_INVALID: default branch rejection was topological, not server-side policy/authz.' >&2
+            exit 1
+          fi
+
+          echo 'HARD_BOUNDARY_PASS: fast-forward default-branch dry-run rejected by server-side policy/authz; feature branch allowed.' | tee -a artifacts/gov-77/result.txt
 
       - name: Upload governance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pasay-gov-77-branch-protection-evidence
           path: artifacts/gov-77/
