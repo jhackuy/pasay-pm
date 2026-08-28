@@ -647,7 +647,7 @@ jobs:
                   print(f"FORBIDDEN_SELECTION BLOCK: selected dir '{selected}' is denylisted.")
                   sys.exit(62)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"selected_app_dir={selected}\nchange_count_run1={change_count}\n")
+              fh.write(f"selected_app_dir={selected}\nchange_count={change_count}\n")
           print("PATH_GUARD_RUN1_PASS.")
           PYEOF
           )
