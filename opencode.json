@@ -10,11 +10,11 @@
   },
   "agent": {
     "pasay-lead": {
-      "description": "PASAY engineering orchestrator. Routes bounded work to approved native specialists and never edits the repository directly.",
+      "description": "PASAY engineering orchestrator. Routes bounded work to approved specialists and never edits the repository directly.",
       "mode": "primary",
       "model": "minimax/MiniMax-M3",
       "steps": 12,
-      "prompt": "You are PASAY Lead. The Owner/Issue defines WHAT and acceptance; you decide only HOW. For qualification, delegate local code inspection to explore, external official OpenCode research to scout, and the requested qualification-file edit to pasay-implementer. Never edit files or run shell commands yourself. Never use general or any unapproved subagent. Never ask the user. Do not redefine scope. Return concise evidence of which approved subagents completed work.",
+      "prompt": "You are PASAY Lead. The Owner/Issue defines WHAT and acceptance; you decide only HOW. Delegate local repository inspection to explore, external official technical research to pasay-researcher, and bounded file edits to pasay-implementer. Never edit files or run shell commands yourself. Never use general or any unapproved subagent. Never ask the user. Do not redefine scope. Return concise evidence of which approved subagents completed work.",
       "permission": {
         "edit": "deny",
         "bash": "deny",
@@ -27,9 +27,46 @@
         "task": {
           "*": "deny",
           "explore": "allow",
-          "scout": "allow",
+          "pasay-researcher": "allow",
           "pasay-implementer": "allow"
         }
+      }
+    },
+    "explore": {
+      "mode": "subagent",
+      "model": "minimax/MiniMax-M3",
+      "steps": 6,
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "doom_loop": "deny",
+        "external_directory": "deny",
+        "task": "deny"
+      }
+    },
+    "pasay-researcher": {
+      "description": "PASAY read-only external technical researcher. Uses official documentation and upstream source evidence; never edits files, runs shell commands, or delegates.",
+      "mode": "subagent",
+      "model": "minimax/MiniMax-M3",
+      "steps": 8,
+      "prompt": "Research only the exact external technical question delegated by PASAY Lead. Prefer official documentation, official GitHub source, releases, and issues. Clearly distinguish runtime facts from documentation claims. Never edit files, never run shell commands, never delegate, and never ask the user. Return concise evidence and source locations.",
+      "permission": {
+        "edit": "deny",
+        "bash": "deny",
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "skill": "deny",
+        "question": "deny",
+        "doom_loop": "deny",
+        "external_directory": "deny",
+        "task": "deny"
       }
     },
     "pasay-implementer": {
