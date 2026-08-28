@@ -1944,6 +1944,8 @@ jobs:
       # ═══════════════════════════════════════════════════════════════════
       - name: FINAL Evidence summary (names only — NO secrets / NO URIs)
         if: always()
+        env:
+          EXPECTED_TARGET_SHA: ${{ inputs.expected_target_sha }}
         run: |
           set +e
           DEPLOYED_SHA="${{ steps.wrangler_deploy.outputs.deployed_sha }}"
@@ -1966,5 +1968,5 @@ jobs:
           echo "  step6_infra_smoke         = ${{ inputs.step6_infra_smoke }}"
           echo "  step78910_owner_bootstrap_and_tg_smoke = ${{ inputs.step78910_owner_bootstrap_and_tg_smoke }}"
           echo "  run_smoke_only            = ${{ inputs.run_smoke_only }}"
-          echo "  expected_target_sha set   = $( [ -n "${{ inputs.expected_target_sha }}" ] && echo true || echo false )"
+          echo "  expected_target_sha set   = $( [ -n "${EXPECTED_TARGET_SHA:-}" ] && echo true || echo false )"
           echo "==== END EVIDENCE (secrets/URIs never printed) ===="
