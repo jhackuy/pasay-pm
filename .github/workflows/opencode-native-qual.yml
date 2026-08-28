@@ -32,7 +32,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p .opencode-qualification/evidence
-          printf '%s\n' "HEAD=$(git rev-parse HEAD)" | tee .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "MERGE_HEAD=$(git rev-parse HEAD)" | tee .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "PR_HEAD=${{ github.event.pull_request.head.sha }}" | tee -a .opencode-qualification/evidence/identity.txt
           printf '%s\n' "BASE=${{ github.base_ref }}" | tee -a .opencode-qualification/evidence/identity.txt
           printf '%s\n' "HEAD_REF=${{ github.head_ref }}" | tee -a .opencode-qualification/evidence/identity.txt
           printf '%s\n' "MODEL=minimax/MiniMax-M3" | tee -a .opencode-qualification/evidence/identity.txt
@@ -63,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
           opencode debug config > .opencode-qualification/evidence/debug-config.json
-          for agent in pasay-lead explore scout pasay-implementer; do
+          for agent in pasay-lead explore pasay-researcher pasay-implementer; do
             opencode debug agent "$agent" > ".opencode-qualification/evidence/agent-${agent}.json"
             test -s ".opencode-qualification/evidence/agent-${agent}.json"
           done
@@ -77,20 +78,34 @@ jobs:
           assert not any('superpowers' in str(x).lower() for x in plugins), plugins
           agents = cfg.get('agent') or {}
           lead = agents['pasay-lead']
+          explore = agents['explore']
+          researcher = agents['pasay-researcher']
           impl = agents['pasay-implementer']
           assert lead.get('mode') == 'primary'
           assert lead.get('model') == 'minimax/MiniMax-M3'
           assert lead.get('steps') == 12
+          assert explore.get('mode') == 'subagent'
+          assert explore.get('model') == 'minimax/MiniMax-M3'
+          assert explore.get('steps') == 6
+          assert researcher.get('mode') == 'subagent'
+          assert researcher.get('model') == 'minimax/MiniMax-M3'
+          assert researcher.get('steps') == 8
           assert impl.get('mode') == 'subagent'
           assert impl.get('model') == 'minimax/MiniMax-M3'
           assert impl.get('steps') == 8
           task = (lead.get('permission') or {}).get('task')
-          assert task == {'*': 'deny', 'explore': 'allow', 'scout': 'allow', 'pasay-implementer': 'allow'}, task
-          assert (impl.get('permission') or {}).get('task') == 'deny'
+          assert task == {'*': 'deny', 'explore': 'allow', 'pasay-researcher': 'allow', 'pasay-implementer': 'allow'}, task
+          for name in ('explore', 'pasay-researcher', 'pasay-implementer'):
+              assert (agents[name].get('permission') or {}).get('task') == 'deny', (name, agents[name].get('permission'))
+          assert (explore.get('permission') or {}).get('edit') == 'deny'
+          assert (explore.get('permission') or {}).get('bash') == 'deny'
+          assert (researcher.get('permission') or {}).get('edit') == 'deny'
+          assert (researcher.get('permission') or {}).get('bash') == 'deny'
+          assert (impl.get('permission') or {}).get('bash') == 'deny'
           Path('.opencode-qualification/evidence/effective-config-check.txt').write_text('PASS\n')
           PY
 
-      - name: Run Native Lead to Explore Scout Implementer
+      - name: Run Native Lead to Explore Researcher Implementer
         shell: bash
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
@@ -102,7 +117,7 @@ jobs:
             --model minimax/MiniMax-M3 \
             --format json \
             --title PASAY-OC-QUAL-001 \
-            "Qualification only. Complete all three delegations in order. (1) Use explore to inspect the repository opencode.json and report the effective intended values for share and whether a Superpowers plugin entry exists in that file. (2) Use scout to consult the official OpenCode documentation/source and report the names of the built-in subagents documented there. (3) Then delegate to pasay-implementer to create exactly .opencode-qualification/native-positive.txt with these six lines: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, SCOUT_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not use general. Do not edit any other file." \
+            "Qualification only. Complete all three delegations in order. (1) Use explore to inspect repository opencode.json and report the intended values for share, subagent_depth, and whether a Superpowers plugin entry exists. (2) Use pasay-researcher to inspect official OpenCode v1.18.24 release source/docs and report which ordinary built-in subagents are actually instantiated by the release agent service, noting any docs/runtime mismatch. (3) Then delegate to pasay-implementer to create exactly .opencode-qualification/native-positive.txt with these six lines: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not use general. Do not edit any other file." \
             | tee .opencode-qualification/evidence/events.jsonl
 
       - name: Machine-verify real child task calls
@@ -127,10 +142,10 @@ jobs:
                   continue
               tool_events += 1
               blob = json.dumps(part, sort_keys=True).lower()
-              for name in ('explore', 'scout', 'pasay-implementer'):
+              for name in ('explore', 'pasay-researcher', 'pasay-implementer'):
                   if name in blob:
                       names.add(name)
-          expected = {'explore', 'scout', 'pasay-implementer'}
+          expected = {'explore', 'pasay-researcher', 'pasay-implementer'}
           assert names == expected, f'task agents observed={sorted(names)} task_events={tool_events}'
           Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + ','.join(sorted(names)) + '\n')
           PY
@@ -138,7 +153,7 @@ jobs:
           cat .opencode-qualification/native-positive.txt
           grep -Fx 'QUALIFICATION=PASS_CANDIDATE' .opencode-qualification/native-positive.txt
           grep -Fx 'EXPLORE_USED=true' .opencode-qualification/native-positive.txt
-          grep -Fx 'SCOUT_USED=true' .opencode-qualification/native-positive.txt
+          grep -Fx 'RESEARCHER_USED=true' .opencode-qualification/native-positive.txt
           grep -Fx 'IMPLEMENTER_USED=true' .opencode-qualification/native-positive.txt
           grep -Fx 'SHARE=disabled' .opencode-qualification/native-positive.txt
           grep -Fx 'SUPERPOWERS_PLUGIN=absent' .opencode-qualification/native-positive.txt
@@ -187,4 +202,5 @@ jobs:
           name: pasay-opencode-native-qual-evidence
           path: .opencode-qualification/
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 14
