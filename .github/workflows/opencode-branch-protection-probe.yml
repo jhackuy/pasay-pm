@@ -1,0 +1,78 @@
+name: opencode-branch-protection-probe
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [feature/telegram-ui-v2]
+    paths:
+      - .github/workflows/opencode-branch-protection-probe.yml
+
+concurrency:
+  group: opencode-branch-protection-probe-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    if: github.head_ref == 'chore/pasay-gov-77-probe' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Create PASAY OpenCode GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.PASAY_OPENCODE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PASAY_OPENCODE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Checkout probe branch with App identity
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Probe default and feature branch write boundaries
+        shell: bash
+        env:
+          DEFAULT_BRANCH: feature/telegram-ui-v2
+          PROBE_BRANCH: chore/pasay-gov-77-server-probe-target
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/gov-77
+
+          set +e
+          git push --dry-run origin "HEAD:refs/heads/${DEFAULT_BRANCH}" > artifacts/gov-77/default-branch.txt 2>&1
+          default_rc=$?
+          git push --dry-run origin "HEAD:refs/heads/${PROBE_BRANCH}" > artifacts/gov-77/feature-branch.txt 2>&1
+          feature_rc=$?
+          set -e
+
+          printf 'DEFAULT_BRANCH_RC=%s\nFEATURE_BRANCH_RC=%s\n' "$default_rc" "$feature_rc" | tee artifacts/gov-77/result.txt
+          sed -E 's#https://x-access-token:[^@]+@github.com/#https://github.com/#g' artifacts/gov-77/default-branch.txt | tee artifacts/gov-77/default-branch-sanitized.txt
+          sed -E 's#https://x-access-token:[^@]+@github.com/#https://github.com/#g' artifacts/gov-77/feature-branch.txt | tee artifacts/gov-77/feature-branch-sanitized.txt
+
+          if [ "$default_rc" -eq 0 ]; then
+            echo 'HARD_BOUNDARY_FAIL: OpenCode App dry-run push to default/integration branch was accepted by GitHub.' >&2
+            exit 1
+          fi
+
+          if [ "$feature_rc" -ne 0 ]; then
+            echo 'FEATURE_BRANCH_FAIL: OpenCode App could not dry-run push to a normal feature branch.' >&2
+            exit 1
+          fi
+
+          echo 'HARD_BOUNDARY_PASS: default branch rejected; feature branch allowed.' | tee -a artifacts/gov-77/result.txt
+
+      - name: Upload governance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pasay-gov-77-branch-protection-evidence
+          path: artifacts/gov-77/
+          if-no-files-found: error
