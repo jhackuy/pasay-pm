@@ -24,69 +24,106 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 1
-          persist-credentials: true
+          persist-credentials: false
 
-      - name: Run opencode reviewer
-        uses: anomalyco/opencode/github@2c14fc5586fe0b88e5c04732d2e846769cc35671
+      - name: Install verified OpenCode V1 runtime
+        shell: bash
+        env:
+          OPENCODE_VERSION: '1.18.24'
+          OPENCODE_ASSET_SHA256: '573e48cd095670bf87dd834442077800b4bc979d0ad7d8b19802ec2b73e90c54'
+        run: |
+          set -euo pipefail
+          archive="/tmp/opencode-linux-x64.tar.gz"
+          dist="/tmp/opencode-dist"
+          curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-x64.tar.gz" -o "$archive"
+          printf '%s  %s\n' "$OPENCODE_ASSET_SHA256" "$archive" | sha256sum -c -
+          rm -rf "$dist"
+          mkdir -p "$dist" "$HOME/.opencode/bin"
+          tar -xzf "$archive" -C "$dist"
+          bin="$(find "$dist" -type f -name opencode -print -quit)"
+          test -n "$bin"
+          install -m 0755 "$bin" "$HOME/.opencode/bin/opencode"
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          "$HOME/.opencode/bin/opencode" --version
+          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = "$OPENCODE_VERSION"
+
+      - name: Build read-only PR review context
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr view "$PR_NUMBER" --json number,title,body,url,baseRefName,headRefName,author,comments > /tmp/opencode-pr.json
+          gh pr diff "$PR_NUMBER" > /tmp/opencode-pr.diff
+          test -s /tmp/opencode-pr.json
+          test -s /tmp/opencode-pr.diff
+
+      - name: Run independent OpenCode reviewer
+        id: reviewer
+        shell: bash
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          model: minimax/MiniMax-M3
-          use_github_token: "true"
-          share: false
-          prompt: |
-            You are the independent OpenCode PR Reviewer for jhackuy/pasay-pm.
-            READ-ONLY: never edit files, never commit, never push, never create
-            another PR, never reveal any secret or env value, never print the
-            contents of MINIMAX_API_KEY or GITHUB_TOKEN.
+          OPENCODE_CONFIG_CONTENT: '{"permission":{"edit":"deny","bash":"deny","task":"deny","webfetch":"deny","websearch":"deny"}}'
+        run: |
+          set -euo pipefail
+          prompt=$(cat <<'EOF'
+          You are the independent OpenCode PR Reviewer for jhackuy/pasay-pm.
+          READ-ONLY: never edit files, never commit, never push, never create another PR,
+          never reveal any secret or environment value.
 
-            Source material (only):
-            - This PR's diff and PR conversation.
-            - The originating Issue and the latest OWNER contract when identifiable
-              from the PR body or linked issues.
-            - Directly relevant context reachable from this checkout.
+          Review only the attached PR metadata/conversation and PR diff.
+          Check acceptance intent identifiable from the PR body/conversation, scope creep,
+          correctness/regressions, security/concurrency/data integrity when applicable,
+          and missing tests for changed behavior. Ignore stylistic preferences, speculative
+          refactors, and unrelated legacy debt.
 
-            Required checks (only against the PR diff and directly relevant context):
-            1. Acceptance criteria from the originating Issue / latest OWNER contract
-               when identifiable.
-            2. Forbidden paths / scope creep:
-               - business code under app/, migrations/, Mini App
-               - Cloudflare / Neon / Telegram production deployment
-               - AGENTS.md (project or global)
-               - custom runners, watchers, pollers, daemons, orchestrators
-               - label automation beyond the contract
-               - any change to production secrets, auth, or provider/model config
-            3. Correctness and regressions.
-            4. Security, concurrency, data integrity when applicable.
-            5. Missing tests for the changed behaviour.
+          Forbidden scope includes business code under app/, migrations/, Mini App,
+          Cloudflare/Neon/Telegram production deployment, AGENTS.md, custom runners/watchers/
+          pollers/daemons/orchestrators, label automation beyond contract, and production
+          secrets/auth/provider-model changes.
 
-            Ignore purely stylistic preferences, speculative refactors, and
-            unrelated legacy debt. Do not request out-of-scope refactors.
+          Output exactly one of:
+          REVIEW_PASS
+          or
+          BLOCKING_FINDINGS
+          followed by 1..N lines:
+          SEVERITY | file:line | concrete evidence | minimum fix
+          where SEVERITY is blocker, high, or medium.
+          Do not output greetings, summaries, or closing remarks.
+          EOF
+          )
 
-            Do not mention or trigger the existing /oc or /opencode comment path
-            in any output text. Do not request re-review by posting /oc.
+          output="$(opencode run --model minimax/MiniMax-M3 --file /tmp/opencode-pr.json --file /tmp/opencode-pr.diff "$prompt")"
+          printf '%s\n' "$output" | sed -r 's/\x1B\[[0-9;]*[mK]//g' > /tmp/opencode-review.txt
+          cat /tmp/opencode-review.txt
 
-            Output exactly one of the two deterministic verdicts on its own line,
-            then either nothing else (for REVIEW_PASS) or 1..N finding lines
-            (for BLOCKING_FINDINGS):
+          if grep -qx 'REVIEW_PASS' /tmp/opencode-review.txt; then
+            echo 'verdict=pass' >> "$GITHUB_OUTPUT"
+          elif grep -qx 'BLOCKING_FINDINGS' /tmp/opencode-review.txt; then
+            echo 'verdict=block' >> "$GITHUB_OUTPUT"
+          else
+            echo 'Reviewer output did not contain a deterministic verdict.' >&2
+            exit 2
+          fi
 
-              REVIEW_PASS
-            or
-              BLOCKING_FINDINGS
-            then for each finding a single line of the form:
-              SEVERITY | file:line | concrete evidence | minimum fix
+      - name: Publish reviewer verdict
+        if: always() && steps.reviewer.outcome == 'success'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$PR_NUMBER" --body-file /tmp/opencode-review.txt
+          if [ "${{ steps.reviewer.outputs.verdict }}" = "block" ]; then
+            exit 1
+          fi
 
-            SEVERITY values: blocker | high | medium
-            Do not output any other text. Do not output greetings, summaries,
-            or closing remarks.
-
-      - name: Record OpenCode runtime version evidence
+      - name: Record exact OpenCode runtime version evidence
         if: always()
         shell: bash
         run: |
-          if command -v opencode >/dev/null 2>&1; then
-            opencode --version
-          else
-            echo "KNOWN_LIMITATION: OpenCode CLI is not exposed on runner PATH after the pinned GitHub Action; wrapper SHA does not prove CLI runtime version."
-          fi
+          set -euo pipefail
+          command -v opencode
+          opencode --version
