@@ -661,7 +661,7 @@ jobs:
         run: |
           set -euo pipefail
           set -o pipefail
-          npx wrangler deploy --containers-rollout=immediate 2>&1 | tee /tmp/wrangler_deploy.log | tail -160
+          npx wrangler deploy --containers-rollout=immediate --var "PASAY_BUILD_SHA:${GITHUB_SHA}" 2>&1 | tee /tmp/wrangler_deploy.log | tail -160
 
           WORKER_NAME="pasay-cloudflare-worker"
           DEPLOY_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
