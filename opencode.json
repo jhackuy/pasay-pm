@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
   "plugin": ["superpowers@git+https://github.com/obra/superpowers.git#v6.1.1"],
   "permission": {
     "question": "deny",

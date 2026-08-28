@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: opencode-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   opencode:
@@ -57,3 +57,14 @@ jobs:
         with:
           use_github_token: true
           model: minimax/MiniMax-M3
+          share: false
+
+      - name: Record OpenCode runtime version evidence
+        if: always()
+        shell: bash
+        run: |
+          if command -v opencode >/dev/null 2>&1; then
+            opencode --version
+          else
+            echo "KNOWN_LIMITATION: OpenCode CLI is not exposed on runner PATH after the pinned GitHub Action; wrapper SHA does not prove CLI runtime version."
+          fi
