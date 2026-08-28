@@ -191,7 +191,7 @@ jobs:
             "Qualification only. Complete exactly three delegations in this exact order and make no other task calls: (1) explore inspects repository opencode.json and reports share, subagent_depth, and whether a Superpowers plugin entry exists; (2) pasay-researcher inspects official OpenCode v1.18.24 release source/docs and reports the runtime built-in subagents and any docs/runtime mismatch; (3) pasay-implementer exactly once creates .opencode-qualification/native-positive.txt whose visible text is exactly: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, RESEARCHER_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not include the two literal characters backslash+n in the file. A normal optional final LF is acceptable. Do not retry any delegation, do not use general, and do not edit any other file." \
             | tee .opencode-qualification/evidence/events.jsonl
 
-      - name: Machine-verify exact child task sequence and output
+      - name: Machine-verify exact completed child task sequence and output
         shell: bash
         run: |
           set -euo pipefail
@@ -212,9 +212,14 @@ jobs:
                   continue
               state = part.get('state') or {}
               subagent = ((state.get('input') or {}).get('subagent_type') or '').lower()
-              task_sequence.append(subagent)
-          expected_sequence = ['explore', 'pasay-researcher', 'pasay-implementer']
-          assert task_sequence == expected_sequence, f'task sequence={task_sequence}'
+              status = (state.get('status') or '').lower()
+              task_sequence.append((subagent, status))
+          expected_sequence = [
+              ('explore', 'completed'),
+              ('pasay-researcher', 'completed'),
+              ('pasay-implementer', 'completed'),
+          ]
+          assert task_sequence == expected_sequence, f'task sequence/status={task_sequence}'
           Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + json.dumps(task_sequence) + '\n')
 
           output = Path('.opencode-qualification/native-positive.txt')
@@ -278,17 +283,20 @@ jobs:
 
       - name: Prove OpenCode runtime has no GitHub push identity
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+          test -n "${DEFAULT_BRANCH:-}"
           remote="$(git remote get-url origin)"
-          printf '%s\n' "REMOTE=${remote}" | tee .opencode-qualification/evidence/push-identity-preflight.txt
+          printf '%s\n' "REMOTE=${remote}" "DEFAULT_BRANCH=${DEFAULT_BRANCH}" | tee .opencode-qualification/evidence/push-identity-preflight.txt
           test "$remote" = 'https://github.com/jhackuy/pasay-pm'
           if git config --local --get-regexp '^http\..*\.extraheader$' >> .opencode-qualification/evidence/push-identity-preflight.txt 2>&1; then
             echo 'NEGATIVE_FAIL: checkout left a local HTTP authorization extraheader' >&2
             exit 1
           fi
           set +e
-          GIT_TERMINAL_PROMPT=0 git push --dry-run origin HEAD:refs/heads/feature/telegram-ui-v2 \
+          GIT_TERMINAL_PROMPT=0 git push --dry-run origin "HEAD:refs/heads/${DEFAULT_BRANCH}" \
             > .opencode-qualification/evidence/default-push-negative.stdout \
             2> .opencode-qualification/evidence/default-push-negative.stderr
           rc=$?
@@ -302,7 +310,7 @@ jobs:
             echo 'NEGATIVE_FAIL: push failed, but not for an identity/authentication reason' >&2
             exit 1
           fi
-          echo "NEGATIVE_PASS: dry-run push rejected for missing identity rc=$rc" | tee .opencode-qualification/evidence/default-push-negative.txt
+          echo "NEGATIVE_PASS: dry-run push to ${DEFAULT_BRANCH} rejected for missing identity rc=$rc" | tee .opencode-qualification/evidence/default-push-negative.txt
 
       - name: Upload qualification evidence
         if: always()
