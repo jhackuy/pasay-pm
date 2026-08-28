@@ -1,0 +1,190 @@
+name: opencode-native-qual
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [feature/telegram-ui-v2]
+    paths:
+      - opencode.json
+      - .github/workflows/opencode-native-qual.yml
+
+concurrency:
+  group: opencode-native-qual-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  native-qualification:
+    if: github.head_ref == 'chore/pasay-oc-qual-001' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout qualification branch without credentials
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record immutable run identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .opencode-qualification/evidence
+          printf '%s\n' "HEAD=$(git rev-parse HEAD)" | tee .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "BASE=${{ github.base_ref }}" | tee -a .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "HEAD_REF=${{ github.head_ref }}" | tee -a .opencode-qualification/evidence/identity.txt
+          printf '%s\n' "MODEL=minimax/MiniMax-M3" | tee -a .opencode-qualification/evidence/identity.txt
+
+      - name: Prove missing-provider-secret guard fails closed
+        shell: bash
+        env:
+          MINIMAX_API_KEY: ''
+        run: |
+          set -euo pipefail
+          if test -n "${MINIMAX_API_KEY:-}"; then
+            echo 'NEGATIVE_FAIL: empty provider secret unexpectedly passed preflight' >&2
+            exit 1
+          fi
+          echo 'NEGATIVE_PASS: empty MINIMAX_API_KEY is rejected before OpenCode provider execution' | tee .opencode-qualification/evidence/missing-secret-negative.txt
+
+      - name: Install exact OpenCode V1 runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.23
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          "$HOME/.opencode/bin/opencode" --version | tee .opencode-qualification/evidence/runtime-version.txt
+          test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = '1.18.23'
+
+      - name: Verify effective config and exact agent catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          opencode debug config > .opencode-qualification/evidence/debug-config.json
+          for agent in pasay-lead explore scout pasay-implementer; do
+            opencode debug agent "$agent" > ".opencode-qualification/evidence/agent-${agent}.json"
+            test -s ".opencode-qualification/evidence/agent-${agent}.json"
+          done
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          cfg = json.loads(Path('.opencode-qualification/evidence/debug-config.json').read_text())
+          assert cfg.get('share') == 'disabled', cfg.get('share')
+          assert cfg.get('subagent_depth') == 1, cfg.get('subagent_depth')
+          plugins = cfg.get('plugin') or []
+          assert not any('superpowers' in str(x).lower() for x in plugins), plugins
+          agents = cfg.get('agent') or {}
+          lead = agents['pasay-lead']
+          impl = agents['pasay-implementer']
+          assert lead.get('mode') == 'primary'
+          assert lead.get('model') == 'minimax/MiniMax-M3'
+          assert lead.get('steps') == 12
+          assert impl.get('mode') == 'subagent'
+          assert impl.get('model') == 'minimax/MiniMax-M3'
+          assert impl.get('steps') == 8
+          task = (lead.get('permission') or {}).get('task')
+          assert task == {'*': 'deny', 'explore': 'allow', 'scout': 'allow', 'pasay-implementer': 'allow'}, task
+          assert (impl.get('permission') or {}).get('task') == 'deny'
+          Path('.opencode-qualification/evidence/effective-config-check.txt').write_text('PASS\n')
+          PY
+
+      - name: Run Native Lead to Explore Scout Implementer
+        shell: bash
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "${MINIMAX_API_KEY:-}"
+          timeout 600 opencode run \
+            --agent pasay-lead \
+            --model minimax/MiniMax-M3 \
+            --format json \
+            --title PASAY-OC-QUAL-001 \
+            "Qualification only. Complete all three delegations in order. (1) Use explore to inspect the repository opencode.json and report the effective intended values for share and whether a Superpowers plugin entry exists in that file. (2) Use scout to consult the official OpenCode documentation/source and report the names of the built-in subagents documented there. (3) Then delegate to pasay-implementer to create exactly .opencode-qualification/native-positive.txt with these six lines: QUALIFICATION=PASS_CANDIDATE, EXPLORE_USED=true, SCOUT_USED=true, IMPLEMENTER_USED=true, SHARE=disabled, SUPERPOWERS_PLUGIN=absent. Do not use general. Do not edit any other file." \
+            | tee .opencode-qualification/evidence/events.jsonl
+
+      - name: Machine-verify real child task calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path('.opencode-qualification/evidence/events.jsonl')
+          names = set()
+          tool_events = 0
+          for raw in p.read_text().splitlines():
+              try:
+                  event = json.loads(raw)
+              except json.JSONDecodeError:
+                  continue
+              if event.get('type') != 'tool_use':
+                  continue
+              part = event.get('part') or {}
+              if part.get('tool') != 'task':
+                  continue
+              tool_events += 1
+              blob = json.dumps(part, sort_keys=True).lower()
+              for name in ('explore', 'scout', 'pasay-implementer'):
+                  if name in blob:
+                      names.add(name)
+          expected = {'explore', 'scout', 'pasay-implementer'}
+          assert names == expected, f'task agents observed={sorted(names)} task_events={tool_events}'
+          Path('.opencode-qualification/evidence/task-call-check.txt').write_text('PASS ' + ','.join(sorted(names)) + '\n')
+          PY
+          test -f .opencode-qualification/native-positive.txt
+          cat .opencode-qualification/native-positive.txt
+          grep -Fx 'QUALIFICATION=PASS_CANDIDATE' .opencode-qualification/native-positive.txt
+          grep -Fx 'EXPLORE_USED=true' .opencode-qualification/native-positive.txt
+          grep -Fx 'SCOUT_USED=true' .opencode-qualification/native-positive.txt
+          grep -Fx 'IMPLEMENTER_USED=true' .opencode-qualification/native-positive.txt
+          grep -Fx 'SHARE=disabled' .opencode-qualification/native-positive.txt
+          grep -Fx 'SUPERPOWERS_PLUGIN=absent' .opencode-qualification/native-positive.txt
+
+      - name: Enforce Agent write-scope guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --porcelain | tee .opencode-qualification/evidence/git-status.txt
+          python - <<'PY'
+          import subprocess
+          from pathlib import Path
+          lines = subprocess.check_output(['git','status','--porcelain'], text=True).splitlines()
+          bad=[]
+          for line in lines:
+              path=line[3:]
+              if ' -> ' in path:
+                  path=path.split(' -> ',1)[1]
+              if not path.startswith('.opencode-qualification/'):
+                  bad.append(path)
+          assert not bad, f'Agent changed forbidden paths: {bad}'
+          Path('.opencode-qualification/evidence/path-guard.txt').write_text('PASS\n')
+          PY
+
+      - name: Prove OpenCode runtime has no GitHub push identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name pasay-oc-qual-probe
+          git config user.email pasay-oc-qual-probe@users.noreply.github.com
+          set +e
+          git push origin HEAD:refs/heads/feature/telegram-ui-v2 2> .opencode-qualification/evidence/default-push-negative.stderr
+          rc=$?
+          set -e
+          cat .opencode-qualification/evidence/default-push-negative.stderr
+          if [ "$rc" -eq 0 ]; then
+            echo 'NEGATIVE_FAIL: default branch push unexpectedly succeeded' >&2
+            exit 1
+          fi
+          echo "NEGATIVE_PASS: default branch push failed rc=$rc" | tee .opencode-qualification/evidence/default-push-negative.txt
+
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pasay-opencode-native-qual-evidence
+          path: .opencode-qualification/
+          if-no-files-found: error
+          retention-days: 14
