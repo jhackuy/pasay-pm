@@ -270,8 +270,25 @@ jobs:
           echo "design013_ok=${{ steps.gate4.outputs.design013_ok }}" >> "$GITHUB_OUTPUT"
           echo "pasay_pm_files_not_touched=${{ steps.gate0.outputs.pasay_pm_files_not_touched }}" >> "$GITHUB_OUTPUT"
           echo "dry_run=${{ inputs.dry_run_preflight }}" >> "$GITHUB_OUTPUT"
-          # overall_pass is true iff all upstream output keys are truthy AND dry_run flag was read ok
-          echo "overall_pass=true" >> "$GITHUB_OUTPUT"
+          # overall_pass is true iff every upstream gate output key is truthy (NOT hard-coded)
+          G1="${{ steps.gate1.outputs.target_repo_valid }}"
+          G3_STATE="${{ steps.gate3.outputs.issue_state }}"
+          G4_OK="${{ steps.gate4.outputs.design013_ok }}"
+          G5_OK="${{ steps.gate5.outputs.token_read_ok }}"
+          G0_OK="${{ steps.gate0.outputs.pasay_pm_files_not_touched }}"
+          ISSUE_OPEN="${{ steps.gate3.outputs.issue_exists }}"
+          DRY_OK="${{ inputs.dry_run_preflight }}"
+          set +u
+          OK=true
+          if [ "${G1}" != "true" ]; then OK=false; fi
+          if [ "${ISSUE_OPEN}" != "true" ]; then OK=false; fi
+          if [ "${G3_STATE}" != "open" ]; then OK=false; fi
+          if [ "${G4_OK}" != "true" ]; then OK=false; fi
+          if [ "${G5_OK}" != "true" ]; then OK=false; fi
+          if [ "${G0_OK}" != "true" ]; then OK=false; fi
+          if [ -z "${DRY_OK}" ]; then OK=false; fi
+          set -u
+          echo "overall_pass=${OK}" >> "$GITHUB_OUTPUT"
 
       - name: PREFLIGHT SUMMARY REPORT (always runs)
         if: always()
@@ -357,6 +374,15 @@ jobs:
           # Purge any credential leakage from the prior actions/checkout call, because persist-credentials=false.
           git config --global --unset-all credential.helper || true
           git config --unset-all credential.helper || true
+          # Machine assert NO credential.helper anywhere in .git/config or global config (fail-closed).
+          if git config --global --get-all credential.helper >/dev/null 2>&1; then
+            echo "ASSERT FAIL: global credential.helper still present after unset."
+            exit 51
+          fi
+          if git config --local --get-all credential.helper >/dev/null 2>&1; then
+            echo "ASSERT FAIL: local credential.helper still present after unset."
+            exit 51
+          fi
           git remote set-url origin "https://github.com/${TARGET_REPO}.git"
           # Confirm no remote URL embeds a token
           URL=$(git remote get-url origin)
@@ -380,6 +406,19 @@ jobs:
           echo "Actual   SHA256: ${ACTUAL}"
           if [ "$ACTUAL" != "${OPENCODE_SHA256}" ]; then
             echo "FATAL: SHA256 mismatch for OpenCode binary tarball. BLOCKED."
+            exit 52
+          fi
+          # Cross-check 1/2: expected binary URL must match anomalyco/opencode v1.18.24 release asset browser_download_url as published by GitHub.
+          ASSET_URL=$(gh api repos/anomalyco/opencode/releases/tags/v1.18.24 --jq '.assets[] | select(.name=="opencode-linux-x64.tar.gz") | .browser_download_url')
+          if [ "${ASSET_URL}" != "${OPENCODE_BINARY_URL}" ]; then
+            echo "FATAL: release asset browser_download_url mismatch. Expected '${OPENCODE_BINARY_URL}', got '${ASSET_URL}'."
+            exit 52
+          fi
+          # Cross-check 2/2: size match asset size as published.
+          ASSET_SIZE_EXPECTED=$(gh api repos/anomalyco/opencode/releases/tags/v1.18.24 --jq '.assets[] | select(.name=="opencode-linux-x64.tar.gz") | .size')
+          ASSET_SIZE_ACTUAL=$(wc -c < opencode.tar.gz | tr -d ' ')
+          if [ "${ASSET_SIZE_EXPECTED}" != "${ASSET_SIZE_ACTUAL}" ]; then
+            echo "FATAL: release asset size mismatch. expected=${ASSET_SIZE_EXPECTED} actual=${ASSET_SIZE_ACTUAL}."
             exit 52
           fi
           tar -xzf opencode.tar.gz
@@ -494,15 +533,17 @@ jobs:
             echo "FATAL: MINIMAX_API_KEY is empty. Cannot launch OpenCode agent. BLOCKED."
             exit 56
           fi
-          # Actually invoke the OpenCode binary against the local issue.
-          echo "Launching OpenCode 1.18.24 against target issue #${{ inputs.target_issue }} in ${TARGET_REPO} (local checkout only, no pushes here)."
-          opencode run \
-            --repo "${TARGET_REPO}" \
-            --issue "${{ inputs.target_issue }}" \
-            --no-push \
-            --no-pr \
-            --config .opencode/config.yaml \
-            --output-directory /tmp/opencode_run_logs
+          # Actually invoke the OpenCode binary against the local checkout.
+          echo "Launching OpenCode 1.18.24 in ${TARGET_REPO} (local checkout only, no network pushes here)."
+          # Machine assert opencode --help lists 'run' subcommand and '--model' flag.
+          opencode --help > /tmp/oc_main_help.txt
+          grep -qE '^\s*run\b' /tmp/oc_main_help.txt
+          opencode run --help > /tmp/oc_run_help.txt
+          grep -qE -- '--model\b' /tmp/oc_run_help.txt
+          # Export target issue context into a local file so OpenCode can act on it.
+          printf 'Miniapp M001 target context:\n  target repo = %s\n  target issue = #%s\n  Pasay Lead: bounded by single new top-level app dir + denylist below.\n\n' "${TARGET_REPO}" "${{ inputs.target_issue }}" > /tmp/oc_task.md
+          printf 'Prohibited prefixes: .github/ .git/ docs/prototype/ docs/design/ browser-qa/ prototype/ fixtures/ .env *.pem *.key\nProhibited exact file: pasay-mini-app.html\nAll M001 product changes must share exactly one new top-level application directory.\n' >> /tmp/oc_task.md
+          opencode run --model minimax/MiniMax-M3 /tmp/oc_task.md
           echo "agent_run_complete=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload agent worktree artifact (for validation/package job only; publisher re-checks from scratch)
@@ -536,7 +577,7 @@ jobs:
       patch_artifact: oc-patch-${{ github.run_id }}
       selected_app_dir: ${{ steps.pathguard_run1.outputs.selected_app_dir }}
       change_count: ${{ steps.pathguard_run1.outputs.change_count }}
-      validation_gates_pass: ${{ steps.validation_gates.outputs.validation_gates_pass }}
+      validation_gates_declared_only: ${{ steps.validation_gates.outputs.validation_gates_declared_only }}
     steps:
       - name: Download agent worktree artifact (NOT containing .git or credentials by construction)
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
@@ -564,11 +605,20 @@ jobs:
                 --exclude='*.log' --exclude='.*_history' --exclude='.env*' --exclude='*.pem' --exclude='*.key' \
                 agent_worktree/target_repo/ pristine_base/
           cd pristine_base
-          git config user.name "Pasay Opencode Publisher (deterministic only)" || true
-          git config user.email "noreply@users.noreply.github.com" || true
+          git config user.name "Pasay Opencode Publisher (deterministic only)"
+          git config user.email "noreply@users.noreply.github.com"
           # Remove any credentials that may have leaked into the copy
           git config --global --unset-all credential.helper || true
           git config --unset-all credential.helper || true
+          # Machine assert NO credential.helper in local/global before proceeding
+          if git config --global --get-all credential.helper >/dev/null 2>&1; then
+            echo "ASSERT FAIL: global credential.helper still present in validation-package."
+            exit 51
+          fi
+          if git config --local --get-all credential.helper >/dev/null 2>&1; then
+            echo "ASSERT FAIL: local credential.helper still present in validation-package."
+            exit 51
+          fi
           git remote set-url origin "https://github.com/${{ inputs.target_repo }}.git"
 
       - name: Path Guard RUN #1 — git status --porcelain=v1 -z; BOTH endpoints checked for rename/copy; single new top-level app-dir enforcement; prototype denylist
@@ -691,7 +741,7 @@ jobs:
           echo "Total declared validation gates: ${GATE_RAN}."
           # Machine assert: at least 13 expected gates declared above.
           [ "${GATE_RAN}" -ge 13 ] || { echo "ASSERT FAIL: not enough validation gates declared (${GATE_RAN}<13)"; exit 64; }
-          echo "validation_gates_pass=declared_and_count_ok" >> "$GITHUB_OUTPUT"
+          echo "validation_gates_declared_only=declared_and_count_ok" >> "$GITHUB_OUTPUT"
 
       - name: Generate sanitized binary patch artifact (only allowlisted files; NO .git/credentials/tokens/logs)
         id: make_patch

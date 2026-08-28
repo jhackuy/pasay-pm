@@ -114,12 +114,10 @@ def gate3_entry_contract_and_pins(yaml_text: str, lines: list[str]) -> bool:
         (False, has_text_substr("issue_comment"), "issue_comment trigger (forbidden)"),
         (False, has_text_substr("issues:"), "issues labeled trigger (forbidden)"),
         (False, has_text_substr("\"/oc\"") or has_text_substr("'/oc'"), "bot /oc comment pattern (forbidden)"),
-        (True, has_text_substr("agentic-apps/opencode"), "uses: agentic-apps/opencode (should be DELETED — expect False)"),
+        (False, has_text_substr("agentic-apps/opencode"), "uses: agentic-apps/opencode (DELETED required — expect absent)"),
     ]
     for expect_true, actual, label in checks:
-        # For the agentic-apps one we want False actually, not True — flip.
-        if label.startswith("uses: agentic-apps/opencode"):
-            expect_true = False
+        # Schema is (expect_present: bool, predicate_result: bool, label: str) from start; no post-hoc mutation.
         status = "PASS" if actual == expect_true else "FAIL"
         if status == "FAIL":
             ok = False
