@@ -76,6 +76,38 @@ jobs:
           gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" --json number,title,body,url,comments > /tmp/opencode-issue.json
           test -s /tmp/opencode-issue.json
 
+      - name: Recover immutable historical deploy contract evidence
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          LAST_GOOD_SHA: '044c9c63dbacca08727e95ab22184ff7ffc521c4'
+        run: |
+          set -euo pipefail
+          contract=/tmp/pasay-deploy-phase1.last-good.yml
+          context=/tmp/opencode-dispatch-context.md
+          curl -fsSL "https://raw.githubusercontent.com/${REPOSITORY}/${LAST_GOOD_SHA}/.github/workflows/pasay-deploy-phase1.yml" -o "$contract"
+          test -s "$contract"
+          grep -Fxq 'name: pasay-deploy-phase1' "$contract"
+          grep -Fq 'environment: production' "$contract"
+          grep -Fq 'cancel-in-progress: false' "$contract"
+          grep -Fq 'CLOUDFLARE_API_TOKEN' "$contract"
+          grep -Fq 'NEON_API_KEY' "$contract"
+          {
+            printf '# PASAY OpenCode authoritative dispatch context\n\n'
+            printf '## GitHub Issue JSON\n```json\n'
+            cat /tmp/opencode-issue.json
+            printf '\n```\n\n'
+            printf '## Owner-supplied immutable historical deployment evidence\n'
+            printf 'Source commit SHA: `%s`\n' "$LAST_GOOD_SHA"
+            printf 'Source path: `.github/workflows/pasay-deploy-phase1.yml`\n\n'
+            printf 'The following historical YAML was recovered deterministically from that immutable Git commit. Treat it as authoritative historical evidence for Issue #78. Do not claim git history is unavailable.\n\n```yaml\n'
+            cat "$contract"
+            printf '\n```\n'
+          } > "$context"
+          test -s "$context"
+          echo "LAST_GOOD_SHA=$LAST_GOOD_SHA"
+          echo "LAST_GOOD_BYTES=$(wc -c < "$contract")"
+
       - name: Verify effective PASAY Lead routing
         shell: bash
         env:
@@ -115,8 +147,8 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          prompt="Execute GitHub Issue #${ISSUE_NUMBER} exactly as written. Treat the attached issue body and latest OWNER comments as the authoritative contract. Work only in this checkout. Do not merge, do not production-deploy, do not reveal secrets. Stop BLOCKED rather than inventing missing infrastructure or credentials."
-          opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-issue.json
+          prompt="Execute GitHub Issue #${ISSUE_NUMBER} exactly as written. The attached context contains both the current Issue/OWNER comments and immutable last-good deployment evidence from commit 044c9c63dbacca08727e95ab22184ff7ffc521c4. Treat that historical YAML as authoritative evidence and do not stop on lack of git-history access. Work only in this checkout. Do not merge, do not production-deploy, do not reveal secrets. If a different required credential/environment boundary remains genuinely unprovable, stop BLOCKED with exact evidence rather than inventing it."
+          opencode run --model minimax/MiniMax-M3 "$prompt" --file /tmp/opencode-dispatch-context.md
 
       - name: Validate bounded change and publish PR
         shell: bash
