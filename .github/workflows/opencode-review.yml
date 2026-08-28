@@ -10,6 +10,9 @@ concurrency:
 
 jobs:
   review:
+    # Fork PRs do not receive repository secrets and their GITHUB_TOKEN is downgraded.
+    # Keep provider secrets out of untrusted fork contexts; CI/CodeRabbit remain available.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -27,7 +30,7 @@ jobs:
         uses: anomalyco/opencode/github@2c14fc5586fe0b88e5c04732d2e846769cc35671
         env:
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           model: minimax/MiniMax-M3
           use_github_token: "true"
