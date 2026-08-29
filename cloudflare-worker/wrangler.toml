@@ -1,73 +1,43 @@
 name = "pasay-cloudflare-worker"
 main = "src/index.ts"
 compatibility_date = "2026-08-20"
+compatibility_flags = ["nodejs_compat"]
 
-# Low-volume production service: retain complete Worker + Container logs so
-# queue, cron, container startup, and Neon failures are diagnosable.
-[observability]
-enabled = true
-head_sampling_rate = 1
-
-# ── Cloudflare Containers — OFFICIAL native binding (ND_RETURN FIX2 #1) ──
-# Container class is declared in src/index.ts as "export class PasayContainer extends Container"
-# with defaultPort=8000 matching Dockerfile CMD "uvicorn ... --port 8000".
-# Each container instance is a Durable Object (DO) with idFromName → id, so we can
-# route to a globally unique pasay-singleton instance by getContainer(env.PASAY_CONTAINER, "pasay-singleton").
+# Singleton Cloudflare Container built from the repository Dockerfile.
 [[containers]]
 class_name = "PasayContainer"
-image = "../Dockerfile"
+image = "../../Dockerfile"
 max_instances = 1
 instance_type = "basic"
+region = "APAC"
 
-# Neon production is in Singapore. Keep the singleton Container in APAC to
-# avoid a cold start placing the long-lived process far from PostgreSQL.
-[containers.constraints]
-regions = ["APAC"]
-
-# Container env vars: provisioned via wrangler secret put BEFORE deploy.
-# Cloudflare 2025 Containers auto-inject secret values into the container
-# runtime; do NOT hardcode secrets here.  Operator instructions listed in
-# the Secrets block below apply to both Worker + Container equally.
-
-# Durable Object binding used as the Container backing DO namespace.
-# Name "PASAY_CONTAINER" matches what getContainer(env.PASAY_CONTAINER, ...)
-# expects; class_name "PasayContainer" MUST match the exported Container subclass.
 [[durable_objects.bindings]]
-name = "PASAY_CONTAINER"
 class_name = "PasayContainer"
+name = "PASAY_CONTAINER"
 
-# One-time migration to register the Container DO class.
-# "new_sqlite_classes" is the OFFICIAL required key for Container DO migrations
-# (per Cloudflare Containers 2025 docs).
 [[migrations]]
-new_sqlite_classes = [ "PasayContainer" ]
 tag = "v1-pasay-container"
+new_sqlite_classes = ["PasayContainer"]
 
-# ── Cron trigger — OFFICIAL pasay_heartbeat production cron (FIX2 #2) ──
-# Cloudflare fires scheduled() every 5 minutes UTC, which routes a single
-# scheduled_job envelope through PASAY_QUEUE → Container ingest path, same
-# queue contract as Telegram ingress.
+# Queue producer and consumer are the same queue.
+[[queues.producers]]
+queue = "pasay-events"
+binding = "PASAY_QUEUE"
+
+[[queues.consumers]]
+queue = "pasay-events"
+max_batch_size = 10
+max_batch_timeout = 1
+max_retries = 5
+dead_letter_queue = "pasay-events-dlq"
+
+# Heartbeat cron.
 [triggers]
 crons = ["*/5 * * * *"]
 
-# ── Queue binding (single unified queue for telegram + cron) ──
-[[queues.producers]]
-  queue = "pasay-events"
-  binding = "PASAY_QUEUE"
-
-[[queues.consumers]]
-  queue = "pasay-events"
-  max_batch_size = 10
-  max_batch_timeout = 1
-  max_retries = 5
-  dead_letter_queue = "pasay-events-dlq"
-
-# ── Secrets (set via wrangler secret put BEFORE deploy) ──
-# Operator must configure ALL of the following before `wrangler deploy`:
-#   wrangler secret put TELEGRAM_WEBHOOK_SECRET
-#   wrangler secret put PASAY_CONTAINER_INGEST_TOKEN
-#   wrangler secret put DATABASE_URL
-#   wrangler secret put DATABASE_URL_UNPOOLED
-#   wrangler secret put TELEGRAM_BOT_TOKEN
-# Missing any above → Worker startup or Container binding fetch fails
-# closed (fail-fast per Scope D + ND_RETURN FIX1 blocker #4).
+# Secrets (set via `wrangler secret put`):
+#   TELEGRAM_WEBHOOK_SECRET
+#   PASAY_CONTAINER_INGEST_TOKEN
+#   DATABASE_URL
+#   DATABASE_URL_UNPOOLED
+#   TELEGRAM_BOT_TOKEN
