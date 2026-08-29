@@ -1,15 +1,6 @@
 /**
- * PASAY Cloudflare Worker — single unified entry for:
- *   (A) Telegram webhook ingress → enqueue
- *   (C) Queue consumer          → official Cloudflare Container instance
- *   (F) Cron scheduled()        → enqueue (same queue, same container)
- *
- * Invariants:
- *   - Worker NEVER runs business logic.
- *   - Worker ONLY validates ingress + envelopes + calls Container binding.
- *   - One queue. One container. One FastAPI app. One DB boundary.
- *   - Container is the official @cloudflare/containers PasayContainer (singleton
- *     instance id "pasay-singleton"). Wrangler manages the Durable Object class.
+ * PASAY Cloudflare Worker — ingress → queue → container → Neon.
+ * Business logic belongs in the FastAPI application, never in this Worker.
  */
 import {
   ENVELOPE_VERSION,
@@ -61,23 +52,35 @@ function header_eq(a: string | null, b: string): boolean {
   if (!a) return !b;
   if (a.length !== b.length) return false;
   let diff = 0;
-  for (let i = 0; i < a.length; i++) {
-    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
 
-function extract_telegram_meta(
-  raw: Record<string, unknown>,
-): { update_id: number; chat_id?: number } {
+/** Redact configured secret values before server-side logging. */
+export function mask_sensitive(input: unknown, env: Env): string {
+  let text = input instanceof Error ? input.stack ?? input.message : String(input);
+  const secrets = [
+    env.DATABASE_URL,
+    env.DATABASE_URL_UNPOOLED,
+    env.TELEGRAM_BOT_TOKEN,
+    env.TELEGRAM_WEBHOOK_SECRET,
+    env.PASAY_CONTAINER_INGEST_TOKEN,
+  ].filter((value): value is string => Boolean(value && value.trim()));
+  for (const secret of secrets) text = text.split(secret).join("[REDACTED]");
+  return text;
+}
+
+function log_error(scope: string, err: unknown, env: Env): void {
+  console.error(`[pasay-worker:${scope}] ${mask_sensitive(err, env)}`);
+}
+
+function extract_telegram_meta(raw: Record<string, unknown>): { update_id: number; chat_id?: number } {
   const update_id = Number(raw["update_id"]);
   let chat_id: number | undefined;
   for (const key of ["message", "edited_message", "callback_query", "channel_post", "edited_channel_post"]) {
     const node = raw[key] as Record<string, unknown> | undefined;
     if (node && typeof node === "object") {
-      const chat = (node as Record<string, unknown>)["chat"] as
-        | Record<string, unknown>
-        | undefined;
+      const chat = node["chat"] as Record<string, unknown> | undefined;
       if (chat && typeof chat["id"] === "number") {
         chat_id = chat["id"];
         break;
@@ -87,40 +90,26 @@ function extract_telegram_meta(
   return { update_id: Number.isFinite(update_id) ? update_id : 0, chat_id };
 }
 
-// (A) Telegram ingress
-async function handle_telegram_ingress(
-  request: Request,
-  env: Env,
-): Promise<Response> {
-  if (request.method !== "POST") {
-    return json(405, { ok: false, error: "method_not_allowed" }, { Allow: "POST" });
-  }
+async function handle_telegram_ingress(request: Request, env: Env): Promise<Response> {
+  if (request.method !== "POST") return json(405, { ok: false, error: "method_not_allowed" }, { Allow: "POST" });
   const ct = request.headers.get("content-type") ?? "";
-  if (!ct.toLowerCase().includes("application/json")) {
-    return json(400, { ok: false, error: "bad_content_type" });
-  }
+  if (!ct.toLowerCase().includes("application/json")) return json(400, { ok: false, error: "bad_content_type" });
   const configured_secret = env.TELEGRAM_WEBHOOK_SECRET ?? "";
-  if (!configured_secret.trim()) {
-    return json(401, { ok: false, error: "webhook_not_configured" });
-  }
+  if (!configured_secret.trim()) return json(401, { ok: false, error: "webhook_not_configured" });
   const received = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
-  if (!header_eq(received, configured_secret)) {
-    return json(403, { ok: false, error: "forbidden" });
-  }
+  if (!header_eq(received, configured_secret)) return json(403, { ok: false, error: "forbidden" });
+
   let raw: unknown;
   try {
     raw = await request.json();
   } catch {
     return json(400, { ok: false, error: "invalid_json" });
   }
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    return json(400, { ok: false, error: "malformed_payload" });
-  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return json(400, { ok: false, error: "malformed_payload" });
   const payload = raw as Record<string, unknown>;
   const meta = extract_telegram_meta(payload);
-  if (!Number.isFinite(meta.update_id) || meta.update_id <= 0) {
-    return json(400, { ok: false, error: "missing_update_id" });
-  }
+  if (!Number.isFinite(meta.update_id) || meta.update_id <= 0) return json(400, { ok: false, error: "missing_update_id" });
+
   const occurred_at = now_iso();
   const envelope: PasayQueueEnvelope = {
     version: ENVELOPE_VERSION,
@@ -133,62 +122,48 @@ async function handle_telegram_ingress(
   try {
     await env.PASAY_QUEUE.send(envelope as unknown as MessageSendRequest);
   } catch (err) {
-    return json(503, { ok: false, error: "enqueue_failed", detail: String(err) });
+    log_error("enqueue", err, env);
+    return json(503, { ok: false, error: "enqueue_failed" });
   }
   return json(200, { ok: true, state: "enqueued", event_id: envelope.event_id });
 }
 
-// (C) Queue consumer → Container
-async function deliver_envelope_to_container(
-  env: Env,
-  envelope: PasayQueueEnvelope,
-): Promise<"ack" | "retry" | "terminal"> {
+async function deliver_envelope_to_container(env: Env, envelope: PasayQueueEnvelope): Promise<"ack" | "retry" | "terminal"> {
   if (!env.PASAY_CONTAINER) return "retry";
   const token = env.PASAY_CONTAINER_INGEST_TOKEN;
   if (!token || !token.trim()) return "retry";
   let handle: { fetch: (req: Request) => Promise<Response> } | undefined;
   try {
-    handle = getContainer(env.PASAY_CONTAINER as unknown as any, PASAY_CONTAINER_INSTANCE_ID) as unknown as {
-      fetch: (req: Request) => Promise<Response>;
-    };
-  } catch {
+    handle = getContainer(env.PASAY_CONTAINER as unknown as any, PASAY_CONTAINER_INSTANCE_ID) as unknown as { fetch: (req: Request) => Promise<Response> };
+  } catch (err) {
+    log_error("container-handle", err, env);
     return "retry";
   }
-  if (!handle) return "retry";
-  const url = `${PASAY_CONTAINER_ORIGIN}${CONTAINER_INGEST_PATH}`;
-  const req = new Request(url, {
+  const req = new Request(`${PASAY_CONTAINER_ORIGIN}${CONTAINER_INGEST_PATH}`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      [INGEST_AUTH_HEADER]: token,
-    },
+    headers: { "Content-Type": "application/json", [INGEST_AUTH_HEADER]: token },
     body: JSON.stringify(envelope),
   });
   let resp: Response;
   try {
-    resp = await (handle as any).fetch(req);
-  } catch {
+    resp = await handle.fetch(req);
+  } catch (err) {
+    log_error("container-fetch", err, env);
     return "retry";
   }
-  const s = resp.status;
-  if (s === 200 || s === 202 || s === 208) return "ack";
-  if (s === 400 || s === 415 || s === 422) return "terminal";
+  if (resp.status === 200 || resp.status === 202 || resp.status === 208) return "ack";
+  if (resp.status === 400 || resp.status === 415 || resp.status === 422) return "terminal";
   return "retry";
 }
 
 function json(status: number, body: unknown, extra: Record<string, string> = {}): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json", ...extra },
-  });
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extra } });
 }
 
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === TELEGRAM_WEBHOOK_PATH) {
-      return handle_telegram_ingress(request, env);
-    }
+    if (url.pathname === TELEGRAM_WEBHOOK_PATH) return handle_telegram_ingress(request, env);
     if (url.pathname === "/health" || url.pathname === "/healthz") {
       return json(200, {
         worker: "alive",
@@ -208,12 +183,7 @@ export default {
   async queue(batch: MessageBatch<PasayQueueEnvelope>, env: Env, _ctx: ExecutionContext): Promise<void> {
     for (const msg of batch.messages) {
       const envelope = msg.body;
-      if (
-        typeof envelope !== "object" ||
-        envelope === null ||
-        envelope.version !== ENVELOPE_VERSION ||
-        (envelope.kind !== "telegram_update" && envelope.kind !== "scheduled_job")
-      ) {
+      if (typeof envelope !== "object" || envelope === null || envelope.version !== ENVELOPE_VERSION || (envelope.kind !== "telegram_update" && envelope.kind !== "scheduled_job")) {
         msg.ack();
         continue;
       }
@@ -225,22 +195,17 @@ export default {
 
   async scheduled(controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     const occurred_at = now_iso();
-    const job_name = "pasay_heartbeat";
     const envelope: PasayQueueEnvelope = {
       version: ENVELOPE_VERSION,
       kind: "scheduled_job",
-      event_id: make_scheduled_event_id(job_name, occurred_at),
+      event_id: make_scheduled_event_id("pasay_heartbeat", occurred_at),
       occurred_at,
-      payload: {
-        job_name,
-        scheduled_at: occurred_at,
-        params: { cron_expression: controller.cron ?? "unscheduled" },
-      },
+      payload: { job_name: "pasay_heartbeat", scheduled_at: occurred_at, params: { cron_expression: controller.cron ?? "unscheduled" } },
     };
     try {
       await env.PASAY_QUEUE.send(envelope as unknown as MessageSendRequest);
-    } catch {
-      // best-effort; cron will fire again next window
+    } catch (err) {
+      log_error("scheduled-enqueue", err, env);
     }
   },
 };
