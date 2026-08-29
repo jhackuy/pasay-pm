@@ -3,10 +3,9 @@ main = "src/index.ts"
 compatibility_date = "2026-08-20"
 compatibility_flags = ["nodejs_compat"]
 
-# Singleton Cloudflare Container built from the repository Dockerfile.
 [[containers]]
 class_name = "PasayContainer"
-image = "../../Dockerfile"
+image = "../Dockerfile"
 max_instances = 1
 instance_type = "basic"
 region = "APAC"
@@ -19,7 +18,6 @@ name = "PASAY_CONTAINER"
 tag = "v1-pasay-container"
 new_sqlite_classes = ["PasayContainer"]
 
-# Queue producer and consumer are the same queue.
 [[queues.producers]]
 queue = "pasay-events"
 binding = "PASAY_QUEUE"
@@ -31,13 +29,9 @@ max_batch_timeout = 1
 max_retries = 5
 dead_letter_queue = "pasay-events-dlq"
 
-# Heartbeat cron.
 [triggers]
 crons = ["*/5 * * * *"]
 
-# Secrets (set via `wrangler secret put`):
-#   TELEGRAM_WEBHOOK_SECRET
-#   PASAY_CONTAINER_INGEST_TOKEN
-#   DATABASE_URL
-#   DATABASE_URL_UNPOOLED
-#   TELEGRAM_BOT_TOKEN
+[observability]
+enabled = true
+head_sampling_rate = 1
