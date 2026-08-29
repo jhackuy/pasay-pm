@@ -23,8 +23,22 @@ class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key is invalid or reused with a different payload."""
 
 
+# Back-compat alias: tests and services may import `IdempotencyError` directly.
+# Both names refer to the same ValueError subclass.
+IdempotencyError = IdempotencyConflictError
+
+
 # Matches IdempotencyMixin.key column width in app/db/base.py.
 MAX_IDEMPOTENCY_KEY_LEN = 128
+
+
+__all__ = [
+    "IdempotencyConflictError",
+    "IdempotencyError",
+    "MAX_IDEMPOTENCY_KEY_LEN",
+    "compute_payload_hash",
+    "normalize_idempotency_key",
+]
 
 
 def normalize_idempotency_key(raw: Any) -> str:

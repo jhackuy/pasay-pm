@@ -1,6 +1,8 @@
 """WorkspaceService: create orgs, invite/list members."""
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy.orm import Session
 
 from app.core.permissions import (
@@ -10,7 +12,9 @@ from app.core.permissions import (
     UnknownRoleError,
     require_org_scope,
 )
+from app.core.security import hash_api_key
 from app.v1.models.foundation import (
+    ApiCredential,
     Membership,
     MembershipState,
     Organization,

@@ -27,7 +27,8 @@ from app.core.permissions import (
 )
 from app.core.security import hash_api_key
 from app.db.session import get_db
-from app.v1.models.foundation import ApiCredential, Membership, MembershipState
+from app.v1.models.foundation import ApiCredential, Membership
+from app.v1.models.base import MembershipState
 
 
 def get_db_dep(db: Session = Depends(get_db)) -> Session:
@@ -134,6 +135,7 @@ __all__ = [
     "get_current_principal",
     "get_db_dep",
     "parse_idempotency_key_header",
+    "Principal",
     "require_role",
     "compute_payload_hash",
 ]

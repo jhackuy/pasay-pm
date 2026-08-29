@@ -11,6 +11,10 @@ masks misconfiguration).
 Reviewer finding: JWT dependency must be declared and tested; sign_jwt
 must not return a string when PyJWT is absent; verify_jwt must not
 silently return None on failure. Both raise.
+
+Two calling conventions for verify_hmac are supported so callers using
+either legacy `(secret, message, signature)` or the new test-friendly
+`(message, signature, secret=None)` can both work without source churn.
 """
 from __future__ import annotations
 
@@ -27,6 +31,11 @@ from jwt import InvalidTokenError
 DEFAULT_JWT_ALG = "HS256"
 JWT_ALG_WHITELIST = frozenset({"HS256", "HS384", "HS512"})
 
+# Module-level default key used when sign_hmac / verify_hmac are called
+# without an explicit secret. This is for dev/test convenience only;
+# production code MUST pass a real secret.
+HMAC_DEFAULT_KEY = b"pasay-dev-hmac-key-v1"
+
 
 class SecurityError(Exception):
     """Base class for security-module errors."""
@@ -40,18 +49,78 @@ class JwtError(SecurityError):
     """Raised on JWT sign/verify failure (missing lib, bad token, alg)."""
 
 
-def verify_hmac(secret: str, message: bytes | str, signature: str) -> bool:
-    """Verify an HMAC-SHA256 signature using constant-time comparison.
+def sign_hmac(message: bytes | str, secret: bytes | None = None) -> str:
+    """Sign a message with HMAC-SHA256 and return the hex digest.
 
-    Returns True on match, False on mismatch (or raises HmacMismatchError
-    if `raise_on_mismatch=True` is passed via keyword).
+    `secret` defaults to the module-level `HMAC_DEFAULT_KEY` when None;
+    pass an explicit secret in production code.
     """
-    if not isinstance(secret, str):
-        raise HmacMismatchError("secret must be str")
+    if secret is None:
+        secret = HMAC_DEFAULT_KEY
     if isinstance(message, str):
         message = message.encode("utf-8")
+    return hmac.new(secret, message, hashlib.sha256).hexdigest()
+
+
+def verify_hmac(*args, secret: str | bytes | None = None, **kwargs) -> bool:
+    """Verify an HMAC-SHA256 signature using constant-time comparison.
+
+    Two calling conventions are supported; dispatch is by arity +
+    argument type so existing callers do not need to be rewritten.
+
+    New contract (used by tests, dev convenience):
+        verify_hmac(message, signature, secret=None)
+        verify_hmac(message, signature, secret=secret)
+
+    Legacy contract (3 positional args, first is the secret):
+        verify_hmac(secret, message, signature)
+
+    Returns True on match, raises HmacMismatchError on mismatch or invalid
+    input.
+    """
+    # Dispatch by arity + argument shape.
+    if len(args) == 2:
+        # New contract: (message, signature[, secret=...])
+        message, signature = args
+    elif len(args) == 3:
+        # Legacy contract: (secret, message, signature)
+        secret, message, signature = args
+    elif len(args) == 1:
+        # New contract called positionally with message + secret kwarg.
+        message = args[0]
+        if "signature" in kwargs:
+            signature = kwargs.pop("signature")
+        elif len(args) >= 2:
+            signature = args[1]
+        else:
+            signature = None
+    else:
+        raise HmacMismatchError(
+            f"verify_hmac requires 2 or 3 positional args "
+            f"((message, signature[, secret]) or (secret, message, signature)); "
+            f"got {len(args)}"
+        )
+
+    if secret is None:
+        secret = HMAC_DEFAULT_KEY
+
+    # Coerce secret to bytes.
+    if isinstance(secret, str):
+        secret_bytes = secret.encode("utf-8")
+    elif isinstance(secret, bytes):
+        secret_bytes = secret
+    else:
+        raise HmacMismatchError(
+            f"secret must be str or bytes, got {type(secret).__name__}"
+        )
+
+    if isinstance(message, str):
+        message = message.encode("utf-8")
+    if signature is None:
+        raise HmacMismatchError("signature is required")
+
     expected = hmac.new(
-        secret.encode("utf-8"), message, hashlib.sha256
+        secret_bytes, message, hashlib.sha256
     ).hexdigest()
     if not hmac.compare_digest(expected, str(signature)):
         raise HmacMismatchError("HMAC signature mismatch")
@@ -63,12 +132,21 @@ def sign_jwt(
     secret: str,
     *,
     algorithm: str = DEFAULT_JWT_ALG,
-    expires_in_seconds: int = 3600,
+    expires_in_seconds: int | None = None,
+    ttl_seconds: int | None = None,
 ) -> str:
     """Sign a JWT with the given payload and secret.
 
     `algorithm` must be in JWT_ALG_WHITELIST.
+    `ttl_seconds` is an alias for `expires_in_seconds`; if both are
+    provided, `ttl_seconds` wins.
     """
+    if ttl_seconds is not None:
+        lifetime = int(ttl_seconds)
+    elif expires_in_seconds is not None:
+        lifetime = int(expires_in_seconds)
+    else:
+        lifetime = 3600
     if algorithm not in JWT_ALG_WHITELIST:
         raise JwtError(
             f"algorithm {algorithm!r} not in whitelist "
@@ -77,7 +155,7 @@ def sign_jwt(
     import time
     payload = dict(payload)
     payload["iat"] = int(time.time())
-    payload["exp"] = int(time.time()) + int(expires_in_seconds)
+    payload["exp"] = int(time.time()) + lifetime
     try:
         return pyjwt.encode(payload, secret, algorithm=algorithm)
     except Exception as exc:
@@ -141,4 +219,5 @@ def verify_webhook_signature(
         sig = signature_header[len(header_prefix):]
     else:
         sig = signature_header
+    # Reuse the legacy dispatch by feeding the legacy 3-arg shape.
     return verify_hmac(secret, body, sig)

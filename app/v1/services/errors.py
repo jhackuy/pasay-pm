@@ -5,8 +5,11 @@ Routes map these to HTTPException:
 - ConflictError → 409
 - ValidationError → 400
 - CrossOrgAccessError → 403
+- PermissionDenied (re-export) → 403
 """
 from __future__ import annotations
+
+from app.core.permissions import PermissionDenied
 
 
 class ServiceError(Exception):
@@ -27,3 +30,13 @@ class ValidationError(ServiceError):
 
 class CrossOrgAccessError(ServiceError):
     """Cross-org access attempt (fail-closed)."""
+
+
+__all__ = [
+    "ConflictError",
+    "CrossOrgAccessError",
+    "NotFoundError",
+    "PermissionDenied",
+    "ServiceError",
+    "ValidationError",
+]

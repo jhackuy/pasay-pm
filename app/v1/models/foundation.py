@@ -2,14 +2,18 @@
 
 AGENTS.md §4 invariants:
 - Organization: BIGSERIAL pk, name UNIQUE.
-- User: telegram_id UNIQUE NULLABLE (a user may not have a Telegram account).
-- Membership: composite UNIQUE (org_id, user_id); role CHECK;
-  state CHECK in ('ACTIVE','SUSPENDED','REMOVED'); org_id indexed.
+- User: telegram_user_id UNIQUE NULLABLE (a user may not have a Telegram
+  account); default_language NOT NULL with whitelist CHECK.
+- Membership: composite UNIQUE (org_id, user_id); role CHECK in
+  ('OWNER','SECRETARY'); state CHECK in ('ACTIVE','REMOVED'); is_bootstrap
+  flag identifies the original owner (last-Owner protection invariant).
 - ApiCredential: key_hash UNIQUE; user_id indexed.
+
+DATA_CONTRACT §2.5 mandates the exact uppercase enum values; the
+MembershipRole / MembershipState StrEnums in app.v1.models.base are the
+single source of truth and their string values match these CHECK constraints.
 """
 from __future__ import annotations
-
-import enum
 
 from sqlalchemy import (
     BigInteger,
@@ -23,13 +27,12 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
-from app.v1.models.base import TimestampMixin, V1Base, big_pk
-
-
-class MembershipState(str, enum.Enum):
-    ACTIVE = "ACTIVE"
-    SUSPENDED = "SUSPENDED"
-    REMOVED = "REMOVED"
+from app.v1.models.base import (
+    MembershipState,
+    TimestampMixin,
+    V1Base,
+    big_pk,
+)
 
 
 class Organization(V1Base, TimestampMixin):
@@ -54,13 +57,21 @@ class Organization(V1Base, TimestampMixin):
 class User(V1Base, TimestampMixin):
     __tablename__ = "v1_users"
     __table_args__ = (
-        UniqueConstraint("telegram_id", name="uq_v1_users_telegram_id"),
+        UniqueConstraint(
+            "telegram_user_id", name="uq_v1_users_telegram_user_id",
+        ),
+        CheckConstraint(
+            "default_language IN ('zh-CN','en-US','tl-PH')",
+            name="ck_v1_users_default_language",
+        ),
     )
 
     id = big_pk()
-    telegram_id = Column(BigInteger, nullable=True)
+    telegram_user_id = Column(BigInteger, nullable=True)
     username = Column(String(64), nullable=True)
     display_name = Column(String(120), nullable=True)
+    # DATA_CONTRACT §2.5: every user has a default UI language.
+    default_language = Column(String(8), nullable=False, default="zh-CN")
 
     memberships = relationship(
         "Membership", back_populates="user",
@@ -80,11 +91,11 @@ class Membership(V1Base, TimestampMixin):
             name="uq_v1_memberships_org_user",
         ),
         CheckConstraint(
-            "role IN ('owner','secretary','tenant')",
+            "role IN ('OWNER','SECRETARY')",
             name="ck_v1_memberships_role",
         ),
         CheckConstraint(
-            "state IN ('ACTIVE','SUSPENDED','REMOVED')",
+            "state IN ('ACTIVE','REMOVED')",
             name="ck_v1_memberships_state",
         ),
         Index("ix_v1_memberships_org_id", "org_id"),
@@ -106,6 +117,11 @@ class Membership(V1Base, TimestampMixin):
     state = Column(
         String(16), nullable=False,
         default=MembershipState.ACTIVE.value,
+    )
+    # The bootstrap (founding) OWNER of a workspace; only one per org,
+    # enforced at service layer (last-Owner protection).
+    is_bootstrap = Column(
+        Boolean, nullable=False, default=False, server_default="false",
     )
 
     organization = relationship("Organization", back_populates="memberships")
