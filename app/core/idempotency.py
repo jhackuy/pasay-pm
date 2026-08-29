@@ -1,16 +1,20 @@
 """Idempotency key normalization and payload hashing.
 
-AGENTS.md §4: idempotent requests return same result on retry. The
+AGENTS.md §4: idempotent requests return the same result on retry. The
 composite key (org_id, key, kind) is enforced by IdempotencyMixin in
 app/db/base.py. This module provides the canonical normalization +
-hash used by services and the middleware layer.
+hash used by services and middleware.
 
-Owner invariant (PR #100 review): opaque client idempotency keys MUST
-preserve case and MUST be rejected (not truncated) when they exceed
-the storage cap. Two client requests that differ only in case are
-distinct idempotency keys; silent normalization would let one erase
-the other. Silent truncation would let a malicious or buggy client
-collapse distinct keys into the same stored value.
+CANONICAL CONTRACT (Owner-mandated; no aliases, no fallbacks):
+- Idempotency keys are opaque client-provided strings. They MUST be
+  preserved verbatim — no case folding, no whitespace stripping, no
+  truncation. Two requests that differ only in case, or only in
+  leading/trailing whitespace, are distinct idempotency keys.
+- Empty keys and whitespace-only keys are rejected as
+  IdempotencyKeyError.
+- Keys longer than MAX_IDEMPOTENCY_KEY_LEN are rejected as
+  IdempotencyKeyError — never silently truncated.
+- Reusing a key with a different payload raises IdempotencyConflictError.
 """
 from __future__ import annotations
 
@@ -19,62 +23,69 @@ import json
 from typing import Any, Mapping
 
 
-class IdempotencyConflictError(ValueError):
-    """Raised when an idempotency key is invalid or reused with a different payload."""
-
-
-# Back-compat alias: tests and services may import `IdempotencyError` directly.
-# Both names refer to the same ValueError subclass.
-IdempotencyError = IdempotencyConflictError
-
-
 # Matches IdempotencyMixin.key column width in app/db/base.py.
 MAX_IDEMPOTENCY_KEY_LEN = 128
 
 
+class IdempotencyKeyError(ValueError):
+    """Raised when an idempotency key is malformed (empty, oversize, non-str).
+
+    Distinct from IdempotencyConflictError so callers can distinguish a
+    client-input problem from a state-conflict problem.
+    """
+
+
+class IdempotencyConflictError(ValueError):
+    """Raised when an idempotency key is reused with a different payload
+    or already maps to a stored result.
+    """
+
+
 __all__ = [
-    "IdempotencyConflictError",
-    "IdempotencyError",
     "MAX_IDEMPOTENCY_KEY_LEN",
+    "IdempotencyKeyError",
+    "IdempotencyConflictError",
     "compute_payload_hash",
     "normalize_idempotency_key",
 ]
 
 
 def normalize_idempotency_key(raw: Any) -> str:
-    """Canonicalize an idempotency key.
+    """Validate and return an idempotency key verbatim (no normalization).
 
-    Rules (Owner-mandated):
-    - Reject non-str input with IdempotencyConflictError.
-    - Strip leading/trailing whitespace.
-    - Preserve case exactly (NO lowercasing — opaque client keys must
-      not collide with their case variants).
-    - Reject empty keys after trim.
-    - Reject keys longer than MAX_IDEMPOTENCY_KEY_LEN (no truncation).
+    Rules (canonical):
+    - Must be a `str`.
+    - Must not be empty.
+    - Must not be whitespace-only.
+    - Length must not exceed MAX_IDEMPOTENCY_KEY_LEN (rejected, NOT truncated).
+    - Case is preserved exactly.
+    - Leading/trailing whitespace is preserved exactly.
+
+    Raises IdempotencyKeyError on any of the above. Returns the input
+    string unchanged on success.
     """
     if not isinstance(raw, str):
-        raise IdempotencyConflictError(
+        raise IdempotencyKeyError(
             f"idempotency key must be str, got {type(raw).__name__}"
         )
-    key = raw.strip()
-    if not key:
-        raise IdempotencyConflictError(
-            "idempotency key is empty after normalization"
-        )
-    if len(key) > MAX_IDEMPOTENCY_KEY_LEN:
-        raise IdempotencyConflictError(
-            f"idempotency key too long: {len(key)} chars exceeds "
+    if not raw:
+        raise IdempotencyKeyError("idempotency key is empty")
+    if raw.isspace():
+        raise IdempotencyKeyError("idempotency key is whitespace-only")
+    if len(raw) > MAX_IDEMPOTENCY_KEY_LEN:
+        raise IdempotencyKeyError(
+            f"idempotency key too long: {len(raw)} chars exceeds "
             f"max {MAX_IDEMPOTENCY_KEY_LEN}"
         )
-    return key
+    return raw
 
 
 def compute_payload_hash(payload: Mapping[str, Any]) -> str:
     """Compute a stable SHA-256 hex digest of a JSON payload.
 
-    Keys are sorted for determinism. The default JSON serializer
-    coerces non-JSON scalars via str(); services should pre-normalize
-    datetimes to ISO-8601 strings before passing in.
+    Keys are sorted for determinism. Non-JSON scalars are coerced via
+    `str()` so services should pre-normalize datetimes to ISO-8601 strings
+    before passing in.
     """
     canonical = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str,
