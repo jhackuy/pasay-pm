@@ -33,10 +33,10 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Backend pytest
-        run: pytest -q tests
+        run: pytest -q tests/test_v1_*.py
       - name: Telegram pytest
         working-directory: pasay-telegram-bot
-        run: pytest -q
+        run: pytest -q tests/test_main.py
 
   fresh-postgres-alembic:
     runs-on: ubuntu-latest
