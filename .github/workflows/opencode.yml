@@ -110,10 +110,18 @@ jobs:
           assert cfg.get('share') == 'disabled', cfg.get('share')
           assert cfg.get('subagent_depth') == 1, cfg.get('subagent_depth')
           agents = cfg.get('agent') or {}
-          assert agents.get('pasay-lead', {}).get('mode') == 'primary'
+          lead = agents.get('pasay-lead') or {}
+          assert lead.get('mode') == 'primary', lead.get('mode')
+          assert (lead.get('steps') or 0) >= 40, lead.get('steps')
+          permissions = lead.get('permission') or {}
+          assert permissions.get('edit') == 'allow', permissions.get('edit')
+          assert permissions.get('bash') == 'allow', permissions.get('bash')
+          prompt = lead.get('prompt') or ''
+          assert 'PASAY-OC-QUAL-001' not in prompt
+          assert 'never edits the repository directly' not in prompt.lower()
           PY
 
-      - name: Run OpenCode GitHub handler with qualified PASAY Lead
+      - name: Run OpenCode GitHub handler with PASAY Lead
         shell: bash
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
