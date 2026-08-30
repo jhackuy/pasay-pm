@@ -1401,8 +1401,359 @@ def upgrade() -> None:
         "v1_renewal_activities", ["renewal_id"],
     )
 
+    # ---- Move-out / Settlement ----
+    op.create_table(
+        "v1_move_outs",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "lease_id", sa.BigInteger(),
+            sa.ForeignKey("v1_leases.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "state", sa.String(length=16), nullable=False,
+            server_default="REQUESTED",
+        ),
+        sa.Column(
+            "requested_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "requested_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column("planned_move_out_date", sa.Date(), nullable=True),
+        sa.Column(
+            "inspected_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column(
+            "inspected_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column("inspection_notes", sa.String(length=4000), nullable=True),
+        sa.Column(
+            "settled_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        # NOTE: settlement_id references v1_deposit_settlements.id which
+        # is created later in this baseline. We declare it as a plain
+        # BigInteger here and add the FK as an ALTER TABLE after both
+        # tables exist; the application layer still enforces referential
+        # integrity via org-scope and the closure-gate flow.
+        sa.Column(
+            "settlement_id", sa.BigInteger(), nullable=True,
+        ),
+        sa.Column(
+            "cancelled_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column("cancel_reason", sa.String(length=500), nullable=True),
+        sa.Column(
+            "idempotency_key", sa.String(length=128), nullable=False,
+        ),
+        sa.Column(
+            "payload_hash", sa.String(length=64), nullable=False,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "state IN ('REQUESTED','INSPECTED','SETTLED','CANCELLED')",
+            name="ck_v1_move_outs_state",
+        ),
+        sa.UniqueConstraint(
+            "org_id", "idempotency_key",
+            name="uq_v1_move_outs_org_idempotency_key",
+        ),
+    )
+    op.create_index(
+        "ix_v1_move_outs_org_id", "v1_move_outs", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_move_outs_org_state", "v1_move_outs", ["org_id", "state"],
+    )
+    op.create_index(
+        "ix_v1_move_outs_lease_id", "v1_move_outs", ["lease_id"],
+    )
+    op.create_index(
+        "ix_v1_move_outs_settlement_id", "v1_move_outs", ["settlement_id"],
+    )
+
+    op.create_table(
+        "v1_deposit_settlements",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "move_out_id", sa.BigInteger(),
+            sa.ForeignKey("v1_move_outs.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "disposition", sa.String(length=20), nullable=False,
+        ),
+        sa.Column(
+            "deposit_held", sa.Numeric(14, 2), nullable=False,
+        ),
+        sa.Column(
+            "deductions_total", sa.Numeric(14, 2), nullable=False,
+            server_default="0",
+        ),
+        sa.Column(
+            "refund_amount", sa.Numeric(14, 2), nullable=False,
+            server_default="0",
+        ),
+        sa.Column(
+            "additional_owed", sa.Numeric(14, 2), nullable=False,
+            server_default="0",
+        ),
+        sa.Column("notes", sa.String(length=2000), nullable=True),
+        sa.Column(
+            "settled_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "settled_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "disposition IN ("
+            "'FULL_REFUND','PARTIAL_REFUND','NO_REFUND','ADDITIONAL_OWED'"
+            ")",
+            name="ck_v1_deposit_settlements_disposition",
+        ),
+        sa.CheckConstraint(
+            "deposit_held >= 0",
+            name="ck_v1_deposit_settlements_deposit_held_nonneg",
+        ),
+        sa.CheckConstraint(
+            "deductions_total >= 0",
+            name="ck_v1_deposit_settlements_deductions_nonneg",
+        ),
+        sa.CheckConstraint(
+            "refund_amount >= 0",
+            name="ck_v1_deposit_settlements_refund_nonneg",
+        ),
+        sa.CheckConstraint(
+            "additional_owed >= 0",
+            name="ck_v1_deposit_settlements_additional_owed_nonneg",
+        ),
+        sa.CheckConstraint(
+            "(disposition = 'FULL_REFUND' AND refund_amount = deposit_held "
+            "AND additional_owed = 0) OR disposition <> 'FULL_REFUND'",
+            name="ck_v1_deposit_settlements_full_refund_amounts",
+        ),
+        sa.CheckConstraint(
+            "(disposition = 'NO_REFUND' AND refund_amount = 0 "
+            "AND additional_owed = 0) OR disposition <> 'NO_REFUND'",
+            name="ck_v1_deposit_settlements_no_refund_amounts",
+        ),
+    )
+    op.create_index(
+        "ix_v1_deposit_settlements_org_id",
+        "v1_deposit_settlements", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_deposit_settlements_move_out_id",
+        "v1_deposit_settlements", ["move_out_id"],
+    )
+
+    op.create_table(
+        "v1_move_out_inspections",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "move_out_id", sa.BigInteger(),
+            sa.ForeignKey("v1_move_outs.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "inspected_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "inspected_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "summary", sa.String(length=4000), nullable=False,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_v1_move_out_inspections_org_id",
+        "v1_move_out_inspections", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_move_out_inspections_move_out_id",
+        "v1_move_out_inspections", ["move_out_id"],
+    )
+
+    op.create_table(
+        "v1_move_out_damages",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "move_out_id", sa.BigInteger(),
+            sa.ForeignKey("v1_move_outs.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "kind", sa.String(length=32), nullable=False,
+        ),
+        sa.Column(
+            "description", sa.String(length=2000), nullable=False,
+        ),
+        sa.Column(
+            "amount", sa.Numeric(14, 2), nullable=False,
+        ),
+        sa.Column(
+            "accepted_amount", sa.Numeric(14, 2), nullable=False,
+            server_default="0",
+        ),
+        sa.Column(
+            "recorded_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "kind IN ('CLEANING','REPAIR','REPLACEMENT','UTILITIES','OTHER')",
+            name="ck_v1_move_out_damages_kind",
+        ),
+        sa.CheckConstraint(
+            "amount >= 0",
+            name="ck_v1_move_out_damages_amount_nonneg",
+        ),
+        sa.CheckConstraint(
+            "accepted_amount >= 0",
+            name="ck_v1_move_out_damages_accepted_nonneg",
+        ),
+        sa.CheckConstraint(
+            "accepted_amount <= amount",
+            name="ck_v1_move_out_damages_accepted_le_amount",
+        ),
+    )
+    op.create_index(
+        "ix_v1_move_out_damages_org_id", "v1_move_out_damages", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_move_out_damages_move_out_id",
+        "v1_move_out_damages", ["move_out_id"],
+    )
+
+    op.create_table(
+        "v1_move_out_activities",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "move_out_id", sa.BigInteger(),
+            sa.ForeignKey("v1_move_outs.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "kind", sa.String(length=32), nullable=False,
+        ),
+        sa.Column(
+            "actor_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "detail", sa.String(length=500), nullable=True,
+        ),
+        sa.Column(
+            "occurred_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_v1_move_out_activities_org_id",
+        "v1_move_out_activities", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_move_out_activities_move_out_id",
+        "v1_move_out_activities", ["move_out_id"],
+    )
+
+    # Now that both tables exist, add the circular FK between
+    # v1_move_outs.settlement_id and v1_deposit_settlements.id.
+    op.create_foreign_key(
+        "fk_v1_move_outs_settlement_id",
+        "v1_move_outs", "v1_deposit_settlements",
+        ["settlement_id"], ["id"],
+        ondelete="RESTRICT",
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("v1_move_out_activities")
+    op.drop_table("v1_move_out_damages")
+    op.drop_table("v1_move_out_inspections")
+    # Drop the FK from v1_move_outs.settlement_id before dropping
+    # v1_deposit_settlements.
+    op.drop_constraint(
+        "fk_v1_move_outs_settlement_id", "v1_move_outs", type_="foreignkey",
+    )
+    op.drop_table("v1_deposit_settlements")
+    op.drop_table("v1_move_outs")
     op.drop_table("v1_renewal_activities")
     op.drop_table("v1_lease_renewals")
     op.drop_table("v1_repair_activities")

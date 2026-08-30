@@ -93,3 +93,21 @@ from app.v1.models.renewal import (  # noqa: F401
     RenewalState,
     TASK_KIND_RENEWAL_FOLLOW_UP,
 )
+from app.v1.models.move_out import (  # noqa: F401
+    DEPOSIT_DISPOSITIONS,
+    MOVE_OUT_ACTIVITY_KINDS,
+    MOVE_OUT_DAMAGE_KINDS,
+    MOVE_OUT_STATES,
+    DepositDisposition,
+    DepositSettlement,
+    MoveOut,
+    MoveOutActivity,
+    MoveOutActivityKind,
+    MoveOutDamage,
+    MoveOutDamageKind,
+    MoveOutInspection,
+    MoveOutState,
+    OPERATION_KIND_MOVE_OUT,
+    OPERATION_SUBJECT_MOVE_OUT,
+    TASK_KIND_MOVE_OUT_FOLLOW_UP,
+)

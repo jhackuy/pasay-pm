@@ -21,6 +21,8 @@ from datetime import date
 from decimal import Decimal
 from typing import Iterator
 
+import sqlalchemy as sa
+
 from app.core.permissions import Principal, Role
 from app.core.security import generate_api_key, hash_api_key
 from app.db.session import bind_engine, get_session_factory, reset_engine_cache
@@ -45,6 +47,7 @@ import app.v1.models.rent_payment  # noqa: F401
 import app.v1.models.expense  # noqa: F401
 import app.v1.models.repair  # noqa: F401
 import app.v1.models.renewal  # noqa: F401
+import app.v1.models.move_out  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -105,12 +108,33 @@ def v1_engine_ctx() -> Iterator[object]:
         )
     reset_engine_cache()
     engine = bind_engine(url)
+    # Drop any circular FK that the alembic baseline added (it is created
+    # via ALTER TABLE *after* both tables exist, so it survives the
+    # metadata-driven drop_all only when CASCADE is used). Drop the FK
+    # directly first so the metadata-driven drop_all can run without
+    # cascade and the test DB stays clean.
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "ALTER TABLE IF EXISTS v1_move_outs "
+                "DROP CONSTRAINT IF EXISTS fk_v1_move_outs_settlement_id"
+            )
+        )
     V1Base.metadata.drop_all(engine)
     V1Base.metadata.create_all(engine)
     try:
         yield engine
     finally:
         try:
+            # Drop the late FK again so drop_all can run cleanly during
+            # teardown.
+            with engine.begin() as conn:
+                conn.execute(
+                    sa.text(
+                        "ALTER TABLE IF EXISTS v1_move_outs "
+                        "DROP CONSTRAINT IF EXISTS fk_v1_move_outs_settlement_id"
+                    )
+                )
             V1Base.metadata.drop_all(engine)
         finally:
             reset_engine_cache()
