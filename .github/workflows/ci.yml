@@ -1,0 +1,67 @@
+name: rewrite-ci
+
+on:
+  pull_request:
+    branches: [feature/telegram-ui-v2]
+  push:
+    branches: [opencode/issue99-20260829042355]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  fresh-postgres-alembic:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: pasay
+          POSTGRES_PASSWORD: pasay
+          POSTGRES_DB: pasay
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pasay -d pasay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://pasay:pasay@localhost:5432/pasay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: alembic upgrade head
+
+  build-core-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Backend import smoke
+        run: python -c "from app.main import app; assert app is not None"
+      - name: Container build
+        run: docker build -t pasay-rewrite .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: mini_app/package-lock.json
+      - name: Mini App build
+        working-directory: mini_app
+        run: npm ci && npm run build
