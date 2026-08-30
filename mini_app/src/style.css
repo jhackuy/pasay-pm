@@ -1,0 +1,25 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #17312a; background: #f3f0e8; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; }
+main { max-width: 720px; margin: 0 auto; padding: 28px 20px 100px; }
+header { margin-bottom: 28px; }
+.eyebrow { color: #c15f32; font-size: 12px; font-weight: 800; letter-spacing: .15em; }
+h1 { margin: 4px 0; font-size: 32px; }
+.hero, .panel, .card { border: 1px solid #d9d5ca; border-radius: 20px; background: #fffdf8; box-shadow: 0 8px 28px #18332b10; }
+.hero { padding: 24px; background: #14342b; color: white; }
+.hero span, .hero p, article span, .empty span, .error span { display: block; opacity: .72; }
+.hero strong { display: block; margin: 12px 0; font-size: 24px; line-height: 1.2; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 14px; }
+.card { min-height: 112px; padding: 18px; color: inherit; text-align: left; }
+.card b, .card span { display: block; }
+.card span { margin-top: 24px; color: #c15f32; }
+.panel { padding: 8px 20px; }
+article { padding: 18px 0; border-bottom: 1px solid #ebe7dd; }
+article:last-child { border: 0; }
+.empty, .error { min-height: 180px; display: flex; flex-direction: column; justify-content: center; gap: 9px; }
+.error button { align-self: flex-start; min-height: 44px; padding: 0 20px; border: 0; border-radius: 12px; background: #c15f32; color: white; }
+nav { position: fixed; z-index: 2; left: 50%; bottom: 0; transform: translateX(-50%); width: min(100%, 720px); display: grid; grid-template-columns: repeat(5, 1fr); padding: 8px 8px max(8px, env(safe-area-inset-bottom)); background: #fffdf8ee; border-top: 1px solid #d9d5ca; backdrop-filter: blur(12px); }
+nav button { min-height: 52px; border: 0; border-radius: 12px; background: transparent; color: #66736f; }
+nav button.active { background: #dce9e2; color: #14342b; font-weight: 800; }
+@media (prefers-color-scheme: dark) { :root { color: #eef5f1; background: #0d1714; } .panel, .card, nav { background: #15231f; border-color: #2b3a35; } }
+@media (max-width: 390px) { main { padding-inline: 14px; } .grid { grid-template-columns: 1fr; } }

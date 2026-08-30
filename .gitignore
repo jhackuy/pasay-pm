@@ -52,4 +52,5 @@ g4_*.json
 bagua.html
 script.js
 style.css
+!mini_app/src/style.css
 tests/_diag_*.py
