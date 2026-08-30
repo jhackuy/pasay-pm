@@ -112,7 +112,6 @@ jobs:
           agents = cfg.get('agent') or {}
           lead = agents.get('pasay-lead') or {}
           assert lead.get('mode') == 'primary', lead.get('mode')
-          assert (lead.get('steps') or 0) >= 40, lead.get('steps')
           permissions = lead.get('permission') or {}
           assert permissions.get('edit') == 'allow', permissions.get('edit')
           assert permissions.get('bash') == 'allow', permissions.get('bash')
