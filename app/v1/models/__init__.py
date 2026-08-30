@@ -39,3 +39,21 @@ from app.v1.models.rent_payment import (  # noqa: F401
     VERIFICATION_DECISIONS,
     VerificationDecision,
 )
+from app.v1.models.expense import (  # noqa: F401
+    EXPENSE_CATEGORIES,
+    EXPENSE_CLAIM_STATUSES,
+    EXPENSE_RECEIPT_KINDS,
+    EXPENSE_VERIFICATION_DECISIONS,
+    ExpenseActivity,
+    ExpenseActivityKind,
+    ExpenseCategory,
+    ExpenseClaim,
+    ExpenseClaimStatus,
+    ExpenseReceipt,
+    ExpenseReceiptKind,
+    ExpenseVerification,
+    ExpenseVerificationDecision,
+    OPERATION_KIND_EXPENSE,
+    OPERATION_SUBJECT_EXPENSE_CLAIM,
+    TASK_KIND_EXPENSE_FOLLOW_UP,
+)

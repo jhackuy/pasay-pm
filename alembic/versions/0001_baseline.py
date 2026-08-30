@@ -668,8 +668,221 @@ def upgrade() -> None:
         "v1_rent_activities", ["due_schedule_id"],
     )
 
+    # --- expense slice (Operation-is-Truth, Claim/Evidence/Verification separated) ---
+
+    op.create_table(
+        "v1_expense_claims",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("title", sa.String(length=200), nullable=False),
+        sa.Column("category", sa.String(length=32), nullable=False),
+        sa.Column("claimed_amount", sa.Numeric(14, 2), nullable=False),
+        sa.Column("verified_amount", sa.Numeric(14, 2), nullable=True),
+        sa.Column("status", sa.String(length=16), nullable=False, server_default="OPEN"),
+        sa.Column(
+            "opened_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "opened_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column("idempotency_key", sa.String(length=128), nullable=False),
+        sa.Column("payload_hash", sa.String(length=64), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "status IN ('OPEN','SUBMITTED','VERIFIED','FAILED','CANCELLED')",
+            name="ck_v1_expense_claims_status",
+        ),
+        sa.CheckConstraint(
+            "category IN ("
+            "'UTILITIES','REPAIRS','SUPPLIES','TAX',"
+            "'INSURANCE','SERVICE','OTHER'"
+            ")",
+            name="ck_v1_expense_claims_category",
+        ),
+        sa.CheckConstraint(
+            "claimed_amount > 0",
+            name="ck_v1_expense_claims_claimed_positive",
+        ),
+        sa.CheckConstraint(
+            "verified_amount IS NULL OR verified_amount > 0",
+            name="ck_v1_expense_claims_verified_positive",
+        ),
+        sa.UniqueConstraint(
+            "org_id", "idempotency_key",
+            name="uq_v1_expense_claims_org_idempotency_key",
+        ),
+    )
+    op.create_index(
+        "ix_v1_expense_claims_org_id", "v1_expense_claims", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_expense_claims_org_status",
+        "v1_expense_claims", ["org_id", "status"],
+    )
+
+    op.create_table(
+        "v1_expense_receipts",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "claim_id", sa.BigInteger(),
+            sa.ForeignKey("v1_expense_claims.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("kind", sa.String(length=16), nullable=False),
+        sa.Column("reference", sa.String(length=500), nullable=False),
+        sa.Column(
+            "uploaded_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "kind IN ('PHOTO','DOCUMENT','TEXT','TELEGRAM_FILE')",
+            name="ck_v1_expense_receipts_kind",
+        ),
+    )
+    op.create_index(
+        "ix_v1_expense_receipts_org_id", "v1_expense_receipts", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_expense_receipts_claim_id",
+        "v1_expense_receipts", ["claim_id"],
+    )
+
+    op.create_table(
+        "v1_expense_verifications",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "claim_id", sa.BigInteger(),
+            sa.ForeignKey("v1_expense_claims.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("decision", sa.String(length=16), nullable=False),
+        sa.Column("verified_amount", sa.Numeric(14, 2), nullable=True),
+        sa.Column(
+            "verifier_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "decided_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column("reason", sa.String(length=500), nullable=True),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "decision IN ('VERIFIED','REJECTED','REVERSED')",
+            name="ck_v1_expense_verifications_decision",
+        ),
+    )
+    op.create_index(
+        "ix_v1_expense_verifications_org_id",
+        "v1_expense_verifications", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_expense_verifications_claim_id",
+        "v1_expense_verifications", ["claim_id"],
+    )
+
+    op.create_table(
+        "v1_expense_activities",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "claim_id", sa.BigInteger(),
+            sa.ForeignKey("v1_expense_claims.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "receipt_id", sa.BigInteger(),
+            sa.ForeignKey("v1_expense_receipts.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column("kind", sa.String(length=32), nullable=False),
+        sa.Column("detail", sa.String(length=500), nullable=True),
+        sa.Column(
+            "actor_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "occurred_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_v1_expense_activities_org_id",
+        "v1_expense_activities", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_expense_activities_claim_id",
+        "v1_expense_activities", ["claim_id"],
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("v1_expense_activities")
+    op.drop_table("v1_expense_verifications")
+    op.drop_table("v1_expense_receipts")
+    op.drop_table("v1_expense_claims")
     op.drop_table("v1_rent_activities")
     op.drop_table("v1_rent_verifications")
     op.drop_table("v1_rent_evidences")

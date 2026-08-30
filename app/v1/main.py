@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from app.v1.api.bootstrap import router as bootstrap_router
+from app.v1.api.expenses import router as expenses_router
 from app.v1.api.leases import router as leases_router
 from app.v1.api.properties import router as properties_router
 from app.v1.api.rent_payments import router as rent_payments_router
@@ -35,6 +36,7 @@ def create_v1_app() -> FastAPI:
     app.include_router(tenants_router, prefix="/api/v1")
     app.include_router(leases_router, prefix="/api/v1")
     app.include_router(rent_payments_router, prefix="/api/v1")
+    app.include_router(expenses_router, prefix="/api/v1")
     return app
 
 
