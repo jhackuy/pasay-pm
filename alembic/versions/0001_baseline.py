@@ -1251,8 +1251,160 @@ def upgrade() -> None:
         "v1_repair_activities", ["report_id"],
     )
 
+    # ---- Lease Renewal ----
+    op.create_table(
+        "v1_lease_renewals",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_lease_id", sa.BigInteger(),
+            sa.ForeignKey("v1_leases.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "new_lease_id", sa.BigInteger(),
+            sa.ForeignKey("v1_leases.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "state", sa.String(length=16), nullable=False, server_default="PROPOSED",
+        ),
+        sa.Column("proposed_start_date", sa.Date(), nullable=False),
+        sa.Column("proposed_end_date", sa.Date(), nullable=False),
+        sa.Column(
+            "proposed_monthly_rent", sa.Numeric(14, 2), nullable=False,
+        ),
+        sa.Column(
+            "proposed_deposit", sa.Numeric(14, 2), nullable=False,
+            server_default="0",
+        ),
+        sa.Column(
+            "proposed_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "proposed_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "decided_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "decided_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column(
+            "decision_reason", sa.String(length=500), nullable=True,
+        ),
+        sa.Column(
+            "executed_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column(
+            "idempotency_key", sa.String(length=128), nullable=False,
+        ),
+        sa.Column(
+            "payload_hash", sa.String(length=64), nullable=False,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "state IN ('PROPOSED','APPROVED','REJECTED','EXECUTED','CANCELLED')",
+            name="ck_v1_lease_renewals_state",
+        ),
+        sa.CheckConstraint(
+            "proposed_end_date > proposed_start_date",
+            name="ck_v1_lease_renewals_dates",
+        ),
+        sa.CheckConstraint(
+            "proposed_monthly_rent > 0",
+            name="ck_v1_lease_renewals_rent_positive",
+        ),
+        sa.CheckConstraint(
+            "proposed_deposit >= 0",
+            name="ck_v1_lease_renewals_deposit_nonneg",
+        ),
+        sa.UniqueConstraint(
+            "org_id", "idempotency_key",
+            name="uq_v1_lease_renewals_org_idempotency_key",
+        ),
+    )
+    op.create_index(
+        "ix_v1_lease_renewals_org_id", "v1_lease_renewals", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_lease_renewals_org_state",
+        "v1_lease_renewals", ["org_id", "state"],
+    )
+    op.create_index(
+        "ix_v1_lease_renewals_source_lease_id",
+        "v1_lease_renewals", ["source_lease_id"],
+    )
+    op.create_index(
+        "ix_v1_lease_renewals_new_lease_id",
+        "v1_lease_renewals", ["new_lease_id"],
+    )
+
+    op.create_table(
+        "v1_renewal_activities",
+        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "renewal_id", sa.BigInteger(),
+            sa.ForeignKey("v1_lease_renewals.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "kind", sa.String(length=40), nullable=False,
+        ),
+        sa.Column(
+            "actor_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "detail", sa.String(length=500), nullable=True,
+        ),
+        sa.Column(
+            "occurred_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_v1_renewal_activities_org_id", "v1_renewal_activities", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_renewal_activities_renewal_id",
+        "v1_renewal_activities", ["renewal_id"],
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("v1_renewal_activities")
+    op.drop_table("v1_lease_renewals")
     op.drop_table("v1_repair_activities")
     op.drop_table("v1_repair_verifications")
     op.drop_table("v1_repair_completion_claims")

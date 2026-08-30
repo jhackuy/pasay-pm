@@ -44,6 +44,7 @@ from app.v1.models.tenant_lease import Lease, Tenant
 import app.v1.models.rent_payment  # noqa: F401
 import app.v1.models.expense  # noqa: F401
 import app.v1.models.repair  # noqa: F401
+import app.v1.models.renewal  # noqa: F401
 
 
 @dataclass(frozen=True)

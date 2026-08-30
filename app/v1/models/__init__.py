@@ -83,3 +83,13 @@ from app.v1.models.repair import (  # noqa: F401
     RepairWorkState,
     TASK_KIND_REPAIR_FOLLOW_UP,
 )
+from app.v1.models.renewal import (  # noqa: F401
+    OPERATION_KIND_LEASE_RENEWAL,
+    OPERATION_SUBJECT_LEASE_RENEWAL,
+    RENEWAL_ACTIVITY_KINDS,
+    RENEWAL_STATES,
+    RenewalActivity,
+    RenewalActivityKind,
+    RenewalState,
+    TASK_KIND_RENEWAL_FOLLOW_UP,
+)
