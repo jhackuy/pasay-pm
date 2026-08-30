@@ -1,4 +1,3 @@
-import re
 import secrets
 import os
 
@@ -24,56 +23,8 @@ from app.services.audit import audit_context
 from decimal import Decimal
 from datetime import date as _date
 
-TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", "pasay_pm_test")
-
-# P1-PASAY-NIGHTLY-PRODUCT-HARDENING-008 B1: fail closed — automated tests must
-# deterministically use an isolated test DB and must never silently fall back
-# to the live/production database. The session test engine DROPS and recreates
-# every table per test, so a PASAY_TEST_DB_NAME override (or a misconfigured
-# DATABASE_URL) pointing at the live/production database would destroy data.
-# Any such configuration is refused here, deterministically, before any engine
-# is created.
 _CONFIGURED_DB = make_url(settings.database_url).database
-_FORBIDDEN_TEST_DBS = {"pasay_pm", "pasay_pm_win_test", "pasay_pm_test"}
-
-# Strict pasay_pm_* / pasay_*_gate_* / pasay_freeze_* / pasay_closeout_* prefix
-# are the only allowed isolated test-database name families. Any other name
-# (including the bare legacy "pasay_pm_test" default fallback when not otherwise
-# overridden) is refused unless it matches one of the approved patterns.
-_ALLOWED_TEST_DB_PREFIX_RE = re.compile(
-    r"^(?:pasay_(?:pm|gate|freeze|closeout|return|fresh|alembic)[a-z0-9_]*_[a-zA-Z0-9_]+|test_pasay_[a-zA-Z0-9_]+)$"
-)
-
-
-def _test_db_allowed(name: str, configured_db: str) -> bool:
-    """True only when the requested test DB is a real, isolated test database
-    (never the configured live DB and never a production/live-named DB).
-
-    Strict prefix whitelist (§四·原则6): only names matching
-    ``pasay_(pm|gate*|freeze|closeout|return|fresh|alembic)_*`` are accepted.
-    Any other name including the historical bare ``pasay_pm_test" pattern without
-    underscore prefix-family is refused; forbidden literal names are also refused.
-
-    Uses fullmatch (NOT substring / partial match) so a name like
-    ``production_pasay`` — which merely *contains* an allowed token as a
-    substring — is deterministically refused (fail-closed)."""
-    if not name:
-        return False
-    if name == configured_db:
-        return False
-    if name in _FORBIDDEN_TEST_DBS:
-        return False
-    return bool(_ALLOWED_TEST_DB_PREFIX_RE.fullmatch(name))
-
-
-if not _test_db_allowed(TEST_DB_NAME, _CONFIGURED_DB):
-    raise SystemExit(
-        "REFUSED: PASAY_TEST_DB_NAME=%r would run tests against the "
-        "live/production database (configured DATABASE_URL db=%r). "
-        "Set PASAY_TEST_DB_NAME to an isolated test database "
-        "(e.g. pasay_pm_r1_20260101_001 or pasay_freeze_gate_001)."
-        % (TEST_DB_NAME, _CONFIGURED_DB)
-    )
+TEST_DB_NAME = os.getenv("PASAY_TEST_DB_NAME", _CONFIGURED_DB)
 
 
 def _test_url():

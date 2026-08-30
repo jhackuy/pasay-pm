@@ -35,6 +35,7 @@ pasay-telegram-bot/.pytest_tmp/
 .agents/
 node_modules/
 **/node_modules/
+**/dist/
 *.bak
 *.bak-*
 *.swp
