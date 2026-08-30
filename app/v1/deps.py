@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.core.idempotency import (
     IdempotencyConflictError,
+    IdempotencyKeyError,
     MAX_IDEMPOTENCY_KEY_LEN,
     compute_payload_hash,
     normalize_idempotency_key,
@@ -125,7 +126,10 @@ def parse_idempotency_key_header(
         return None
     try:
         return normalize_idempotency_key(idempotency_key)
-    except IdempotencyConflictError as exc:
+    except (IdempotencyConflictError, IdempotencyKeyError) as exc:
+        # Both parse-level (oversize, empty, whitespace) and conflict-level
+        # (already in a state that conflicts with this header) failures are
+        # 400 Bad Request from the client's perspective.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, str(exc),
         ) from exc

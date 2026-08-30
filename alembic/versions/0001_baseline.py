@@ -705,7 +705,9 @@ def upgrade() -> None:
             server_default=sa.func.now(),
         ),
         sa.CheckConstraint(
-            "status IN ('OPEN','SUBMITTED','VERIFIED','FAILED','CANCELLED')",
+            "status IN ("
+            "'OPEN','SUBMITTED','VERIFIED','SETTLED','FAILED','CANCELLED'"
+            ")",
             name="ck_v1_expense_claims_status",
         ),
         sa.CheckConstraint(
@@ -807,6 +809,13 @@ def upgrade() -> None:
         ),
         sa.Column("reason", sa.String(length=500), nullable=True),
         sa.Column(
+            "reversed_by_verification_id", sa.BigInteger(),
+            sa.ForeignKey(
+                "v1_expense_verifications.id", ondelete="RESTRICT",
+            ),
+            nullable=True,
+        ),
+        sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False,
             server_default=sa.func.now(),
         ),
@@ -826,6 +835,10 @@ def upgrade() -> None:
     op.create_index(
         "ix_v1_expense_verifications_claim_id",
         "v1_expense_verifications", ["claim_id"],
+    )
+    op.create_index(
+        "ix_v1_expense_verifications_reversed_by",
+        "v1_expense_verifications", ["reversed_by_verification_id"],
     )
 
     op.create_table(

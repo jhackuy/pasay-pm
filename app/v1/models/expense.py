@@ -50,11 +50,18 @@ from app.v1.models.base import (
 
 
 class ExpenseClaimStatus(StrEnum):
-    """Lifecycle of one expense claim."""
+    """Lifecycle of one expense claim.
+
+    ``SETTLED`` is the terminal "fully verified" state — it is reached
+    only when the sum of verified amounts for the claim covers the
+    claimed amount. A reversal returns the claim to ``VERIFIED`` and
+    reopens the Operation.
+    """
 
     OPEN = "OPEN"
     SUBMITTED = "SUBMITTED"
     VERIFIED = "VERIFIED"
+    SETTLED = "SETTLED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
 
@@ -140,7 +147,9 @@ class ExpenseClaim(V1Base, TimestampMixin):
     __tablename__ = "v1_expense_claims"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('OPEN','SUBMITTED','VERIFIED','FAILED','CANCELLED')",
+            "status IN ("
+            "'OPEN','SUBMITTED','VERIFIED','SETTLED','FAILED','CANCELLED'"
+            ")",
             name="ck_v1_expense_claims_status",
         ),
         CheckConstraint(
@@ -235,7 +244,17 @@ class ExpenseReceipt(V1Base, TimestampMixin):
 
 
 class ExpenseVerification(V1Base, TimestampMixin):
-    """Append-only verification decision log for a claim."""
+    """Append-only verification decision log for a claim.
+
+    A VERIFIED row may be superseded by a later REVERSED row. The original
+    VERIFIED row is preserved in the audit log, but its ``verified_amount``
+    is excluded from the closure balance once the reversal is recorded.
+
+    The link is recorded as ``reversed_by_verification_id`` on the
+    original VERIFIED row pointing at the new REVERSED row. This keeps
+    the table fully append-only (no UPDATE on existing rows) while
+    making the balance computation deterministic and audit-friendly.
+    """
 
     __tablename__ = "v1_expense_verifications"
     __table_args__ = (
@@ -246,6 +265,10 @@ class ExpenseVerification(V1Base, TimestampMixin):
         Index("ix_v1_expense_verifications_org_id", "org_id"),
         Index(
             "ix_v1_expense_verifications_claim_id", "claim_id",
+        ),
+        Index(
+            "ix_v1_expense_verifications_reversed_by",
+            "reversed_by_verification_id",
         ),
     )
 
@@ -273,6 +296,13 @@ class ExpenseVerification(V1Base, TimestampMixin):
         DateTime(timezone=True), nullable=False, default=utcnow,
     )
     reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # FK to the REVERSED row that superseded this VERIFIED row.
+    # NULL on the original VERIFIED row that is still active.
+    reversed_by_verification_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("v1_expense_verifications.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
 
 
 class ExpenseActivity(V1Base, TimestampMixin):

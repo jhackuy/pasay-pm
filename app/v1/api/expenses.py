@@ -283,6 +283,30 @@ def list_follow_ups(
     return [TaskRead.model_validate(t) for t in tasks]
 
 
+@router.post(
+    "/follow-ups/{task_id}/complete", response_model=TaskRead,
+)
+def complete_follow_up(
+    task_id: int,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> TaskRead:
+    """Mark a follow-up Task as done.
+
+    This endpoint NEVER closes the linked Operation — Operation closure
+    is gated exclusively by ``_settle`` once verified_total >=
+    claimed_total. Completing a follow-up is a projection of human
+    activity, not the truth about the expense.
+    """
+    service = ExpenseClaimService(db)
+    with _mapped_errors():
+        task = service.complete_follow_up(
+            principal, org_id=org_id, task_id=task_id,
+        )
+    return TaskRead.model_validate(task)
+
+
 # ---------- verification ----------
 
 

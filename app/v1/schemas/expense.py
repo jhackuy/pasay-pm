@@ -8,14 +8,41 @@ rather than a silently ignored instruction.
 
 Category is on the claim itself; purpose is a separate Property/Unit column
 (not exposed here — see Property DTOs).
+
+Money fields use a ``BeforeValidator`` that rejects JSON floats at the
+schema boundary (422). Pydantic v2 lax mode would otherwise silently
+convert JSON floats to ``Decimal`` before our service-layer ``parse_money``
+float-rejection could fire; the schema-level rejection matches the
+constitutional contract that no float shall ever represent money on the
+wire.
 """
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Annotated, Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+
+
+def _reject_json_float(v: Any) -> Any:
+    """Reject a JSON float at the Pydantic schema boundary.
+
+    JSON ``1.5`` arrives here as a Python ``float``. JSON ``"1.50"``
+    arrives as a Python ``str``. JSON ``1`` arrives as a Python ``int``.
+    The string and int paths are accepted (Pydantic converts them to
+    ``Decimal`` normally); the float path is rejected with 422 to honor
+    AGENTS.md §4 (never float money).
+    """
+    if isinstance(v, float):
+        raise ValueError(
+            "float is not allowed for money values; "
+            "use str, int, or Decimal (AGENTS.md §4)",
+        )
+    return v
+
+
+MoneyDecimal = Annotated[Decimal, BeforeValidator(_reject_json_float)]
 
 
 # ---- create / input --------------------------------------------------
@@ -37,7 +64,9 @@ class ExpenseClaimOpen(BaseModel):
 
     title: str = Field(min_length=1, max_length=200)
     category: str = Field(min_length=1, max_length=32)
-    claimed_amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
+    claimed_amount: MoneyDecimal = Field(
+        gt=0, max_digits=14, decimal_places=2,
+    )
     receipts: list[ExpenseReceiptIn] = Field(
         default_factory=list, max_length=20,
     )
@@ -48,17 +77,25 @@ class ExpenseVerifyRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    verified_amount: Optional[Decimal] = Field(
+    verified_amount: Optional[MoneyDecimal] = Field(
         default=None, gt=0, max_digits=14, decimal_places=2,
     )
 
 
 class ExpenseDecisionRequest(BaseModel):
-    """Rejection / reversal always requires an explicit reason."""
+    """Rejection / reversal always requires an explicit reason.
+
+    ``min_length=0`` (not 1) is intentional: the service-level check
+    ``if not reason or not reason.strip()`` rejects both empty and
+    whitespace-only strings with a 400 ValidationError. Letting the
+    schema accept the empty string keeps the rejection path on a single
+    400 contract instead of splitting it between 422 (Pydantic) and 400
+    (service).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    reason: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=0, max_length=500)
 
 
 class ExpenseFollowUpCreate(BaseModel):

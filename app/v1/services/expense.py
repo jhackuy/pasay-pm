@@ -128,14 +128,21 @@ def _log_activity(
 def _verified_total(db: Session, *, claim_id: int) -> Decimal:
     """Sum of verified amounts recorded on this claim.
 
-    Only ExpenseVerification rows with decision='VERIFIED' contribute.
-    This is the single source of truth for how much was actually approved.
+    Only ``ExpenseVerification`` rows with ``decision='VERIFIED'`` AND
+    ``reversed_by_verification_id IS NULL`` contribute. This excludes
+    verifications that have been superseded by a later REVERSED row —
+    the original VERIFIED row stays in the audit log but no longer
+    counts toward the closure balance.
+
+    This is the single source of truth for how much was actually approved
+    and still stands.
     """
     rows = (
         db.query(ExpenseVerification)
         .filter(
             ExpenseVerification.claim_id == claim_id,
             ExpenseVerification.decision == "VERIFIED",
+            ExpenseVerification.reversed_by_verification_id.is_(None),
         )
         .all()
     )
@@ -163,7 +170,14 @@ def _settle(
     claim leaves the claim at status=VERIFIED but does NOT close the
     Operation (and does NOT change the claim to SETTLED); the remaining
     gap is exposed via ``ExpenseBalanceSnapshot.remaining_amount``.
+
+    The session uses ``autoflush=False`` for explicit control over the
+    flush boundary, so we MUST flush before reading ``_verified_total``
+    to make the just-inserted VERIFIED rows visible to the SQL aggregate
+    query. Without this flush, a partial verify followed by a full
+    verify would only see the first row and never settle.
     """
+    db.flush()
     claimed = Decimal(claim.claimed_amount)
     total = _verified_total(db, claim_id=claim.id)
     if total >= claimed and claim.status != ExpenseClaimStatus.SETTLED.value:
@@ -191,6 +205,13 @@ def _settle(
         )
         db.flush()
         return True
+    if total < claimed and claim.status != ExpenseClaimStatus.SETTLED.value:
+        # Partial verification is non-trivial business activity on the
+        # Operation; bump OPEN → IN_PROGRESS. The Operation only advances
+        # to RESOLVED via the closure gate above.
+        if operation.state == OperationState.OPEN.value:
+            operation.state = OperationState.IN_PROGRESS.value
+        db.flush()
     return False
 
 
@@ -204,8 +225,9 @@ def _reopen(
     """Reopen a previously-settled Operation when a verified decision is reversed.
 
     The claim goes back to ``VERIFIED`` (the prior verified rows are still
-    in the audit log); the Operation returns to ``in_progress`` and a
-    ``REOPENED`` activity entry is recorded.
+    in the audit log, but they have ``reversed_by_verification_id`` set
+    so they no longer count toward the balance); the Operation returns
+    to ``in_progress`` and a ``REOPENED`` activity entry is recorded.
     """
     claim.status = ExpenseClaimStatus.VERIFIED.value
     operation.state = OperationState.IN_PROGRESS.value
@@ -219,6 +241,21 @@ def _reopen(
         actor_user_id=actor_user_id,
     )
     db.flush()
+
+
+def _bump_to_in_progress(operation: Operation) -> bool:
+    """Transition an Operation from OPEN → IN_PROGRESS.
+
+    Called whenever the claim/operation receives non-trivial business
+    activity (follow-up creation, claim rejection). The Operation only
+    advances to RESOLVED via ``_settle`` when verified_total >= claimed_total.
+
+    Returns True if the state was changed.
+    """
+    if operation.state == OperationState.OPEN.value:
+        operation.state = OperationState.IN_PROGRESS.value
+        return True
+    return False
 
 
 # ---------- service ----------
@@ -477,6 +514,10 @@ class ExpenseClaimService:
         _ensure_role(principal, Role.OWNER, Role.SECRETARY)
         claim = self.get_claim(principal, org_id=org_id, claim_id=claim_id)
         op = self.get_operation(principal, org_id=org_id, claim_id=claim_id)
+        # Follow-up creation is non-trivial business activity; the
+        # Operation moves from OPEN → IN_PROGRESS. The Operation may
+        # only resolve via the verified-balance gate in ``_settle``.
+        _bump_to_in_progress(op)
         existing_open = (
             self.db.query(Task)
             .filter(
@@ -721,18 +762,18 @@ class ExpenseClaimService:
                     f"verified={verified}"
                 ),
             )
-        _log_activity(
-            self.db,
-            org_id=org_id,
-            claim_id=claim.id,
-            receipt_id=None,
-            kind=(
-                ExpenseActivityKind.SETTLED
-                if is_settled
-                else ExpenseActivityKind.VERIFIED
-            ),
-            actor_user_id=principal.user_id,
-        )
+        # The SETTLED activity row is logged inside ``_settle`` itself
+        # when the closure gate fires; logging it here as well would
+        # produce a duplicate activity row per claim.
+        if not is_settled:
+            _log_activity(
+                self.db,
+                org_id=org_id,
+                claim_id=claim.id,
+                receipt_id=None,
+                kind=ExpenseActivityKind.VERIFIED,
+                actor_user_id=principal.user_id,
+            )
         self.db.commit()
         return claim
 
@@ -769,6 +810,12 @@ class ExpenseClaimService:
                 reason=reason,
             )
         )
+        # Rejection is non-trivial business activity on the Operation; bump
+        # the Operation from OPEN → IN_PROGRESS. The Operation never resolves
+        # via rejection — only via ``_settle`` once verified_total >=
+        # claimed_total.
+        op = self.get_operation(principal, org_id=org_id, claim_id=claim_id)
+        _bump_to_in_progress(op)
         _log_activity(
             self.db,
             org_id=org_id,
@@ -801,23 +848,38 @@ class ExpenseClaimService:
                 f"cannot reverse a non-SETTLED claim "
                 f"(status={claim.status})",
             )
-        # The verified row remains in the audit log; the claim is
-        # recomputed by _settle() which will see verified_total < claimed
-        # again and reopen the Operation.
         op = self.get_operation(principal, org_id=org_id, claim_id=claim_id)
-        self.db.add(
-            ExpenseVerification(
-                org_id=org_id,
-                claim_id=claim.id,
-                decision=ExpenseVerificationDecision.REVERSED.value,
-                verified_amount=None,
-                verifier_user_id=principal.user_id,
-                reason=reason,
-            )
+        # Record the REVERSED decision first; we then mark the existing
+        # VERIFIED audit rows as superseded by linking them to this new
+        # REVERSED row id. The original VERIFIED rows remain in the audit
+        # log untouched, but ``_verified_total`` filters them out via
+        # ``reversed_by_verification_id IS NOT NULL``. This keeps the
+        # audit log fully append-only.
+        reversal = ExpenseVerification(
+            org_id=org_id,
+            claim_id=claim.id,
+            decision=ExpenseVerificationDecision.REVERSED.value,
+            verified_amount=None,
+            verifier_user_id=principal.user_id,
+            reason=reason,
         )
-        # Restore Operation to in_progress; the existing VERIFIED audit row
-        # remains but the claim is no longer at SETTLED until verified_total
-        # covers the claim again.
+        self.db.add(reversal)
+        self.db.flush()  # so reversal.id is populated
+        superseded = (
+            self.db.query(ExpenseVerification)
+            .filter(
+                ExpenseVerification.claim_id == claim.id,
+                ExpenseVerification.decision == (
+                    ExpenseVerificationDecision.VERIFIED.value
+                ),
+                ExpenseVerification.reversed_by_verification_id.is_(None),
+            )
+            .all()
+        )
+        for v in superseded:
+            v.reversed_by_verification_id = reversal.id
+        # Restore Operation to in_progress; the existing VERIFIED audit
+        # rows remain but they no longer count toward verified_total.
         _reopen(
             self.db,
             claim=claim,

@@ -152,7 +152,14 @@ def _settle(
 
     Returns True iff the schedule is now fully PAID (Operation resolved).
     Idempotent — safe to call multiple times.
+
+    The session uses ``autoflush=False`` for explicit control over the
+    flush boundary, so we MUST flush before reading ``_verified_total``
+    to make the just-mutated ``RentPayment.status`` rows visible to the
+    SQL aggregate query. Without this flush, a partial verify followed by
+    a full verify would only see the first row and never settle.
     """
+    db.flush()
     amount_due = Decimal(schedule.amount_due)
     total = _verified_total(db, due_schedule_id=schedule.id)
     if total >= amount_due and schedule.state != RentDueState.PAID.value:
@@ -184,6 +191,21 @@ def _settle(
         if operation.state == OperationState.OPEN.value:
             operation.state = OperationState.IN_PROGRESS.value
         db.flush()
+    return False
+
+
+def _bump_to_in_progress(operation: Operation) -> bool:
+    """Transition an Operation from OPEN → IN_PROGRESS.
+
+    Called whenever the schedule/operation receives non-trivial business
+    activity (follow-up creation, claim rejection). The Operation only
+    advances to RESOLVED via ``_settle`` when verified_total >= amount_due.
+
+    Returns True if the state was changed.
+    """
+    if operation.state == OperationState.OPEN.value:
+        operation.state = OperationState.IN_PROGRESS.value
+        return True
     return False
 
 
@@ -450,6 +472,10 @@ class RentPaymentService:
         op = self.get_operation(
             principal, org_id=org_id, due_schedule_id=due_schedule_id,
         )
+        # Follow-up creation is non-trivial business activity; the
+        # Operation moves from OPEN → IN_PROGRESS. The Operation may
+        # only resolve via the verified-balance gate in ``_settle``.
+        _bump_to_in_progress(op)
         existing_open = (
             self.db.query(Task)
             .filter(
@@ -836,6 +862,22 @@ class RentPaymentService:
                 reason=reason,
             )
         )
+        # Rejection is non-trivial business activity on the Operation; bump
+        # the Operation from OPEN → IN_PROGRESS. The Operation never resolves
+        # via rejection — only via ``_settle`` once verified_total >=
+        # amount_due.
+        schedule = self.db.get(RentDueSchedule, payment.due_schedule_id)
+        op = (
+            self.db.query(Operation)
+            .filter(
+                Operation.subject_type == OPERATION_SUBJECT_RENT_DUE,
+                Operation.subject_id == schedule.id,
+                Operation.org_id == org_id,
+            )
+            .first()
+        )
+        if op is not None:
+            _bump_to_in_progress(op)
         _log_activity(
             self.db,
             org_id=org_id,
