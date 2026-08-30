@@ -1,1 +1,0 @@
-# RETIRED — code promoted to app/core/* and app/db/*. See PR #100 / Issue #99.
