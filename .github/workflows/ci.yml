@@ -24,7 +24,7 @@ jobs:
           --health-retries 20
     env:
       DATABASE_URL: postgresql+psycopg2://pasay:pasay@localhost:5432/pasay
-      PYTHONPATH: pasay-telegram-bot
+      PYTHONPATH: ${{ github.workspace }}/pasay-telegram-bot
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
