@@ -1,46 +1,124 @@
-import "./style.css";
-import { apiGet } from "./api";
+/** PASAY Mini App — entrypoint.
+ *
+ *  Wires the typed API client, the in-memory session, the hash router,
+ *  and the view modules. No business truth is ever persisted in
+ *  localStorage (AGENTS.md §4).
+ */
 
-type Property = { id: number; name: string; address?: string };
-type View = "home" | "properties" | "work" | "finance" | "more";
+import { PasayClient } from "./api";
+import { router } from "./router";
+import { SessionStore } from "./state";
+import { renderShell } from "./shell";
+import { type Locale } from "./i18n";
+import { renderHome } from "./views/home";
+import { renderProperties, renderPropertyDetail } from "./views/properties";
+import { renderWork } from "./views/work";
+import { renderFinance } from "./views/finance";
+import { renderMore } from "./views/more";
 
-const app = document.querySelector<HTMLDivElement>("#app")!;
-const labels: Record<View, string> = {
-  home: "首页", properties: "房产", work: "工作", finance: "财务", more: "更多",
-};
+const root = document.querySelector<HTMLDivElement>("#app");
+if (!root) throw new Error("Mini App mount point #app is missing");
 
-function shell(content: string, active: View) {
-  app.innerHTML = `<main><header><p class="eyebrow">PASAY RENT</p><h1>${labels[active]}</h1></header>${content}</main>
-    <nav aria-label="主导航">${(Object.keys(labels) as View[]).map(key =>
-      `<button data-view="${key}" class="${key === active ? "active" : ""}">${labels[key]}</button>`
-    ).join("")}</nav>`;
-  document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach(button => {
-    button.onclick = () => render(button.dataset.view as View);
-  });
+const client = new PasayClient();
+const session = new SessionStore(client);
+let locale: Locale = (localStorage.getItem("pasay.locale") === "en" ? "en" : "zh") as Locale;
+
+function setLocale(next: Locale): void {
+  locale = next;
+  localStorage.setItem("pasay.locale", next);
+  paint();
 }
 
-async function render(view: View) {
-  if (view === "home") {
-    shell(`<section class="hero"><span>今日待办</span><strong>打开工作台处理下一步</strong><p>租金、维修与租约动作集中在同一处。</p></section>
-      <section class="grid"><button data-view="work" class="card"><b>待处理事项</b><span>查看业务动作 →</span></button><button data-view="finance" class="card"><b>财务</b><span>租金与支出 →</span></button></section>`, view);
-  } else if (view === "properties") {
-    shell(`<section class="panel" id="property-list"><p class="muted">正在从 PASAY API 加载房产…</p></section>`, view);
-    try {
-      const result = await apiGet<Property[] | { items: Property[] }>("/properties");
-      const items = Array.isArray(result) ? result : result.items;
-      document.querySelector("#property-list")!.innerHTML = items.length
-        ? items.map(item => `<article><b>${item.name}</b><span>${item.address ?? "查看房产详情"}</span></article>`).join("")
-        : `<div class="empty"><b>还没有房产</b><span>从真实 PASAY API 创建第一处房产。</span></div>`;
-    } catch {
-      document.querySelector("#property-list")!.innerHTML = `<div class="error"><b>暂时无法连接服务</b><span>请检查网络后重试。</span><button id="retry">重试</button></div>`;
-      document.querySelector<HTMLButtonElement>("#retry")!.onclick = () => render("properties");
-    }
-  } else {
-    const copy = view === "work" ? ["业务工作台", "维修、续租、退租和待办动作将在这里汇总。"]
-      : view === "finance" ? ["财务中心", "查看租金、付款凭证和支出状态。"]
-      : ["设置与归档", "成员、语言偏好和完整活动记录。"];
-    shell(`<section class="panel empty"><b>${copy[0]}</b><span>${copy[1]}</span></section>`, view);
+async function paint(): Promise<void> {
+  const route = router.current;
+  if (!session.isAuthenticated()) {
+    renderBootstrap();
+    return;
+  }
+  const orgId = session.orgId ?? 0;
+  renderShell(
+    {
+      root: root!,
+      locale,
+      onLocaleChange: setLocale,
+      isAuthenticated: () => session.isAuthenticated(),
+      onSignOut: () => {
+        session.signOut();
+        window.location.hash = "";
+        paint();
+      },
+    },
+    route,
+    `<section class="card loading"><p>${locale === "zh" ? "加载中…" : "Loading…"}</p></section>`,
+  );
+  switch (route.name) {
+    case "home":
+      await renderHome(client, orgId, locale);
+      break;
+    case "properties":
+      await renderProperties(client, orgId, locale);
+      break;
+    case "properties.detail":
+      await renderPropertyDetail(client, orgId, route.propertyId, locale);
+      break;
+    case "work":
+      await renderWork(client, orgId, locale);
+      break;
+    case "finance":
+      await renderFinance(client, orgId, locale);
+      break;
+    case "more":
+      await renderMore(client, orgId, session, locale);
+      break;
   }
 }
 
-render("home");
+function renderBootstrap(): void {
+  root!.innerHTML = `
+    <header class="app-header">
+      <p class="eyebrow">PASAY RENT</p>
+      <h1>${locale === "zh" ? "引导第一个工作区" : "Bootstrap workspace"}</h1>
+    </header>
+    <main id="view-root" class="view-root">
+      <section class="panel">
+        <form id="bootstrap-form" class="form">
+          <label>${locale === "zh" ? "工作区名称" : "Workspace name"}<input name="workspace_name" required maxlength="120" value="Demo Workspace" /></label>
+          <label>${locale === "zh" ? "用户名" : "Username"}<input name="owner_username" maxlength="64" value="owner" /></label>
+          <label>${locale === "zh" ? "显示名" : "Display name"}<input name="owner_display_name" maxlength="120" value="Demo Owner" /></label>
+          <div class="form-actions">
+            <button class="primary-btn" type="submit">${locale === "zh" ? "引导" : "Bootstrap"}</button>
+          </div>
+          <p class="muted form-error" id="bootstrap-error" hidden></p>
+        </form>
+        <p class="muted">${locale === "zh" ? "Bootstrap 仅在数据库无用户时可用（dev/test）" : "Bootstrap is only available when no users exist (dev/test)."}</p>
+      </section>
+    </main>
+  `;
+  const formEl = document.querySelector<HTMLFormElement>("#bootstrap-form");
+  formEl?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const formEl = event.target as HTMLFormElement;
+    const data = new FormData(formEl);
+    try {
+      const response = await client.bootstrap({
+        workspace_name: String(data.get("workspace_name") || "").trim(),
+        owner_username: String(data.get("owner_username") || "") || null,
+        owner_display_name: String(data.get("owner_display_name") || "") || null,
+      });
+      session.bootstrap(response.api_key, response.org_id, response.user_id, response.role);
+      await paint();
+    } catch (err) {
+      const errorEl = document.querySelector<HTMLElement>("#bootstrap-error");
+      if (errorEl) {
+        errorEl.textContent = err instanceof Error ? err.message : String(err);
+        errorEl.hidden = false;
+      }
+    }
+  });
+}
+
+router.subscribe(() => {
+  void paint();
+});
+
+void paint();
