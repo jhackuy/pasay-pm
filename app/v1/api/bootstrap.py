@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app.core.permissions import Role
 from app.core.security import generate_api_key, hash_api_key
 from app.v1.deps import get_db_dep
 from app.v1.models.foundation import (
@@ -18,7 +19,6 @@ from app.v1.models.foundation import (
     Membership,
     MembershipState,
     Organization,
-    Role,
     User,
 )
 
@@ -52,7 +52,7 @@ def bootstrap(
             "bootstrap disabled: users already exist",
         )
     user = User(
-        telegram_id=None,
+        telegram_user_id=None,
         username=body.owner_username,
         display_name=body.owner_display_name or body.owner_username,
     )
