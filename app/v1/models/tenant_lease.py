@@ -1,25 +1,24 @@
 """Tenant + Lease ORM.
 
-AGENTS.md §4 invariants:
+Rewrite invariants:
 - Decimal money (NUMERIC(14,2)) — never float.
 - UTC-aware timestamps.
-- Lease state machine: DRAFT → ACTIVE → TERMINATED | EXPIRED (CHECK constraint).
+- Lease state machine: DRAFT → ACTIVE → TERMINATED | EXPIRED.
 """
 from __future__ import annotations
 
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
-    Column,
     Date,
     ForeignKey,
     Index,
     Numeric,
     String,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import Mapped, mapped_column
 
-from app.v1.models.base import TimestampMixin, V1Base, big_pk
+from app.v1.models.base import BigPK, TimestampMixin, V1Base
 
 
 LEASE_STATES = ("DRAFT", "ACTIVE", "TERMINATED", "EXPIRED")
@@ -27,24 +26,22 @@ LEASE_STATES = ("DRAFT", "ACTIVE", "TERMINATED", "EXPIRED")
 
 class Tenant(V1Base, TimestampMixin):
     __tablename__ = "v1_tenants"
-    __table_args__ = (
-        Index("ix_v1_tenants_org_id", "org_id"),
-    )
+    __table_args__ = (Index("ix_v1_tenants_org_id", "org_id"),)
 
-    id = big_pk()
-    org_id = Column(
+    id: Mapped[BigPK]
+    org_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    user_id = Column(
+    user_id: Mapped[int | None] = mapped_column(
         BigInteger,
         ForeignKey("v1_users.id", ondelete="SET NULL"),
         nullable=True,
     )
-    full_name = Column(String(120), nullable=False)
-    contact_phone = Column(String(32), nullable=True)
-    contact_email = Column(String(120), nullable=True)
+    full_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    contact_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    contact_email: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
 
 class Lease(V1Base, TimestampMixin):
@@ -59,24 +56,24 @@ class Lease(V1Base, TimestampMixin):
         Index("ix_v1_leases_tenant_id", "tenant_id"),
     )
 
-    id = big_pk()
-    org_id = Column(
+    id: Mapped[BigPK]
+    org_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    unit_id = Column(
+    unit_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("v1_units.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    tenant_id = Column(
+    tenant_id: Mapped[int] = mapped_column(
         BigInteger,
         ForeignKey("v1_tenants.id", ondelete="RESTRICT"),
         nullable=False,
     )
-    start_date = Column(Date, nullable=False)
-    end_date = Column(Date, nullable=False)
-    monthly_rent = Column(Numeric(14, 2), nullable=False)
-    deposit = Column(Numeric(14, 2), nullable=False, default=0)
-    state = Column(String(16), nullable=False, default="DRAFT")
+    start_date: Mapped[object] = mapped_column(Date, nullable=False)
+    end_date: Mapped[object] = mapped_column(Date, nullable=False)
+    monthly_rent: Mapped[object] = mapped_column(Numeric(14, 2), nullable=False)
+    deposit: Mapped[object] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="DRAFT")
