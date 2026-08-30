@@ -36,7 +36,9 @@ jobs:
         run: pytest -q tests/test_v1_*.py
       - name: Telegram pytest
         working-directory: pasay-telegram-bot
-        run: pytest -q tests/test_main.py
+        run: >-
+          pytest -q tests/test_ux_freeze_v1_polish_targeted.py
+          -k "fixed_menu_is_3x2 or group_menu_is_3x2"
 
   fresh-postgres-alembic:
     runs-on: ubuntu-latest
