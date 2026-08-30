@@ -4,34 +4,22 @@ Deliberately NOT a conftest: the legacy ``tests/conftest.py`` owns the
 PostgreSQL harness plus the ``db_session`` / ``client`` fixture names, so the
 V1 rewrite tests build their own isolated engine and never reuse those names.
 
-The engine is a throwaway *file-backed* SQLite database rather than
-``:memory:`` because FastAPI's TestClient runs sync endpoints on worker
-threads, and an in-memory SQLite database is not shared across threads.
-
-TEST-HARNESS PK AUTO-FILL (Owner-mandated, sqlite-specific):
-SQLite's BigInteger PK column is NOT NULL BIGINT with NO autoincrement,
-while production PostgreSQL uses BIGSERIAL which does autoincrement. The
-``_auto_fill_pk`` ``before_insert`` listener registered in
-``v1_engine_ctx()`` bridges the gap for the test harness only: any V1
-entity whose ``id`` is unset at insert time receives a deterministic
-integer from a per-process counter. Production code paths running against
-PostgreSQL are unaffected. This is NOT a production-schema change; the
-``BigInteger`` column type and the ``BigPK = Annotated[...]`` declaration
-in ``app/v1/models/base.py`` are untouched.
+This file deliberately uses the CI's PostgreSQL 16 test DB. Production
+PostgreSQL ``BIGSERIAL`` autoincrements PKs naturally, so no test-harness PK
+auto-fill is needed. The CI workflow (``.github/workflows/ci.yml``) exports
+``DATABASE_URL=postgresql+psycopg2://pasay:pasay@localhost:5432/pasay`` via a
+``postgres:16`` service; local ``pytest`` runs inherit the same URL. There is
+no SQLite fallback, no ``before_insert`` mapper/engine listener, and no
+deterministic PK counter — the database itself assigns every ``id``.
 """
 from __future__ import annotations
 
 import os
-import shutil
-import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from itertools import count
 from typing import Iterator
-
-from sqlalchemy import event
 
 from app.core.permissions import Principal, Role
 from app.core.security import generate_api_key, hash_api_key
@@ -54,14 +42,6 @@ from app.v1.models.tenant_lease import Lease, Tenant
 # Imported for its side effect: registers the rent/payment tables on
 # V1Base.metadata so create_all() builds the full schema.
 import app.v1.models.rent_payment  # noqa: F401
-
-
-# Per-process deterministic counter for the test-harness PK auto-fill
-# listener. Starts at a high value (10000) so it cannot collide with any
-# row a future caller might pre-seed at low IDs. The counter persists for
-# the lifetime of the pytest worker; each test session uses its own engine
-# so the counter never needs resetting.
-_test_id_seq = count(start=10_000)
 
 
 @dataclass(frozen=True)
@@ -101,48 +81,36 @@ class Workspace:
 
 @contextmanager
 def v1_engine_ctx() -> Iterator[object]:
-    """Bind a throwaway SQLite engine with the whole V1 schema created.
+    """Bind the CI PostgreSQL test DB with the whole V1 schema created.
 
-    Registers the test-harness-only PK auto-fill listener (see module
-    docstring). Production code is unaffected.
+    Each ``with v1_engine_ctx():`` block starts from an empty schema
+    (``drop_all`` is idempotent — first run drops nothing, subsequent runs
+    drop whatever leftover tables exist) and ends with the tables dropped,
+    so tests stay isolated.
+
+    PostgreSQL ``BIGSERIAL`` autoincrements PKs naturally; no test-harness
+    PK auto-fill is needed.
+
+    Raises ``RuntimeError`` when ``DATABASE_URL`` is unset or empty — this
+    fixture deliberately does not fall back to SQLite.
     """
-    tmpdir = tempfile.mkdtemp(prefix="pasay-v1-test-")
-    url = f"sqlite:///{os.path.join(tmpdir, 'v1.db')}?check_same_thread=False"
-    previous_url = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = url
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL must be set to the CI PostgreSQL test DB; "
+            "v1_engine_ctx no longer falls back to SQLite",
+        )
     reset_engine_cache()
     engine = bind_engine(url)
-
-    @event.listens_for(engine, "connect")
-    def _enable_sqlite_foreign_keys(dbapi_connection, _record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    @event.listens_for(engine, "before_insert", propagate=True)
-    def _auto_fill_pk(_mapper, _connection, target):
-        """Test-harness only: assign a deterministic PK if not set.
-
-        SQLite's BigInteger PK column is NOT NULL BIGINT with NO
-        autoincrement (production PostgreSQL BIGSERIAL does autoincrement).
-        Any V1 entity inserted through this engine whose ``id`` is None
-        at insert time receives a deterministic integer from the per-process
-        counter. Production code paths running against PostgreSQL are
-        unaffected by this listener.
-        """
-        if getattr(target, "id", None) is None:
-            target.id = next(_test_id_seq)
-
+    V1Base.metadata.drop_all(engine)
     V1Base.metadata.create_all(engine)
     try:
         yield engine
     finally:
-        reset_engine_cache()
-        if previous_url is None:
-            os.environ.pop("DATABASE_URL", None)
-        else:
-            os.environ["DATABASE_URL"] = previous_url
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            V1Base.metadata.drop_all(engine)
+        finally:
+            reset_engine_cache()
 
 
 @contextmanager
@@ -159,7 +127,8 @@ def v1_session_ctx() -> Iterator[object]:
 def seed_workspace(session, *, name: str) -> Workspace:
     """Create org + OWNER + SECRETARY + property/unit/tenant/ACTIVE lease.
 
-    IDs are auto-filled by the test-harness listener — see v1_engine_ctx.
+    IDs are assigned by the database: PostgreSQL ``BIGSERIAL`` autoincrements
+    PKs naturally on every ``flush()``, so we never set ``id`` explicitly.
     """
     org = Organization(name=name)
     session.add(org)
