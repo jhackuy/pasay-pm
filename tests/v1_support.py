@@ -39,10 +39,11 @@ from app.v1.models.foundation import (
 from app.v1.models.property import Property, Unit
 from app.v1.models.tenant_lease import Lease, Tenant
 
-# Imported for its side effect: registers the rent/payment + expense tables on
-# V1Base.metadata so create_all() builds the full schema.
+# Imported for its side effect: registers the rent/payment + expense + repair
+# tables on V1Base.metadata so create_all() builds the full schema.
 import app.v1.models.rent_payment  # noqa: F401
 import app.v1.models.expense  # noqa: F401
+import app.v1.models.repair  # noqa: F401
 
 
 @dataclass(frozen=True)

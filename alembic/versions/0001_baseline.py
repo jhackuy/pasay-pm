@@ -890,8 +890,375 @@ def upgrade() -> None:
         "v1_expense_activities", ["claim_id"],
     )
 
+    # ---- v1_repair_reports -------------------------------------------------
+    op.create_table(
+        "v1_repair_reports",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "unit_id", sa.BigInteger(),
+            sa.ForeignKey("v1_units.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("title", sa.String(length=200), nullable=False),
+        sa.Column("description", sa.String(length=2000), nullable=False),
+        sa.Column("category", sa.String(length=32), nullable=False),
+        sa.Column("severity", sa.String(length=16), nullable=False),
+        sa.Column("state", sa.String(length=24), nullable=False),
+        sa.Column(
+            "reported_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "reported_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column("technician_name", sa.String(length=200), nullable=True),
+        sa.Column("technician_source", sa.String(length=16), nullable=True),
+        sa.Column(
+            "technician_eta_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column("quoted_amount", sa.Numeric(14, 2), nullable=True),
+        sa.Column("idempotency_key", sa.String(length=128), nullable=False),
+        sa.Column("payload_hash", sa.String(length=64), nullable=False),
+        sa.Column("linked_expense_payment_id", sa.BigInteger(), nullable=True),
+        sa.Column(
+            "completed_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "state IN ("
+            "'REPORTED','CONFIRMED','AWAITING_TECHNICIAN','QUOTE_REQUESTED',"
+            "'QUOTE_RECEIVED','QUOTE_APPROVED','IN_PROGRESS',"
+            "'COMPLETION_CLAIMED','COMPLETED','CANCELLED'"
+            ")",
+            name="ck_v1_repair_reports_state",
+        ),
+        sa.CheckConstraint(
+            "category IN ("
+            "'PLUMBING','ELECTRICAL','APPLIANCE','STRUCTURAL',"
+            "'PEST','HVAC','OTHER'"
+            ")",
+            name="ck_v1_repair_reports_category",
+        ),
+        sa.CheckConstraint(
+            "severity IN ('LOW','MEDIUM','HIGH','URGENT')",
+            name="ck_v1_repair_reports_severity",
+        ),
+        sa.CheckConstraint(
+            "linked_expense_payment_id IS NULL "
+            "OR linked_expense_payment_id > 0",
+            name="ck_v1_repair_reports_linked_expense_positive",
+        ),
+        sa.UniqueConstraint(
+            "org_id", "idempotency_key",
+            name="uq_v1_repair_reports_org_idempotency_key",
+        ),
+    )
+    op.create_index(
+        "ix_v1_repair_reports_org_id", "v1_repair_reports", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_reports_org_state",
+        "v1_repair_reports", ["org_id", "state"],
+    )
+    op.create_index(
+        "ix_v1_repair_reports_unit_id", "v1_repair_reports", ["unit_id"],
+    )
+
+    # ---- v1_repair_quotes --------------------------------------------------
+    op.create_table(
+        "v1_repair_quotes",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "report_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_reports.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("amount", sa.Numeric(14, 2), nullable=False),
+        sa.Column("description", sa.String(length=2000), nullable=False),
+        sa.Column("decision", sa.String(length=16), nullable=False),
+        sa.Column("technician_name", sa.String(length=200), nullable=False),
+        sa.Column(
+            "submitted_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "decided_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "decided_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column("reason", sa.String(length=500), nullable=True),
+        sa.Column("idempotency_key", sa.String(length=128), nullable=False),
+        sa.Column("payload_hash", sa.String(length=64), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "decision IN ('SUBMITTED','APPROVED','REJECTED')",
+            name="ck_v1_repair_quotes_decision",
+        ),
+        sa.CheckConstraint(
+            "amount > 0", name="ck_v1_repair_quotes_amount_positive",
+        ),
+        sa.UniqueConstraint(
+            "org_id", "idempotency_key",
+            name="uq_v1_repair_quotes_org_idempotency_key",
+        ),
+    )
+    op.create_index(
+        "ix_v1_repair_quotes_org_id", "v1_repair_quotes", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_quotes_report_id", "v1_repair_quotes", ["report_id"],
+    )
+
+    # ---- v1_repair_works ---------------------------------------------------
+    op.create_table(
+        "v1_repair_works",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "report_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_reports.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("state", sa.String(length=16), nullable=False),
+        sa.Column("note", sa.String(length=2000), nullable=False),
+        sa.Column(
+            "actor_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "occurred_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "state IN ('STARTED','BLOCKED','PROGRESS','DONE_ON_SITE')",
+            name="ck_v1_repair_works_state",
+        ),
+    )
+    op.create_index(
+        "ix_v1_repair_works_org_id", "v1_repair_works", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_works_report_id", "v1_repair_works", ["report_id"],
+    )
+
+    # ---- v1_repair_completion_claims --------------------------------------
+    op.create_table(
+        "v1_repair_completion_claims",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "report_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_reports.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("summary", sa.String(length=2000), nullable=False),
+        sa.Column(
+            "claimed_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "claimed_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_v1_repair_completion_claims_org_id",
+        "v1_repair_completion_claims", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_completion_claims_report_id",
+        "v1_repair_completion_claims", ["report_id"],
+    )
+
+    # ---- v1_repair_verifications ------------------------------------------
+    op.create_table(
+        "v1_repair_verifications",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "report_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_reports.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("decision", sa.String(length=16), nullable=False),
+        sa.Column(
+            "verifier_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "decided_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column("reason", sa.String(length=500), nullable=True),
+        sa.Column(
+            "reversed_by_verification_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_verifications.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.CheckConstraint(
+            "decision IN ('VERIFIED','REJECTED','REVERSED')",
+            name="ck_v1_repair_verifications_decision",
+        ),
+    )
+    op.create_index(
+        "ix_v1_repair_verifications_org_id",
+        "v1_repair_verifications", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_verifications_report_id",
+        "v1_repair_verifications", ["report_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_verifications_reversed_by",
+        "v1_repair_verifications", ["reversed_by_verification_id"],
+    )
+
+    # ---- v1_repair_activities ---------------------------------------------
+    op.create_table(
+        "v1_repair_activities",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "report_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_reports.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "quote_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_quotes.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "work_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_works.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column(
+            "claim_id", sa.BigInteger(),
+            sa.ForeignKey("v1_repair_completion_claims.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.Column("kind", sa.String(length=32), nullable=False),
+        sa.Column("detail", sa.String(length=500), nullable=True),
+        sa.Column(
+            "actor_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+        sa.Column(
+            "occurred_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.func.now(),
+        ),
+    )
+    op.create_index(
+        "ix_v1_repair_activities_org_id", "v1_repair_activities", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_repair_activities_report_id",
+        "v1_repair_activities", ["report_id"],
+    )
+
 
 def downgrade() -> None:
+    op.drop_table("v1_repair_activities")
+    op.drop_table("v1_repair_verifications")
+    op.drop_table("v1_repair_completion_claims")
+    op.drop_table("v1_repair_works")
+    op.drop_table("v1_repair_quotes")
+    op.drop_table("v1_repair_reports")
     op.drop_table("v1_expense_activities")
     op.drop_table("v1_expense_verifications")
     op.drop_table("v1_expense_receipts")
