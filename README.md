@@ -1,5 +1,7 @@
 # PASay Property Management — V1 第一阶段后端
 
+> 当前 PASAY 重写主线：[📊 开发流程和项目进度](PROJECT_STATUS.md)。重写权威范围以 Issue #99 / PR #100 为准。
+
 小型物业管理后端（约 10 套出租房）：FastAPI + PostgreSQL 16，Bearer API Key 认证 + 简单 RBAC，佣金由纯函数引擎计算，全部关键操作写入审计日志。规格唯一来源：`BRIEF.md`。
 
 ## GitHub Workflow
