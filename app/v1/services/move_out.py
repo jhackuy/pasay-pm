@@ -60,6 +60,7 @@ from app.v1.models.move_out import (
     TASK_KIND_MOVE_OUT_FOLLOW_UP,
 )
 from app.v1.models.rent_payment import Operation, Task
+from app.v1.models.tenant_lease import Lease
 from app.v1.services.errors import (
     ConflictError,
     NotFoundError,
