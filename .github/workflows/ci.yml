@@ -9,6 +9,7 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16
@@ -25,6 +26,7 @@ jobs:
     env:
       DATABASE_URL: postgresql+psycopg2://pasay:pasay@localhost:5432/pasay
       PYTHONPATH: ${{ github.workspace }}/pasay-telegram-bot
+      PYTHONUNBUFFERED: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,7 +35,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Backend pytest
-        run: pytest -q tests/test_v1_*.py
+        run: pytest -vv --durations=20 tests/test_v1_*.py
       - name: Telegram adapter regressions
         working-directory: pasay-telegram-bot
         run: pytest -q tests/test_v1_adapter_regressions.py
