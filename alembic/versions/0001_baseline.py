@@ -345,6 +345,9 @@ def upgrade() -> None:
             "contact_email", sa.String(length=120), nullable=True,
         ),
         sa.Column(
+            "archived_at", sa.DateTime(timezone=True), nullable=True,
+        ),
+        sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False,
             server_default=sa.func.now(),
         ),
@@ -393,6 +396,9 @@ def upgrade() -> None:
         sa.Column(
             "contact_status", sa.String(length=16), nullable=False,
             server_default="PENDING",
+        ),
+        sa.Column(
+            "archived_at", sa.DateTime(timezone=True), nullable=True,
         ),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False,

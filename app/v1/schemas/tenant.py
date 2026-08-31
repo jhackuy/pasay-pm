@@ -22,5 +22,6 @@ class TenantRead(BaseModel):
     full_name: str
     contact_phone: str | None
     contact_email: str | None
+    archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime

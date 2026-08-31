@@ -65,3 +65,27 @@ def get_tenant(
     except NotFoundError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     return TenantRead.model_validate(t)
+
+
+@router.delete("/{tenant_id}", response_model=TenantRead)
+def soft_delete_tenant(
+    tenant_id: int,
+    org_id: int,
+    principal: Principal = Depends(require_role(Role.OWNER)),
+    db: Session = Depends(get_db_dep),
+) -> TenantRead:
+    """Coverage Matrix Move-out 7.8: soft-delete a tenant (OWNER only).
+
+    Sets ``archived_at`` (UTC); row is never erased. History is retained
+    for audit. Idempotent: re-DELETE returns the same row unchanged.
+    """
+    svc = TenantService(db)
+    try:
+        t = svc.soft_delete(
+            principal, org_id=org_id, tenant_id=tenant_id,
+        )
+    except PermissionDenied as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    except NotFoundError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    return TenantRead.model_validate(t)

@@ -1,11 +1,17 @@
-"""TenantService: create/list/get tenants; org-scope enforced.
+"""TenantService: create/list/get/soft-delete tenants; org-scope enforced.
 
 This module exposes BOTH:
 - A class-based ``TenantService`` for legacy routes.
 - Module-level functions (``create_tenant``, ``get_tenant``) used by V1 handlers.
+
+Tenant history retention (Coverage Matrix 7.8): soft-delete only, never
+hard-delete. ``archived_at`` timestamp; ``list_tenants`` filters out
+archived tenants by default but ``get_tenant`` still returns archived
+tenants by id (audit trail).
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -16,8 +22,10 @@ from app.core.permissions import (
     Role,
     require_org_scope,
 )
+from app.core.time import utcnow
 from app.v1.models.tenant_lease import Tenant
 from app.v1.services.errors import (
+    ConflictError,
     NotFoundError,
     ValidationError,
 )
@@ -34,6 +42,15 @@ def _principal_from(
         role=parsed,
         membership_state="ACTIVE",
     )
+
+
+def _ensure_role(principal: Principal, *allowed: Role) -> None:
+    """Role guard helper."""
+    if principal.role not in allowed:
+        raise PermissionDenied(
+            f"requires one of {[r.value for r in allowed]}; "
+            f"got {principal.role.value!r}",
+        )
 
 
 def create_tenant(
@@ -126,7 +143,27 @@ class TenantService:
     def list_tenants(
         self, principal: Principal, *, org_id: int,
     ) -> list[Tenant]:
+        """List ACTIVE (non-archived) tenants by default."""
         require_org_scope(principal, org_id)
+        return (
+            self.db.query(Tenant)
+            .filter(
+                Tenant.org_id == org_id,
+                Tenant.archived_at.is_(None),
+            )
+            .order_by(Tenant.id.asc())
+            .all()
+        )
+
+    def list_all_tenants(
+        self, principal: Principal, *, org_id: int,
+    ) -> list[Tenant]:
+        """List every tenant (incl. archived) — OWNER/SECRETARY audit only."""
+        require_org_scope(principal, org_id)
+        if principal.role not in (Role.OWNER, Role.SECRETARY):
+            raise PermissionDenied(
+                "only OWNER/SECRETARY can list archived tenants",
+            )
         return (
             self.db.query(Tenant)
             .filter(Tenant.org_id == org_id)
@@ -147,6 +184,36 @@ class TenantService:
             raise NotFoundError(
                 f"tenant {tenant_id} not found in org {org_id}",
             )
+        return t
+
+    def soft_delete(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        tenant_id: int,
+    ) -> Tenant:
+        """Soft-delete a tenant (Coverage Matrix 7.8).
+
+        Sets ``archived_at`` to the current UTC timestamp; never erases
+        the row. After soft-delete, ``list_tenants`` no longer returns the
+        tenant but ``get_tenant`` does (for audit purposes).
+
+        OWNER-only. Cross-org → NotFoundError. Already-archived → no-op
+        with idempotent return.
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER)
+        t = self.db.get(Tenant, tenant_id)
+        if t is None or t.org_id != org_id:
+            raise NotFoundError(
+                f"tenant {tenant_id} not found in org {org_id}",
+            )
+        if t.archived_at is not None:
+            return t  # idempotent: already archived
+        t.archived_at = utcnow()
+        self.db.commit()
+        self.db.refresh(t)
         return t
 
 

@@ -13,6 +13,7 @@ from app.v1.api.dashboard import router as dashboard_router
 from app.v1.api.expenses import router as expenses_router
 from app.v1.api.leases import router as leases_router
 from app.v1.api.move_outs import router as move_outs_router
+from app.v1.api.operations import router as operations_router
 from app.v1.api.properties import router as properties_router
 from app.v1.api.rent_payments import router as rent_payments_router
 from app.v1.api.renewals import router as renewals_router
@@ -45,6 +46,7 @@ def create_v1_app() -> FastAPI:
     app.include_router(repairs_router, prefix="/api/v1")
     app.include_router(renewals_router, prefix="/api/v1")
     app.include_router(move_outs_router, prefix="/api/v1")
+    app.include_router(operations_router, prefix="/api/v1")
     app.include_router(dashboard_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")
     return app

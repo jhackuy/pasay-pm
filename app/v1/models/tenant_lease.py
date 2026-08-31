@@ -13,6 +13,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     Date,
+    DateTime,
     ForeignKey,
     Index,
     Numeric,
@@ -20,7 +21,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.v1.models.base import BigPK, TimestampMixin, V1Base
+from app.v1.models.base import BigPK, TimestampMixin, V1Base, utcnow
 
 
 LEASE_STATES = ("DRAFT", "ACTIVE", "TERMINATED", "EXPIRED")
@@ -64,6 +65,9 @@ class Tenant(V1Base, TimestampMixin):
     full_name: Mapped[str] = mapped_column(String(120), nullable=False)
     contact_phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     contact_email: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    archived_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
+    )
 
 
 class Lease(V1Base, TimestampMixin):
@@ -105,4 +109,7 @@ class Lease(V1Base, TimestampMixin):
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="DRAFT")
     contact_status: Mapped[str] = mapped_column(
         String(16), nullable=False, default=LeaseContactStatus.PENDING.value,
+    )
+    archived_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, default=None,
     )
