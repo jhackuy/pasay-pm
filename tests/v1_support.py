@@ -106,38 +106,29 @@ def v1_engine_ctx() -> Iterator[object]:
             "DATABASE_URL must be set to the CI PostgreSQL test DB; "
             "v1_engine_ctx no longer falls back to SQLite",
         )
+    def reset_public_schema(target_engine: object) -> None:
+        """Reset the disposable CI schema without metadata-order DDL locks."""
+        with target_engine.begin() as conn:
+            conn.execute(sa.text("DROP SCHEMA IF EXISTS public CASCADE"))
+            conn.execute(sa.text("CREATE SCHEMA public"))
+            conn.execute(sa.text("GRANT ALL ON SCHEMA public TO public"))
+
     reset_engine_cache()
     engine = bind_engine(url)
-    # Drop any circular FK that the alembic baseline added (it is created
-    # via ALTER TABLE *after* both tables exist, so it survives the
-    # metadata-driven drop_all only when CASCADE is used). Drop the FK
-    # directly first so the metadata-driven drop_all can run without
-    # cascade and the test DB stays clean.
-    with engine.begin() as conn:
-        conn.execute(
-            sa.text(
-                "ALTER TABLE IF EXISTS v1_move_outs "
-                "DROP CONSTRAINT IF EXISTS fk_v1_move_outs_settlement_id"
-            )
-        )
-    V1Base.metadata.drop_all(engine)
+    reset_public_schema(engine)
     V1Base.metadata.create_all(engine)
     try:
         yield engine
     finally:
+        # Close the application pool first.  The previous order ran drop_all()
+        # while request-scoped transactions could still own PostgreSQL locks,
+        # which made the first V1 test hang forever in fixture teardown.
+        reset_engine_cache()
+        cleanup_engine = sa.create_engine(url, future=True)
         try:
-            # Drop the late FK again so drop_all can run cleanly during
-            # teardown.
-            with engine.begin() as conn:
-                conn.execute(
-                    sa.text(
-                        "ALTER TABLE IF EXISTS v1_move_outs "
-                        "DROP CONSTRAINT IF EXISTS fk_v1_move_outs_settlement_id"
-                    )
-                )
-            V1Base.metadata.drop_all(engine)
+            reset_public_schema(cleanup_engine)
         finally:
-            reset_engine_cache()
+            cleanup_engine.dispose()
 
 
 @contextmanager
