@@ -99,13 +99,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Mini App build + smoke
+      - name: Mini App build + JSDOM smoke
         working-directory: mini_app
         run: |
           npm ci
           npm run build
           test -s dist/index.html
-          npm test
+          npm run test:smoke
       - name: Install Playwright Chromium browser
         working-directory: mini_app
         run: npx --yes playwright@1.48.2 install --with-deps chromium
