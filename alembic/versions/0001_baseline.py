@@ -1571,6 +1571,14 @@ def upgrade() -> None:
             "cancelled_at", sa.DateTime(timezone=True), nullable=True,
         ),
         sa.Column("cancel_reason", sa.String(length=500), nullable=True),
+        sa.Column("keys_returned", sa.Boolean(), nullable=True),
+        sa.Column("arrears_amount", sa.Numeric(14, 2), nullable=True),
+        sa.Column(
+            "keys_arrears_notes", sa.String(length=2000), nullable=True,
+        ),
+        sa.Column(
+            "archived_at", sa.DateTime(timezone=True), nullable=True,
+        ),
         sa.Column(
             "idempotency_key", sa.String(length=128), nullable=False,
         ),

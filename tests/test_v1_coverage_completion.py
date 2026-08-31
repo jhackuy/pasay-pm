@@ -619,3 +619,78 @@ class TestOperationService:
                 assert op.resolved_at is None
             finally:
                 session.close()
+
+
+# ---- Coverage Matrix 7.6 / 7.7 — Move-out record_keys_arrears + close_atomically ---
+
+
+class TestMoveOutKeysArrearsAndClose:
+    """Move-out 7.6 + 7.7 gap-fix tests."""
+
+    def _create_move_out(self, client, alpha, *, key_suffix: str):
+        return client.post(
+            "/api/v1/move-outs",
+            params={"org_id": alpha.org_id},
+            headers={
+                "Authorization": f"Bearer {alpha.owner_api_key}",
+                "Idempotency-Key": f"mo-{key_suffix}",
+            },
+            json={
+                "lease_id": alpha.lease_id,
+                "planned_move_out_date": str(
+                    date.today() + timedelta(days=30),
+                ),
+            },
+        )
+
+    def test_record_keys_arrears_persists_state(self, api):
+        client, alpha, _ = api
+        create = self._create_move_out(client, alpha, key_suffix="ka-1")
+        assert create.status_code == 201, create.text
+        move_out_id = create.json()["id"]
+
+        rec = client.post(
+            f"/api/v1/move-outs/{move_out_id}/keys-arrears",
+            params={"org_id": alpha.org_id},
+            headers={"Authorization": f"Bearer {alpha.owner_api_key}"},
+            json={
+                "keys_returned": True,
+                "arrears_amount": "0.00",
+                "notes": "All keys returned",
+            },
+        )
+        assert rec.status_code == 200, rec.text
+        assert rec.json()["keys_returned"] is True
+
+    def test_record_keys_arrears_rejects_terminal(self, api):
+        client, alpha, _ = api
+        create = self._create_move_out(client, alpha, key_suffix="ka-2")
+        move_out_id = create.json()["id"]
+        # Cancel to put move-out into a terminal state
+        cancel = client.post(
+            f"/api/v1/move-outs/{move_out_id}/cancel",
+            params={"org_id": alpha.org_id},
+            headers={"Authorization": f"Bearer {alpha.owner_api_key}"},
+            json={"reason": "Test cancellation"},
+        )
+        assert cancel.status_code == 200
+        # record_keys_arrears must fail on terminal state.
+        rec = client.post(
+            f"/api/v1/move-outs/{move_out_id}/keys-arrears",
+            params={"org_id": alpha.org_id},
+            headers={"Authorization": f"Bearer {alpha.owner_api_key}"},
+            json={"keys_returned": True},
+        )
+        assert rec.status_code == 409
+
+    def test_close_atomically_rejects_non_settled(self, api):
+        client, alpha, _ = api
+        create = self._create_move_out(client, alpha, key_suffix="close-1")
+        move_out_id = create.json()["id"]
+        # Cannot close without settling first.
+        close = client.post(
+            f"/api/v1/move-outs/{move_out_id}/close",
+            params={"org_id": alpha.org_id},
+            headers={"Authorization": f"Bearer {alpha.owner_api_key}"},
+        )
+        assert close.status_code == 409

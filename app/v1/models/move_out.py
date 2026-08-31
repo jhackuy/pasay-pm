@@ -39,8 +39,10 @@ from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 
+import sqlalchemy as sa
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -192,6 +194,18 @@ class MoveOut(V1Base, TimestampMixin):
     )
     cancel_reason: Mapped[str | None] = mapped_column(
         String(500), nullable=True,
+    )
+    keys_returned: Mapped[bool | None] = mapped_column(
+        Boolean(), nullable=True, default=None,
+    )
+    arrears_amount: Mapped[Decimal | None] = mapped_column(
+        Numeric(14, 2), nullable=True, default=None,
+    )
+    keys_arrears_notes: Mapped[str | None] = mapped_column(
+        String(2000), nullable=True,
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)

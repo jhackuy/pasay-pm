@@ -20,12 +20,13 @@ from sqlalchemy.orm import Session
 
 from app.core.idempotency import IdempotencyConflictError, IdempotencyKeyError
 from app.core.money import MoneyError
-from app.core.permissions import PermissionDenied, Principal
+from app.core.permissions import PermissionDenied, Principal, Role
 from app.core.time import NaiveDatetimeError
 from app.v1.deps import (
     get_current_principal,
     get_db_dep,
     parse_idempotency_key_header,
+    require_role,
 )
 from app.v1.schemas.move_out import (
     DepositSettlementCreate,
@@ -39,6 +40,7 @@ from app.v1.schemas.move_out import (
     MoveOutFollowUpCreate,
     MoveOutInspectionCreate,
     MoveOutInspectionRead,
+    MoveOutKeysArrearsRequest,
     MoveOutRead,
     MoveOutRequestCreate,
     OperationRead,
@@ -346,6 +348,57 @@ def cancel_move_out(
             org_id=org_id,
             move_out_id=move_out_id,
             reason=body.reason,
+        )
+    return MoveOutRead.model_validate(m)
+
+
+@router.post(
+    "/{move_out_id}/keys-arrears",
+    response_model=MoveOutRead,
+)
+def record_keys_arrears(
+    move_out_id: int,
+    body: MoveOutKeysArrearsRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> MoveOutRead:
+    """Coverage Matrix 7.6: record keys-returned + arrears ledger."""
+    service = MoveOutService(db)
+    with _mapped_errors():
+        m = service.record_keys_arrears(
+            principal,
+            org_id=org_id,
+            move_out_id=move_out_id,
+            keys_returned=body.keys_returned,
+            arrears_amount=body.arrears_amount,
+            notes=body.notes,
+        )
+    return MoveOutRead.model_validate(m)
+
+
+@router.post(
+    "/{move_out_id}/close",
+    response_model=MoveOutRead,
+)
+def close_move_out(
+    move_out_id: int,
+    org_id: int,
+    principal: Principal = Depends(require_role(Role.OWNER)),
+    db: Session = Depends(get_db_dep),
+) -> MoveOutRead:
+    """Coverage Matrix 7.7: atomic final close (single transaction).
+
+    Terminates the source lease, flips the unit back to AVAILABLE,
+    archives the move-out, and resolves the linked Operation. Only
+    fires after the move-out has been SETTLED.
+    """
+    service = MoveOutService(db)
+    with _mapped_errors():
+        m = service.close_atomically(
+            principal,
+            org_id=org_id,
+            move_out_id=move_out_id,
         )
     return MoveOutRead.model_validate(m)
 

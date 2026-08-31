@@ -133,6 +133,18 @@ class MoveOutCancelRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=500)
 
 
+class MoveOutKeysArrearsRequest(BaseModel):
+    """Coverage Matrix 7.6: record keys-returned + arrears ledger."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    keys_returned: bool
+    arrears_amount: Decimal = Field(
+        default=Decimal("0"), ge=0, max_digits=14, decimal_places=2,
+    )
+    notes: str | None = Field(default=None, max_length=2000)
+
+
 class MoveOutFollowUpCreate(BaseModel):
     """Create a Task projection on the move-out's linked Operation."""
 
@@ -163,6 +175,10 @@ class MoveOutRead(BaseModel):
     settlement_id: Optional[int] = None
     cancelled_at: Optional[datetime] = None
     cancel_reason: Optional[str] = None
+    keys_returned: Optional[bool] = None
+    arrears_amount: Optional[Decimal] = None
+    keys_arrears_notes: Optional[str] = None
+    archived_at: Optional[datetime] = None
     idempotency_key: str
 
 
@@ -247,6 +263,7 @@ __all__ = [
     "MoveOutDamageCreate",
     "MoveOutDamageRead",
     "MoveOutFollowUpCreate",
+    "MoveOutKeysArrearsRequest",
     "MoveOutInspectionCreate",
     "MoveOutInspectionRead",
     "MoveOutRead",

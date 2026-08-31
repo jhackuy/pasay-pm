@@ -719,6 +719,145 @@ class MoveOutService:
         self.db.commit()
         return m
 
+    # ---- record_keys_arrears (Coverage Matrix 7.6) ----
+
+    def record_keys_arrears(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        move_out_id: int,
+        keys_returned: bool,
+        arrears_amount: Decimal | str | int = 0,
+        notes: Optional[str] = None,
+    ) -> MoveOut:
+        """Coverage Matrix 7.6: keys-returned + arrears ledger.
+
+        Persists the keys/arrears state of the move-out without
+        mutating the deposit or the settlement. This is a soft update
+        used by the Owner checklist on the Mini App before
+        `close_atomically` is invoked.
+
+        OWNER/SECRETARY may record. ``arrears_amount`` is parsed via
+        ``parse_money`` (Decimal-only). Setting ``keys_returned=False``
+        plus a non-zero ``arrears_amount`` is allowed and logs an
+        activity row but never auto-closes the move-out.
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER, Role.SECRETARY)
+        m = self.get_move_out(
+            principal, org_id=org_id, move_out_id=move_out_id,
+        )
+        if m.state in (
+            MoveOutState.SETTLED.value,
+            MoveOutState.CANCELLED.value,
+        ):
+            raise ConflictError(
+                f"cannot record keys/arrears on terminal move-out "
+                f"(state={m.state})",
+            )
+        arrears_dec = parse_money(arrears_amount)
+        if arrears_dec < 0:
+            raise ValidationError("arrears_amount must be non-negative")
+        m.keys_returned = keys_returned
+        m.arrears_amount = arrears_dec
+        m.keys_arrears_notes = notes
+        # Soft update — only bump Operation to in_progress if not
+        # already resolved. Never closes.
+        op = self.get_operation(
+            principal, org_id=org_id, move_out_id=move_out_id,
+        )
+        _bump_to_in_progress(op)
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            move_out_id=m.id,
+            kind=MoveOutActivityKind.FOLLOW_UP_CREATED,
+            actor_user_id=principal.user_id,
+            detail=(
+                f"keys_returned={keys_returned} arrears={arrears_dec}"
+            ),
+        )
+        self.db.commit()
+        return m
+
+    # ---- close_atomically (Coverage Matrix 7.7) ----
+
+    def close_atomically(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        move_out_id: int,
+    ) -> MoveOut:
+        """Coverage Matrix 7.7: atomic final close.
+
+        Single transaction that:
+          1. Verifies the move-out has been SETTLED (close only after
+             real settlement).
+          2. Terminates the source Lease (ACTIVE → TERMINATED).
+          3. Flips the Unit back to AVAILABLE.
+          4. Marks the move-out archived (preserved for audit).
+          5. Resolves the linked Operation; cancels open follow-ups.
+
+        Cross-step guarantees:
+          - a partial close (e.g. settlement only) cannot leave the
+            move-out in a half-closed state.
+          - related Expense/Payment actions never trigger this method
+            (state-machine guard enforced at the ExpenseService level).
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER)
+        m = self.get_move_out(
+            principal, org_id=org_id, move_out_id=move_out_id,
+        )
+        if m.state != MoveOutState.SETTLED.value:
+            raise ConflictError(
+                f"cannot close move-out {move_out_id} in state "
+                f"{m.state!r} (must be SETTLED first)",
+            )
+        if m.settlement_id is None:
+            raise ConflictError(
+                f"cannot close move-out {move_out_id}: "
+                f"settlement row missing",
+            )
+        # 1) Terminate the source lease (if still ACTIVE).
+        if m.lease_id is not None:
+            lease = self.db.get(Lease, m.lease_id)
+            if (
+                lease is not None
+                and lease.org_id == org_id
+                and lease.state == LeaseState.ACTIVE.value
+            ):
+                lease.state = LeaseState.TERMINATED.value
+                lease.archived_at = utcnow()
+        # 2) Flip the unit back to AVAILABLE.
+        if m.lease_id is not None and m.lease is not None and m.lease.unit_id is not None:
+            unit = self.db.get(Unit, m.lease.unit_id)
+            if unit is not None and unit.org_id == org_id:
+                unit.status = UnitStatus.AVAILABLE.value
+        # 3) Archive the move-out (history retained, never erased).
+        if m.archived_at is None:
+            m.archived_at = utcnow()
+        # 4) Resolve Operation.
+        op = self.get_operation(
+            principal, org_id=org_id, move_out_id=move_out_id,
+        )
+        _close_operation(
+            self.db, operation=op, actor_user_id=principal.user_id,
+        )
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            move_out_id=m.id,
+            kind=MoveOutActivityKind.SETTLED,
+            actor_user_id=principal.user_id,
+            detail="close_atomically",
+        )
+        self.db.commit()
+        self.db.refresh(m)
+        return m
+
     # ---- follow-up (Task projection) ----
 
     def create_follow_up(
