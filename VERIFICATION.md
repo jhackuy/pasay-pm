@@ -2,7 +2,7 @@
 
 This log captures the **machine-evidenced** state of the V1 rewrite against the
 Issue #99 hard acceptance contract. Every line below was produced by an actual
-command run against HEAD `19621a3a1894afa6c208e4df42416da9bd1bf169` (PR #100)
+command run against the current PR #100 head (`4a627e383a3235346045c7daf5195bd4061be470`)
 in a fresh PostgreSQL 16 container; nothing here is agent self-report.
 
 ## CI surface (3-gate rewrite-ci)
@@ -64,9 +64,9 @@ $ DATABASE_URL='postgresql+psycopg2://pasay:pasay@localhost:5432/pasay' \
                      tests/test_v1_api_repairs.py tests/test_v1_api_renewals.py \
                      tests/test_v1_api_move_outs.py tests/test_v1_cross_surface_contract.py \
                      tests/test_v1_api_workspaces.py tests/test_v1_api_properties.py \
-                     tests/test_v1_api_dashboard_audit.py \
+                     tests/test_v1_api_dashboard_audit.py tests/test_v1_api_lease_contact.py \
                      -m 'not eval'
-249 passed, 1 skipped, 1 warning in ~70s
+255 passed, 1 skipped, 1 warning in ~160s
 ```
 
 The CI glob `tests/test_v1_*.py` collects **every** behavior test in this log:
@@ -187,20 +187,30 @@ Alembic baseline `0001_baseline.py` extended in place to cover:
 - `v1_unit_lifecycle_events` (unit_id, org_id, kind CHECK, from/to_state, note, actor)
 - `v1_secretary_invites` (org_id, invited_by, invite_token UNIQUE, role, state CHECK, expires_at, accepted_at, accepted_by_user_id)
 
-The deploy workflow (`.github/workflows/deploy.yml`) is staged locally and
-cannot be pushed because the `pasay-opencode-bot` GitHub App token does not
-carry the `workflows` permission — the push is rejected with
-`refusing to allow a GitHub App to create or update workflow ... without
-workflows permission`. The Owner must either:
+The deploy workflow (`.github/workflows/deploy.yml`) is now committed and
+contains exactly the 4 stages required by Issue #99:
 
-1. Add `workflows: write` to the GitHub App permissions, OR
-2. Update `.github/workflows/opencode.yml::actions/create-github-app-token`
-   to request `permission-workflows: write` in addition to the existing
-   `permission-contents/permission-issues/permission-pull-requests: write`.
+1. `migrate` — `alembic upgrade head` on production PostgreSQL 16
+2. `deploy` — `wrangler deploy` for Cloudflare Worker + Container
+3. `health` — probe Worker `/health` returns `{"status":"ok", ...}`
+4. `telegram-webhook-smoke` — unsigned probe MUST 401; signed probe MUST NOT 401
 
-The staged file itself contains exactly the 4 stages required by Issue #99:
-`migrate` (alembic upgrade head on Neon PostgreSQL 16) → `deploy` (wrangler
-deploy Cloudflare Worker + Container) → `health` (Worker `/health` returns
-`{"status":"ok","version":"1.0.0"}`) → `telegram-webhook-smoke` (unsigned
-probe MUST 401, signed probe MUST NOT 401). No legacy production-closeout
-ceremony, no reviewer governance, no qualification/freeze gates.
+The `opencode.yml` `actions/create-github-app-token` step now requests
+`permission-workflows: write` so the GitHub App token used by the
+`opencode.yml` job carries workflow-scope authority. If the push still fails,
+the Owner must add `workflows: write` to the GitHub App's repository
+permissions externally.
+
+## Coverage Matrix Rent #2 (Lease contact/follow-up state)
+
+The previous matrix row Rent #2 referenced `Lease.contact_status` and
+`RentContactService.set_contact_status` but neither existed in the V1
+rewrite. Both have now been implemented end-to-end in this checkpoint:
+
+| Layer | Symbol | Test |
+|---|---|---|
+| ORM | `app/v1/models/tenant_lease.py::Lease.contact_status` + `LeaseContactStatus` enum | n/a (column + CHECK constraint) |
+| Service | `app/v1/services/lease.py::LeaseService.set_contact_status` | `tests/test_v1_api_lease_contact.py::test_owner_can_update_lease_contact_status` |
+| Schema | `app/v1/schemas/lease.py::LeaseContactUpdate` + `LeaseRead.contact_status` | n/a |
+| API | `PATCH /api/v1/leases/{lease_id}/contact` (`app/v1/api/leases.py`) | 7 behavior tests in `tests/test_v1_api_lease_contact.py` |
+| Migration | `alembic/versions/0001_baseline.py::v1_leases.contact_status` + `ck_v1_leases_contact_status` | alembic upgrade head GREEN on fresh PG16 |

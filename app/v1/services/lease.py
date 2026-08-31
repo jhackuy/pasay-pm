@@ -21,7 +21,7 @@ from app.core.permissions import (
 )
 from app.v1.models.base import LeaseState, UnitStatus
 from app.v1.models.property import Unit
-from app.v1.models.tenant_lease import Lease, Tenant
+from app.v1.models.tenant_lease import Lease, LeaseContactStatus, Tenant
 from app.v1.services.errors import (
     ConflictError,
     NotFoundError,
@@ -354,5 +354,44 @@ class LeaseService:
             .all()
         )
 
+    def set_contact_status(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        lease_id: int,
+        contact_status: str | LeaseContactStatus,
+    ) -> Lease:
+        """Update the lease's contact/follow-up state.
 
-__all__ = ["create_lease", "activate_lease", "terminate_lease", "LeaseService"]
+        Used by the Telegram NL bridge (Tenant replied / Wrong number) and
+        the Owner/Secretary contact flow. Owner + Secretary may update;
+        the resulting state is one of the LeaseContactStatus values.
+        """
+        require_org_scope(principal, org_id)
+        if principal.role not in (Role.OWNER, Role.SECRETARY):
+            raise PermissionDenied(
+                "only OWNER/SECRETARY can update lease contact status",
+            )
+        parsed = (
+            contact_status
+            if isinstance(contact_status, LeaseContactStatus)
+            else LeaseContactStatus(contact_status)
+        )
+        lease = self.db.get(Lease, lease_id)
+        if lease is None or lease.org_id != org_id:
+            raise NotFoundError(
+                f"lease {lease_id} not found in org {org_id}",
+            )
+        lease.contact_status = parsed.value
+        self.db.commit()
+        self.db.refresh(lease)
+        return lease
+
+
+__all__ = [
+    "create_lease",
+    "activate_lease",
+    "terminate_lease",
+    "LeaseService",
+]

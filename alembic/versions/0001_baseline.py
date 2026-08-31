@@ -391,6 +391,10 @@ def upgrade() -> None:
             server_default="DRAFT",
         ),
         sa.Column(
+            "contact_status", sa.String(length=16), nullable=False,
+            server_default="PENDING",
+        ),
+        sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False,
             server_default=sa.func.now(),
         ),
@@ -401,6 +405,10 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "state IN ('DRAFT','ACTIVE','TERMINATED','EXPIRED')",
             name="ck_v1_leases_state",
+        ),
+        sa.CheckConstraint(
+            "contact_status IN ('PENDING','REPLIED','WRONG_NUMBER','DISCONNECTED','NO_ANSWER')",
+            name="ck_v1_leases_contact_status",
         ),
     )
     op.create_index(

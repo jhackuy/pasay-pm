@@ -7,6 +7,8 @@ Rewrite invariants:
 """
 from __future__ import annotations
 
+from enum import StrEnum
+
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
@@ -22,6 +24,26 @@ from app.v1.models.base import BigPK, TimestampMixin, V1Base
 
 
 LEASE_STATES = ("DRAFT", "ACTIVE", "TERMINATED", "EXPIRED")
+
+
+class LeaseContactStatus(StrEnum):
+    """Per-lease follow-up state used by the Telegram NL bridge and the
+    Owner/Secretary contact flow.
+
+    Lifecycle: PENDING -> REPLIED | WRONG_NUMBER | DISCONNECTED | NO_ANSWER.
+    REPLIED is terminal-positive; the others are terminal-negative. The
+    state machine is open (Owner may flip back to PENDING to restart a
+    follow-up cycle) but every flip is captured by RentActivity.
+    """
+
+    PENDING = "PENDING"
+    REPLIED = "REPLIED"
+    WRONG_NUMBER = "WRONG_NUMBER"
+    DISCONNECTED = "DISCONNECTED"
+    NO_ANSWER = "NO_ANSWER"
+
+
+LEASE_CONTACT_STATUSES = tuple(s.value for s in LeaseContactStatus)
 
 
 class Tenant(V1Base, TimestampMixin):
@@ -51,6 +73,10 @@ class Lease(V1Base, TimestampMixin):
             "state IN ('DRAFT','ACTIVE','TERMINATED','EXPIRED')",
             name="ck_v1_leases_state",
         ),
+        CheckConstraint(
+            f"contact_status IN {LEASE_CONTACT_STATUSES!r}",
+            name="ck_v1_leases_contact_status",
+        ),
         Index("ix_v1_leases_org_id", "org_id"),
         Index("ix_v1_leases_unit_id", "unit_id"),
         Index("ix_v1_leases_tenant_id", "tenant_id"),
@@ -77,3 +103,6 @@ class Lease(V1Base, TimestampMixin):
     monthly_rent: Mapped[object] = mapped_column(Numeric(14, 2), nullable=False)
     deposit: Mapped[object] = mapped_column(Numeric(14, 2), nullable=False, default=0)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="DRAFT")
+    contact_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=LeaseContactStatus.PENDING.value,
+    )

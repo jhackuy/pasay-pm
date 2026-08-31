@@ -28,5 +28,15 @@ class LeaseRead(BaseModel):
     monthly_rent: Decimal
     deposit: Decimal
     state: str
+    contact_status: str
     created_at: datetime
     updated_at: datetime
+
+
+class LeaseContactUpdate(BaseModel):
+    """Request body for PATCH /api/v1/leases/{lease_id}/contact."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contact_status: str = Field(min_length=1, max_length=16)
+    note: str | None = Field(default=None, max_length=500)
