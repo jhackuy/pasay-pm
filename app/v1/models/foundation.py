@@ -1,17 +1,22 @@
-"""Foundation ORM: Organization, User, Membership, ApiCredential.
+"""Foundation ORM: Organization, User, Membership, ApiCredential, SecretaryInvite.
 
 DATA_CONTRACT invariants:
 - Organization: BIGSERIAL-compatible primary key, name UNIQUE.
 - User: telegram_user_id UNIQUE NULLABLE; default_language is constrained.
 - Membership: UNIQUE (org_id, user_id), exact OWNER/SECRETARY roles and ACTIVE/REMOVED states.
 - ApiCredential: key_hash UNIQUE; user_id indexed.
+- SecretaryInvite: 4-state lifecycle (PENDING/ACCEPTED/CANCELLED/EXPIRED) keyed by
+  (org_id, invite_token) UNIQUE; invitee_telegram_id nullable for non-telegram invites.
 """
 from __future__ import annotations
+
+from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Index,
     String,
@@ -93,3 +98,41 @@ class ApiCredential(V1Base, TimestampMixin):
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     user = relationship("User", back_populates="credentials")
+
+
+class SecretaryInvite(V1Base, TimestampMixin):
+    """Secretary invite with 4-state lifecycle (PENDING/ACCEPTED/CANCELLED/EXPIRED).
+
+    Invite token is opaque and used as the unique key for accept/cancel.
+    """
+    __tablename__ = "v1_secretary_invites"
+    __table_args__ = (
+        UniqueConstraint("invite_token", name="uq_v1_secretary_invites_token"),
+        CheckConstraint(
+            "state IN ('PENDING','ACCEPTED','CANCELLED','EXPIRED')",
+            name="ck_v1_secretary_invites_state",
+        ),
+        Index("ix_v1_secretary_invites_org_id", "org_id"),
+        Index("ix_v1_secretary_invites_state", "state"),
+    )
+
+    id: Mapped[BigPK]
+    org_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("v1_organizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    invited_by_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("v1_users.id", ondelete="RESTRICT"), nullable=False
+    )
+    invite_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    invitee_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    invitee_telegram_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="SECRETARY")
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    accepted_by_user_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("v1_users.id", ondelete="RESTRICT"), nullable=True
+    )
+
+
+SECRETARY_INVITE_STATES = ("PENDING", "ACCEPTED", "CANCELLED", "EXPIRED")

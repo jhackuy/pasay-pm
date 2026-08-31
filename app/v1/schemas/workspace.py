@@ -21,7 +21,7 @@ class WorkspaceRead(BaseModel):
 
 class MembershipCreate(BaseModel):
     user_id: int = Field(gt=0)
-    role: str = Field(pattern="^(owner|secretary|tenant)$")
+    role: str = Field(pattern="^(OWNER|SECRETARY)$")
 
 
 class MembershipRead(BaseModel):
@@ -32,3 +32,28 @@ class MembershipRead(BaseModel):
     user_id: int
     role: str
     state: str
+
+
+class SecretaryInviteCreate(BaseModel):
+    invitee_username: str | None = Field(default=None, max_length=64)
+    invitee_telegram_id: int | None = Field(default=None, gt=0)
+
+
+class SecretaryInviteAccept(BaseModel):
+    invite_token: str = Field(min_length=1, max_length=64)
+    accepting_user_id: int = Field(gt=0)
+
+
+class SecretaryInviteRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    org_id: int
+    invite_token: str
+    invitee_username: str | None
+    invitee_telegram_id: int | None
+    role: str
+    state: str
+    expires_at: datetime
+    accepted_at: datetime | None
+    accepted_by_user_id: int | None

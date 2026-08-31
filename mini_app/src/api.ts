@@ -7,9 +7,12 @@
  */
 import type {
   ApiKey,
+  AuditEvent,
   BootstrapResponse,
+  DashboardHome,
   ExpenseClaim,
   Lease,
+  Membership,
   MoveOut,
   Operation,
   Organization,
@@ -18,8 +21,11 @@ import type {
   RentDueSchedule,
   RentPayment,
   Repair,
+  SecretaryInvite,
   Task,
   Unit,
+  UnitDetail,
+  Workspace,
   WorkspaceMember,
 } from "./types";
 
@@ -152,6 +158,72 @@ export class PasayClient {
   ): Promise<{ id: number; full_name: string }> {
     return this.request("/tenants", {
       method: "POST", orgId, idempotencyKey, body,
+    });
+  }
+
+  // Dashboard / audit
+  getDashboardHome(orgId: number): Promise<DashboardHome> {
+    return this.request("/dashboard/home", { orgId });
+  }
+  listAuditEvents(
+    orgId: number,
+    options: { limit?: number } = {},
+  ): Promise<AuditEvent[]> {
+    return this.request("/audit", { orgId, ...options });
+  }
+
+  // Workspaces
+  createWorkspaceInvite(
+    orgId: number,
+    body: { invitee_username?: string | null },
+  ): Promise<SecretaryInvite> {
+    return this.request(`/workspaces/${orgId}/invites`, {
+      orgId,
+      method: "POST",
+      body,
+    });
+  }
+  cancelWorkspaceInvite(
+    orgId: number,
+    inviteId: number,
+  ): Promise<SecretaryInvite> {
+    return this.request(`/workspaces/${orgId}/invites/${inviteId}/cancel`, {
+      orgId,
+      method: "POST",
+    });
+  }
+  removeWorkspaceMember(
+    orgId: number,
+    memberId: number,
+  ): Promise<Membership> {
+    return this.request(`/workspaces/${orgId}/members/${memberId}`, {
+      orgId,
+      method: "DELETE",
+    });
+  }
+
+  // Properties
+  getProperty(propertyId: number, orgId: number): Promise<Property> {
+    return this.request(`/properties/${propertyId}`, { orgId });
+  }
+  archiveProperty(propertyId: number, orgId: number): Promise<Property> {
+    return this.request(`/properties/${propertyId}/archive`, {
+      orgId,
+      method: "POST",
+    });
+  }
+  getUnitDetail(unitId: number, orgId: number): Promise<UnitDetail> {
+    return this.request(`/properties/units/${unitId}`, { orgId });
+  }
+  setUnitStatus(
+    unitId: number,
+    orgId: number,
+    body: { status: string; note?: string | null },
+  ): Promise<Unit> {
+    return this.request(`/properties/units/${unitId}/status`, {
+      orgId,
+      method: "PATCH",
+      body,
     });
   }
 

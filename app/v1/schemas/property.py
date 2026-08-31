@@ -27,6 +27,7 @@ class PropertyRead(BaseModel):
     city: str | None
     region: str | None
     postal_code: str | None
+    archived_at: datetime | None
     created_at: datetime
     updated_at: datetime
 
@@ -49,3 +50,36 @@ class UnitRead(BaseModel):
     bathrooms: int
     monthly_rent: Decimal
     status: str
+
+
+class UnitLifecycleEventRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    unit_id: int
+    org_id: int
+    kind: str
+    from_state: str | None
+    to_state: str | None
+    note: str | None
+    actor_user_id: int | None
+    created_at: datetime
+
+
+class UnitStatusUpdate(BaseModel):
+    status: str = Field(pattern="^(AVAILABLE|OCCUPIED|MAINTENANCE|RETIRED)$")
+    note: str | None = Field(default=None, max_length=500)
+
+
+class UnitDetailRead(BaseModel):
+    """Unit + its lifecycle history (newest first)."""
+
+    unit: UnitRead
+    lifecycle_events: list[UnitLifecycleEventRead]
+
+
+class UnitEventCreate(BaseModel):
+    kind: str = Field(
+        pattern="^(STATUS_CHANGE|RENT_CHANGE|ARCHIVED|MAINTENANCE_START|MAINTENANCE_END)$",
+    )
+    note: str | None = Field(default=None, max_length=500)

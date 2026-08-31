@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from app.v1.api.audit import router as audit_router
 from app.v1.api.bootstrap import router as bootstrap_router
+from app.v1.api.dashboard import router as dashboard_router
 from app.v1.api.expenses import router as expenses_router
 from app.v1.api.leases import router as leases_router
 from app.v1.api.move_outs import router as move_outs_router
@@ -43,6 +45,8 @@ def create_v1_app() -> FastAPI:
     app.include_router(repairs_router, prefix="/api/v1")
     app.include_router(renewals_router, prefix="/api/v1")
     app.include_router(move_outs_router, prefix="/api/v1")
+    app.include_router(dashboard_router, prefix="/api/v1")
+    app.include_router(audit_router, prefix="/api/v1")
     return app
 
 

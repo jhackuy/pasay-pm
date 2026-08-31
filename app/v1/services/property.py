@@ -24,8 +24,9 @@ from app.core.permissions import (
     UnknownRoleError,
     require_org_scope,
 )
+from app.core.time import utcnow
 from app.v1.models.base import UnitStatus
-from app.v1.models.property import Property, Unit
+from app.v1.models.property import Property, Unit, UnitLifecycleEvent
 from app.v1.services.errors import (
     ConflictError,
     NotFoundError,
@@ -307,6 +308,167 @@ class PropertyService:
             .order_by(Unit.id.asc())
             .all()
         )
+
+    def get_property_detail(
+        self, principal: Principal, *, org_id: int, property_id: int,
+    ) -> tuple[Property, list[Unit]]:
+        require_org_scope(principal, org_id)
+        prop = self.db.get(Property, property_id)
+        if prop is None or prop.org_id != org_id:
+            raise NotFoundError(
+                f"property {property_id} not found in org {org_id}",
+            )
+        units = (
+            self.db.query(Unit)
+            .filter(Unit.property_id == property_id, Unit.org_id == org_id)
+            .order_by(Unit.id.asc())
+            .all()
+        )
+        return prop, units
+
+    def get_unit_detail(
+        self, principal: Principal, *, org_id: int, unit_id: int,
+    ) -> tuple[Unit, list[UnitLifecycleEvent]]:
+        """Unit + full lifecycle event history (newest first)."""
+        require_org_scope(principal, org_id)
+        unit = self.db.get(Unit, unit_id)
+        if unit is None or unit.org_id != org_id:
+            raise NotFoundError(f"unit {unit_id} not found in org {org_id}")
+        events = (
+            self.db.query(UnitLifecycleEvent)
+            .filter(
+                UnitLifecycleEvent.unit_id == unit_id,
+                UnitLifecycleEvent.org_id == org_id,
+            )
+            .order_by(UnitLifecycleEvent.id.desc())
+            .all()
+        )
+        return unit, events
+
+    def archive_property(
+        self, principal: Principal, *, org_id: int, property_id: int,
+    ) -> Property:
+        """Archive a property (sets archived_at = now, never deletes history).
+
+        Cannot archive a property with any OCCUPIED unit.
+        """
+        require_org_scope(principal, org_id)
+        if principal.role != Role.OWNER:
+            raise PermissionDenied("only OWNER can archive properties")
+        prop = self.db.get(Property, property_id)
+        if prop is None or prop.org_id != org_id:
+            raise NotFoundError(
+                f"property {property_id} not found in org {org_id}",
+            )
+        occupied_count = (
+            self.db.query(Unit)
+            .filter(
+                Unit.property_id == property_id,
+                Unit.org_id == org_id,
+                Unit.status == UnitStatus.OCCUPIED.value,
+            )
+            .count()
+        )
+        if occupied_count > 0:
+            raise ConflictError(
+                "cannot archive property with OCCUPIED units",
+            )
+        prop.archived_at = utcnow()
+        # Record a lifecycle event for each unit.
+        units = (
+            self.db.query(Unit)
+            .filter(Unit.property_id == property_id, Unit.org_id == org_id)
+            .all()
+        )
+        for u in units:
+            self.db.add(UnitLifecycleEvent(
+                unit_id=u.id,
+                org_id=org_id,
+                kind="ARCHIVED",
+                note=f"property archived",
+                actor_user_id=principal.user_id,
+            ))
+        self.db.commit()
+        self.db.refresh(prop)
+        return prop
+
+    def set_unit_status_v1(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        unit_id: int,
+        status: UnitStatus | str,
+        note: str | None = None,
+    ) -> Unit:
+        """Flip a Unit's status with a recorded UnitLifecycleEvent.
+
+        Drives the vacant/occupied notification truth.
+        """
+        require_org_scope(principal, org_id)
+        if principal.role not in (Role.OWNER, Role.SECRETARY):
+            raise PermissionDenied(
+                "only OWNER/SECRETARY can change unit status",
+            )
+        if isinstance(status, str):
+            try:
+                status = UnitStatus(status)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
+        unit = self.db.get(Unit, unit_id)
+        if unit is None or unit.org_id != org_id:
+            raise NotFoundError(
+                f"unit {unit_id} not found in org {org_id}",
+            )
+        from_state = unit.status
+        unit.status = status.value
+        self.db.add(UnitLifecycleEvent(
+            unit_id=unit_id,
+            org_id=org_id,
+            kind="STATUS_CHANGE",
+            from_state=from_state,
+            to_state=status.value,
+            note=note,
+            actor_user_id=principal.user_id,
+        ))
+        self.db.commit()
+        self.db.refresh(unit)
+        return unit
+
+    def record_unit_event(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        unit_id: int,
+        kind: str,
+        note: str | None = None,
+    ) -> UnitLifecycleEvent:
+        """Append-only: record an arbitrary UnitLifecycleEvent (RENT_CHANGE, etc)."""
+        require_org_scope(principal, org_id)
+        if principal.role not in (Role.OWNER, Role.SECRETARY):
+            raise PermissionDenied("only OWNER/SECRETARY can record unit events")
+        if kind not in (
+            "STATUS_CHANGE", "RENT_CHANGE", "ARCHIVED",
+            "MAINTENANCE_START", "MAINTENANCE_END",
+        ):
+            raise ValidationError(f"unknown event kind {kind!r}")
+        unit = self.db.get(Unit, unit_id)
+        if unit is None or unit.org_id != org_id:
+            raise NotFoundError(
+                f"unit {unit_id} not found in org {org_id}",
+            )
+        event = UnitLifecycleEvent(
+            unit_id=unit_id,
+            org_id=org_id,
+            kind=kind,
+            note=note,
+            actor_user_id=principal.user_id,
+        )
+        self.db.add(event)
+        self.db.commit()
+        self.db.refresh(event)
+        return event
 
 
 __all__ = [

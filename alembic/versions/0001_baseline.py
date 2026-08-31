@@ -137,6 +137,62 @@ def upgrade() -> None:
     )
 
     op.create_table(
+        "v1_secretary_invites",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "invited_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("invite_token", sa.String(length=64), nullable=False),
+        sa.Column("invitee_username", sa.String(length=64), nullable=True),
+        sa.Column("invitee_telegram_id", sa.BigInteger(), nullable=True),
+        sa.Column(
+            "role", sa.String(length=16), nullable=False, server_default="SECRETARY",
+        ),
+        sa.Column(
+            "state", sa.String(length=16), nullable=False, server_default="PENDING",
+        ),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("accepted_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "accepted_by_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.UniqueConstraint(
+            "invite_token", name="uq_v1_secretary_invites_token",
+        ),
+        sa.CheckConstraint(
+            "state IN ('PENDING','ACCEPTED','CANCELLED','EXPIRED')",
+            name="ck_v1_secretary_invites_state",
+        ),
+    )
+    op.create_index(
+        "ix_v1_secretary_invites_org_id",
+        "v1_secretary_invites", ["org_id"],
+    )
+    op.create_index(
+        "ix_v1_secretary_invites_state",
+        "v1_secretary_invites", ["state"],
+    )
+
+    op.create_table(
         "v1_properties",
         sa.Column(
             "id", sa.BigInteger(), primary_key=True, autoincrement=True,
@@ -156,6 +212,7 @@ def upgrade() -> None:
         sa.Column("city", sa.String(length=80), nullable=True),
         sa.Column("region", sa.String(length=80), nullable=True),
         sa.Column("postal_code", sa.String(length=20), nullable=True),
+        sa.Column("archived_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), nullable=False,
             server_default=sa.func.now(),
@@ -216,6 +273,53 @@ def upgrade() -> None:
     )
     op.create_index(
         "ix_v1_units_org_id", "v1_units", ["org_id"],
+    )
+
+    op.create_table(
+        "v1_unit_lifecycle_events",
+        sa.Column(
+            "id", sa.BigInteger(), primary_key=True, autoincrement=True,
+        ),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), nullable=False,
+            server_default=sa.text("CURRENT_TIMESTAMP"),
+        ),
+        sa.Column(
+            "unit_id", sa.BigInteger(),
+            sa.ForeignKey("v1_units.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column(
+            "org_id", sa.BigInteger(),
+            sa.ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("kind", sa.String(length=32), nullable=False),
+        sa.Column("from_state", sa.String(length=32), nullable=True),
+        sa.Column("to_state", sa.String(length=32), nullable=True),
+        sa.Column("note", sa.String(length=500), nullable=True),
+        sa.Column(
+            "actor_user_id", sa.BigInteger(),
+            sa.ForeignKey("v1_users.id", ondelete="RESTRICT"),
+            nullable=True,
+        ),
+        sa.CheckConstraint(
+            "kind IN ('STATUS_CHANGE','RENT_CHANGE','ARCHIVED',"
+            "'MAINTENANCE_START','MAINTENANCE_END')",
+            name="ck_v1_unit_lifecycle_events_kind",
+        ),
+    )
+    op.create_index(
+        "ix_v1_unit_lifecycle_events_unit_id",
+        "v1_unit_lifecycle_events", ["unit_id"],
+    )
+    op.create_index(
+        "ix_v1_unit_lifecycle_events_org_id",
+        "v1_unit_lifecycle_events", ["org_id"],
     )
 
     op.create_table(
@@ -1775,8 +1879,10 @@ def downgrade() -> None:
     op.drop_table("v1_operations")
     op.drop_table("v1_leases")
     op.drop_table("v1_tenants")
+    op.drop_table("v1_unit_lifecycle_events")
     op.drop_table("v1_units")
     op.drop_table("v1_properties")
+    op.drop_table("v1_secretary_invites")
     op.drop_table("v1_api_credentials")
     op.drop_table("v1_memberships")
     op.drop_table("v1_users")
