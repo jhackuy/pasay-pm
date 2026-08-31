@@ -100,4 +100,4 @@ jobs:
           node-version: '20'
       - name: Mini App build
         working-directory: mini_app
-        run: npm ci && npm run build && test -s dist/index.html
+        run: npm ci && npm run build && npm test && test -s dist/index.html
