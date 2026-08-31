@@ -106,7 +106,7 @@ def propose_renewal(
 # ---------- read ----------
 
 
-@router.get("/", response_model=list[RenewalRead])
+@router.get("", response_model=list[RenewalRead])
 def list_renewals(
     org_id: int,
     state: str | None = None,

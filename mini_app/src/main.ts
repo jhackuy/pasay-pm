@@ -23,6 +23,26 @@ const client = new PasayClient();
 const session = new SessionStore(client);
 let locale: Locale = (localStorage.getItem("pasay.locale") === "en" ? "en" : "zh") as Locale;
 
+// Test affordance: expose the in-memory session + typed client on
+// `window` so browser-driven tests can seed extra entities (e.g. an
+// ACTIVE lease before opening the renewal form) without inventing a
+// separate "test mode" path. AGENTS.md §4 is honored: nothing here is
+// persisted to localStorage; these are scratch globals on `window`
+// only, present for the lifetime of the page.
+declare global {
+  interface Window {
+    __PASAY_CLIENT__?: PasayClient;
+    __PASAY_SESSION__?: {
+      api_key: string;
+      org_id: number;
+      user_id: number;
+      role: string;
+    };
+    __PASAY_PROPERTY_ID__?: number;
+  }
+}
+window.__PASAY_CLIENT__ = client;
+
 function setLocale(next: Locale): void {
   locale = next;
   localStorage.setItem("pasay.locale", next);
@@ -106,6 +126,15 @@ function renderBootstrap(): void {
         owner_display_name: String(data.get("owner_display_name") || "") || null,
       });
       session.bootstrap(response.api_key, response.org_id, response.user_id, response.role);
+      // Mirror session into a window global so browser-driven tests can
+      // seed extra entities (e.g. an ACTIVE lease) without rerunning
+      // bootstrap. The data is in-memory only.
+      window.__PASAY_SESSION__ = {
+        api_key: response.api_key,
+        org_id: response.org_id,
+        user_id: response.user_id,
+        role: response.role,
+      };
       await paint();
     } catch (err) {
       const errorEl = document.querySelector<HTMLElement>("#bootstrap-error");

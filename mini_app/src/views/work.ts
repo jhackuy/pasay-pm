@@ -4,6 +4,12 @@
  *  verify completion; settle deposit. No localStorage. Idempotency-Key
  *  generated per submit. Failures are surfaced as explicit messages,
  *  not silent "success" placeholders.
+ *
+ *  The renewal form (Coverage Matrix Renewal slice) is populated from the
+ *  org's ACTIVE leases — the Owner picks the lease from a dropdown, never
+ *  types a numeric id manually. The dropdown also surfaces the tenant
+ *  name + unit label so the Owner can audit which contract is being
+ *  renewed before submitting.
  */
 
 import type { PasayClient } from "../api";
@@ -53,7 +59,7 @@ export async function renderWork(
       ${renderMoveOutSection(openMoveOuts, leases, client, orgId, locale)}
     `;
     setViewContent(body);
-    bindWorkHandlers(client, orgId, locale, properties);
+    bindWorkHandlers(client, orgId, locale, properties, leases);
   } catch (err) {
     setViewContent(renderWorkError(err, locale));
   }
@@ -64,13 +70,15 @@ function bindWorkHandlers(
   orgId: number,
   locale: Locale,
   properties: Awaited<ReturnType<PasayClient["listProperties"]>>,
+  leases: Awaited<ReturnType<PasayClient["listLeases"]>>,
 ): void {
+  const activeLeases = leases.filter((l) => l.state === "ACTIVE");
   document
     .querySelector<HTMLButtonElement>("[data-action='new-repair']")
     ?.addEventListener("click", () => renderRepairForm(client, orgId, locale, properties));
   document
     .querySelector<HTMLButtonElement>("[data-action='new-renewal']")
-    ?.addEventListener("click", () => renderRenewalForm(client, orgId, locale, []));
+    ?.addEventListener("click", () => renderRenewalForm(client, orgId, locale, activeLeases));
   document
     .querySelector<HTMLButtonElement>("[data-action='new-moveout']")
     ?.addEventListener("click", () => renderMoveOutForm(client, orgId, locale, []));
@@ -317,18 +325,47 @@ function renderRenewalForm(
   client: PasayClient,
   orgId: number,
   locale: Locale,
-  current: RenewalProposal[],
+  activeLeases: Lease[],
 ): void {
+  const leaseOptions =
+    activeLeases.length === 0
+      ? `<option value="" disabled selected>—</option>`
+      : `<option value="" disabled selected>—</option>` +
+        activeLeases
+          .map(
+            (l) =>
+              `<option value="${l.id}" data-rent="${escapeHtml(l.monthly_rent)}">` +
+              `#${l.id} · ${t(locale, "tenants")} #${l.tenant_id} · ` +
+              `${t(locale, "units")} #${l.unit_id} · ` +
+              `${escapeHtml(l.start_date)} → ${escapeHtml(l.end_date)} · ` +
+              `${formatMoney(l.monthly_rent)}` +
+              `</option>`,
+          )
+          .join("");
+  const emptyHint =
+    activeLeases.length === 0
+      ? `<p class="muted" data-hint="no-active-leases">${
+          locale === "zh"
+            ? "当前工作区没有生效中的租约，先到 Work → 报修 / Properties 单元下创建 ACTIVE 租约。"
+            : "No ACTIVE leases in this workspace. Create an ACTIVE lease under a unit first."
+        }</p>`
+      : "";
   setViewContent(`
     <section class="panel">
       <header class="panel-header"><h2>${t(locale, "workOpenRenewal")}</h2></header>
+      ${emptyHint}
       <form id="renewal-form" class="form">
-        <label>${t(locale, "leases")} #<input name="lease_id" type="number" required min="1" /></label>
+        <label>${t(locale, "leases")}
+          <select name="source_lease_id" required ${activeLeases.length === 0 ? "disabled" : ""}>
+            ${leaseOptions}
+          </select>
+        </label>
         <label>${t(locale, "startDate")}<input name="start_date" type="date" required /></label>
         <label>${t(locale, "endDate")}<input name="end_date" type="date" required /></label>
-        <label>${t(locale, "monthlyRent")}<input name="monthly_rent" required inputmode="decimal" placeholder="0.00" /></label>
+        <label>${t(locale, "monthlyRent")}<input name="proposed_monthly_rent" required inputmode="decimal" placeholder="0.00" /></label>
+        <label>${t(locale, "deposit")}<input name="proposed_deposit" required inputmode="decimal" placeholder="0.00" value="0.00" /></label>
         <div class="form-actions">
-          <button class="primary-btn" type="submit">${t(locale, "submit")}</button>
+          <button class="primary-btn" type="submit" ${activeLeases.length === 0 ? "disabled" : ""}>${t(locale, "submit")}</button>
           <button class="ghost-btn" type="button" data-action="cancel">${t(locale, "cancel")}</button>
         </div>
         <p class="muted form-error" id="renewal-error" hidden></p>
@@ -344,11 +381,12 @@ function renderRenewalForm(
       event.preventDefault();
       const formEl = event.target as HTMLFormElement;
       const data = new FormData(formEl);
-      const leaseId = Number(data.get("lease_id"));
+      const sourceLeaseId = Number(data.get("source_lease_id"));
       const start = String(data.get("start_date") || "").trim();
       const end = String(data.get("end_date") || "").trim();
-      const rent = String(data.get("monthly_rent") || "").trim();
-      if (!leaseId || !start || !end || !rent) {
+      const rent = String(data.get("proposed_monthly_rent") || "").trim();
+      const deposit = String(data.get("proposed_deposit") || "0").trim() || "0";
+      if (!sourceLeaseId || !start || !end || !rent) {
         showFormError(document.querySelector("#renewal-error"), t(locale, "required"));
         return;
       }
@@ -356,15 +394,16 @@ function renderRenewalForm(
         const proposal = await client.proposeRenewal(
           orgId,
           {
-            lease_id: leaseId,
+            source_lease_id: sourceLeaseId,
             proposed_start_date: start,
             proposed_end_date: end,
             proposed_monthly_rent: rent,
+            proposed_deposit: deposit,
           },
           makeIdempotencyKey("renewal"),
         );
-        current.push(proposal);
         await renderWork(client, orgId, locale);
+        return proposal;
       } catch (err) {
         showFormError(document.querySelector("#renewal-error"), formatError(err, locale));
       }

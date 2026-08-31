@@ -245,7 +245,7 @@ export class PasayClient {
       start_date: string;
       end_date: string;
       monthly_rent: string;
-      deposit_amount: string;
+      deposit?: string;
     },
     idempotencyKey: string,
   ): Promise<Lease> {
@@ -406,35 +406,44 @@ export class PasayClient {
     });
   }
 
-  // Renewals
+  // Renewals — the FastAPI routes are nested under `/renewals/proposals/*`
+  // (POST /renewals/proposals is the create endpoint; the approve / reject /
+  // execute / cancel verbs are also nested there). Field names mirror
+  // `app/v1/schemas/renewal.RenewalProposeRequest` (source_lease_id,
+  // proposed_monthly_rent, proposed_deposit, …).
   listRenewals(orgId: number): Promise<RenewalProposal[]> {
     return this.request("/renewals", { orgId });
   }
   proposeRenewal(
     orgId: number,
     body: {
-      lease_id: number;
+      source_lease_id: number;
       proposed_start_date: string;
       proposed_end_date: string;
       proposed_monthly_rent: string;
+      proposed_deposit?: string;
       notes?: string | null;
     },
     idempotencyKey: string,
   ): Promise<RenewalProposal> {
-    return this.request("/renewals", {
+    return this.request("/renewals/proposals", {
       method: "POST", orgId, idempotencyKey, body,
     });
   }
   approveRenewal(orgId: number, renewalId: number): Promise<RenewalProposal> {
-    return this.request(`/renewals/${renewalId}/approve`, { method: "POST", orgId });
+    return this.request(`/renewals/proposals/${renewalId}/approve`, {
+      method: "POST", orgId,
+    });
   }
   rejectRenewal(orgId: number, renewalId: number, reason: string): Promise<RenewalProposal> {
-    return this.request(`/renewals/${renewalId}/reject`, {
+    return this.request(`/renewals/proposals/${renewalId}/reject`, {
       method: "POST", orgId, body: { reason },
     });
   }
   executeRenewal(orgId: number, renewalId: number): Promise<RenewalProposal> {
-    return this.request(`/renewals/${renewalId}/execute`, { method: "POST", orgId });
+    return this.request(`/renewals/proposals/${renewalId}/execute`, {
+      method: "POST", orgId,
+    });
   }
 
   // Move-out

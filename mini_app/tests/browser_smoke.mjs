@@ -205,6 +205,11 @@ async function main() {
       page,
       async () => `id=${propertyId}`,
     );
+    // Mirror the property id into a window global for downstream test
+    // steps that need to seed auxiliary entities (e.g. ACTIVE leases).
+    await page.evaluate((id) => {
+      window.__PASAY_PROPERTY_ID__ = id;
+    }, propertyId);
     // The property should now appear in the list.
     await page.waitForSelector(`[data-action="open-property"][data-id="${propertyId}"]`, {
       timeout: 5000,
@@ -395,6 +400,195 @@ async function main() {
       "15. only pasay.locale may live in localStorage",
       page,
       async () => `keys=${JSON.stringify(Object.keys(ls))}`,
+    );
+
+    // ----------------------------------------------------------------
+    // Lease Renewal Owner UI flow (Coverage Matrix Renewal slice).
+    // The previous steps seeded:
+    //   - 1 property ("Smoke Plaza")
+    //   - 1 unit ("Unit-A" with monthly_rent=12345.67)
+    //   - 1 tenant ("Smoke Tenant" id from step 8)
+    // We need an ACTIVE lease for that (tenant, unit) pair before the
+    // renewal form will offer a non-empty dropdown. We seed the lease
+    // directly via the API (the typed client surface used by the Mini
+    // App is exercised through the form itself).
+    // ----------------------------------------------------------------
+
+    // Pull the org_id + api_key out of the in-memory PasayClient.
+    const sessionInfo = await page.evaluate(() => {
+      // The Mini App keeps the apiKey in memory only (AGENTS.md §4). We
+      // re-bootstrap a fresh TestClient from the bootstrap response.
+      // Instead, read what's available on `window` if exposed, otherwise
+      // fetch /api/v1/bootstrap is not available (DB now has data).
+      // Fall back: scrape the apiKey from a known network call. The
+      // simplest reliable approach is to re-create a session by hitting
+      // /api/v1/bootstrap again is not allowed post-bootstrap. So we
+      // expose `__PASAY_SESSION__` for test purposes only (it is set by
+      // main.ts at bootstrap time and contains the api key).
+      return window.__PASAY_SESSION__ ?? null;
+    });
+    await expect(
+      sessionInfo && typeof sessionInfo.api_key === "string" && sessionInfo.api_key.length > 0,
+      "16. session is available for seeding an ACTIVE lease",
+      page,
+      async () => `sessionInfo=${JSON.stringify(sessionInfo)}`,
+    );
+
+    // Resolve the tenant id + unit id by hitting the API directly. Use
+    // the in-memory PasayClient from the page context (it carries the
+    // Bearer header).
+    const tenantId = await page.evaluate(async () => {
+      const tenants = await window.__PASAY_CLIENT__.listTenants(
+        window.__PASAY_SESSION__.org_id,
+      );
+      return tenants[0]?.id ?? null;
+    });
+    const unitId = await page.evaluate(async () => {
+      const units = await window.__PASAY_CLIENT__.listUnits(
+        window.__PASAY_SESSION__.org_id,
+        window.__PASAY_PROPERTY_ID__,
+      );
+      return units[0]?.id ?? null;
+    });
+    await expect(
+      Number.isInteger(tenantId) && Number.isInteger(unitId) && tenantId > 0 && unitId > 0,
+      "17. tenant + unit ids resolved for lease seeding",
+      page,
+      async () => `tenantId=${tenantId} unitId=${unitId}`,
+    );
+
+    // Seed a DRAFT lease and activate it. We can't reuse the renewal UI
+    // because that's what we're testing, but every other lease-touching
+    // path goes through the same LeaseService the renewal flow consumes.
+    const leaseDraft = await page.evaluate(
+      async ({ orgId, tenantId, unitId }) => {
+        const client = window.__PASAY_CLIENT__;
+        const today = new Date();
+        const start = new Date(today.getFullYear(), today.getMonth(), 1)
+          .toISOString()
+          .slice(0, 10);
+        const end = new Date(today.getFullYear() + 1, today.getMonth(), 1)
+          .toISOString()
+          .slice(0, 10);
+        return client.createLease(
+          orgId,
+          {
+            tenant_id: tenantId,
+            unit_id: unitId,
+            start_date: start,
+            end_date: end,
+            monthly_rent: "12345.67",
+            deposit: "0",
+          },
+          `seed-draft-${Date.now().toString(36)}`,
+        );
+      },
+      { orgId: sessionInfo.org_id, tenantId, unitId },
+    );
+    const leaseId = leaseDraft.id;
+    await page.evaluate(
+      async ({ orgId, leaseId }) => {
+        await window.__PASAY_CLIENT__.activateLease(orgId, leaseId);
+      },
+      { orgId: sessionInfo.org_id, leaseId },
+    );
+
+    // Now navigate to the Work tab and open the renewal form.
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          resp.url().includes("/api/v1/renewals") &&
+          resp.request().method() === "GET",
+        { timeout: 10000 },
+      ),
+      page.locator('.nav-btn[data-route="work"]').click(),
+    ]);
+    await page.waitForSelector('[data-action="new-renewal"]', { timeout: 5000 });
+    await page.locator('[data-action="new-renewal"]').click();
+    await page.waitForSelector("#renewal-form", { timeout: 5000 });
+
+    // The dropdown must contain at least one option matching our seeded
+    // lease id (with the lease #id label).
+    const selectExists = await page
+      .locator('#renewal-form select[name="source_lease_id"]')
+      .count();
+    await expect(
+      selectExists === 1,
+      "18. renewal form exposes a <select> with name=source_lease_id",
+      page,
+      async () => `selectExists=${selectExists}`,
+    );
+    const optionValues = await page.$$eval(
+      '#renewal-form select[name="source_lease_id"] option',
+      (opts) => opts.map((o) => o.value),
+    );
+    await expect(
+      optionValues.includes(String(leaseId)),
+      "19. lease dropdown lists the seeded ACTIVE lease id",
+      page,
+      async () => `optionValues=${JSON.stringify(optionValues)} leaseId=${leaseId}`,
+    );
+
+    // Fill the rest of the form: start = current lease end (one day
+    // after), end = +12 months, proposed_monthly_rent = same rent,
+    // proposed_deposit = same as the seeded 0.
+    const startNext = new Date(leaseDraft.end_date);
+    startNext.setUTCDate(startNext.getUTCDate() + 1);
+    const endNext = new Date(startNext);
+    endNext.setUTCFullYear(endNext.getUTCFullYear() + 1);
+    const fmtIso = (d) => d.toISOString().slice(0, 10);
+    await page.selectOption(
+      '#renewal-form select[name="source_lease_id"]',
+      String(leaseId),
+    );
+    await page.fill('#renewal-form input[name="start_date"]', fmtIso(startNext));
+    await page.fill('#renewal-form input[name="end_date"]', fmtIso(endNext));
+    await page.fill('#renewal-form input[name="proposed_monthly_rent"]', "13500.00");
+    await page.fill('#renewal-form input[name="proposed_deposit"]', "0.00");
+
+    const renewalPosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          /\/api\/v1\/renewals\/proposals(?:\?|$)/.test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#renewal-form button[type="submit"]').click(),
+    ]);
+    const renewalJson = await renewalPosted[0].json();
+    await expect(
+      Number.isInteger(renewalJson.id) && renewalJson.id > 0,
+      "20. POST /api/v1/renewals/proposals returned a numeric id",
+      page,
+      async () => `id=${renewalJson.id} body=${JSON.stringify(renewalJson)}`,
+    );
+    await expect(
+      renewalJson.state === "PROPOSED" &&
+        Number(renewalJson.proposed_monthly_rent) === 13500 &&
+        renewalJson.source_lease_id === leaseId,
+      "21. POST /api/v1/renewals/proposals persisted proposed terms + state=PROPOSED",
+      page,
+      async () =>
+        `state=${renewalJson.state} ` +
+        `proposed_monthly_rent=${renewalJson.proposed_monthly_rent} ` +
+        `source_lease_id=${renewalJson.source_lease_id}`,
+    );
+    // Idempotency-Key header must have been sent on the POST.
+    const renewalIdem = await renewalPosted[0]
+      .request()
+      .headerValue("idempotency-key");
+    await expect(
+      typeof renewalIdem === "string" && renewalIdem.length > 0,
+      "22. POST /api/v1/renewals/proposals carried an Idempotency-Key header",
+      page,
+      async () => `idem=${renewalIdem}`,
+    );
+    // Re-rendered Work view must surface the new renewal as a row with
+    // an Approve button (only PROPOSED renewals get the Approve button).
+    await page.waitForSelector(
+      `[data-action="approve-renewal-${renewalJson.id}"]`,
+      { timeout: 5000 },
     );
   } catch (err) {
     if (!failed) {
