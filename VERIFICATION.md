@@ -188,6 +188,19 @@ Alembic baseline `0001_baseline.py` extended in place to cover:
 - `v1_secretary_invites` (org_id, invited_by, invite_token UNIQUE, role, state CHECK, expires_at, accepted_at, accepted_by_user_id)
 
 The deploy workflow (`.github/workflows/deploy.yml`) is staged locally and
-will be pushed when the GitHub App `workflows` permission is available. It
-contains exactly the 4 stages required by Issue #99: migrate → deploy →
-health → Telegram webhook smoke.
+cannot be pushed because the `pasay-opencode-bot` GitHub App token does not
+carry the `workflows` permission — the push is rejected with
+`refusing to allow a GitHub App to create or update workflow ... without
+workflows permission`. The Owner must either:
+
+1. Add `workflows: write` to the GitHub App permissions, OR
+2. Update `.github/workflows/opencode.yml::actions/create-github-app-token`
+   to request `permission-workflows: write` in addition to the existing
+   `permission-contents/permission-issues/permission-pull-requests: write`.
+
+The staged file itself contains exactly the 4 stages required by Issue #99:
+`migrate` (alembic upgrade head on Neon PostgreSQL 16) → `deploy` (wrangler
+deploy Cloudflare Worker + Container) → `health` (Worker `/health` returns
+`{"status":"ok","version":"1.0.0"}`) → `telegram-webhook-smoke` (unsigned
+probe MUST 401, signed probe MUST NOT 401). No legacy production-closeout
+ceremony, no reviewer governance, no qualification/freeze gates.
