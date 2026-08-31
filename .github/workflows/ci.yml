@@ -6,6 +6,10 @@ on:
   push:
     branches: [opencode/issue99-20260829042355]
 
+concurrency:
+  group: rewrite-ci-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
