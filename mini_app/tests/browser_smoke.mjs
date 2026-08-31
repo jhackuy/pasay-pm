@@ -590,6 +590,357 @@ async function main() {
       `[data-action="approve-renewal-${renewalJson.id}"]`,
       { timeout: 5000 },
     );
+
+    // ----------------------------------------------------------------
+    // Move-out / Settlement Owner UI flow (Coverage Matrix 7.1–7.7).
+    //   1. request       POST /api/v1/move-outs (Idempotency-Key required)
+    //   2. inspection    POST /api/v1/move-outs/:id/inspections
+    //   3. damage        POST /api/v1/move-outs/:id/damages
+    //   4. accept        POST /api/v1/move-outs/damages/:id/accept
+    //   5. keys/arrears  POST /api/v1/move-outs/:id/keys-arrears
+    //   6. settle        POST /api/v1/move-outs/:id/settlement (closure gate)
+    //   7. atomic close  POST /api/v1/move-outs/:id/close
+    // The round trip must transition REQUESTED → INSPECTED → SETTLED,
+    // then close atomically. Each step uses a real API call; no
+    // localStorage business truth.
+    // ----------------------------------------------------------------
+
+    // (A) Open the move-out form and submit against the seeded ACTIVE lease.
+    await page.locator('[data-action="new-moveout"]').click();
+    await page.waitForSelector("#moveout-open-form", { timeout: 5000 });
+    await page.selectOption(
+      '#moveout-open-form select[name="lease_id"]',
+      String(leaseId),
+    );
+    await page.fill(
+      '#moveout-open-form input[name="planned_move_out_date"]',
+      fmtIso(new Date()),
+    );
+    await page.fill(
+      '#moveout-open-form textarea[name="notes"]',
+      "Smoke move-out: full end-of-term inspection.",
+    );
+    const moveOutPosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          /\/api\/v1\/move-outs(?:\?|$)/.test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          (resp.status() === 201 || resp.status() === 200),
+        { timeout: 10000 },
+      ),
+      page.locator('#moveout-open-form button[type="submit"]').click(),
+    ]);
+    const moveOutJson = await moveOutPosted[0].json();
+    await expect(
+      Number.isInteger(moveOutJson.id) && moveOutJson.id > 0,
+      "23. POST /api/v1/move-outs returned a numeric id",
+      page,
+      async () => `id=${moveOutJson.id} body=${JSON.stringify(moveOutJson)}`,
+    );
+    await expect(
+      moveOutJson.state === "REQUESTED" && moveOutJson.lease_id === leaseId,
+      "24. POST /api/v1/move-outs persisted state=REQUESTED + lease_id",
+      page,
+      async () =>
+        `state=${moveOutJson.state} lease_id=${moveOutJson.lease_id}`,
+    );
+    const moveOutIdem = await moveOutPosted[0]
+      .request()
+      .headerValue("idempotency-key");
+    await expect(
+      typeof moveOutIdem === "string" && moveOutIdem.length > 0,
+      "25. POST /api/v1/move-outs carried an Idempotency-Key header",
+      page,
+      async () => `idem=${moveOutIdem}`,
+    );
+    const moveOutId = moveOutJson.id;
+    // The successful submit navigates to the detail view.
+    await page.waitForSelector("#inspection-form", { timeout: 10000 });
+    await expect(
+      page.url().includes(`/move-outs/${moveOutId}`),
+      "26. submit navigates to the move-out detail view",
+      page,
+      async () => `url=${page.url()}`,
+    );
+
+    // (B) Record the walk-through inspection.
+    await page.fill(
+      '#inspection-form textarea[name="summary"]',
+      "Walk-through OK; one scratched door noted.",
+    );
+    const inspectionPosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/move-outs/${moveOutId}/inspections(?:\\?|$)`).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#inspection-form button[type="submit"]').click(),
+    ]);
+    const inspectionJson = await inspectionPosted[0].json();
+    await expect(
+      typeof inspectionJson.summary === "string" && inspectionJson.summary.length > 0,
+      "27. POST /api/v1/move-outs/:id/inspections persisted summary",
+      page,
+      async () => `summary=${inspectionJson.summary} id=${inspectionJson.id}`,
+    );
+    // Re-rendered detail view must show state=INSPECTED.
+    await page.waitForFunction(
+      () => document.body.innerText.includes("INSPECTED"),
+      null,
+      { timeout: 5000 },
+    );
+
+    // (C) Record a damage + accept it.
+    await page.selectOption('#damage-form select[name="kind"]', "REPAIR");
+    await page.fill(
+      '#damage-form input[name="description"]',
+      "Scratched bedroom door panel",
+    );
+    await page.fill('#damage-form input[name="amount"]', "1500.00");
+    const damagePosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/move-outs/${moveOutId}/damages(?:\\?|$)`).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#damage-form button[type="submit"]').click(),
+    ]);
+    const damageJson = await damagePosted[0].json();
+    await expect(
+      damageJson.amount === "1500.00" && damageJson.kind === "REPAIR",
+      "28. POST /api/v1/move-outs/:id/damages persisted kind=REPAIR + amount=1500.00",
+      page,
+      async () => `amount=${damageJson.amount} kind=${damageJson.kind}`,
+    );
+    // Accept the damage via the accept endpoint (the prompt() is
+    // intercepted by the handler before any test fixture can fill it; we
+    // invoke the typed client directly because accept_damage is
+    // exercising a confirmation flow that has no form submission).
+    const damageId = damageJson.id;
+    const acceptResult = await page.evaluate(
+      async ({ orgId, damageId }) => {
+        const client = window.__PASAY_CLIENT__;
+        return client.acceptDamage(orgId, damageId, {
+          accepted_amount: "1500.00",
+        });
+      },
+      { orgId: sessionInfo.org_id, damageId },
+    );
+    await expect(
+      acceptResult.accepted_amount === "1500.00",
+      "29. POST /api/v1/move-outs/damages/:id/accept persisted accepted_amount=1500.00",
+      page,
+      async () => `accepted_amount=${acceptResult.accepted_amount}`,
+    );
+
+    // (D) Record keys/arrears (keys returned + arrears_amount).
+    await page.selectOption('#keys-arrears-form select[name="keys_returned"]', "true");
+    await page.fill('#keys-arrears-form input[name="arrears_amount"]', "0.00");
+    await page.fill('#keys-arrears-form textarea[name="notes"]', "All keys returned.");
+    const keysPosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/move-outs/${moveOutId}/keys-arrears(?:\\?|$)`).test(
+            resp.url(),
+          ) && resp.request().method() === "POST",
+        { timeout: 10000 },
+      ),
+      page.locator('#keys-arrears-form button[type="submit"]').click(),
+    ]);
+    const keysJson = await keysPosted[0].json();
+    await expect(
+      keysJson.keys_returned === true &&
+        (keysJson.arrears_amount === "0.00" || keysJson.arrears_amount === "0"),
+      "30. POST /api/v1/move-outs/:id/keys-arrears persisted keys_returned=true + arrears=0.00",
+      page,
+      async () =>
+        `keys_returned=${keysJson.keys_returned} arrears_amount=${keysJson.arrears_amount}`,
+    );
+
+    // (E) Settle (closure gate). Use FULL_REFUND with deposit_held=24000
+    // and refund_amount=24000 (FULL_REFUND requires the two to match).
+    await page.selectOption('#settle-form select[name="disposition"]', "FULL_REFUND");
+    await page.fill('#settle-form input[name="deposit_held"]', "24000.00");
+    await page.fill('#settle-form input[name="refund_amount"]', "24000.00");
+    await page.fill('#settle-form input[name="additional_owed"]', "0.00");
+    const settlePosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/move-outs/${moveOutId}/settlement(?:\\?|$)`).test(
+            resp.url(),
+          ) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('#settle-form button[type="submit"]').click(),
+    ]);
+    const settleJson = await settlePosted[0].json();
+    await expect(
+      settleJson.disposition === "FULL_REFUND" &&
+        Number(settleJson.deposit_held) === 24000 &&
+        Number(settleJson.refund_amount) === 24000 &&
+        Number(settleJson.deductions_total) === 1500,
+      "31. POST /api/v1/move-outs/:id/settlement persisted FULL_REFUND + deductions_total=1500",
+      page,
+      async () =>
+        `disposition=${settleJson.disposition} ` +
+        `deposit_held=${settleJson.deposit_held} ` +
+        `refund_amount=${settleJson.refund_amount} ` +
+        `deductions_total=${settleJson.deductions_total}`,
+    );
+    // Re-rendered detail view must show state=SETTLED + a close button.
+    await page.waitForSelector('[data-action="close-moveout"]', { timeout: 5000 });
+
+    // (F) Persisted-state assertion: re-fetch the move-out via the
+    // typed client and confirm closure transitioned correctly. The
+    // server, not the Mini App, is the source of truth (AGENTS.md §4).
+    const persisted = await page.evaluate(
+      async ({ orgId, moveOutId }) => {
+        const client = window.__PASAY_CLIENT__;
+        const m = await client.getMoveOut(orgId, moveOutId);
+        const balance = await client.getMoveOutBalance(orgId, moveOutId);
+        const activity = await client.listMoveOutActivity(orgId, moveOutId);
+        return {
+          state: m.state,
+          settlement_id: m.settlement_id,
+          settled_at: m.settled_at,
+          keys_returned: m.keys_returned,
+          arrears_amount: m.arrears_amount,
+          balance_is_settled: balance.is_settled,
+          balance_deposit_held: balance.deposit_held,
+          balance_refund: balance.refund_amount,
+          balance_deductions: balance.deductions_total,
+          activity_kinds: activity.map((a) => a.kind),
+        };
+      },
+      { orgId: sessionInfo.org_id, moveOutId },
+    );
+    await expect(
+      persisted.state === "SETTLED" &&
+        Number(persisted.settlement_id) > 0 &&
+        typeof persisted.settled_at === "string" &&
+        persisted.balance_is_settled === true &&
+        Number(persisted.balance_deductions) === 1500 &&
+        persisted.activity_kinds.includes("SETTLED") &&
+        persisted.activity_kinds.includes("INSPECTED") &&
+        persisted.activity_kinds.includes("DAMAGE_RECORDED"),
+      "32. persisted-state: state=SETTLED + settlement_id + activity audit chain",
+      page,
+      async () =>
+        `state=${persisted.state} settlement_id=${persisted.settlement_id} ` +
+        `activity=${JSON.stringify(persisted.activity_kinds)}`,
+    );
+    await expect(
+      persisted.keys_returned === true &&
+        (persisted.arrears_amount === "0.00" || persisted.arrears_amount === "0"),
+      "33. persisted-state: keys_returned=true + arrears_amount=0.00 from keys-arrears step",
+      page,
+      async () =>
+        `keys_returned=${persisted.keys_returned} arrears=${persisted.arrears_amount}`,
+    );
+
+    // (G) Atomic close (OWNER-only). Single transaction: terminate lease,
+    // free the unit, archive the move-out, resolve the Operation.
+    const closePosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/move-outs/${moveOutId}/close(?:\\?|$)`).test(
+            resp.url(),
+          ) && resp.request().method() === "POST",
+        { timeout: 10000 },
+      ),
+      page.locator('[data-action="close-moveout"]').click(),
+    ]);
+    const closeJson = await closePosted[0].json();
+    await expect(
+      closeJson.state === "SETTLED" &&
+        typeof closeJson.archived_at === "string" &&
+        closeJson.archived_at !== null,
+      "34. POST /api/v1/move-outs/:id/close archived the move-out (archived_at set)",
+      page,
+      async () =>
+        `state=${closeJson.state} archived_at=${closeJson.archived_at}`,
+    );
+
+    // (H) Re-fetch from server: archived_at must persist; the linked
+    // lease must now be TERMINATED; the unit must be AVAILABLE; the
+    // Operation must be resolved.
+    const closed = await page.evaluate(
+      async ({ orgId, leaseId, unitId, moveOutId }) => {
+        const client = window.__PASAY_CLIENT__;
+        const m = await client.getMoveOut(orgId, moveOutId);
+        const op = await client.getMoveOutOperation(orgId, moveOutId);
+        const lease = await client.listLeases(orgId);
+        const unit = await client.getUnitDetail(unitId, orgId);
+        return {
+          move_out_archived_at: m.archived_at,
+          operation_state: op.state,
+          operation_resolved_at: op.resolved_at,
+          lease_state: lease.find((l) => l.id === leaseId)?.state ?? null,
+          unit_status: unit.unit.status,
+        };
+      },
+      {
+        orgId: sessionInfo.org_id,
+        leaseId,
+        unitId,
+        moveOutId,
+      },
+    );
+    await expect(
+      typeof closed.move_out_archived_at === "string" &&
+        closed.operation_state === "resolved" &&
+        closed.lease_state === "TERMINATED" &&
+        closed.unit_status === "AVAILABLE",
+      "35. atomic close: lease=TERMINATED + unit=AVAILABLE + operation=resolved",
+      page,
+      async () =>
+        `archived_at=${closed.move_out_archived_at} ` +
+        `op_state=${closed.operation_state} ` +
+        `lease_state=${closed.lease_state} unit_status=${closed.unit_status}`,
+    );
+
+    // (I) localStorage business truth assertion — move-out business keys
+    // must NEVER land in localStorage. The only allowed key is
+    // `pasay.locale` (UI preference).
+    const lsAfter = await page.evaluate(() => {
+      const out = {};
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const k = window.localStorage.key(i);
+        out[k] = window.localStorage.getItem(k);
+      }
+      return out;
+    });
+    const forbiddenMoveOutKeys = [
+      "apiKey",
+      "orgId",
+      "userId",
+      "role",
+      "api_key",
+      "org_id",
+      "move_out_id",
+      "settlement_id",
+      "deposit_held",
+      "refund_amount",
+      "deductions_total",
+      "disposition",
+      "archived_at",
+    ];
+    const moveOutLeaks = Object.keys(lsAfter).filter((k) =>
+      forbiddenMoveOutKeys.includes(k),
+    );
+    await expect(
+      moveOutLeaks.length === 0,
+      "36. localStorage does NOT persist move-out business truth",
+      page,
+      async () =>
+        `keys=${JSON.stringify(Object.keys(lsAfter))} leaks=${JSON.stringify(moveOutLeaks)}`,
+    );
   } catch (err) {
     if (!failed) {
       record("(uncaught)", false, String(err && err.message ? err.message : err));

@@ -1,5 +1,6 @@
 /** Tiny hash router — hash-based so the Mini App works without a server.
- *  Routes: #/, #/properties, #/work, #/finance, #/more, #/properties/:id
+ *  Routes: #/, #/properties, #/work, #/finance, #/more, #/properties/:id,
+ *          #/move-outs/:id
  */
 
 export type Route =
@@ -8,7 +9,8 @@ export type Route =
   | { name: "properties.detail"; propertyId: number }
   | { name: "work" }
   | { name: "finance" }
-  | { name: "more" };
+  | { name: "more" }
+  | { name: "move_out.detail"; moveOutId: number };
 
 export function parseHash(hash: string): Route {
   const cleaned = hash.replace(/^#/, "").replace(/^\//, "");
@@ -22,6 +24,10 @@ export function parseHash(hash: string): Route {
   if (parts[0] === "work") return { name: "work" };
   if (parts[0] === "finance") return { name: "finance" };
   if (parts[0] === "more") return { name: "more" };
+  if (parts[0] === "move-outs") {
+    const id = Number(parts[1]);
+    if (Number.isFinite(id)) return { name: "move_out.detail", moveOutId: id };
+  }
   return { name: "home" };
 }
 
@@ -39,6 +45,8 @@ export function toHash(route: Route): string {
       return "#/finance";
     case "more":
       return "#/more";
+    case "move_out.detail":
+      return `#/move-outs/${route.moveOutId}`;
   }
 }
 

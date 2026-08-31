@@ -10,6 +10,11 @@
  *  types a numeric id manually. The dropdown also surfaces the tenant
  *  name + unit label so the Owner can audit which contract is being
  *  renewed before submitting.
+ *
+ *  Move-out: the open form lives here; the detail page (inspection,
+ *  damages, keys/arrears, settle, atomic close) lives in
+ *  `views/move_out.ts` and is reached via the hash router
+ *  `#/move-outs/:id`.
  */
 
 import type { PasayClient } from "../api";
@@ -19,6 +24,7 @@ import { type Locale, t } from "../i18n";
 import { escapeHtml } from "./home";
 import { formatMoney, makeIdempotencyKey, statusLabel, statusToneClass } from "../format";
 import type { Lease, MoveOut, RenewalProposal, Repair, Unit } from "../types";
+import { renderMoveOutList, renderMoveOutOpenForm } from "./move_out";
 
 export async function renderWork(
   client: PasayClient,
@@ -151,10 +157,10 @@ function bindWorkHandlers(
       );
     });
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='settle-moveout-']").forEach((btn) => {
+  document.querySelectorAll<HTMLButtonElement>("[data-action^='open-moveout-']").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = Number(btn.dataset.moveOutId);
-      renderMoveOutSettleForm(client, orgId, id, locale);
+      window.location.hash = `#/move-outs/${id}`;
     });
   });
 }
@@ -247,29 +253,12 @@ function renderRenewalSection(
 
 function renderMoveOutSection(
   items: MoveOut[],
-  _leases: Lease[],
+  leases: Lease[],
   _client: PasayClient,
   _orgId: number,
   locale: Locale,
 ): string {
-  if (items.length === 0) return "";
-  return `<section class="panel">
-    <h3>${t(locale, "workOpenMoveOut")}</h3>
-    <ul class="list">${items
-      .map(
-        (m) => `<li class="list-row list-row--action">
-          <div class="row-main">
-            <b>${escapeHtml(m.requested_at)}</b>
-            <span class="${statusToneClass(m.state)}">${statusLabel(m.state, locale)}</span>
-            ${m.deposit_held ? `<span class="muted">${t(locale, "deposit")}: ${formatMoney(m.deposit_held)}</span>` : ""}
-          </div>
-          <div class="row-actions">
-            ${m.state === "INSPECTED" ? `<button class="primary-btn" data-action="settle-moveout-${m.id}" data-move-out-id="${m.id}" type="button">${t(locale, "workSettleMoveOut")}</button>` : ""}
-          </div>
-        </li>`,
-      )
-      .join("")}</ul>
-  </section>`;
+  return renderMoveOutList(items, leases, locale);
 }
 
 function renderRepairForm(
@@ -414,100 +403,19 @@ function renderMoveOutForm(
   client: PasayClient,
   orgId: number,
   locale: Locale,
-  current: MoveOut[],
+  _current: MoveOut[],
 ): void {
-  setViewContent(`
-    <section class="panel">
-      <header class="panel-header"><h2>${t(locale, "workOpenMoveOut")}</h2></header>
-      <form id="moveout-form" class="form">
-        <label>${t(locale, "leases")} #<input name="lease_id" type="number" required min="1" /></label>
-        <label>${t(locale, "workReason")}<textarea name="reason" rows="3" maxlength="500"></textarea></label>
-        <div class="form-actions">
-          <button class="primary-btn" type="submit">${t(locale, "submit")}</button>
-          <button class="ghost-btn" type="button" data-action="cancel">${t(locale, "cancel")}</button>
-        </div>
-        <p class="muted form-error" id="moveout-error" hidden></p>
-      </form>
-    </section>
-  `);
-  document
-    .querySelector<HTMLButtonElement>("[data-action='cancel']")
-    ?.addEventListener("click", () => renderWork(client, orgId, locale).catch(() => undefined));
-  document
-    .querySelector<HTMLFormElement>("#moveout-form")
-    ?.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const formEl = event.target as HTMLFormElement;
-      const data = new FormData(formEl);
-      const leaseId = Number(data.get("lease_id"));
-      const reason = String(data.get("reason") || "").trim();
-      if (!leaseId) {
-        showFormError(document.querySelector("#moveout-error"), t(locale, "required"));
-        return;
-      }
-      try {
-        const moveOut = await client.requestMoveOut(
-          orgId,
-          { lease_id: leaseId, reason: reason || null },
-          makeIdempotencyKey("moveout"),
-        );
-        current.push(moveOut);
-        await renderWork(client, orgId, locale);
-      } catch (err) {
-        showFormError(document.querySelector("#moveout-error"), formatError(err, locale));
-      }
-    });
-}
-
-function renderMoveOutSettleForm(
-  client: PasayClient,
-  orgId: number,
-  moveOutId: number,
-  locale: Locale,
-): void {
-  setViewContent(`
-    <section class="panel">
-      <header class="panel-header"><h2>${t(locale, "workSettleMoveOut")}</h2></header>
-      <form id="settle-form" class="form">
-        <label>${t(locale, "deposit")}<input name="deposit_held" required inputmode="decimal" placeholder="0.00" /></label>
-        <label>${t(locale, "workRefund")}<input name="refund_amount" required inputmode="decimal" placeholder="0.00" /></label>
-        <label>${t(locale, "workAdditionalOwed")}<input name="additional_owed" required inputmode="decimal" placeholder="0.00" /></label>
-        <label>${t(locale, "workOutcome")}<select name="outcome">
-          <option value="FULL_REFUND">FULL_REFUND</option>
-          <option value="PARTIAL_REFUND">PARTIAL_REFUND</option>
-          <option value="NO_REFUND">NO_REFUND</option>
-        </select></label>
-        <label>${t(locale, "workNotes")}<textarea name="notes" rows="3" maxlength="500"></textarea></label>
-        <div class="form-actions">
-          <button class="primary-btn" type="submit">${t(locale, "submit")}</button>
-          <button class="ghost-btn" type="button" data-action="cancel">${t(locale, "cancel")}</button>
-        </div>
-        <p class="muted form-error" id="settle-error" hidden></p>
-      </form>
-    </section>
-  `);
-  document
-    .querySelector<HTMLButtonElement>("[data-action='cancel']")
-    ?.addEventListener("click", () => renderWork(client, orgId, locale).catch(() => undefined));
-  document
-    .querySelector<HTMLFormElement>("#settle-form")
-    ?.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      const formEl = event.target as HTMLFormElement;
-      const data = new FormData(formEl);
-      try {
-        await client.settleMoveOut(orgId, moveOutId, {
-          outcome: String(data.get("outcome")),
-          deposit_held: String(data.get("deposit_held")),
-          refund_amount: String(data.get("refund_amount")),
-          additional_owed: String(data.get("additional_owed")),
-          notes: String(data.get("notes") || "") || null,
-        });
-        await renderWork(client, orgId, locale);
-      } catch (err) {
-        showFormError(document.querySelector("#settle-error"), formatError(err, locale));
-      }
-    });
+  // The real open form is in views/move_out.ts. We fetch the active
+  // leases here so the Owner sees a dropdown of valid contracts, not a
+  // raw numeric input. The form navigates to #/move-outs/:id on success.
+  void client.listLeases(orgId).then((leases) => {
+    renderMoveOutOpenForm(
+      client,
+      orgId,
+      locale,
+      leases.filter((l) => l.state === "ACTIVE"),
+    );
+  });
 }
 
 function renderWorkError(err: unknown, locale: Locale): string {

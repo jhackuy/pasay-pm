@@ -245,13 +245,83 @@ export type RenewalProposal = {
 
 export type MoveOut = {
   id: number;
+  org_id: number;
   lease_id: number;
   state: "REQUESTED" | "INSPECTED" | "SETTLED" | "CANCELLED";
-  deposit_held: Money | null;
-  refund_amount: Money | null;
-  additional_owed: Money | null;
-  outcome: string | null;
   requested_at: string;
+  requested_by_user_id: number | null;
+  planned_move_out_date: string | null;
+  inspected_at: string | null;
+  inspected_by_user_id: number | null;
+  inspection_notes: string | null;
+  settled_at: string | null;
+  settlement_id: number | null;
+  cancelled_at: string | null;
+  cancel_reason: string | null;
+  keys_returned: boolean | null;
+  arrears_amount: Money | null;
+  keys_arrears_notes: string | null;
+  archived_at: string | null;
+  idempotency_key: string;
+};
+
+export type MoveOutInspection = {
+  id: number;
+  org_id: number;
+  move_out_id: number;
+  inspected_at: string;
+  inspected_by_user_id: number | null;
+  summary: string;
+};
+
+export type MoveOutDamage = {
+  id: number;
+  org_id: number;
+  move_out_id: number;
+  kind: "CLEANING" | "REPAIR" | "REPLACEMENT" | "UTILITIES" | "OTHER";
+  description: string;
+  amount: Money;
+  accepted_amount: Money;
+  recorded_by_user_id: number | null;
+};
+
+export type DepositDisposition =
+  | "FULL_REFUND"
+  | "PARTIAL_REFUND"
+  | "NO_REFUND"
+  | "ADDITIONAL_OWED";
+
+export type DepositSettlement = {
+  id: number;
+  org_id: number;
+  move_out_id: number;
+  disposition: DepositDisposition;
+  deposit_held: Money;
+  deductions_total: Money;
+  refund_amount: Money;
+  additional_owed: Money;
+  notes: string | null;
+  settled_by_user_id: number | null;
+  settled_at: string;
+};
+
+export type MoveOutBalance = {
+  move_out_id: number;
+  deposit_held: Money;
+  deductions_total: Money;
+  refund_amount: Money;
+  additional_owed: Money;
+  is_settled: boolean;
+};
+
+export type MoveOutActivity = {
+  id: number;
+  org_id: number;
+  move_out_id: number;
+  kind: string;
+  actor_user_id: number | null;
+  detail: string | null;
+  occurred_at: string;
 };
 
 export type Operation = {
