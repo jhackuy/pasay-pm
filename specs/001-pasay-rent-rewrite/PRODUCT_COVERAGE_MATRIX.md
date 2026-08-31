@@ -156,8 +156,8 @@
 
 ## Coverage Matrix Totals
 
-- **Total rows:** 84
-- **Implemented (verified by row-level evidence above):** 84 (100%)
+- **Total rows:** 86 (Workspace 8 + Property 8 + Rent 8 + Expense 9 + Repair 9 + Renewal 7 + Move-out 8 + Operations/Tasks 5 + Payments/Evidence 5 + Telegram 10 + Mini App 9)
+- **Implemented (verified by row-level evidence above):** 86 (100%)
 - **Out-of-scope with evidence:** 0
 - **Unimplemented / missing:** 0 (must be 0)
 
@@ -172,19 +172,22 @@
 | `tests/test_v1_api_repairs.py` | 45 | Repair 9-state machine: REPORTED→CONFIRMED→AWAITING_TECHNICIAN→QUOTE_REQUESTED→QUOTE_RECEIVED→QUOTE_APPROVED→IN_PROGRESS→COMPLETION_CLAIMED→COMPLETED + CANCELLED; closure only after verified real completion; related expense/payment never closes Repair |
 | `tests/test_v1_api_renewals.py` | 34 | Lease Renewal: PROPOSED→APPROVED→EXECUTED, REJECTED/CANCELLED; `Approval != Execution`; execute terminates source lease + creates/activates new lease + flips unit status + resolves Operation; overlapping ACTIVE lease ⇒ 409 |
 | `tests/test_v1_api_move_outs.py` | 32 | Move-out / Settlement: REQUESTED→INSPECTED→SETTLED, 5 separate tables, `DepositSettlement` is the single source of truth for "deposit cleared", FULL_REFUND/NO_REFUND DB+Pydantic+service invariants, Reminder != Completion |
-| `tests/test_cross_surface_contract.py` | 12 | API ↔ Mini App ↔ Telegram share V1 truth: Money as string, idempotency-key contract, StrEnum values match across surfaces, Mini App tabs = 5, Telegram buttons = 6 (3×2), Mini App `dist/` bundle ≥ 10 KB, no business truth in localStorage |
+| `tests/test_v1_cross_surface_contract.py` | 12 | API ↔ Mini App ↔ Telegram share V1 truth: Money as string, idempotency-key contract, StrEnum values match across surfaces, Mini App tabs = 5, Telegram buttons = 6 (3×2), Mini App `dist/` bundle ≥ 10 KB, no business truth in localStorage |
+| `tests/test_v1_api_workspaces.py` | 10 | Workspace invite lifecycle (PENDING→ACCEPTED, CANCELLED, double-accept 409), remove member + Last-Owner guard, cross-org cancel 404, default_language_for_role (Owner=zh-CN, Secretary=en-US) |
+| `tests/test_v1_api_properties.py` | 10 | Property archive (preserves history, blocks OCCUPIED), unit lifecycle events (STATUS_CHANGE, RENT_CHANGE), get_unit_detail returns events newest-first, cross-org 403/404 |
+| `tests/test_v1_api_dashboard_audit.py` | 5 | GET /dashboard/home returns all aggregate counts; cross-org 403; GET /audit returns list with limit; requires auth |
 | `pasay-telegram-bot/tests/test_ux_freeze_v1_polish_targeted.py` | 7 | Telegram 3×2 fixed menu contract (Owner zh, Secretary en), 3-3-3-1 inline layout for unit navigation, callback mapping deterministic |
 | `pasay-telegram-bot/tests/test_v1_adapter_regressions.py` | 9 | Unit 7777 + tenant + PH phone NEVER create expense; group chat silent on /start; Owner zh-CN / Secretary en-US default language |
 | `mini_app/tests/smoke.ts` | 8 | Mini App: bootstrap form, 5-tab nav, hash router, bilingual parity, Decimal money in `formatMoney`, 44 px touch targets, 430 px breakpoint, `dist/` build artifacts |
-| **Total** | **248** | All passing locally in <60s |
+| **Total** | **273** | All passing locally in <70s |
 
 ### How to verify on CI
 
-- **pytest:** `pytest -q tests/test_v1_*.py` → 224 backend tests (V1 + cross-surface)
-- **Telegram pytest:** `pytest -q pasay-telegram-bot/tests/test_ux_freeze_v1_polish_targeted.py -k "fixed_menu_is_3x2 or group_menu_is_3x2"`
-- **Mini App smoke:** `cd mini_app && npm ci && npm test`
-- **Fresh PostgreSQL + alembic:** `alembic upgrade head` on `postgresql://pasay:pasay@localhost:5432/pasay`
-- **Mini App build:** `cd mini_app && npm ci && npm run build` → `dist/index.html` (~366 B) + `dist/assets/index-*.js` (~50 kB)
+- **pytest:** `pytest -q tests/test_v1_*.py` → 249 backend tests (V1 + cross-surface + new workspaces/properties/dashboard/audit)
+- **Telegram pytest:** `pytest -q pasay-telegram-bot/tests/test_v1_adapter_regressions.py` (regressions) + `tests/test_ux_freeze_v1_polish_targeted.py -k "fixed_menu_is_3x2 or group_menu_is_3x2"` (3×2 contract)
+- **Mini App smoke:** `cd mini_app && npm ci && npm test` → 8/8
+- **Fresh PostgreSQL + alembic:** `alembic upgrade head` on `postgresql://pasay:pasay@localhost:5432/pasay` → single linear head `0001_baseline`
+- **Mini App build:** `cd mini_app && npm ci && npm run build` → `dist/index.html` + `dist/assets/index-*.js` (~52 kB)
 
 ### Reference (Issue #99 hard acceptance contract)
 

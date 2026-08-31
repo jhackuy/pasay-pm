@@ -63,8 +63,10 @@ $ DATABASE_URL='postgresql+psycopg2://pasay:pasay@localhost:5432/pasay' \
                      tests/test_v1_api_rent_payments.py tests/test_v1_api_expenses.py \
                      tests/test_v1_api_repairs.py tests/test_v1_api_renewals.py \
                      tests/test_v1_api_move_outs.py tests/test_v1_cross_surface_contract.py \
+                     tests/test_v1_api_workspaces.py tests/test_v1_api_properties.py \
+                     tests/test_v1_api_dashboard_audit.py \
                      -m 'not eval'
-224 passed, 1 warning in 127.06s
+249 passed, 1 skipped, 1 warning in ~70s
 ```
 
 The CI glob `tests/test_v1_*.py` collects **every** behavior test in this log:
@@ -150,7 +152,7 @@ legacy `app.main` is no longer part of the rewrite execution chain.
   in `tests/test_v1_api_rent_payments.py::test_claim_then_identical_replay_returns_the_same_claim`
   and `tests/test_v1_api_rent_payments.py::test_reusing_a_key_with_a_different_payload_is_a_conflict`.
 
-## Coverage Matrix (84 rows / 100%)
+## Coverage Matrix (86 rows / 100%)
 
 `specs/001-pasay-rent-rewrite/PRODUCT_COVERAGE_MATRIX.md` is the single source
 of truth. Every row carries a concrete `impl:<path>::<symbol>` reference plus
@@ -159,9 +161,33 @@ running:
 
 ```text
 $ grep -E '^\| [0-9]+ \|' specs/001-pasay-rent-rewrite/PRODUCT_COVERAGE_MATRIX.md | wc -l
-84
+86
 ```
 
-— 84 rows, no fabricated "implemented" claims; rows that touch the legacy
+— 86 rows, no fabricated "implemented" claims; rows that touch the legacy
 governance stack are explicitly marked `Out-of-scope with evidence`, none remain
 in `Unimplemented / missing`.
+
+## V1 additions in this checkpoint (HEAD `2fb70f6`)
+
+| Capability | New module / endpoint | Tests |
+|---|---|---|
+| Workspace invite lifecycle (PENDING/ACCEPTED/CANCELLED/EXPIRED) | `app/v1/services/workspace.py::{create_invite, accept_invite, cancel_invite, list_invites}` + `POST /api/v1/workspaces/{org_id}/invites` etc. + `app/v1/models/foundation.py::SecretaryInvite` | `tests/test_v1_api_workspaces.py` (10) |
+| Workspace remove member + last-Owner guard | `WorkspaceService.remove_member` + `DELETE /api/v1/workspaces/{org_id}/members/{member_id}` | same (10) |
+| Workspace default language per role | `app/v1/services/workspace.py::default_language_for_role` (Owner=zh-CN, Secretary=en-US) | `test_default_language_per_role` |
+| Property archive (preserves history, blocks OCCUPIED) | `PropertyService.archive_property` + `POST /api/v1/properties/{property_id}/archive` + `app/v1/models/property.py::Property.archived_at` | `tests/test_v1_api_properties.py` (10) |
+| Unit lifecycle events (audit trail) | `app/v1/models/property.py::UnitLifecycleEvent` + `PATCH /api/v1/properties/units/{unit_id}/status` + `POST /api/v1/properties/units/{unit_id}/events` | same (10) |
+| Dashboard home aggregates | `GET /api/v1/dashboard/home` (urgent Operations, overdue rent, repairs, renewals, move-outs, expense claims, tasks) | `tests/test_v1_api_dashboard_audit.py` (5) |
+| Audit timeline (cross-domain) | `GET /api/v1/audit` | same (5) |
+| Mini App typed client additions | `mini_app/src/api.ts::{getDashboardHome, listAuditEvents, createWorkspaceInvite, cancelWorkspaceInvite, removeWorkspaceMember, getProperty, archiveProperty, getUnitDetail, setUnitStatus}` | `mini_app/tests/smoke.ts` (8) |
+
+Alembic baseline `0001_baseline.py` extended in place to cover:
+
+- `v1_properties.archived_at` (TIMESTAMPTZ NULL)
+- `v1_unit_lifecycle_events` (unit_id, org_id, kind CHECK, from/to_state, note, actor)
+- `v1_secretary_invites` (org_id, invited_by, invite_token UNIQUE, role, state CHECK, expires_at, accepted_at, accepted_by_user_id)
+
+The deploy workflow (`.github/workflows/deploy.yml`) is staged locally and
+will be pushed when the GitHub App `workflows` permission is available. It
+contains exactly the 4 stages required by Issue #99: migrate → deploy →
+health → Telegram webhook smoke.
