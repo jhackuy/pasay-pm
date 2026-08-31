@@ -38,12 +38,6 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Diagnose first V1 test
-        run: >-
-          timeout --signal=TERM 120s
-          pytest -vv -s --setup-show
-          -o faulthandler_timeout=60
-          tests/test_v1_api_dashboard_audit.py::test_dashboard_home_returns_aggregates
       - name: Backend pytest
         run: >-
           pytest -vv -s
