@@ -124,8 +124,30 @@ def v1_engine_ctx() -> Iterator[object]:
         # while request-scoped transactions could still own PostgreSQL locks,
         # which made the first V1 test hang forever in fixture teardown.
         reset_engine_cache()
+        parsed_url = sa.engine.make_url(url)
+        admin_engine = sa.create_engine(
+            parsed_url.set(database="postgres"),
+            isolation_level="AUTOCOMMIT",
+            future=True,
+        )
+        try:
+            with admin_engine.connect() as conn:
+                conn.execute(
+                    sa.text(
+                        "SELECT pg_terminate_backend(pid) "
+                        "FROM pg_stat_activity "
+                        "WHERE datname = :database_name "
+                        "AND pid <> pg_backend_pid()"
+                    ),
+                    {"database_name": parsed_url.database},
+                )
+        finally:
+            admin_engine.dispose()
+
         cleanup_engine = sa.create_engine(url, future=True)
         try:
+            with cleanup_engine.begin() as conn:
+                conn.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
             reset_public_schema(cleanup_engine)
         finally:
             cleanup_engine.dispose()
