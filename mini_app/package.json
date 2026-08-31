@@ -6,13 +6,15 @@
   "scripts": {
     "build": "tsc --noEmit && vite build",
     "test:smoke": "node --experimental-vm-modules --import tsx tests/smoke.ts",
-    "test": "npm run test:smoke"
+    "test:browser": "node tests/run_browser_smoke.mjs",
+    "test": "npm run test:smoke && npm run test:browser"
   },
   "devDependencies": {
     "typescript": "5.9.2",
     "vite": "7.1.3",
     "tsx": "4.19.2",
     "@types/node": "22.18.0",
-    "jsdom": "25.0.1"
+    "jsdom": "25.0.1",
+    "playwright": "1.48.2"
   }
 }

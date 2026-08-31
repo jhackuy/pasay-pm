@@ -134,6 +134,27 @@ def list_reports(
     return [RepairReportRead.model_validate(r) for r in items]
 
 
+@router.get("", response_model=list[RepairReportRead])
+def list_repair_reports_root(
+    org_id: int,
+    state: Optional[str] = None,
+    category: Optional[str] = None,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> list[RepairReportRead]:
+    """Top-level list of repair reports for the org.
+
+    The Mini App dashboard calls ``GET /repairs`` (no ``/reports`` prefix),
+    so this alias exists alongside ``/reports``.
+    """
+    service = RepairService(db)
+    with _mapped_errors():
+        items = service.list_reports(
+            principal, org_id=org_id, state=state, category=category,
+        )
+    return [RepairReportRead.model_validate(r) for r in items]
+
+
 @router.get("/reports/{report_id}", response_model=RepairReportRead)
 def get_report(
     report_id: int,

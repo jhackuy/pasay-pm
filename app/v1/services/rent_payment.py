@@ -679,6 +679,26 @@ class RentPaymentService:
             .all()
         )
 
+    def list_all_payments(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        status: Optional[str] = None,
+        due_schedule_id: Optional[int] = None,
+    ) -> list[RentPayment]:
+        """List every RentPayment in the org (used by /rent/claims).
+
+        Filters are optional. Org scope is fail-closed (require_org_scope).
+        """
+        require_org_scope(principal, org_id)
+        q = self.db.query(RentPayment).filter(RentPayment.org_id == org_id)
+        if status is not None:
+            q = q.filter(RentPayment.status == status)
+        if due_schedule_id is not None:
+            q = q.filter(RentPayment.due_schedule_id == due_schedule_id)
+        return q.order_by(RentPayment.id.desc()).all()
+
     def add_evidence(
         self,
         principal: Principal,

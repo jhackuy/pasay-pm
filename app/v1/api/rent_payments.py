@@ -131,6 +131,30 @@ def list_overdue(
     return [RentDueScheduleRead.model_validate(s) for s in schedules]
 
 
+@router.get("/claims", response_model=list[RentPaymentRead])
+def list_all_claims(
+    org_id: int,
+    status: Optional[str] = None,
+    due_schedule_id: Optional[int] = None,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> list[RentPaymentRead]:
+    """Org-scoped list of every RentPayment claim.
+
+    Used by the Mini App dashboard / Finance view, which renders all claims
+    at once rather than per-due-schedule.
+    """
+    service = RentPaymentService(db)
+    with _mapped_errors():
+        payments = service.list_all_payments(
+            principal,
+            org_id=org_id,
+            status=status,
+            due_schedule_id=due_schedule_id,
+        )
+    return [RentPaymentRead.model_validate(p) for p in payments]
+
+
 @router.post("/mark-overdue", response_model=list[RentDueScheduleRead])
 def mark_overdue(
     org_id: int,
