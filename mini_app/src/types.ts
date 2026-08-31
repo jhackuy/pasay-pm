@@ -162,9 +162,14 @@ export type Unit = {
 
 export type Tenant = {
   id: number;
+  org_id: number;
+  user_id: number | null;
   full_name: string;
-  phone: string | null;
-  email: string | null;
+  contact_phone: string | null;
+  contact_email: string | null;
+  archived_at: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 export type Lease = {

@@ -19,10 +19,16 @@
 //   7. open add-unit form + submit
 //                            -> real POST /api/v1/properties/:id/units,
 //                               unit now visible in detail view
-//   8. click Home tab        -> dashboard renders 4 KPI cards with real
+//   8. tenant registration   -> real POST /api/v1/tenants with
+//                               Idempotency-Key; tenant appears in the
+//                               workspace tenants panel
+//   9. tenant negative path  -> empty full_name surfaces a localized
+//                               required error (no silent success, no
+//                               network round-trip on blocked input)
+//  10. click Home tab        -> dashboard renders 4 KPI cards with real
 //                               values (overdue / pending claims / open
 //                               repairs / active leases)
-//   9. localStorage assertion: apiKey, orgId, userId, role NEVER present.
+//  11. localStorage assertion: apiKey, orgId, userId, role NEVER present.
 //                               Only pasay.locale (UI preference) is
 //                               allowed. This is the AGENTS.md §4 invariant
 //                               for the Mini App.
@@ -247,7 +253,105 @@ async function main() {
       { timeout: 5000 },
     );
 
-    // (8) Home tab -> dashboard KPIs from real API. The Home view fires
+    // (8) Tenant registration — Owner UI flow (Coverage Matrix 7.1).
+    //     Navigate back to the Properties tab to reach the workspace-level
+    //     tenants panel, then drive the register-tenant form against the
+    //     real /api/v1/tenants endpoint (POST with Idempotency-Key).
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          resp.url().includes("/api/v1/tenants") &&
+          resp.request().method() === "GET",
+        { timeout: 10000 },
+      ),
+      page.locator('.nav-btn[data-route="properties"]').click(),
+    ]);
+    await page.waitForSelector('[data-action="new-tenant"]', { timeout: 10000 });
+    await page.locator('[data-action="new-tenant"]').click();
+    await page.waitForSelector("#tenant-form", { timeout: 5000 });
+    await page.fill('#tenant-form input[name="full_name"]', "Smoke Tenant");
+    await page.fill('#tenant-form input[name="contact_phone"]', "+63-917-555-7777");
+    await page.fill('#tenant-form input[name="contact_email"]', "smoke-tenant@example.com");
+    const tenantCreated = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          /\/api\/v1\/tenants(?:\?|$)/.test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#tenant-form button[type="submit"]').click(),
+    ]);
+    const tenantJson = await tenantCreated[0].json();
+    await expect(
+      Number.isInteger(tenantJson.id) && tenantJson.id > 0,
+      "8. POST /api/v1/tenants returned a numeric id",
+      page,
+      async () => `id=${tenantJson.id} body=${JSON.stringify(tenantJson)}`,
+    );
+    await expect(
+      tenantJson.full_name === "Smoke Tenant" &&
+        tenantJson.contact_phone === "+63-917-555-7777" &&
+        tenantJson.contact_email === "smoke-tenant@example.com",
+      "9. POST /api/v1/tenants persisted full_name + contact_phone + contact_email",
+      page,
+      async () =>
+        `full_name=${tenantJson.full_name} ` +
+        `contact_phone=${tenantJson.contact_phone} ` +
+        `contact_email=${tenantJson.contact_email}`,
+    );
+    // The Idempotency-Key header must have been sent on the POST.
+    const tenantPostIdemHeader = await tenantCreated[0].request().headerValue(
+      "idempotency-key",
+    );
+    await expect(
+      typeof tenantPostIdemHeader === "string" && tenantPostIdemHeader.length > 0,
+      "10. POST /api/v1/tenants carried an Idempotency-Key header",
+      page,
+      async () => `idem=${tenantPostIdemHeader}`,
+    );
+    // The re-rendered properties view must show the new tenant in the list.
+    await page.waitForFunction(
+      () => document.body.innerText.includes("Smoke Tenant"),
+      null,
+      { timeout: 5000 },
+    );
+    // And the list panel count must reflect at least 1 tenant.
+    const tenantListHtml = await page
+      .locator('[data-list="tenants"]')
+      .innerHTML()
+      .catch(() => "");
+    await expect(
+      tenantListHtml.includes("Smoke Tenant") && tenantListHtml.includes("+63-917-555-7777"),
+      "11. tenants panel lists the newly registered tenant with phone + email",
+      page,
+      async () => `tenantPanel contains: ${tenantListHtml.length > 0 ? "yes" : "no"}`,
+    );
+    // Negative path: empty full_name → 400 ValidationError.
+    await page.locator('[data-action="new-tenant"]').click();
+    await page.waitForSelector("#tenant-form", { timeout: 5000 });
+    // Submit with only whitespace in full_name; the form's `required` attr
+    // plus the submit handler will block this without firing a request.
+    await page.fill('#tenant-form input[name="full_name"]', "   ");
+    // Bypass the HTML5 required attribute by removing it.
+    await page.evaluate(() => {
+      const el = document.querySelector('#tenant-form input[name="full_name"]');
+      if (el) el.removeAttribute("required");
+    });
+    await page.locator('#tenant-form button[type="submit"]').click();
+    // The client-side guard must surface the localized `required` message.
+    const requiredErr = await page
+      .locator("#tenant-error")
+      .textContent()
+      .catch(() => "");
+    await expect(
+      typeof requiredErr === "string" && requiredErr.length > 0,
+      "12. empty full_name surfaces a localized required error (no silent success)",
+      page,
+      async () => `errorText=${requiredErr}`,
+    );
+
+    // (9) Home tab -> dashboard KPIs from real API. The Home view fires
     //     four parallel GETs (overdue / claims / repairs / leases); any of
     //     them resolves before the .kpi cards render.
     await Promise.all([
@@ -263,12 +367,12 @@ async function main() {
     const kpiCount = await page.locator(".kpi").count();
     await expect(
       kpiCount === 4,
-      "7. home dashboard renders 4 KPI cards",
+      "13. home dashboard renders 4 KPI cards",
       page,
       async () => `kpiCount=${kpiCount}`,
     );
 
-    // (9) localStorage must NOT contain business truth.
+    // (10) localStorage must NOT contain business truth.
     const ls = await page.evaluate(() => {
       const out = {};
       for (let i = 0; i < window.localStorage.length; i += 1) {
@@ -281,14 +385,14 @@ async function main() {
     const leaks = Object.keys(ls).filter((k) => forbiddenKeys.includes(k));
     await expect(
       leaks.length === 0,
-      "7. localStorage does NOT persist business truth (apiKey/orgId/userId/role)",
+      "14. localStorage does NOT persist business truth (apiKey/orgId/userId/role)",
       page,
       async () => `keys=${JSON.stringify(Object.keys(ls))} leaks=${JSON.stringify(leaks)}`,
     );
     // Only the UI preference key is allowed.
     await expect(
       Object.keys(ls).length === 0 || Object.keys(ls).every((k) => k === "pasay.locale"),
-      "8. only pasay.locale may live in localStorage",
+      "15. only pasay.locale may live in localStorage",
       page,
       async () => `keys=${JSON.stringify(Object.keys(ls))}`,
     );

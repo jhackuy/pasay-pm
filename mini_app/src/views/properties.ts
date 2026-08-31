@@ -1,6 +1,9 @@
-/** Properties view — list + detail (with units).
+/** Properties view — list + detail (with units) + workspace tenant panel.
  *
  *  Real workflow: list → open detail → list units → add new property/unit.
+ *  Plus the workspace-level tenants panel (Coverage Matrix 7.1: tenant
+ *  registration). Registration creates the tenant entity in the org; the
+ *  follow-on step (create lease on a unit) is reached from the Work tab.
  *  No localStorage. Idempotency-Key generated fresh per submit.
  */
 
@@ -11,7 +14,7 @@ import { setViewContent } from "../shell";
 import { type Locale, t } from "../i18n";
 import { escapeHtml } from "./home";
 import { formatMoney, makeIdempotencyKey, statusLabel, statusToneClass } from "../format";
-import type { Property, Unit } from "../types";
+import type { Property, Tenant, Unit } from "../types";
 
 export async function renderProperties(
   client: PasayClient,
@@ -20,7 +23,10 @@ export async function renderProperties(
 ): Promise<void> {
   setViewContent(`<section class="card loading"><p>${t(locale, "loading")}</p></section>`);
   try {
-    const items = await client.listProperties(orgId);
+    const [items, tenants] = await Promise.all([
+      client.listProperties(orgId),
+      client.listTenants(orgId),
+    ]);
     const body = `
       <section class="panel">
         <header class="panel-header">
@@ -31,9 +37,11 @@ export async function renderProperties(
           ? `<div class="empty"><b>${t(locale, "empty")}</b><span>${t(locale, "newProperty")} →</span></div>`
           : `<ul class="list">${items.map((p) => renderPropertyRow(p, locale)).join("")}</ul>`}
       </section>
+      ${renderTenantsPanel(tenants, locale)}
     `;
     setViewContent(body);
     bindPropertyHandlers(client, orgId, locale, items);
+    bindTenantsPanelHandlers(client, orgId, locale, tenants);
   } catch (err) {
     setViewContent(renderPropertiesError(err, locale));
   }
@@ -260,4 +268,114 @@ function formatError(err: unknown, locale: Locale): string {
     return err.message;
   }
   return t(locale, "networkError");
+}
+
+// ---- Tenant registration panel ------------------------------------------
+//
+// Workspace-level tenant panel. Tenant CRUD lives in `app/v1/services/tenant.py`
+// (Coverage Matrix 7.1) and `app/v1/api/tenants.py` (thin router). This view
+// is the Owner UI for the "Register tenant" flow: form fields are validated
+// client-side, then the typed API client posts to /api/v1/tenants with a
+// fresh Idempotency-Key. The list is refreshed locally after a successful
+// create so the new tenant appears without a full reload.
+
+function renderTenantsPanel(tenants: Tenant[], locale: Locale): string {
+  return `
+    <section class="panel" data-panel="tenants">
+      <header class="panel-header">
+        <h2>${t(locale, "tenants")} (${tenants.length})</h2>
+        <button class="primary-btn" data-action="new-tenant" type="button">+ ${t(locale, "registerTenant")}</button>
+      </header>
+      <p class="muted">${t(locale, "tenantFormHint")}</p>
+      ${tenants.length === 0
+        ? `<div class="empty"><b>${t(locale, "tenantsEmpty")}</b><span>${t(locale, "registerTenant")} →</span></div>`
+        : `<ul class="list" data-list="tenants">${tenants.map((tn) => renderTenantRow(tn, locale)).join("")}</ul>`}
+    </section>
+  `;
+}
+
+function renderTenantRow(tn: Tenant, locale: Locale): string {
+  const phone = tn.contact_phone || "—";
+  const email = tn.contact_email || "—";
+  return `<li class="list-row" data-tenant-id="${tn.id}">
+    <div class="row-main">
+      <b>${escapeHtml(tn.full_name)}</b>
+      <span class="muted">${t(locale, "phone")}: ${escapeHtml(phone)} · ${t(locale, "email")}: ${escapeHtml(email)}</span>
+    </div>
+  </li>`;
+}
+
+function bindTenantsPanelHandlers(
+  client: PasayClient,
+  orgId: number,
+  locale: Locale,
+  current: Tenant[],
+): void {
+  const newBtn = document.querySelector<HTMLButtonElement>("[data-action='new-tenant']");
+  newBtn?.addEventListener("click", () =>
+    renderTenantRegisterForm(client, orgId, locale, current),
+  );
+}
+
+function renderTenantRegisterForm(
+  client: PasayClient,
+  orgId: number,
+  locale: Locale,
+  current: Tenant[],
+): void {
+  const form = `
+    <section class="panel" data-panel="tenant-form">
+      <header class="panel-header"><h2>${t(locale, "registerTenant")}</h2></header>
+      <form id="tenant-form" class="form">
+        <label>${t(locale, "fullName")}<input name="full_name" required maxlength="120" /></label>
+        <label>${t(locale, "contactPhone")}<input name="contact_phone" inputmode="tel" maxlength="32" /></label>
+        <label>${t(locale, "contactEmail")}<input name="contact_email" inputmode="email" maxlength="120" /></label>
+        <div class="form-actions">
+          <button class="primary-btn" type="submit">${t(locale, "submit")}</button>
+          <button class="ghost-btn" type="button" data-action="cancel-tenant">${t(locale, "cancel")}</button>
+        </div>
+        <p class="muted form-error" id="tenant-error" hidden></p>
+      </form>
+    </section>
+  `;
+  setViewContent(form);
+  document
+    .querySelector<HTMLButtonElement>("[data-action='cancel-tenant']")
+    ?.addEventListener("click", () =>
+      renderProperties(client, orgId, locale).catch(() => undefined),
+    );
+  const formEl = document.querySelector<HTMLFormElement>("#tenant-form");
+  formEl?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const data = new FormData(formEl);
+    const fullName = String(data.get("full_name") || "").trim();
+    const contactPhone = String(data.get("contact_phone") || "").trim();
+    const contactEmail = String(data.get("contact_email") || "").trim();
+    if (!fullName) {
+      showFormError(tenantErrorEl(), t(locale, "required"));
+      return;
+    }
+    const payload: {
+      full_name: string;
+      contact_phone?: string | null;
+      contact_email?: string | null;
+    } = { full_name: fullName };
+    if (contactPhone) payload.contact_phone = contactPhone;
+    if (contactEmail) payload.contact_email = contactEmail;
+    try {
+      const created = await client.createTenant(
+        orgId,
+        payload,
+        makeIdempotencyKey("tenant"),
+      );
+      current.push(created);
+      await renderProperties(client, orgId, locale);
+    } catch (err) {
+      showFormError(tenantErrorEl(), formatError(err, locale));
+    }
+  });
+}
+
+function tenantErrorEl(): HTMLElement | null {
+  return document.querySelector<HTMLElement>("#tenant-error");
 }

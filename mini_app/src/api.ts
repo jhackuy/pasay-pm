@@ -23,6 +23,7 @@ import type {
   Repair,
   SecretaryInvite,
   Task,
+  Tenant,
   Unit,
   UnitDetail,
   Workspace,
@@ -148,16 +149,21 @@ export class PasayClient {
   }
 
   // Tenants
-  listTenants(orgId: number): Promise<{ id: number; full_name: string; phone?: string | null }[]> {
-    return this.request("/tenants", { orgId });
+  listTenants(orgId: number): Promise<Tenant[]> {
+    return this.request<Tenant[]>("/tenants", { orgId });
   }
   createTenant(
     orgId: number,
-    body: { full_name: string; phone?: string | null; email?: string | null },
+    body: { full_name: string; contact_phone?: string | null; contact_email?: string | null },
     idempotencyKey: string,
-  ): Promise<{ id: number; full_name: string }> {
-    return this.request("/tenants", {
+  ): Promise<Tenant> {
+    return this.request<Tenant>("/tenants", {
       method: "POST", orgId, idempotencyKey, body,
+    });
+  }
+  softDeleteTenant(orgId: number, tenantId: number): Promise<Tenant> {
+    return this.request<Tenant>(`/tenants/${tenantId}`, {
+      method: "DELETE", orgId,
     });
   }
 
