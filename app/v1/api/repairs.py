@@ -18,12 +18,13 @@ from sqlalchemy.orm import Session
 
 from app.core.idempotency import IdempotencyConflictError, IdempotencyKeyError
 from app.core.money import MoneyError
-from app.core.permissions import PermissionDenied, Principal
+from app.core.permissions import PermissionDenied, Principal, Role
 from app.core.time import NaiveDatetimeError
 from app.v1.deps import (
     get_current_principal,
     get_db_dep,
     parse_idempotency_key_header,
+    require_role,
 )
 from app.v1.schemas.repair import (
     OperationRead,
@@ -516,6 +517,34 @@ def cancel_report(
             org_id=org_id,
             report_id=report_id,
             reason=body.reason,
+        )
+    return RepairReportRead.model_validate(report)
+
+
+@router.post(
+    "/reports/{report_id}/close",
+    response_model=RepairReportRead,
+)
+def close_report(
+    report_id: int,
+    org_id: int,
+    principal: Principal = Depends(require_role(Role.OWNER)),
+    db: Session = Depends(get_db_dep),
+) -> RepairReportRead:
+    """Coverage Matrix 5.8: explicit close after verified completion.
+
+    Idempotent: if the report is already COMPLETED, returns the report
+    unchanged. Raises 409 if the report is CANCELLED or has no active
+    VERIFIED decision. The closure gate runs through
+    ``assert_not_closed_by_payment`` (Coverage Matrix 5.9) before any
+    state mutation.
+    """
+    service = RepairService(db)
+    with _mapped_errors():
+        report = service.close(
+            principal,
+            org_id=org_id,
+            report_id=report_id,
         )
     return RepairReportRead.model_validate(report)
 

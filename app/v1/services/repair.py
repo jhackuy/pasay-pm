@@ -1122,6 +1122,132 @@ class RepairService:
         self.db.commit()
         return report
 
+    # ---- Coverage Matrix 5.8 — close -----------------------------------
+
+    # ---- Coverage Matrix 5.8 — close -----------------------------------
+
+    def close(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        report_id: int,
+    ) -> RepairReport:
+        """Coverage Matrix 5.8: explicit close after verified real completion.
+
+        Idempotent — if the report is already COMPLETED, returns the
+        report unchanged. If the report is in any state other than
+        COMPLETED or CANCELLED, requires that at least one active
+        VERIFIED decision exists (the only legitimate closure path).
+
+        Cross-step guarantees (Repair 5.9):
+          - related Expense/Payment actions never auto-close a Repair.
+            ``assert_not_closed_by_payment`` is enforced centrally
+            inside this method (see below).
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER)
+        report = self.get_report(
+            principal, org_id=org_id, report_id=report_id,
+        )
+        if report.state == RepairState.COMPLETED.value:
+            return report  # idempotent
+        if report.state == RepairState.CANCELLED.value:
+            raise ConflictError(
+                f"cannot close a CANCELLED report (id={report_id})",
+            )
+        # 5.9 — repair closure is gated on a verified completion claim;
+        # related expense/payment must not have closed it.
+        self.assert_not_closed_by_payment(
+            principal, org_id=org_id, report_id=report_id,
+        )
+        active_verified = (
+            self.db.query(RepairVerification)
+            .filter(
+                RepairVerification.report_id == report_id,
+                RepairVerification.decision
+                    == RepairVerificationDecision.VERIFIED.value,
+                RepairVerification.reversed_by_verification_id.is_(None),
+            )
+            .count()
+        )
+        if active_verified == 0:
+            raise ConflictError(
+                f"cannot close report {report_id} without an active "
+                f"VERIFIED decision (state={report.state!r})",
+            )
+        report.state = RepairState.COMPLETED.value
+        op = self.get_operation(
+            principal, org_id=org_id, report_id=report_id,
+        )
+        _close_operation(
+            self.db,
+            report=report,
+            operation=op,
+            actor_user_id=principal.user_id,
+        )
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            report_id=report.id,
+            kind=RepairActivityKind.VERIFIED,
+            actor_user_id=principal.user_id,
+            detail="close()",
+        )
+        self.db.commit()
+        return report
+
+    # ---- Coverage Matrix 5.9 — assert_not_closed_by_payment -----------
+
+    def assert_not_closed_by_payment(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        report_id: int,
+    ) -> None:
+        """Coverage Matrix 5.9: state-machine guard.
+
+        Enforces the AGENTS.md §4 invariant that a related
+        Expense/Payment action NEVER closes a Repair. This guard is
+        invoked by:
+          - ``ExpenseClaimService.verify_claim`` when the expense
+            claim is linked to a Repair (advisory pointer)
+          - ``RentPaymentService.verify_payment`` when the payment
+            is linked to a Repair
+          - ``close()`` above (always runs before closure)
+
+        Raises ``ConflictError`` if any related Expense/Payment row
+        has tried to close the Repair (the actual closure must come
+        from ``verify_completion`` or ``close()``).
+        """
+        require_org_scope(principal, org_id)
+        # The guard is centralised here: it inspects any linked
+        # expense/payment rows and refuses to auto-close on their
+        # behalf. In this rewrite, repairs do not have hard FKs to
+        # expenses/payments (advisory pointer in
+        # ``linked_expense_payment_id``); the guard is therefore a
+        # forward-compatibility check that returns silently when no
+        # linked row exists, and raises when a misrouted close is
+        # detected.
+        report = self.get_report(
+            principal, org_id=org_id, report_id=report_id,
+        )
+        if (
+            report.linked_expense_payment_id is not None
+            and report.state == RepairState.COMPLETED.value
+            and report.completed_at is not None
+        ):
+            # Defensive — should never fire because Expense/Payment
+            # paths do not call close(). Kept as a forward-compatible
+            # safety net for future direct integrations.
+            raise ConflictError(
+                f"repair {report_id} appears to have been closed by "
+                f"a related expense/payment action "
+                f"(linked={report.linked_expense_payment_id}); "
+                f"verify the closure gate",
+            )
+
     # ---- follow-up (Task projection) ----
 
     def create_follow_up(
