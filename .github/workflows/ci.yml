@@ -47,6 +47,9 @@ jobs:
       - name: Telegram adapter regressions
         working-directory: pasay-telegram-bot
         run: pytest -q tests/test_v1_adapter_regressions.py
+      - name: Telegram group silence and business intent
+        working-directory: pasay-telegram-bot
+        run: pytest -q tests/test_group_silence_and_intent.py
       - name: Telegram 3x2 UX contract
         working-directory: pasay-telegram-bot
         run: >-
