@@ -34,7 +34,10 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Backend pytest
         run: pytest -q tests/test_v1_*.py
-      - name: Telegram pytest
+      - name: Telegram adapter regressions
+        working-directory: pasay-telegram-bot
+        run: pytest -q tests/test_v1_adapter_regressions.py
+      - name: Telegram 3x2 UX contract
         working-directory: pasay-telegram-bot
         run: >-
           pytest -q tests/test_ux_freeze_v1_polish_targeted.py
