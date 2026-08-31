@@ -84,6 +84,7 @@ jobs:
 
   build-core-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -98,6 +99,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Mini App build
+      - name: Mini App build + smoke
         working-directory: mini_app
-        run: npm ci && npm run build && npm test && test -s dist/index.html
+        run: |
+          npm ci
+          npm run build
+          test -s dist/index.html
+          npm test
+      - name: Install Playwright Chromium browser
+        working-directory: mini_app
+        run: npx --yes playwright@1.48.2 install --with-deps chromium
+      - name: Mini App real-browser smoke (Playwright)
+        working-directory: mini_app
+        run: npm run test:browser
