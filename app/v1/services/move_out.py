@@ -42,7 +42,7 @@ from app.core.permissions import (
     require_org_scope,
 )
 from app.core.time import utcnow
-from app.v1.models.base import OperationState
+from app.v1.models.base import LeaseState, OperationState
 from app.v1.models.move_out import (
     DEPOSIT_DISPOSITIONS,
     MOVE_OUT_DAMAGE_KINDS,
