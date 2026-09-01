@@ -263,6 +263,7 @@ export type ExpenseClaim = {
 
 export type Repair = {
   id: number;
+  org_id: number;
   unit_id: number | null;
   title: string;
   description: string;
@@ -277,7 +278,73 @@ export type Repair = {
     | "COMPLETION_CLAIMED"
     | "COMPLETED"
     | "CANCELLED";
+  category: string;
+  severity: string;
+  reported_by_user_id: number | null;
   reported_at: string;
+  technician_name: string | null;
+  technician_source: string | null;
+  technician_eta_at: string | null;
+  quoted_amount: Money | null;
+  idempotency_key: string;
+  linked_expense_payment_id: number | null;
+  completed_at: string | null;
+};
+
+export type RepairQuote = {
+  id: number;
+  org_id: number;
+  report_id: number;
+  amount: Money;
+  description: string;
+  decision: "SUBMITTED" | "APPROVED" | "REJECTED";
+  technician_name: string;
+  submitted_by_user_id: number | null;
+  decided_by_user_id: number | null;
+  decided_at: string | null;
+  reason: string | null;
+};
+
+export type RepairWork = {
+  id: number;
+  org_id: number;
+  report_id: number;
+  state: string;
+  note: string;
+  actor_user_id: number | null;
+  occurred_at: string;
+};
+
+export type RepairCompletionClaim = {
+  id: number;
+  org_id: number;
+  report_id: number;
+  summary: string;
+  claimed_by_user_id: number | null;
+  claimed_at: string;
+};
+
+export type RepairVerification = {
+  id: number;
+  org_id: number;
+  report_id: number;
+  decision: "VERIFIED" | "REJECTED" | "REVERSED";
+  verifier_user_id: number | null;
+  decided_at: string;
+  reason: string | null;
+};
+
+export type RepairActivity = {
+  id: number;
+  org_id: number;
+  report_id: number | null;
+  quote_id: number | null;
+  work_id: number | null;
+  claim_id: number | null;
+  kind: string;
+  detail: string | null;
+  actor_user_id: number | null;
+  occurred_at: string;
 };
 
 export type RenewalProposal = {

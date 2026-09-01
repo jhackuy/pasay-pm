@@ -11,7 +11,8 @@ export type Route =
   | { name: "finance" }
   | { name: "more" }
   | { name: "move_out.detail"; moveOutId: number }
-  | { name: "rent_claim.detail"; paymentId: number };
+  | { name: "rent_claim.detail"; paymentId: number }
+  | { name: "repair.detail"; repairId: number };
 
 export function parseHash(hash: string): Route {
   const cleaned = hash.replace(/^#/, "").replace(/^\//, "");
@@ -32,6 +33,10 @@ export function parseHash(hash: string): Route {
   if (parts[0] === "rent" && parts[1] === "claims") {
     const id = Number(parts[2]);
     if (Number.isFinite(id)) return { name: "rent_claim.detail", paymentId: id };
+  }
+  if (parts[0] === "repairs") {
+    const id = Number(parts[1]);
+    if (Number.isFinite(id)) return { name: "repair.detail", repairId: id };
   }
   return { name: "home" };
 }
@@ -54,6 +59,8 @@ export function toHash(route: Route): string {
       return `#/move-outs/${route.moveOutId}`;
     case "rent_claim.detail":
       return `#/rent/claims/${route.paymentId}`;
+    case "repair.detail":
+      return `#/repairs/${route.repairId}`;
   }
 }
 

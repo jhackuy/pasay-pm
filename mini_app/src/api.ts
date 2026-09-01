@@ -31,6 +31,11 @@ import type {
   RentPayment,
   RentVerification,
   Repair,
+  RepairActivity,
+  RepairCompletionClaim,
+  RepairQuote,
+  RepairVerification,
+  RepairWork,
   SecretaryInvite,
   Task,
   Tenant,
@@ -409,63 +414,183 @@ export class PasayClient {
     });
   }
 
-  // Repairs
+  // Repairs — full Owner workflow through closure.
+  // The V1 router exposes /repairs/reports (list + create) and
+  // /repairs/reports/{id}/<verb> for every state transition.
+  // Cover 5.8/5.9 invariant: payment/approval/evidence must never
+  // directly close a repair; only verify_completion + close() through
+  // RepairService are allowed.
   listRepairs(orgId: number): Promise<Repair[]> {
     return this.request("/repairs", { orgId });
+  }
+  getRepair(orgId: number, repairId: number): Promise<Repair> {
+    return this.request<Repair>(`/repairs/reports/${repairId}`, { orgId });
+  }
+  getRepairOperation(orgId: number, repairId: number): Promise<Operation> {
+    return this.request<Operation>(
+      `/repairs/reports/${repairId}/operation`,
+      { orgId },
+    );
+  }
+  listRepairActivity(orgId: number, repairId: number): Promise<RepairActivity[]> {
+    return this.request<RepairActivity[]>(
+      `/repairs/reports/${repairId}/activity`,
+      { orgId },
+    );
+  }
+  listRepairQuotes(orgId: number, repairId: number): Promise<RepairQuote[]> {
+    return this.request<RepairQuote[]>(
+      `/repairs/reports/${repairId}/quotes`,
+      { orgId },
+    );
+  }
+  listRepairWork(orgId: number, repairId: number): Promise<RepairWork[]> {
+    return this.request<RepairWork[]>(
+      `/repairs/reports/${repairId}/work`,
+      { orgId },
+    );
+  }
+  listRepairCompletionClaims(
+    orgId: number,
+    repairId: number,
+  ): Promise<RepairCompletionClaim[]> {
+    return this.request<RepairCompletionClaim[]>(
+      `/repairs/reports/${repairId}/completion-claim`,
+      { orgId },
+    );
+  }
+  listRepairVerifications(
+    orgId: number,
+    repairId: number,
+  ): Promise<RepairVerification[]> {
+    return this.request<RepairVerification[]>(
+      `/repairs/reports/${repairId}/verifications`,
+      { orgId },
+    );
   }
   openRepair(
     orgId: number,
     body: {
+      unit_id: number;
       title: string;
       description: string;
-      unit_id?: number | null;
-      severity?: string;
+      category: string;
+      severity: string;
+      linked_expense_payment_id?: number | null;
     },
     idempotencyKey: string,
   ): Promise<Repair> {
-    return this.request("/repairs", {
+    return this.request("/repairs/reports", {
       method: "POST", orgId, idempotencyKey, body,
     });
   }
   confirmRepair(orgId: number, repairId: number): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/confirm`, { method: "POST", orgId });
+    return this.request(`/repairs/reports/${repairId}/confirm`, { method: "POST", orgId });
+  }
+  assignTechnician(
+    orgId: number,
+    repairId: number,
+    body: {
+      technician_name: string;
+      technician_source: string;
+      technician_eta_at?: string | null;
+    },
+  ): Promise<Repair> {
+    return this.request(`/repairs/reports/${repairId}/assign-technician`, {
+      method: "POST", orgId, body,
+    });
+  }
+  requestQuote(orgId: number, repairId: number): Promise<Repair> {
+    return this.request(`/repairs/reports/${repairId}/request-quote`, { method: "POST", orgId });
   }
   submitQuote(
     orgId: number,
     repairId: number,
-    body: { amount: string; note?: string | null },
+    body: {
+      amount: string;
+      description: string;
+      technician_name: string;
+    },
     idempotencyKey: string,
-  ): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/quote`, {
+  ): Promise<RepairQuote> {
+    return this.request<RepairQuote>(`/repairs/reports/${repairId}/quotes`, {
       method: "POST", orgId, idempotencyKey, body,
     });
   }
-  approveQuote(orgId: number, repairId: number): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/quote/approve`, {
-      method: "POST", orgId, body: { decision: "APPROVED" },
+  approveQuote(orgId: number, repairId: number, quoteId: number): Promise<Repair> {
+    return this.request(
+      `/repairs/reports/${repairId}/quotes/${quoteId}/approve`,
+      { method: "POST", orgId },
+    );
+  }
+  rejectQuote(
+    orgId: number,
+    repairId: number,
+    quoteId: number,
+    reason: string,
+  ): Promise<Repair> {
+    return this.request(
+      `/repairs/reports/${repairId}/quotes/${quoteId}/reject`,
+      { method: "POST", orgId, body: { reason } },
+    );
+  }
+  recordRepairWork(
+    orgId: number,
+    repairId: number,
+    body: { state: string; note: string },
+  ): Promise<RepairWork> {
+    return this.request<RepairWork>(`/repairs/reports/${repairId}/work`, {
+      method: "POST", orgId, body,
     });
   }
-  rejectQuote(orgId: number, repairId: number, reason: string): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/quote/reject`, {
+  claimRepairCompletion(
+    orgId: number,
+    repairId: number,
+    summary: string,
+  ): Promise<RepairCompletionClaim> {
+    return this.request<RepairCompletionClaim>(
+      `/repairs/reports/${repairId}/completion-claim`,
+      { method: "POST", orgId, body: { summary } },
+    );
+  }
+  verifyRepairCompletion(
+    orgId: number,
+    repairId: number,
+    reason: string,
+  ): Promise<Repair> {
+    return this.request<Repair>(
+      `/repairs/reports/${repairId}/verify-completion`,
+      { method: "POST", orgId, body: { reason } },
+    );
+  }
+  rejectRepairCompletion(
+    orgId: number,
+    repairId: number,
+    reason: string,
+  ): Promise<Repair> {
+    return this.request<Repair>(
+      `/repairs/reports/${repairId}/reject-completion`,
+      { method: "POST", orgId, body: { reason } },
+    );
+  }
+  reverseRepairVerification(
+    orgId: number,
+    repairId: number,
+    reason: string,
+  ): Promise<Repair> {
+    return this.request<Repair>(
+      `/repairs/reports/${repairId}/reverse-verification`,
+      { method: "POST", orgId, body: { reason } },
+    );
+  }
+  cancelRepair(orgId: number, repairId: number, reason: string): Promise<Repair> {
+    return this.request<Repair>(`/repairs/reports/${repairId}/cancel`, {
       method: "POST", orgId, body: { reason },
     });
   }
-  startWork(orgId: number, repairId: number): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/start-work`, { method: "POST", orgId });
-  }
-  claimCompletion(orgId: number, repairId: number, note: string): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/completion-claim`, {
-      method: "POST", orgId, body: { note },
-    });
-  }
-  verifyCompletion(orgId: number, repairId: number): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/completion-verify`, {
+  closeRepair(orgId: number, repairId: number): Promise<Repair> {
+    return this.request<Repair>(`/repairs/reports/${repairId}/close`, {
       method: "POST", orgId,
-    });
-  }
-  rejectCompletion(orgId: number, repairId: number, reason: string): Promise<Repair> {
-    return this.request(`/repairs/${repairId}/completion-reject`, {
-      method: "POST", orgId, body: { reason },
     });
   }
 

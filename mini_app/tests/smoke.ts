@@ -157,6 +157,9 @@ test("router hash parses to correct view names", async () => {
     if (parts[0] === "work") return "work";
     if (parts[0] === "finance") return "finance";
     if (parts[0] === "more") return "more";
+    if (parts[0] === "repairs") return "repair.detail";
+    if (parts[0] === "move-outs") return "move_out.detail";
+    if (parts[0] === "rent" && parts[1] === "claims") return "rent_claim.detail";
     return "home";
   }
   expect(parseHash("#/")).toBe("home");
@@ -165,6 +168,9 @@ test("router hash parses to correct view names", async () => {
   expect(parseHash("#/work")).toBe("work");
   expect(parseHash("#/finance")).toBe("finance");
   expect(parseHash("#/more")).toBe("more");
+  expect(parseHash("#/repairs/7")).toBe("repair.detail");
+  expect(parseHash("#/move-outs/9")).toBe("move_out.detail");
+  expect(parseHash("#/rent/claims/11")).toBe("rent_claim.detail");
   void window;
 });
 

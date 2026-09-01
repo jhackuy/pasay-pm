@@ -17,6 +17,7 @@ import { renderFinance } from "./views/finance";
 import { renderMore } from "./views/more";
 import { renderMoveOutDetail } from "./views/move_out";
 import { renderRentClaimDetail } from "./views/rent_payment";
+import { renderRepairDetail } from "./views/repair";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Mini App mount point #app is missing");
@@ -97,6 +98,9 @@ async function paint(): Promise<void> {
       break;
     case "rent_claim.detail":
       await renderRentClaimDetail(client, orgId, route.paymentId, locale);
+      break;
+    case "repair.detail":
+      await renderRepairDetail(client, orgId, route.repairId, locale);
       break;
   }
 }

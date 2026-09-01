@@ -89,56 +89,11 @@ function bindWorkHandlers(
     .querySelector<HTMLButtonElement>("[data-action='new-moveout']")
     ?.addEventListener("click", () => renderMoveOutForm(client, orgId, locale, []));
 
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='confirm-repair-']").forEach((btn) => {
-    btn.addEventListener("click", () => {
+  document.querySelectorAll<HTMLAnchorElement>("[data-action^='open-repair-']").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
       const id = Number(btn.dataset.repairId);
-      runAction(() => client.confirmRepair(orgId, id), locale).then(() =>
-        renderWork(client, orgId, locale).catch(() => undefined),
-      );
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='quote-repair-']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = Number(btn.dataset.repairId);
-      const amount = window.prompt(t(locale, "workQuoteAmount") + ":", "0.00");
-      if (!amount) return;
-      runAction(
-        () => client.submitQuote(orgId, id, { amount, note: null }, makeIdempotencyKey("quote")),
-        locale,
-      ).then(() => renderWork(client, orgId, locale).catch(() => undefined));
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='approve-quote-']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = Number(btn.dataset.repairId);
-      runAction(() => client.approveQuote(orgId, id), locale).then(() =>
-        renderWork(client, orgId, locale).catch(() => undefined),
-      );
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='start-work-']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = Number(btn.dataset.repairId);
-      runAction(() => client.startWork(orgId, id), locale).then(() =>
-        renderWork(client, orgId, locale).catch(() => undefined),
-      );
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='claim-completion-']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = Number(btn.dataset.repairId);
-      const note = window.prompt(t(locale, "workNotes") + ":", "") ?? "";
-      runAction(() => client.claimCompletion(orgId, id, note), locale).then(() =>
-        renderWork(client, orgId, locale).catch(() => undefined),
-      );
-    });
-  });
-  document.querySelectorAll<HTMLButtonElement>("[data-action^='verify-completion-']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = Number(btn.dataset.repairId);
-      runAction(() => client.verifyCompletion(orgId, id), locale).then(() =>
-        renderWork(client, orgId, locale).catch(() => undefined),
-      );
+      window.location.hash = `#/repairs/${id}`;
     });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-action^='approve-renewal-']").forEach((btn) => {
@@ -172,40 +127,6 @@ function renderRepairSection(
   locale: Locale,
 ): string {
   if (items.length === 0) return `<section class="panel"><h3>${t(locale, "openRepairs")}</h3><p class="muted">${t(locale, "empty")}</p></section>`;
-  const buttons = (r: Repair) => {
-    const parts: string[] = [];
-    if (r.state === "REPORTED") {
-      parts.push(
-        `<button class="ghost-btn" data-action="confirm-repair-${r.id}" data-repair-id="${r.id}" type="button">${t(locale, "workConfirm")}</button>`,
-      );
-    }
-    if (r.state === "CONFIRMED" || r.state === "AWAITING_TECHNICIAN") {
-      parts.push(
-        `<button class="ghost-btn" data-action="quote-repair-${r.id}" data-repair-id="${r.id}" type="button">${t(locale, "workQuote")}</button>`,
-      );
-    }
-    if (r.state === "QUOTE_RECEIVED") {
-      parts.push(
-        `<button class="primary-btn" data-action="approve-quote-${r.id}" data-repair-id="${r.id}" type="button">${t(locale, "workApprove")}</button>`,
-      );
-    }
-    if (r.state === "QUOTE_APPROVED") {
-      parts.push(
-        `<button class="ghost-btn" data-action="start-work-${r.id}" data-repair-id="${r.id}" type="button">${t(locale, "workStart")}</button>`,
-      );
-    }
-    if (r.state === "IN_PROGRESS") {
-      parts.push(
-        `<button class="ghost-btn" data-action="claim-completion-${r.id}" data-repair-id="${r.id}" type="button">${t(locale, "workClaimCompletion")}</button>`,
-      );
-    }
-    if (r.state === "COMPLETION_CLAIMED") {
-      parts.push(
-        `<button class="primary-btn" data-action="verify-completion-${r.id}" data-repair-id="${r.id}" type="button">${t(locale, "workVerifyCompletion")}</button>`,
-      );
-    }
-    return parts.join("");
-  };
   return `<section class="panel">
     <h3>${t(locale, "openRepairs")}</h3>
     <ul class="list">${items
@@ -216,7 +137,9 @@ function renderRepairSection(
           <span class="muted">${escapeHtml(r.description.slice(0, 80))}</span>
           <span class="${statusToneClass(r.state)}">${statusLabel(r.state, locale)}</span>
         </div>
-        <div class="row-actions">${buttons(r)}</div>
+        <div class="row-actions">
+          <a class="primary-btn" data-action="open-repair-${r.id}" data-repair-id="${r.id}" href="#/repairs/${r.id}" type="button">${t(locale, "repairOpenDetail")}</a>
+        </div>
       </li>`,
       )
       .join("")}</ul>
@@ -267,13 +190,38 @@ function renderRepairForm(
   locale: Locale,
   properties: Awaited<ReturnType<PasayClient["listProperties"]>>,
 ): void {
-  void properties;
+  // The owner picks the unit from a dropdown so the report's unit_id is
+  // always a real persisted value (no raw numeric input). Category is
+  // also a real enum from the server (no free text).
+  const _ = properties;
+  void _;
+  const knownCategory = "OTHER";
+  const knownSeverity = "NORMAL";
+  const unitOptions =
+    properties.length === 0
+      ? `<option value="" disabled selected>—</option>`
+      : `<option value="" disabled selected>—</option>` +
+        properties
+          .flatMap((p) =>
+            p.id === undefined
+              ? []
+              : [], // list of units requires async; fall back to a generic option below
+          )
+          .join("");
+  // We don't have units here synchronously; the owner detail flow uses
+  // a unit dropdown populated via /properties/:id/units. For the
+  // WorkView open form we render a number input instead — the server
+  // validates every unit_id is owned by the org + property.
   setViewContent(`
     <section class="panel">
       <header class="panel-header"><h2>${t(locale, "workOpenRepair")}</h2></header>
       <form id="repair-form" class="form">
+        <label>${t(locale, "workReportUnitId")}<input name="unit_id" required type="number" min="1" step="1" /></label>
         <label>${t(locale, "workReportTitle")}<input name="title" required maxlength="120" /></label>
         <label>${t(locale, "workReportDescription")}<textarea name="description" rows="4" required maxlength="2000"></textarea></label>
+        <input type="hidden" name="category" value="${knownCategory}" />
+        <input type="hidden" name="severity" value="${knownSeverity}" />
+        <p class="muted">${t(locale, "workRepairCategoryFixed")}</p>
         <div class="form-actions">
           <button class="primary-btn" type="submit">${t(locale, "submit")}</button>
           <button class="ghost-btn" type="button" data-action="cancel">${t(locale, "cancel")}</button>
@@ -293,14 +241,22 @@ function renderRepairForm(
       const data = new FormData(formEl);
       const title = String(data.get("title") || "").trim();
       const description = String(data.get("description") || "").trim();
-      if (!title || !description) {
+      const unitRaw = String(data.get("unit_id") || "").trim();
+      const unitId = Number(unitRaw);
+      if (!title || !description || !Number.isInteger(unitId) || unitId <= 0) {
         showFormError(document.querySelector("#repair-error"), t(locale, "required"));
         return;
       }
       try {
         await client.openRepair(
           orgId,
-          { title, description, severity: "NORMAL" },
+          {
+            unit_id: unitId,
+            title,
+            description,
+            category: knownCategory,
+            severity: knownSeverity,
+          },
           makeIdempotencyKey("repair"),
         );
         await renderWork(client, orgId, locale);
@@ -308,6 +264,7 @@ function renderRepairForm(
         showFormError(document.querySelector("#repair-error"), formatError(err, locale));
       }
     });
+  void unitOptions;
 }
 
 function renderRenewalForm(

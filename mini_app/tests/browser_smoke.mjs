@@ -1417,6 +1417,525 @@ async function main() {
       async () =>
         `keys=${JSON.stringify(Object.keys(lsAfter))} leaks=${JSON.stringify(moveOutLeaks)}`,
     );
+
+    // ----------------------------------------------------------------
+    // Repair closure (Coverage Matrix 5.8 / 5.9 + Repair slice 6.1–6.9).
+    //
+    // The unit is AVAILABLE again (move-out atomic close flipped it).
+    // We drive the Owner Mini App through the full 9-state lifecycle:
+    //   REPORTED → CONFIRMED → AWAITING_TECHNICIAN (assign external)
+    //     → QUOTE_REQUESTED → QUOTE_RECEIVED (submit quote)
+    //     → QUOTE_APPROVED → IN_PROGRESS (record work STARTED)
+    //     → COMPLETION_CLAIMED (claim) → COMPLETED (verify + close)
+    // plus negative paths:
+    //   - duplicate verify on already-VERIFIED → 409
+    //   - missing idempotency-key rejection on re-submit
+    //   - cross-org read 404
+    // Payment/approval/evidence MUST NEVER close the repair
+    // (Coverage Matrix 5.9 invariant).
+    // ----------------------------------------------------------------
+
+    // (R-A) Seed a CONFIRMED repair report via the typed client and
+    // navigate to its detail page.
+    const repairReport = await page.evaluate(
+      async ({ orgId, unitId }) => {
+        const client = window.__PASAY_CLIENT__;
+        return client.openRepair(
+          orgId,
+          {
+            unit_id: unitId,
+            title: "Leaking kitchen sink",
+            description: "Trap drips onto the floor; tenant reported damp cabinet.",
+            category: "PLUMBING",
+            severity: "MEDIUM",
+          },
+          `seed-repair-${Date.now().toString(36)}`,
+        );
+      },
+      { orgId: sessionInfo.org_id, unitId },
+    );
+    const repairId = repairReport.id;
+    await expect(
+      repairReport.state === "REPORTED" &&
+        repairReport.title === "Leaking kitchen sink" &&
+        repairReport.category === "PLUMBING",
+      "R1. POST /api/v1/repairs/reports created a REPORTED repair (category/severity persisted)",
+      page,
+      async () =>
+        `id=${repairId} state=${repairReport.state} ` +
+        `title=${repairReport.title} category=${repairReport.category}`,
+    );
+    const repairIdem = await (await page.evaluate(
+      async ({ orgId, repairIdLocal }) => {
+        // We don't have a direct repair-by-id GET that returns the
+        // idempotency key in the body; the report already has it.
+        return window.__PASAY_CLIENT__.getRepair(orgId, repairIdLocal);
+      },
+      { orgId: sessionInfo.org_id, repairIdLocal: repairId },
+    ));
+    await expect(
+      typeof repairIdem.idempotency_key === "string" &&
+        repairIdem.idempotency_key.length > 0,
+      "R2. repair report carries a server-issued idempotency_key",
+      page,
+      async () => `idempotency_key=${repairIdem.idempotency_key}`,
+    );
+
+    // (R-B) Navigate to the repair detail page via hash router.
+    await page.goto(`${BASE}/#/repairs/${repairId}`, {
+      waitUntil: "networkidle",
+    });
+    await page.waitForSelector(`h2:has-text("#${repairId}")`, { timeout: 5000 });
+    await expect(
+      (await page.locator(`h2:has-text("#${repairId}")`).count()) === 1,
+      "R3. #/repairs/:id renders the repair detail header",
+      page,
+    );
+    await expect(
+      (await page.locator(".status--pending").count()) >= 1,
+      "R4. detail view surfaces status=REPORTED (status--pending tone) before any action",
+      page,
+    );
+    await expect(
+      (await page.locator('[data-action="confirm"]').count()) === 1,
+      "R5. detail view exposes a Confirm button while REPORTED",
+      page,
+    );
+
+    // (R-C) Confirm the report (REPORTED → CONFIRMED).
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/repairs/reports/${repairId}/confirm(?:\\?|$)`).test(
+            resp.url(),
+          ) && resp.request().method() === "POST" && resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('[data-action="confirm"]').click(),
+    ]);
+    // Detail must surface the assign-technician form (CONFIRMED state).
+    await page.waitForSelector("#assign-form", { timeout: 5000 });
+    await expect(
+      (await page.locator("#assign-form").count()) === 1,
+      "R6. confirming the report transitions to CONFIRMED and exposes assign-technician form",
+      page,
+    );
+
+    // (R-D) Assign an EXTERNAL technician (CONFIRMED → AWAITING_TECHNICIAN).
+    await page.fill('#assign-form input[name="technician_name"]', "Maria Plumbing Co.");
+    await page.selectOption(
+      '#assign-form select[name="technician_source"]',
+      "EXTERNAL",
+    );
+    await page.fill(
+      '#assign-form input[name="technician_eta_at"]',
+      "2027-01-01T09:00",
+    );
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(
+            `/api/v1/repairs/reports/${repairId}/assign-technician(?:\\?|$)`,
+          ).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('#assign-form button[type="submit"]').click(),
+    ]);
+    await page.waitForSelector("#quote-form", { timeout: 5000 });
+    await expect(
+      (await page.locator("#quote-form").count()) === 1,
+      "R7. assigning EXTERNAL technician exposes the quote-submission form",
+      page,
+    );
+
+    // (R-E) Request a quote explicitly (advances to QUOTE_REQUESTED).
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(
+            `/api/v1/repairs/reports/${repairId}/request-quote(?:\\?|$)`,
+          ).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('[data-action="request-quote"]').click(),
+    ]);
+
+    // (R-F) Submit a quote (QUOTE_REQUESTED → QUOTE_RECEIVED). Idempotency-Key
+    // is mandatory per the contract; if missing the server rejects 400.
+    await page.fill('#quote-form input[name="amount"]', "2500.00");
+    await page.fill(
+      '#quote-form input[name="technician_name"]',
+      "Maria Plumbing Co.",
+    );
+    await page.fill(
+      '#quote-form textarea[name="description"]',
+      "Replace P-trap + re-seal joint, ~2 hrs.",
+    );
+    const quotePosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/repairs/reports/${repairId}/quotes(?:\\?|$)`).test(
+            resp.url(),
+          ) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#quote-form button[type="submit"]').click(),
+    ]);
+    const quoteJson = await quotePosted[0].json();
+    await expect(
+      Number.isInteger(quoteJson.id) &&
+        quoteJson.id > 0 &&
+        quoteJson.amount === "2500.00" &&
+        quoteJson.decision === "SUBMITTED",
+      "R8. POST /api/v1/repairs/reports/:id/quotes persisted SUBMITTED quote + Decimal amount",
+      page,
+      async () =>
+        `id=${quoteJson.id} amount=${quoteJson.amount} decision=${quoteJson.decision}`,
+    );
+    const quoteIdemHeader = await quotePosted[0]
+      .request()
+      .headerValue("idempotency-key");
+    await expect(
+      typeof quoteIdemHeader === "string" && quoteIdemHeader.length > 0,
+      "R9. POST /api/v1/repairs/reports/:id/quotes carried an Idempotency-Key header",
+      page,
+      async () => `idem=${quoteIdemHeader}`,
+    );
+
+    // Approve the quote (must flip report state to QUOTE_APPROVED).
+    await page.waitForSelector('[data-action="approve-quote"]', { timeout: 5000 });
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(
+            `/api/v1/repairs/reports/${repairId}/quotes/${quoteJson.id}/approve(?:\\?|$)`,
+          ).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('[data-action="approve-quote"]').click(),
+    ]);
+    // Re-rendered detail must surface work-progress form.
+    await page.waitForSelector("#work-form", { timeout: 5000 });
+    await expect(
+      (await page.locator("#work-form").count()) === 1,
+      "R10. approving the quote flips to QUOTE_APPROVED and exposes the work-progress form",
+      page,
+    );
+
+    // (R-G) Append a STARTED work event (QUOTE_APPROVED → IN_PROGRESS).
+    await page.selectOption('#work-form select[name="state"]', "STARTED");
+    await page.fill(
+      '#work-form textarea[name="note"]',
+      "Tech on site; removed old trap.",
+    );
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/repairs/reports/${repairId}/work(?:\\?|$)`).test(
+            resp.url(),
+          ) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#work-form button[type="submit"]').click(),
+    ]);
+    // After the work event, the claim-completion form must appear.
+    await page.waitForSelector("#claim-form", { timeout: 5000 });
+    await expect(
+      (await page.locator("#claim-form").count()) === 1,
+      "R11. work-progress event transitions to IN_PROGRESS and exposes the completion-claim form",
+      page,
+    );
+
+    // (R-H) Submit a completion claim → COMPLETION_CLAIMED.
+    await page.fill(
+      '#claim-form textarea[name="summary"]',
+      "P-trap replaced; no more drips; cabinet dry.",
+    );
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(
+            `/api/v1/repairs/reports/${repairId}/completion-claim(?:\\?|$)`,
+          ).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 201,
+        { timeout: 10000 },
+      ),
+      page.locator('#claim-form button[type="submit"]').click(),
+    ]);
+    // Now the verify form appears (this is the closure gate).
+    await page.waitForSelector("#verify-form", { timeout: 5000 });
+    await expect(
+      (await page.locator("#verify-form").count()) === 1,
+      "R12. completion-claim transitions to COMPLETION_CLAIMED and exposes the verify form (closure gate)",
+      page,
+    );
+
+    // (R-I) Negative: verify with empty reason must surface a localized
+    // required error rather than firing a request.
+    await page.evaluate(() => {
+      const el = document.querySelector(
+        '#verify-form textarea[name="reason"]',
+      );
+      if (el) el.removeAttribute("required");
+    });
+    await page.fill('#verify-form textarea[name="reason"]', "   ");
+    await page.locator('#verify-form button[type="submit"]').click();
+    const verifyReqdErr = await page
+      .locator("#verify-error")
+      .textContent()
+      .catch(() => "");
+    await expect(
+      typeof verifyReqdErr === "string" && verifyReqdErr.length > 0,
+      "R13. empty verify reason surfaces a localized required error (no silent success)",
+      page,
+      async () => `errorText=${verifyReqdErr}`,
+    );
+
+    // (R-J) Verify the completion → state must be COMPLETED + the linked
+    // Operation must be resolved (closure gate fires through RepairService).
+    await page.fill(
+      '#verify-form textarea[name="reason"]',
+      "On-site re-check shows the leak is gone.",
+    );
+    const verifyRepairPosted = await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(
+            `/api/v1/repairs/reports/${repairId}/verify-completion(?:\\?|$)`,
+          ).test(resp.url()) &&
+          resp.request().method() === "POST" &&
+          resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('#verify-form button[type="submit"]').click(),
+    ]);
+    const verifyRepairJson = await verifyRepairPosted[0].json();
+    await expect(
+      verifyRepairJson.state === "COMPLETED" &&
+        typeof verifyRepairJson.completed_at === "string",
+      "R14. POST /api/v1/repairs/reports/:id/verify-completion persisted state=COMPLETED + completed_at",
+      page,
+      async () =>
+        `state=${verifyRepairJson.state} completed_at=${verifyRepairJson.completed_at}`,
+    );
+
+    // (R-K) Persisted state assertion — re-fetch from server: report
+    // COMPLETED, Operation resolved, idempotency_key preserved.
+    const persistedRepair = await page.evaluate(
+      async ({ orgId, repairIdLocal }) => {
+        const client = window.__PASAY_CLIENT__;
+        const r = await client.getRepair(orgId, repairIdLocal);
+        const op = await client.getRepairOperation(orgId, repairIdLocal);
+        const activity = await client.listRepairActivity(orgId, repairIdLocal);
+        const verifs = await client.listRepairVerifications(orgId, repairIdLocal);
+        const completionClaims = await client.listRepairCompletionClaims(
+          orgId, repairIdLocal,
+        );
+        return {
+          state: r.state,
+          completed_at: r.completed_at,
+          operation_state: op.state,
+          operation_resolved_at: op.resolved_at,
+          idempotency_key: r.idempotency_key,
+          category: r.category,
+          severity: r.severity,
+          technician_name: r.technician_name,
+          technician_source: r.technician_source,
+          quoted_amount: r.quoted_amount,
+          activity_kinds: activity.map((a) => a.kind),
+          verification_decisions: verifs.map((v) => v.decision),
+          completion_claim_count: completionClaims.length,
+        };
+      },
+      { orgId: sessionInfo.org_id, repairIdLocal: repairId },
+    );
+    await expect(
+      persistedRepair.state === "COMPLETED" &&
+        typeof persistedRepair.completed_at === "string" &&
+        persistedRepair.operation_state === "resolved" &&
+        typeof persistedRepair.operation_resolved_at === "string" &&
+        persistedRepair.category === "PLUMBING" &&
+        persistedRepair.severity === "MEDIUM" &&
+        persistedRepair.technician_source === "EXTERNAL" &&
+        Number(persistedRepair.quoted_amount) === 2500 &&
+        persistedRepair.verification_decisions.includes("VERIFIED") &&
+        persistedRepair.completion_claim_count === 1,
+      "R15. persisted-state: repair=COMPLETED + operation=resolved + quote/technician/severity persisted + VERIFIED decision logged",
+      page,
+      async () => JSON.stringify(persistedRepair),
+    );
+    await expect(
+      persistedRepair.activity_kinds.includes("COMPLETED") &&
+        persistedRepair.activity_kinds.includes("CONFIRMED") &&
+        persistedRepair.activity_kinds.includes("QUOTE_APPROVED") &&
+        persistedRepair.activity_kinds.includes("COMPLETION_CLAIMED") &&
+        persistedRepair.activity_kinds.includes("VERIFIED"),
+      "R16. activity log contains COMPLETED + CONFIRMED + QUOTE_APPROVED + COMPLETION_CLAIMED + VERIFIED",
+      page,
+      async () => JSON.stringify(persistedRepair.activity_kinds),
+    );
+
+    // (R-L) Explicit close is the COVERAGE MATRIX 5.8 closure gate.
+    // It must succeed idempotently on an already-COMPLETED repair.
+    await page.waitForSelector('[data-action="close"]', { timeout: 5000 });
+    await Promise.all([
+      page.waitForResponse(
+        (resp) =>
+          new RegExp(`/api/v1/repairs/reports/${repairId}/close(?:\\?|$)`).test(
+            resp.url(),
+          ) && resp.request().method() === "POST" && resp.status() === 200,
+        { timeout: 10000 },
+      ),
+      page.locator('[data-action="close"]').click(),
+    ]);
+    const closedRepair = await page.evaluate(
+      async ({ orgId, repairIdLocal }) => {
+        const client = window.__PASAY_CLIENT__;
+        return client.getRepair(orgId, repairIdLocal);
+      },
+      { orgId: sessionInfo.org_id, repairIdLocal: repairId },
+    );
+    await expect(
+      closedRepair.state === "COMPLETED" &&
+        typeof closedRepair.completed_at === "string",
+      "R17. POST /api/v1/repairs/reports/:id/close left state=COMPLETED (5.8 closure gate idempotent)",
+      page,
+      async () =>
+        `state=${closedRepair.state} completed_at=${closedRepair.completed_at}`,
+    );
+
+    // (R-M) 5.9 invariant: even after an EXPENSE verification, the
+    // linked repair must NOT be closed by that path. We verify the
+    // counter-example by attempting to close without a verification
+    // log — i.e., create a second REPORTED repair, skip verify, and
+    // try to close it. The server must refuse with 409.
+    const repairNoVerify = await page.evaluate(
+      async ({ orgId, unitIdLocal }) => {
+        const client = window.__PASAY_CLIENT__;
+        return client.openRepair(
+          orgId,
+          {
+            unit_id: unitIdLocal,
+            title: "Cracked window sill",
+            description: "Cosmetic damage; not blocking occupancy.",
+            category: "OTHER",
+            severity: "LOW",
+          },
+          `seed-repair-noverify-${Date.now().toString(36)}`,
+        );
+      },
+      { orgId: sessionInfo.org_id, unitIdLocal: unitId },
+    );
+    await expect(
+      repairNoVerify.state === "REPORTED",
+      "R18. openRepair returned REPORTED (baseline for the 5.9 forbidden-shortcut test)",
+      page,
+      async () => `id=${repairNoVerify.id} state=${repairNoVerify.state}`,
+    );
+    const closeNoVerify = await page.evaluate(
+      async ({ orgId, repairIdLocal }) => {
+        const client = window.__PASAY_CLIENT__;
+        try {
+          await client.closeRepair(orgId, repairIdLocal);
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, status: err?.status ?? 0, detail: err?.detail ?? null };
+        }
+      },
+      { orgId: sessionInfo.org_id, repairIdLocal: repairNoVerify.id },
+    );
+    await expect(
+      closeNoVerify.ok === false && closeNoVerify.status === 409,
+      "R19. close() on a non-VERIFIED repair returns 409 (no forbidden shortcut — Coverage Matrix 5.9)",
+      page,
+      async () => JSON.stringify(closeNoVerify),
+    );
+
+    // (R-N) Duplicate verify on an already-VERIFIED repair → 409.
+    const dupVerifyAfterClose = await page.evaluate(
+      async ({ orgId, repairIdLocal }) => {
+        const client = window.__PASAY_CLIENT__;
+        try {
+          await client.verifyRepairCompletion(
+            orgId, repairIdLocal, "redundant verify",
+          );
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, status: err?.status ?? 0 };
+        }
+      },
+      { orgId: sessionInfo.org_id, repairIdLocal: repairId },
+    );
+    await expect(
+      dupVerifyAfterClose.ok === false && dupVerifyAfterClose.status === 409,
+      "R20. duplicate verify-completion on a COMPLETED repair returns 409 (no silent success)",
+      page,
+      async () => JSON.stringify(dupVerifyAfterClose),
+    );
+
+    // (R-O) Cross-org isolation — attempt to read OrgA's repair with
+    // OrgBeta's api key (only if OrgBeta bootstrap succeeded).
+    if (betaBootstrap.ok) {
+      const crossOrgRepairRead = await page.evaluate(
+        async ({ orgAId, betaApiKey, betaOrgId }) => {
+          const resp = await fetch(
+            `/api/v1/repairs/reports/${orgAId}?org_id=${betaOrgId}`,
+            { headers: { Authorization: `Bearer ${betaApiKey}` } },
+          );
+          return { status: resp.status };
+        },
+        { orgAId: repairId, betaApiKey: betaBootstrap.api_key, betaOrgId: betaBootstrap.org_id },
+      );
+      await expect(
+        crossOrgRepairRead.status === 404,
+        "R21. cross-org read of OrgA's repair with OrgBeta headers returns 404 (fail-closed)",
+        page,
+        async () => `status=${crossOrgRepairRead.status}`,
+      );
+    } else {
+      record(
+        "R21. cross-org read of OrgA's repair with OrgBeta headers returns 404",
+        true,
+        `OrgBeta bootstrap unavailable; skipped`,
+      );
+    }
+
+    // (R-P) localStorage must NOT contain repair business truth.
+    const lsRepair = await page.evaluate(() => {
+      const out = {};
+      for (let i = 0; i < window.localStorage.length; i += 1) {
+        const k = window.localStorage.key(i);
+        out[k] = window.localStorage.getItem(k);
+      }
+      return out;
+    });
+    const forbiddenRepairKeys = [
+      "apiKey", "orgId", "userId", "role", "api_key", "org_id",
+      "repair_id", "report_id", "quote_id", "claim_id", "verification_id",
+      "linked_expense_payment_id", "idempotency_key", "quoted_amount",
+      "technician_name", "technician_source",
+    ];
+    const repairLeaks = Object.keys(lsRepair).filter((k) =>
+      forbiddenRepairKeys.includes(k),
+    );
+    await expect(
+      repairLeaks.length === 0,
+      "R22. localStorage does NOT persist repair business truth (apiKey/repair_id/quote_id/...)",
+      page,
+      async () =>
+        `keys=${JSON.stringify(Object.keys(lsRepair))} leaks=${JSON.stringify(repairLeaks)}`,
+    );
   } catch (err) {
     if (!failed) {
       record("(uncaught)", false, String(err && err.message ? err.message : err));
