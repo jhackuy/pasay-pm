@@ -9,6 +9,12 @@ on:
 # Only a new authorized Owner /oc or /opencode command for the same issue/PR
 # may supersede an earlier actionable run. Bots, unauthorized humans, and
 # non-command comments get a run-unique group, so they cannot cancel legitimate work.
+# Concurrency truth table with cancel-in-progress=true:
+# - Owner /oc on #N              -> opencode-N            -> actionable
+# - second Owner /oc on same #N  -> opencode-N            -> intentionally supersedes
+# - github-actions/CodeRabbit bot -> opencode-ignored-RUN  -> cannot cancel actionable run
+# - unauthorized human /oc       -> opencode-ignored-RUN  -> cannot cancel actionable run
+# - human non-command comment     -> opencode-ignored-RUN  -> cannot cancel actionable run
 concurrency:
   group: >-
     ${{ github.event.comment.user.type != 'Bot' &&
@@ -114,23 +120,6 @@ jobs:
           assert 'never edits the repository directly' not in prompt.lower()
           PY
 
-      - name: Capture MiniMax quota before agent run
-        continue-on-error: true
-        shell: bash
-        env:
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-        run: |
-          set -uo pipefail
-          if curl --fail --silent --show-error --max-time 10 \
-            'https://www.minimax.io/v1/token_plan/remains' \
-            -H "Authorization: Bearer ${MINIMAX_API_KEY}" \
-            -H 'Content-Type: application/json' \
-            -o /tmp/minimax-remains-before.json; then
-            python scripts/minimax_quota_snapshot.py before /tmp/minimax-remains-before.json
-          else
-            echo 'MINIMAX_QUOTA before: endpoint unavailable'
-          fi
-
       - name: Run OpenCode GitHub handler with PASAY Lead
         shell: bash
         env:
@@ -143,24 +132,6 @@ jobs:
         run: |
           set -euo pipefail
           opencode github run
-
-      - name: Capture MiniMax quota after agent run
-        if: always()
-        continue-on-error: true
-        shell: bash
-        env:
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-        run: |
-          set -uo pipefail
-          if curl --fail --silent --show-error --max-time 10 \
-            'https://www.minimax.io/v1/token_plan/remains' \
-            -H "Authorization: Bearer ${MINIMAX_API_KEY}" \
-            -H 'Content-Type: application/json' \
-            -o /tmp/minimax-remains-after.json; then
-            python scripts/minimax_quota_snapshot.py after /tmp/minimax-remains-after.json
-          else
-            echo 'MINIMAX_QUOTA after: endpoint unavailable'
-          fi
 
       - name: Record exact OpenCode runtime version evidence
         if: always()
