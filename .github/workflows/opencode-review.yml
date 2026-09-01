@@ -81,9 +81,16 @@ jobs:
           refactors, and unrelated legacy debt.
 
           Forbidden scope includes business code under app/, migrations/, Mini App,
-          Cloudflare/Neon/Telegram production deployment, AGENTS.md, custom runners/watchers/
+          Cloudflare/Neon/Telegram production deployment, custom runners/watchers/
           pollers/daemons/orchestrators, label automation beyond contract, and production
           secrets/auth/provider-model changes.
+
+          AGENTS.md is governance-sensitive, but not categorically forbidden. If a PR changes
+          AGENTS.md, require the PR metadata/conversation to state an explicit Owner-authorized
+          governance/context intent, keep the change narrowly scoped, and reject any weakening
+          of business truths, security, Git history safety, test integrity, deployment/secrets
+          boundaries, or independent review. Otherwise treat AGENTS.md like any other reviewed
+          file and assess the concrete diff rather than blocking on path alone.
 
           Output exactly one of:
           REVIEW_PASS
