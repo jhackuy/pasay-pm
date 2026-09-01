@@ -78,8 +78,42 @@ jobs:
                       "Exact retired PASAY revision detected; "
                       "replacing legacy schema with rewrite baseline."
                   )
-                  connection.execute(text("DROP SCHEMA public CASCADE"))
-                  connection.execute(text("CREATE SCHEMA public"))
+                  # Preserve the public schema owner, ACLs, and default
+                  # privileges. Remove only legacy relation objects so the
+                  # rewrite baseline can create its independent schema.
+                  relations = connection.execute(
+                      text(
+                          """
+                          SELECT c.relkind, c.relname
+                          FROM pg_class AS c
+                          JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                          WHERE n.nspname = 'public'
+                            AND c.relkind IN ('v', 'm', 'r', 'p', 'f', 'S')
+                          ORDER BY CASE c.relkind
+                              WHEN 'v' THEN 1
+                              WHEN 'm' THEN 2
+                              WHEN 'f' THEN 3
+                              WHEN 'p' THEN 4
+                              WHEN 'r' THEN 5
+                              WHEN 'S' THEN 6
+                          END
+                          """
+                      )
+                  ).all()
+                  object_types = {
+                      "v": "VIEW",
+                      "m": "MATERIALIZED VIEW",
+                      "r": "TABLE",
+                      "p": "TABLE",
+                      "f": "FOREIGN TABLE",
+                      "S": "SEQUENCE",
+                  }
+                  quote = connection.dialect.identifier_preparer.quote
+                  for relkind, relname in relations:
+                      connection.exec_driver_sql(
+                          f"DROP {object_types[relkind]} IF EXISTS "
+                          f"public.{quote(relname)} CASCADE"
+                      )
               else:
                   raise SystemExit(
                       "Refusing destructive reset for unexpected Alembic revisions: "
