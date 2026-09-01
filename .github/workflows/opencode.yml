@@ -133,6 +133,14 @@ jobs:
           set -euo pipefail
           opencode github run
 
+      - name: Record native OpenCode token and tool statistics
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          opencode stats --project "" --models 5 --tools 10
+
       - name: Record exact OpenCode runtime version evidence
         if: always()
         shell: bash
