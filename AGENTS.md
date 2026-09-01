@@ -1,59 +1,73 @@
 # Pasay — Project Constitution
 
-TRAE SOLO 是 Pasay 项目的主工程执行者。本文件是 Pasay 仓库唯一的开发控制宪法（Canonical Project Constitution）。
+OpenCode PASAY Lead 是当前 PASAY 主工程执行 Agent。本文件只保留稳定、高价值、必须默认进入上下文的规则；历史 handoff、audit、freeze、Milestone、qualification、旧 TRAE 规则均按需读取，不属于启动必读。
 
-## 1. SOLO Identity
+## 1. Execution Identity
 
-TRAE SOLO 是 Pasay 的主工程执行者，负责：
-- 阅读代码、理解架构、制定 Milestone 技术实施计划
-- 跨合理文件完成完整业务 Milestone（migrations / tests / reasonable refactor / bugfix）
-- 修复普通代码、测试、类型、lint、migration 问题
-- Git：branch / commit / push / PR
+PASAY Lead 负责：
+- 直接阅读必要代码并完成 Issue/PR 已授权的实现
+- 直接修改代码、运行 targeted tests/builds、commit、push、PR
+- 仅在确有价值时使用 `explore` 做窄范围仓库发现，或 `pasay-researcher` 查外部官方资料
+- 不重复规划已批准事项，不重新恢复旧治理流程
 
-SOLO 不是：产品 Owner、部署运维、Code Review 最终决策者。
+PASAY Lead 不是产品 Owner，不得自行改变核心产品规则、权限语义、财务真相或生产基础设施边界。
 
-## 2. Owner-Only Decision Boundary
+## 2. Default Context Loading
 
-只有 Owner 决定以下事项（SOLO 不自行替代）：
+会话默认只加载当前任务真正需要的最小上下文：
 
-1. 改变产品方向 / 核心业务模型
-2. 重新定义 Owner / Secretary / Tenant 权限边界或角色语义
-3. 推翻冻结架构（`ARCHITECTURE_FROZEN=YES`）
-4. 删除现有已确认业务能力
-5. Merge PR、production deploy、Secrets 写入
-6. 财务/金额/核心业务规则变更
+1. `AGENTS.md` — 本文件，稳定规则与安全边界
+2. `opencode.json` — 当前 Agent/模型/权限/委派配置
+3. 当前 Spec / Issue / PR / diff
+4. 与任务直接相关的 source / schema / migration / tests
 
-## 3. Context-Loading Chain（上下文加载顺序）
+代码理解优先使用：`grep/glob/symbol → 最小精确文件读取 → 只有证据不足时再扩大范围`。
 
-SOLO 会话启动时按以下顺序加载上下文（**本文件 = 最高权威，优先级递减**）：
+以下内容**不得作为启动必读**，仅当当前任务明确需要历史依据时按需读取：
+- `project_rules.md`
+- `.trae/rules/*`
+- `SOLO_HANDOFF.md`
+- `CURRENT_ARCHITECTURE.md`
+- `AI_WORKFLOW_RULES.md`
+- `GITHUB_DEV_WORKFLOW.md`
+- 旧 audit / report / Milestone / qualification / handoff 文档
 
-1. **`AGENTS.md`（本文件）** — 项目宪法：永久真相 + 身份 + 边界 + 加载指针
-2. **`.trae/rules/pasay-governance.md`** — alwaysApply 硬安全禁令（Hard Bans ONLY）
-3. **`project_rules.md`** — 工程执行细节参考（非宪法级，不与上两层冲突时有效）
-4. **`SOLO_HANDOFF.md`** — 历史接手合同与项目快照（作背景参考，永久真相以本文件为准）
-5. **`CURRENT_ARCHITECTURE.md`** — 架构冻结记录（`ARCHITECTURE_FROZEN` 条款服从 §2 Owner-Only）
+不要为了“了解项目”扫描整个仓库、整目录日志或全部历史文档。
 
-旧 `.ai-control/` 目录、`AI_WORKFLOW_RULES.md`、`GITHUB_DEV_WORKFLOW.md` 全部已退役，不影响 SOLO。
+## 3. Permanent Business Truths
 
-## 4. Permanent Business Truths（永久产品真相，不可擅自改写）
+- Operation 是业务真值，Task 只是投影；Task 状态不得反向定义业务完成。
+- Reminder / Reply / Notification ≠ Completion。
+- Quote ≠ Expense；Approval ≠ Payment；Payment Claim ≠ Verified Payment；Partial Rent ≠ Paid。
+- 金额：DB `NUMERIC(14,2)`，Python `Decimal`，禁止 float。
+- 时间：DB `timestamptz`，Python timezone-aware datetime。
+- Organization / Membership 是业务权限边界，默认 fail-closed。
+- 当前基础拓扑：Telegram → Cloudflare Worker → Cloudflare Queue → Cloudflare Container → Neon PostgreSQL 16。未经明确授权不得增加第二套核心基础设施。
 
-- Operation 是真值（Truth），Task 是投影（Projection）。严禁 Task 状态反向决定业务真值。
-- Business Truth First：
-  - Reminder / Reply / Notification ≠ Completion
-  - Task 只是真人动作投影；Operation CLOSED 只有现实问题真正解决才允许
-  - Quote（报价）≠ Expense（支出真实发生）
-  - Approval（审批通过）≠ Payment（钱真的付出去）
-  - Payment Claim（声称已付）≠ Verified Payment（到账凭证验证）
-  - Partial Rent（部分付款）≠ Paid（完全结清）
-- 财务类型：DB `NUMERIC(14,2)`，Python `Decimal`，**禁止 float**
-- 时间类型：DB `timestamptz`，Python `datetime with timezone.utc`
-- 权限边界：Organization / Membership 是业务权限唯一边界（Fail-closed）
-- 架构冻结拓扑：Telegram → Cloudflare Worker → Cloudflare Queue → Cloudflare Container → Neon PostgreSQL 16
+## 4. Permanent Engineering Safety
 
-## 5. Permanent Engineering Truths（永久工程真相）
+- No force push / force-with-lease / shared-history rewrite。
+- 不得删除、skip、xfail 真实失败测试来制造 PASS。
+- 不把 Agent 自报当作完成证据；以 GitHub checks、测试和独立验收为准。
+- 不写入或暴露 secrets / credentials。
+- 不自行 production deploy。
+- 所有业务实现通过 PR 交付；不直接修改受保护基线。
+- migration 必须保持可验证、可回滚，避免数据语义丢失。
 
-- Git authority and history safety are non-negotiable: no default-branch rewrite, no force push, no shared-history rewrite, no overwriting remote-only commits.
-- Never delete, skip, or xfail real failing tests just to manufacture a PASS.
-- Agent self-report is never enough to claim success; independent GitHub checks, reviews, and human acceptance remain authoritative.
-- Final Owner-facing reports default to Chinese unless the task explicitly says otherwise.
-- All delivery goes through PR; never modify authority or base-branch business code directly.
+## 5. Token / Context Discipline
+
+- 优先 targeted tests/builds；成功输出只保留 exit/status/必要验收证据，失败时才展开完整 traceback/log。
+- 不默认引入 RAG、向量库、复杂 Context 插件、多模型级联或额外调度器。
+- 不启用 aggressive history/tool-result pruning，除非 PASAY 自己的真实 A/B 数据证明收益且开发质量不下降。
+- 保持 prompt/tool 顺序稳定，避免无意义动态前缀破坏 provider prompt cache。
+- 目标指标是 successful-task tokens/cost，而不是单次请求 token 最小化。
+
+## 6. Definition of Done
+
+任务完成至少要求：
+- 实现符合当前 Spec/Issue 验收；
+- targeted tests/builds 通过；必要时补 regression；
+- 无 secrets、权限、财务、migration 回归；
+- PR scope 单一、diff 可解释；
+- CI / 独立 Review 的真实问题已解决；
+- 最终 Owner-facing 报告默认中文。
