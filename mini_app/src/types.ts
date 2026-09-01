@@ -185,19 +185,66 @@ export type Lease = {
 
 export type RentDueSchedule = {
   id: number;
+  org_id: number;
   lease_id: number;
+  period_start: string;
   due_date: string;
   amount_due: Money;
-  status: "DUE" | "OVERDUE" | "PAID";
+  state: "DUE" | "OVERDUE" | "PAID";
+  created_at: string;
+  updated_at: string;
 };
 
 export type RentPayment = {
   id: number;
+  org_id: number;
   due_schedule_id: number;
-  amount: Money;
+  claimed_amount: Money;
+  verified_amount: Money | null;
   status: "PENDING" | "VERIFIED" | "FAILED" | "REVERSED";
-  note: string | null;
-  submitted_at: string;
+  claimed_by_user_id: number | null;
+  claimed_at: string;
+  idempotency_key: string;
+};
+
+export type RentEvidence = {
+  id: number;
+  org_id: number;
+  rent_payment_id: number;
+  kind: string;
+  reference: string;
+  uploaded_by_user_id: number | null;
+  created_at: string;
+};
+
+export type RentVerification = {
+  id: number;
+  org_id: number;
+  rent_payment_id: number;
+  decision: "VERIFIED" | "REJECTED" | "REVERSED";
+  verified_amount: Money | null;
+  verifier_user_id: number | null;
+  decided_at: string;
+  reason: string | null;
+};
+
+export type RentActivity = {
+  id: number;
+  org_id: number;
+  due_schedule_id: number | null;
+  rent_payment_id: number | null;
+  kind: string;
+  detail: string | null;
+  actor_user_id: number | null;
+  occurred_at: string;
+};
+
+export type RentBalance = {
+  due_schedule_id: number;
+  amount_due: Money;
+  verified_total: Money;
+  remaining_balance: Money;
+  is_paid: boolean;
 };
 
 export type ExpenseClaim = {

@@ -9,7 +9,7 @@ import { ApiError } from "../api";
 import { setViewContent } from "../shell";
 import { type Locale, t } from "../i18n";
 import { escapeHtml } from "./home";
-import { formatMoney, makeIdempotencyKey, statusLabel, statusToneClass } from "../format";
+import { formatDate, formatMoney, makeIdempotencyKey, statusLabel, statusToneClass } from "../format";
 import type { ExpenseClaim, RentDueSchedule, RentPayment } from "../types";
 
 export async function renderFinance(
@@ -38,7 +38,8 @@ export async function renderFinance(
         </div>
       </section>
       ${renderOverdueSection(overdue, client, orgId, locale)}
-      ${renderPendingClaimsSection(pendingClaims, client, orgId, locale)}
+      ${renderClaimsSection(pendingClaims, client, orgId, locale)}
+      ${renderClaimsHistorySection(claims, locale)}
       ${renderExpenseSection(openExpenses, client, orgId, locale)}
     `;
     setViewContent(body);
@@ -63,7 +64,7 @@ function bindFinanceHandlers(
       const amount = window.prompt(`${t(locale, "financeAmount")}:`, "0.00");
       if (!amount) return;
       runAction(
-        () => client.claimPayment(orgId, id, { amount, note: null }, makeIdempotencyKey("claim")),
+        () => client.claimPayment(orgId, id, { claimed_amount: amount, evidence: [] }, makeIdempotencyKey("claim")),
         locale,
       ).then(() => renderFinance(client, orgId, locale).catch(() => undefined));
     });
@@ -72,7 +73,7 @@ function bindFinanceHandlers(
   document.querySelectorAll<HTMLButtonElement>("[data-action^='verify-claim-']").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = Number(btn.dataset.paymentId);
-      runAction(() => client.verifyPayment(orgId, id), locale).then(() =>
+      runAction(() => client.verifyPayment(orgId, id, {}), locale).then(() =>
         renderFinance(client, orgId, locale).catch(() => undefined),
       );
     });
@@ -144,7 +145,7 @@ function renderOverdueSection(
         (item) => `<li class="list-row list-row--action">
           <div class="row-main">
             <b>${escapeHtml(item.due_date)}</b>
-            <span class="${statusToneClass(item.status)}">${statusLabel(item.status, locale)}</span>
+            <span class="${statusToneClass(item.state)}">${statusLabel(item.state, locale)}</span>
             <span class="muted">${formatMoney(item.amount_due)}</span>
           </div>
           <div class="row-actions">
@@ -156,7 +157,7 @@ function renderOverdueSection(
   </section>`;
 }
 
-function renderPendingClaimsSection(
+function renderClaimsSection(
   items: RentPayment[],
   _client: PasayClient,
   _orgId: number,
@@ -169,12 +170,43 @@ function renderPendingClaimsSection(
       .map(
         (claim) => `<li class="list-row list-row--action">
           <div class="row-main">
-            <b>${escapeHtml(claim.submitted_at)}</b>
+            <b>${escapeHtml(formatDate(claim.claimed_at))}</b>
             <span class="${statusToneClass(claim.status)}">${statusLabel(claim.status, locale)}</span>
-            <span class="muted">${formatMoney(claim.amount)}</span>
+            <span class="muted">${formatMoney(claim.claimed_amount)}</span>
           </div>
           <div class="row-actions">
-            <button class="primary-btn" data-action="verify-claim-${claim.id}" data-payment-id="${claim.id}" type="button">${t(locale, "financeVerify")}</button>
+            <a class="ghost-btn" href="#/rent/claims/${claim.id}" data-action="open-claim-${claim.id}" data-payment-id="${claim.id}">${t(locale, "rentClaimTitle")}</a>
+            ${claim.status === "PENDING"
+              ? `<button class="primary-btn" data-action="verify-claim-${claim.id}" data-payment-id="${claim.id}" type="button">${t(locale, "financeVerify")}</button>`
+              : ""}
+          </div>
+        </li>`,
+      )
+      .join("")}</ul>
+  </section>`;
+}
+
+function renderClaimsHistorySection(
+  items: RentPayment[],
+  locale: Locale,
+): string {
+  // Render every non-PENDING claim so the Owner can drill into the
+  // detail view (evidence / verifications / activity / balance) for
+  // any historical claim, not only the ones awaiting verification.
+  const history = items.filter((c) => c.status !== "PENDING");
+  if (history.length === 0) return "";
+  return `<section class="panel">
+    <h3>${t(locale, "financeClaimsHistory")}</h3>
+    <ul class="list">${history
+      .map(
+        (claim) => `<li class="list-row list-row--action">
+          <div class="row-main">
+            <b>${escapeHtml(formatDate(claim.claimed_at))}</b>
+            <span class="${statusToneClass(claim.status)}">${statusLabel(claim.status, locale)}</span>
+            <span class="muted">${formatMoney(claim.claimed_amount)}</span>
+          </div>
+          <div class="row-actions">
+            <a class="ghost-btn" href="#/rent/claims/${claim.id}" data-action="open-claim-${claim.id}" data-payment-id="${claim.id}">${t(locale, "rentClaimTitle")}</a>
           </div>
         </li>`,
       )

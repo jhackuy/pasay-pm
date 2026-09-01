@@ -36,7 +36,7 @@ export async function renderMore(
       ...renewals.map((r) => ({ kind: "RENEWAL", status: r.state, at: r.proposed_start_date, label: `Lease #${r.lease_id}` })),
       ...moveOuts.map((m) => ({ kind: "MOVE_OUT", status: m.state, at: m.requested_at, label: `Lease #${m.lease_id}` })),
       ...expenses.map((e) => ({ kind: "EXPENSE", status: e.status, at: e.submitted_at, label: e.title })),
-      ...claims.map((c) => ({ kind: "RENT", status: c.status, at: c.submitted_at, label: formatMoney(c.amount) })),
+      ...claims.map((c) => ({ kind: "RENT", status: c.status, at: c.claimed_at, label: formatMoney(c.claimed_amount) })),
     ].sort((a, b) => (a.at > b.at ? -1 : a.at < b.at ? 1 : 0));
     const body = `
       <section class="panel">

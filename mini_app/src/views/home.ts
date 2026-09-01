@@ -73,7 +73,7 @@ function renderClaimsList(items: Awaited<ReturnType<PasayClient["listClaims"]>>,
       .map(
         (claim) => `<li>
           <span class="${statusToneClass(claim.status)}">${statusLabel(claim.status, locale)}</span>
-          <span>${formatMoney(claim.amount)}</span>
+          <span>${formatMoney(claim.claimed_amount)}</span>
         </li>`,
       )
       .join("")}

@@ -1,6 +1,6 @@
 /** Tiny hash router — hash-based so the Mini App works without a server.
- *  Routes: #/, #/properties, #/work, #/finance, #/more, #/properties/:id,
- *          #/move-outs/:id
+ *  Routes: #/, #/properties, #/work, #/finance, #/more,
+ *          #/properties/:id, #/move-outs/:id, #/rent/claims/:id
  */
 
 export type Route =
@@ -10,7 +10,8 @@ export type Route =
   | { name: "work" }
   | { name: "finance" }
   | { name: "more" }
-  | { name: "move_out.detail"; moveOutId: number };
+  | { name: "move_out.detail"; moveOutId: number }
+  | { name: "rent_claim.detail"; paymentId: number };
 
 export function parseHash(hash: string): Route {
   const cleaned = hash.replace(/^#/, "").replace(/^\//, "");
@@ -27,6 +28,10 @@ export function parseHash(hash: string): Route {
   if (parts[0] === "move-outs") {
     const id = Number(parts[1]);
     if (Number.isFinite(id)) return { name: "move_out.detail", moveOutId: id };
+  }
+  if (parts[0] === "rent" && parts[1] === "claims") {
+    const id = Number(parts[2]);
+    if (Number.isFinite(id)) return { name: "rent_claim.detail", paymentId: id };
   }
   return { name: "home" };
 }
@@ -47,6 +52,8 @@ export function toHash(route: Route): string {
       return "#/more";
     case "move_out.detail":
       return `#/move-outs/${route.moveOutId}`;
+    case "rent_claim.detail":
+      return `#/rent/claims/${route.paymentId}`;
   }
 }
 

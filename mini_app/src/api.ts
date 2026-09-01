@@ -24,8 +24,12 @@ import type {
   Organization,
   Property,
   RenewalProposal,
+  RentActivity,
+  RentBalance,
   RentDueSchedule,
+  RentEvidence,
   RentPayment,
+  RentVerification,
   Repair,
   SecretaryInvite,
   Task,
@@ -266,41 +270,94 @@ export class PasayClient {
     return this.request(`/leases/${leaseId}/terminate`, { method: "POST", orgId });
   }
 
-  // Rent — due schedules, payments, claims, verifications
-  listDueSchedules(orgId: number): Promise<RentDueSchedule[]> {
-    return this.request("/rent/due-schedules", { orgId });
+  // Rent — due schedules, payments, claims, evidence, verifications,
+  // activity, balance, operation.
+  listDueSchedules(orgId: number, options: { lease_id?: number; state?: string } = {}): Promise<RentDueSchedule[]> {
+    return this.request("/rent/due-schedules", { orgId, query: { lease_id: options.lease_id, state: options.state } });
+  }
+  getDueSchedule(orgId: number, dueScheduleId: number): Promise<RentDueSchedule> {
+    return this.request<RentDueSchedule>(`/rent/due-schedules/${dueScheduleId}`, { orgId });
   }
   listOverdue(orgId: number): Promise<RentDueSchedule[]> {
     return this.request("/rent/overdue", { orgId });
   }
   createDueSchedule(
     orgId: number,
-    body: { lease_id: number; due_date: string; amount_due: string },
+    body: { lease_id: number; period_start: string; due_date: string; amount_due: string },
     idempotencyKey: string,
   ): Promise<RentDueSchedule> {
     return this.request("/rent/due-schedules", {
       method: "POST", orgId, idempotencyKey, body,
     });
   }
-  listClaims(orgId: number): Promise<RentPayment[]> {
-    return this.request("/rent/claims", { orgId });
+  listClaims(orgId: number, options: { status?: string; due_schedule_id?: number } = {}): Promise<RentPayment[]> {
+    return this.request("/rent/claims", { orgId, query: { status: options.status, due_schedule_id: options.due_schedule_id } });
   }
   claimPayment(
     orgId: number,
     dueScheduleId: number,
-    body: { amount: string; note?: string | null },
+    body: { claimed_amount: string; evidence: Array<{ kind: string; reference: string }> },
     idempotencyKey: string,
   ): Promise<RentPayment> {
-    return this.request(
-      `/rent/due-schedules/${dueScheduleId}/claim`,
+    return this.request<RentPayment>(
+      `/rent/due-schedules/${dueScheduleId}/claims`,
       { method: "POST", orgId, idempotencyKey, body },
     );
   }
-  verifyPayment(orgId: number, paymentId: number): Promise<RentPayment> {
-    return this.request(`/rent/claims/${paymentId}/verify`, { method: "POST", orgId });
+  verifyPayment(
+    orgId: number,
+    paymentId: number,
+    body: { verified_amount?: string | null } = {},
+  ): Promise<RentPayment> {
+    return this.request<RentPayment>(
+      `/rent/claims/${paymentId}/verify`,
+      { method: "POST", orgId, body },
+    );
   }
-  remainingBalance(orgId: number, leaseId: number): Promise<{ lease_id: number; amount_due: string; verified_total: string; remaining_balance: string }> {
-    return this.request(`/rent/leases/${leaseId}/remaining-balance`, { orgId });
+  rejectPayment(
+    orgId: number,
+    paymentId: number,
+    reason: string,
+  ): Promise<RentPayment> {
+    return this.request<RentPayment>(
+      `/rent/claims/${paymentId}/reject`,
+      { method: "POST", orgId, body: { reason } },
+    );
+  }
+  reversePayment(
+    orgId: number,
+    paymentId: number,
+    reason: string,
+  ): Promise<RentPayment> {
+    return this.request<RentPayment>(
+      `/rent/claims/${paymentId}/reverse`,
+      { method: "POST", orgId, body: { reason } },
+    );
+  }
+  addEvidence(
+    orgId: number,
+    paymentId: number,
+    body: { kind: string; reference: string },
+  ): Promise<RentEvidence> {
+    return this.request<RentEvidence>(
+      `/rent/claims/${paymentId}/evidence`,
+      { method: "POST", orgId, body },
+    );
+  }
+  listEvidence(orgId: number, paymentId: number): Promise<RentEvidence[]> {
+    return this.request<RentEvidence[]>(`/rent/claims/${paymentId}/evidence`, { orgId });
+  }
+  listVerifications(orgId: number, paymentId: number): Promise<RentVerification[]> {
+    return this.request<RentVerification[]>(`/rent/claims/${paymentId}/verifications`, { orgId });
+  }
+  listActivity(orgId: number, dueScheduleId: number): Promise<RentActivity[]> {
+    return this.request<RentActivity[]>(`/rent/due-schedules/${dueScheduleId}/activity`, { orgId });
+  }
+  getBalance(orgId: number, dueScheduleId: number): Promise<RentBalance> {
+    return this.request<RentBalance>(`/rent/due-schedules/${dueScheduleId}/balance`, { orgId });
+  }
+  getRentOperation(orgId: number, dueScheduleId: number): Promise<Operation> {
+    return this.request<Operation>(`/rent/due-schedules/${dueScheduleId}/operation`, { orgId });
   }
   listOperations(orgId: number, scope: string): Promise<Operation[]> {
     return this.request<Operation[]>(`/${scope}/operations`, { orgId }).catch(
