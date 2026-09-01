@@ -42,7 +42,7 @@ from app.core.permissions import (
     require_org_scope,
 )
 from app.core.time import utcnow
-from app.v1.models.base import LeaseState, OperationState
+from app.v1.models.base import LeaseState, OperationState, UnitStatus
 from app.v1.models.move_out import (
     DEPOSIT_DISPOSITIONS,
     MOVE_OUT_DAMAGE_KINDS,
@@ -59,6 +59,7 @@ from app.v1.models.move_out import (
     OPERATION_SUBJECT_MOVE_OUT,
     TASK_KIND_MOVE_OUT_FOLLOW_UP,
 )
+from app.v1.models.property import Unit
 from app.v1.models.rent_payment import Operation, Task
 from app.v1.models.tenant_lease import Lease
 from app.v1.services.errors import (
@@ -823,18 +824,17 @@ class MoveOutService:
                 f"settlement row missing",
             )
         # 1) Terminate the source lease (if still ACTIVE).
-        if m.lease_id is not None:
-            lease = self.db.get(Lease, m.lease_id)
-            if (
-                lease is not None
-                and lease.org_id == org_id
-                and lease.state == LeaseState.ACTIVE.value
-            ):
-                lease.state = LeaseState.TERMINATED.value
-                lease.archived_at = utcnow()
-        # 2) Flip the unit back to AVAILABLE.
-        if m.lease_id is not None and m.lease is not None and m.lease.unit_id is not None:
-            unit = self.db.get(Unit, m.lease.unit_id)
+        lease = self.db.get(Lease, m.lease_id) if m.lease_id is not None else None
+        if (
+            lease is not None
+            and lease.org_id == org_id
+            and lease.state == LeaseState.ACTIVE.value
+        ):
+            lease.state = LeaseState.TERMINATED.value
+            lease.archived_at = utcnow()
+        # 2) Flip the lease's unit back to AVAILABLE.
+        if lease is not None and lease.unit_id is not None:
+            unit = self.db.get(Unit, lease.unit_id)
             if unit is not None and unit.org_id == org_id:
                 unit.status = UnitStatus.AVAILABLE.value
         # 3) Archive the move-out (history retained, never erased).
