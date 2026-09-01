@@ -49,8 +49,9 @@
 - [x] **T-009** Write `DATA_CONTRACT.md` (schema contract)
   - evidence: `DATA_CONTRACT.md` at repo root (483 lines) — 30 entities with fields / types / FKs / partial-unique indexes
   - file: `DATA_CONTRACT.md`
-- [ ] **T-010** Write `quickstart.md` (dev onboarding commands)
-  - **not done** — original plan referenced `make seed` / `make test` / `make telegram-local` / `make mini-app-dev` / `make deploy-worker`; no `Makefile` and no `quickstart.md` was produced. The CI workflow + `mini_app/package.json` scripts provide an equivalent onboarding path.
+- [x] **T-010** Write `quickstart.md` (dev onboarding commands)
+  - evidence: `specs/001-pasay-rent-rewrite/quickstart.md` documents Python 3.11, PostgreSQL 16 + Alembic, backend/Telegram tests, Mini App build/JSDOM/Playwright, container smoke, the three CI gates, and protected four-stage delivery.
+  - file: `specs/001-pasay-rent-rewrite/quickstart.md`
 
 ## Phase 2 — Backend foundation (V1 package)
 
@@ -270,7 +271,7 @@
 ## Totals (Issue #99 final acceptance)
 
 - Phase 0: 4 tasks (3 done, 1 in-progress)
-- Phase 1: 6 tasks (5 done, 1 not done — `quickstart.md`)
+- Phase 1: 6 tasks (6 done)
 - Phase 2: 7 tasks (6 done, 1 partial — `pyproject.toml` at root not produced; `requirements.txt` is the source of truth)
 - Phase 3: 7 tasks (7 done)
 - Phase 4: 5 tasks (5 done)
@@ -286,14 +287,13 @@
 - Phase 14: 4 tasks (3 done, 1 partial — Mini App Pages deploy step not in `deploy.yml`)
 - Phase 15: 2 tasks (1 done, 1 partial — screenshots not committed)
 
-**Total: 72 tasks. 61 done, 8 partial, 3 not done. All gaps are explicitly noted above with the reason and the alternative path that satisfies the same acceptance contract.**
+**Total: 72 tasks. 62 done, 8 partial, 2 not done. All gaps are explicitly noted above with the reason and the alternative path that satisfies the same acceptance contract.**
 
 ## Unresolved gaps (must be acknowledged in PR review)
 
-1. **`quickstart.md` (T-010) not produced.** The CI workflow + `mini_app/package.json` scripts (`npm run build`, `npm run test:smoke`, `npm run test:browser`) are the actual onboarding path; the OWNER ADDENDUM did not require a separate `quickstart.md`.
-2. **`pyproject.toml` at root not produced (T-011 partial).** `requirements.txt` is the actual dependency manifest. `pasay-telegram-bot/pyproject.toml` exists for that package.
-3. **es / ru i18n bundles (T-053 partial).** The OWNER ADDENDUM requires `zh-CN` (Owner) + `en-US` (Secretary); `es` and `ru` were in the original plan but not required by Issue #99 acceptance.
-4. **`_archive/` evidence preservation (T-003 in-progress).** Legacy governance files were deleted in-place rather than archived. The 8 deleted `.github/workflows/*.yml` files + 29 deleted `alembic/versions/*.py` files are recoverable from `git log --diff-filter=D`.
-5. **`app/seeds/` directory not produced (T-056 / T-057 / T-058 partial).** The V1 bootstrap endpoint and the test fixture cover the same use cases. The OWNER ADDENDUM did not require production seed scripts.
-6. **Cloudflare Pages Mini App deploy step (T-070 partial).** The CI build produces `dist/` as a verifiable artifact. The Pages deploy is not yet wired into `deploy.yml` because the Pages project has not been provisioned.
-7. **PR screenshot artifacts (T-072 not done).** The Playwright browser smoke in CI runs the full Owner console and verifies behavior; PNG snapshots are not stored.
+1. **`pyproject.toml` at root not produced (T-011 partial).** `requirements.txt` is the actual dependency manifest. `pasay-telegram-bot/pyproject.toml` exists for that package.
+2. **es / ru i18n bundles (T-053 partial).** The OWNER ADDENDUM requires `zh-CN` (Owner) + `en-US` (Secretary); `es` and `ru` were in the original plan but not required by Issue #99 acceptance.
+3. **`_archive/` evidence preservation (T-003 in-progress).** Legacy governance files were deleted in-place rather than archived. The 8 deleted `.github/workflows/*.yml` files + 29 deleted `alembic/versions/*.py` files are recoverable from `git log --diff-filter=D`.
+4. **`app/seeds/` directory not produced (T-056 / T-057 / T-058 partial).** The V1 bootstrap endpoint and the test fixture cover the same use cases. The OWNER ADDENDUM did not require production seed scripts.
+5. **Cloudflare Pages Mini App deploy step (T-070 partial).** The CI build produces `dist/` as a verifiable artifact. The Pages deploy is not yet wired into `deploy.yml` because the Pages project has not been provisioned.
+6. **PR screenshot artifacts (T-072 not done).** The Playwright browser smoke in CI runs the full Owner console and verifies behavior; PNG snapshots are not stored.
