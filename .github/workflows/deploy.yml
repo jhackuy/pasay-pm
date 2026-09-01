@@ -1,0 +1,133 @@
+name: rewrite-deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+      NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+      NEON_BRANCH_ID: ${{ vars.NEON_BRANCH_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Alembic upgrade head
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${NEON_API_KEY}" && test -n "${NEON_PROJECT_ID}" && test -n "${NEON_BRANCH_ID}"
+          DATABASE_URL_UNPOOLED="$(python - <<'PY'
+          import json, os, urllib.parse, urllib.request
+          q = urllib.parse.urlencode({
+              'database_name': 'neondb',
+              'role_name': 'neondb_owner',
+              'branch_id': os.environ['NEON_BRANCH_ID'],
+              'pooled': 'false',
+          })
+          req = urllib.request.Request(
+              f"https://console.neon.tech/api/v2/projects/{os.environ['NEON_PROJECT_ID']}/connection_uri?{q}",
+              headers={'Authorization': f"Bearer {os.environ['NEON_API_KEY']}", 'Accept': 'application/json'},
+          )
+          with urllib.request.urlopen(req) as r:
+              data = json.load(r)
+          uri = data.get('uri') or data.get('connection_uri') or (data.get('result') or {}).get('uri')
+          if not uri:
+              raise SystemExit('Neon connection_uri response missing URI')
+          print(uri)
+          PY
+          )"
+          echo "::add-mask::${DATABASE_URL_UNPOOLED}"
+          DATABASE_URL="${DATABASE_URL_UNPOOLED}" alembic upgrade head
+
+  deploy:
+    needs: migrate
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: cloudflare-worker/package-lock.json
+      - name: Wrangler deploy
+        working-directory: cloudflare-worker
+        run: |
+          npm ci --no-audit --no-fund
+          npx wrangler deploy --containers-rollout=immediate
+
+  health:
+    needs: deploy
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Worker health
+        shell: bash
+        run: |
+          set -euo pipefail
+          SUB="$(python - <<'PY'
+          import json, os, urllib.request
+          req = urllib.request.Request(
+              f"https://api.cloudflare.com/client/v4/accounts/{os.environ['CLOUDFLARE_ACCOUNT_ID']}/workers/subdomain",
+              headers={'Authorization': f"Bearer {os.environ['CLOUDFLARE_API_TOKEN']}", 'Accept': 'application/json'},
+          )
+          with urllib.request.urlopen(req) as r:
+              data = json.load(r)
+          sub = (data.get('result') or {}).get('subdomain')
+          if not sub:
+              raise SystemExit('Cloudflare workers subdomain missing')
+          print(sub)
+          PY
+          )"
+          BASE="https://pasay-cloudflare-worker.${SUB}.workers.dev"
+          curl --fail --silent --show-error --retry 6 --retry-delay 5 --max-time 20 "${BASE}/health" | python -c "import json,sys; d=json.load(sys.stdin); assert d.get('worker') == 'alive'"
+
+  telegram-webhook-smoke:
+    needs: health
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+    steps:
+      - name: Telegram webhook auth smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${TELEGRAM_WEBHOOK_SECRET}"
+          SUB="$(python - <<'PY'
+          import json, os, urllib.request
+          req = urllib.request.Request(
+              f"https://api.cloudflare.com/client/v4/accounts/{os.environ['CLOUDFLARE_ACCOUNT_ID']}/workers/subdomain",
+              headers={'Authorization': f"Bearer {os.environ['CLOUDFLARE_API_TOKEN']}", 'Accept': 'application/json'},
+          )
+          with urllib.request.urlopen(req) as r:
+              data = json.load(r)
+          sub = (data.get('result') or {}).get('subdomain')
+          if not sub:
+              raise SystemExit('Cloudflare workers subdomain missing')
+          print(sub)
+          PY
+          )"
+          URL="https://pasay-cloudflare-worker.${SUB}.workers.dev/telegram/webhook"
+          unsigned="$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST -H 'Content-Type: application/json' --data '{}' "${URL}")"
+          test "${unsigned}" = "403"
+          signed="$(curl --silent --output /dev/null --write-out '%{http_code}' -X POST -H 'Content-Type: application/json' -H "X-Telegram-Bot-Api-Secret-Token: ${TELEGRAM_WEBHOOK_SECRET}" --data '{}' "${URL}")"
+          test "${signed}" = "400"

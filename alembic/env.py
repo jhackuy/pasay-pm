@@ -4,7 +4,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from app.config import settings
-from app.models import Base
+from app.v1.models.base import V1Base
 
 config = context.config
 
@@ -21,7 +21,7 @@ _isolated_test_metadata = config.attributes.get("pasay.test.target_metadata", No
 if _isolated_test_metadata is not None:
     target_metadata = _isolated_test_metadata
 else:
-    target_metadata = Base.metadata
+    target_metadata = V1Base.metadata
 
 
 def run_migrations_offline() -> None:
