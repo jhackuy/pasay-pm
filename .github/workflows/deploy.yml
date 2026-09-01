@@ -47,6 +47,45 @@ jobs:
           PY
           )"
           echo "::add-mask::${DATABASE_URL_UNPOOLED}"
+          export DATABASE_URL_UNPOOLED
+          python - <<'PY'
+          import os
+
+          from sqlalchemy import create_engine, text
+
+          EXPECTED_REVISION = "0001_baseline"
+          LEGACY_REVISION = "r3_grant_all_public_20260828"
+
+          engine = create_engine(os.environ["DATABASE_URL_UNPOOLED"])
+          with engine.begin() as connection:
+              has_version_table = connection.execute(
+                  text("SELECT to_regclass('public.alembic_version')")
+              ).scalar()
+              revisions = []
+              if has_version_table:
+                  revisions = list(
+                      connection.execute(
+                          text("SELECT version_num FROM alembic_version ORDER BY version_num")
+                      ).scalars()
+                  )
+
+              if not revisions:
+                  print("No Alembic revision recorded; initializing rewrite baseline.")
+              elif revisions == [EXPECTED_REVISION]:
+                  print("Rewrite baseline already active.")
+              elif revisions == [LEGACY_REVISION]:
+                  print(
+                      "Exact retired PASAY revision detected; "
+                      "replacing legacy schema with rewrite baseline."
+                  )
+                  connection.execute(text("DROP SCHEMA public CASCADE"))
+                  connection.execute(text("CREATE SCHEMA public"))
+              else:
+                  raise SystemExit(
+                      "Refusing destructive reset for unexpected Alembic revisions: "
+                      + ", ".join(revisions)
+                  )
+          PY
           DATABASE_URL="${DATABASE_URL_UNPOOLED}" alembic upgrade head
 
   deploy:
