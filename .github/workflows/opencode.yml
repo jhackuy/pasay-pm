@@ -133,15 +133,6 @@ jobs:
           set -euo pipefail
           opencode github run
 
-      - name: Record native OpenCode token and tool usage
-        if: always()
-        shell: bash
-        run: |
-          set -u
-          if ! opencode stats --project "" --models 5 --tools 10; then
-            echo "OpenCode stats unavailable; observation is non-blocking."
-          fi
-
       - name: Record exact OpenCode runtime version evidence
         if: always()
         shell: bash
