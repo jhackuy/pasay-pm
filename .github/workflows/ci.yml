@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [feature/telegram-ui-v2]
   push:
-    branches: [opencode/issue99-20260829042355]
+    branches: [feature/telegram-ui-v2]
 
 concurrency:
   group: rewrite-ci-${{ github.event.pull_request.head.ref || github.ref_name }}

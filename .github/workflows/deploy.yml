@@ -2,12 +2,24 @@ name: rewrite-deploy
 
 on:
   workflow_dispatch:
+  workflow_run:
+    workflows: [rewrite-ci]
+    types: [completed]
 
 permissions:
   contents: read
 
+concurrency:
+  group: rewrite-deploy-production
+  cancel-in-progress: false
+
 jobs:
   migrate:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_branch == 'feature/telegram-ui-v2')
     runs-on: ubuntu-latest
     environment: production
     env:
@@ -16,6 +28,8 @@ jobs:
       NEON_BRANCH_ID: ${{ vars.NEON_BRANCH_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -131,6 +145,8 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
