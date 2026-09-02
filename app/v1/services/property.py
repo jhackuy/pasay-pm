@@ -38,9 +38,12 @@ from app.v1.services.errors import (
 # Both the service-layer guard (this module) and the PostgreSQL
 # BEFORE INSERT/UPDATE trigger (alembic 0003_units_cap) reference the
 # same constant. The trigger is the source of truth and the race-safe
-# enforcement boundary; this constant lets the service raise a clean
-# ``ConflictError`` (HTTP 409) before commit, instead of letting the
-# raw ``IntegrityError`` bubble up to the caller.
+# enforcement boundary — it locks the parent ``v1_properties`` row
+# FOR UPDATE before counting so concurrent writers serialize per
+# target property under PostgreSQL's default READ COMMITTED. This
+# guard exists so the service can raise a clean ``ConflictError``
+# (HTTP 409) before commit instead of letting the raw
+# ``IntegrityError`` bubble up to the caller.
 UNITS_PER_PROPERTY_CAP = 15
 
 
@@ -69,8 +72,11 @@ def assert_units_within_cap(
 
     Idempotent: returns silently when the property is below the cap.
     The PostgreSQL trigger ``trg_v1_units_units_per_property_cap`` is
-    the ultimate enforcement boundary (race-safe, applied uniformly
-    to every code path). This guard exists so the application can
+    the ultimate enforcement boundary — it locks the parent
+    ``v1_properties`` row FOR UPDATE before counting, so concurrent
+    INSERTs/UPDATEs targeting the same property serialize under
+    PostgreSQL's default READ COMMITTED and the 16th unit is
+    rejected atomically. This guard exists so the application can
     surface a domain-shaped error code before the SQL statement is
     even issued.
     """
@@ -171,8 +177,11 @@ def create_unit(
 
     Issue #112 GAP-P1: refuses to create when the target property
     already has ``UNITS_PER_PROPERTY_CAP`` (15) units. The PostgreSQL
-    trigger ``trg_v1_units_units_per_property_cap`` is the race-safe
-    authority; this guard produces a clean ``ConflictError``.
+    trigger ``trg_v1_units_units_per_property_cap`` is the
+    authoritative race-safe enforcer — it locks the parent property
+    row FOR UPDATE before counting so concurrent INSERTs serialize
+    per target property; this guard produces a clean
+    ``ConflictError`` in the common case.
     """
     if not isinstance(unit_number, str) or not unit_number.strip():
         raise ValidationError(
@@ -337,9 +346,12 @@ class PropertyService:
             )
         # Issue #112 GAP-P1: enforce Units <= 15 per property before
         # the INSERT. The PostgreSQL trigger
-        # ``trg_v1_units_units_per_property_cap`` is the race-safe
-        # authority; this guard exists to surface a clean
-        # ``ConflictError`` → HTTP 409 in the common case.
+        # ``trg_v1_units_units_per_property_cap`` is the
+        # authoritative race-safe enforcer (locks the parent
+        # ``v1_properties`` row FOR UPDATE before counting so
+        # concurrent writers serialize); this guard exists to
+        # surface a clean ``ConflictError`` → HTTP 409 in the
+        # common case.
         assert_units_within_cap(
             self.db, org_id=org_id, property_id=property_id,
         )
