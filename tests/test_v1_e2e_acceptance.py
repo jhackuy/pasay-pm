@@ -181,21 +181,6 @@ def _get(client, workspace, path, *, headers):
     return client.get(path, params={"org_id": workspace.org_id}, headers=headers)
 
 
-def _op_state(client, workspace, *, headers, kind, subject_id):
-    """Read the Operation row directly via the V1 API to avoid
-    coupling this acceptance layer to ORM internals."""
-    response = _get(
-        client,
-        workspace,
-        f"/api/v1/operations/{kind}/{subject_id}",
-        headers=headers,
-    )
-    if response.status_code == 404:
-        # Some domains expose their own /operation sub-route; fall back.
-        return None
-    return response.json()
-
-
 # =====================================================================
 # Domain 1 — Rent lifecycle
 # Issue #112 frozen path:
@@ -368,16 +353,14 @@ class TestRentIssue112Lifecycle:
         assert "PAID" in kinds, kinds
 
         # Money never crossed the wire as a float (AGENTS.md §3).
-        for payload in (first_claim.json(), second_claim.json(),
-                        final_balance, schedule_final):
-            for key, value in (
-                ("claimed_amount", first_claim.json()["claimed_amount"]),
-                ("claimed_amount", second_claim.json()["claimed_amount"]),
-                ("verified_total", final_balance["verified_total"]),
-                ("remaining_balance", final_balance["remaining_balance"]),
-                ("amount_due", schedule_final["amount_due"]),
-            ):
-                assert isinstance(value, str), (key, value)
+        for key, value in (
+            ("claimed_amount", first_claim.json()["claimed_amount"]),
+            ("claimed_amount", second_claim.json()["claimed_amount"]),
+            ("verified_total", final_balance["verified_total"]),
+            ("remaining_balance", final_balance["remaining_balance"]),
+            ("amount_due", schedule_final["amount_due"]),
+        ):
+            assert isinstance(value, str), (key, value)
 
 
 # =====================================================================
