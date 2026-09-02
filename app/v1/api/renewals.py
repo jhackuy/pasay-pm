@@ -33,11 +33,19 @@ from app.v1.schemas.renewal import (
     OperationRead,
     RenewalActivityRead,
     RenewalCancelRequest,
+    RenewalCloseRequest,
+    RenewalContactRequest,
     RenewalDecisionRequest,
     RenewalExecuteResponse,
     RenewalFollowUpCreate,
+    RenewalOwnerDecisionRequest,
     RenewalProposeRequest,
     RenewalRead,
+    RenewalResponseRequest,
+    RenewalScanRead,
+    RenewalScanRequest,
+    RenewalScanResponse,
+    RenewalVerifyRequest,
     TaskRead,
 )
 from app.v1.services.errors import (
@@ -324,3 +332,183 @@ def complete_follow_up(
             principal, org_id=org_id, task_id=task_id,
         )
     return TaskRead.model_validate(task)
+
+
+# ====================================================================
+# 7-stage pipeline (Issue #112 §"Lease Renewal")
+#
+#   DETECT_EXPIRY → CONTACT_TENANT → TENANT_RESPONSE →
+#   OWNER_DECISION → EXECUTE → VERIFY → CLOSED
+# ====================================================================
+
+
+# ---- DETECT_EXPIRY (system scan) ------------------------------------
+
+
+@router.post(
+    "/scan",
+    response_model=RenewalScanResponse,
+)
+def scan_for_upcoming_renewals(
+    body: RenewalScanRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalScanResponse:
+    """DETECT_EXPIRY. Pure-read scan within ``scan_window_days``.
+
+    Idempotent on ``(org_id, source_lease_id, scan_window_days)``:
+    re-scanning with the same window yields the same rows, with a
+    ``SCAN_REPLAYED`` activity logged.
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        result = service.detect_upcoming(
+            principal,
+            org_id=org_id,
+            scan_window_days=body.scan_window_days,
+            as_of=body.as_of,
+            lease_id=body.lease_id,
+        )
+    return RenewalScanResponse(
+        scan_window_days=result.scan_window_days,
+        detected=[RenewalRead.model_validate(r) for r in result.detected],
+        replayed=[RenewalRead.model_validate(r) for r in result.replayed],
+    )
+
+
+# ---- CONTACT_TENANT --------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/contact", response_model=RenewalRead,
+)
+def contact_tenant(
+    renewal_id: int,
+    body: RenewalContactRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """DETECT_EXPIRY → CONTACT_TENANT."""
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.contact_tenant(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            contact_method=body.contact_method,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- TENANT_RESPONSE -------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/respond", response_model=RenewalRead,
+)
+def record_tenant_response(
+    renewal_id: int,
+    body: RenewalResponseRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """CONTACT_TENANT → TENANT_RESPONSE."""
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.record_response(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            tenant_response=body.tenant_response,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- OWNER_DECISION --------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/owner-decide", response_model=RenewalRead,
+)
+def record_owner_decision(
+    renewal_id: int,
+    body: RenewalOwnerDecisionRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """TENANT_RESPONSE → OWNER_DECISION."""
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.decide_owner(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            owner_decision=body.owner_decision,
+            proposed_start_date=body.proposed_start_date,
+            proposed_end_date=body.proposed_end_date,
+            proposed_monthly_rent=body.proposed_monthly_rent,
+            proposed_deposit=body.proposed_deposit,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- VERIFY ----------------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/verify", response_model=RenewalRead,
+)
+def verify_execution(
+    renewal_id: int,
+    body: RenewalVerifyRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """EXECUTE → VERIFY. Owner-only post-execution confirmation."""
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.verify_execution(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- CLOSED (terminal) -----------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/close", response_model=RenewalRead,
+)
+def close_renewal(
+    renewal_id: int,
+    body: RenewalCloseRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """VERIFY → CLOSED. Terminal, Operation resolves.
+
+    Accepts ``VERIFY`` (post-verification normal close) and the
+    early-exit paths from TENANT_RESPONSE / OWNER_DECISION when
+    the tenant or owner decides TERMINATE.
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.close(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
