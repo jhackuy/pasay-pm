@@ -50,6 +50,9 @@ jobs:
       - name: Telegram group silence and business intent
         working-directory: pasay-telegram-bot
         run: pytest -q tests/test_group_silence_and_intent.py
+      - name: Telegram button determinism
+        working-directory: pasay-telegram-bot
+        run: pytest -q tests/test_button_determinism.py
       - name: Telegram 3x2 UX contract
         working-directory: pasay-telegram-bot
         run: >-
