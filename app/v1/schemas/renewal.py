@@ -84,6 +84,85 @@ class RenewalFollowUpCreate(BaseModel):
     due_at: Optional[datetime] = None
 
 
+# ---- 7-stage pipeline (Issue #112 §"Lease Renewal") ----------------
+
+
+class RenewalScanRequest(BaseModel):
+    """DETECT_EXPIRY. System-side scan of upcoming lease expiries."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan_window_days: int = Field(gt=0, le=365)
+    as_of: Optional[date] = None
+    lease_id: Optional[int] = Field(default=None, gt=0)
+
+
+class RenewalScanRead(BaseModel):
+    """Echo of a single renewal row produced / replayed by a scan."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    renewal: RenewalRead
+    replayed: bool
+
+
+class RenewalScanResponse(BaseModel):
+    """Scan result aggregate."""
+
+    scan_window_days: int
+    detected: list[RenewalRead]
+    replayed: list[RenewalRead]
+
+
+class RenewalContactRequest(BaseModel):
+    """DETECT_EXPIRY → CONTACT_TENANT."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contact_method: str = Field(min_length=1, max_length=40)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalResponseRequest(BaseModel):
+    """CONTACT_TENANT → TENANT_RESPONSE."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_response: str = Field(
+        min_length=1, max_length=16,
+    )
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalOwnerDecisionRequest(BaseModel):
+    """TENANT_RESPONSE → OWNER_DECISION. Optional term overrides."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_decision: str = Field(min_length=1, max_length=16)
+    proposed_start_date: Optional[date] = None
+    proposed_end_date: Optional[date] = None
+    proposed_monthly_rent: Optional[MoneyDecimal] = None
+    proposed_deposit: Optional[MoneyDecimal] = None
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalVerifyRequest(BaseModel):
+    """EXECUTE → VERIFY. Owner's post-execution confirmation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalCloseRequest(BaseModel):
+    """VERIFY → CLOSED. Terminal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
 # ---- read ------------------------------------------------------------
 
 
@@ -121,7 +200,21 @@ class RenewalRead(BaseModel):
     decided_at: Optional[datetime] = None
     decision_reason: Optional[str] = None
     executed_at: Optional[datetime] = None
-    idempotency_key: str
+    idempotency_key: Optional[str] = None
+
+    # ---- 7-stage pipeline additions (Issue #112 §"Lease Renewal") ----
+    scan_window_days: Optional[int] = None
+    scan_key: Optional[str] = None
+    contact_method: Optional[str] = None
+    contacted_at: Optional[datetime] = None
+    tenant_response: Optional[str] = None
+    tenant_response_at: Optional[datetime] = None
+    owner_decision: Optional[str] = None
+    owner_decision_at: Optional[datetime] = None
+    verified_at: Optional[datetime] = None
+    verified_by_user_id: Optional[int] = None
+    closed_at: Optional[datetime] = None
+    closed_by_user_id: Optional[int] = None
 
 
 class RenewalActivityRead(BaseModel):
@@ -156,11 +249,19 @@ __all__ = [
     "OperationRead",
     "RenewalActivityRead",
     "RenewalCancelRequest",
+    "RenewalCloseRequest",
+    "RenewalContactRequest",
     "RenewalDecisionRequest",
     "RenewalExecuteRequest",
     "RenewalExecuteResponse",
     "RenewalFollowUpCreate",
+    "RenewalOwnerDecisionRequest",
     "RenewalProposeRequest",
     "RenewalRead",
+    "RenewalResponseRequest",
+    "RenewalScanRead",
+    "RenewalScanRequest",
+    "RenewalScanResponse",
+    "RenewalVerifyRequest",
     "TaskRead",
 ]
