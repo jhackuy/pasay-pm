@@ -62,78 +62,8 @@ jobs:
           )"
           echo "::add-mask::${DATABASE_URL_UNPOOLED}"
           export DATABASE_URL_UNPOOLED
-          python - <<'PY'
-          import os
-
-          from sqlalchemy import create_engine, text
-
-          EXPECTED_REVISION = "0001_baseline"
-          LEGACY_REVISION = "r3_grant_all_public_20260828"
-
-          engine = create_engine(os.environ["DATABASE_URL_UNPOOLED"])
-          with engine.begin() as connection:
-              has_version_table = connection.execute(
-                  text("SELECT to_regclass('public.alembic_version')")
-              ).scalar()
-              revisions = []
-              if has_version_table:
-                  revisions = list(
-                      connection.execute(
-                          text("SELECT version_num FROM alembic_version ORDER BY version_num")
-                      ).scalars()
-                  )
-
-              if not revisions:
-                  print("No Alembic revision recorded; initializing rewrite baseline.")
-              elif revisions == [EXPECTED_REVISION]:
-                  print("Rewrite baseline already active.")
-              elif revisions == [LEGACY_REVISION]:
-                  print(
-                      "Exact retired PASAY revision detected; "
-                      "replacing legacy schema with rewrite baseline."
-                  )
-                  # Preserve the public schema owner, ACLs, and default
-                  # privileges. Remove only legacy relation objects so the
-                  # rewrite baseline can create its independent schema.
-                  relations = connection.execute(
-                      text(
-                          """
-                          SELECT c.relkind, c.relname
-                          FROM pg_class AS c
-                          JOIN pg_namespace AS n ON n.oid = c.relnamespace
-                          WHERE n.nspname = 'public'
-                            AND c.relkind IN ('v', 'm', 'r', 'p', 'f', 'S')
-                          ORDER BY CASE c.relkind
-                              WHEN 'v' THEN 1
-                              WHEN 'm' THEN 2
-                              WHEN 'f' THEN 3
-                              WHEN 'p' THEN 4
-                              WHEN 'r' THEN 5
-                              WHEN 'S' THEN 6
-                          END
-                          """
-                      )
-                  ).all()
-                  object_types = {
-                      "v": "VIEW",
-                      "m": "MATERIALIZED VIEW",
-                      "r": "TABLE",
-                      "p": "TABLE",
-                      "f": "FOREIGN TABLE",
-                      "S": "SEQUENCE",
-                  }
-                  quote = connection.dialect.identifier_preparer.quote
-                  for relkind, relname in relations:
-                      connection.exec_driver_sql(
-                          f"DROP {object_types[relkind]} IF EXISTS "
-                          f"public.{quote(relname)} CASCADE"
-                      )
-              else:
-                  raise SystemExit(
-                      "Refusing destructive reset for unexpected Alembic revisions: "
-                      + ", ".join(revisions)
-                  )
-          PY
+          python scripts/migration_preflight.py \
+            --database-url "${DATABASE_URL_UNPOOLED}"
           DATABASE_URL="${DATABASE_URL_UNPOOLED}" alembic upgrade head
 
   deploy:
