@@ -10,6 +10,17 @@ The closure invariant — Renewal EXECUTES only via the
 terminates the source lease, creates the new lease, activates it, flips
 the unit status, and resolves the linked Operation — lives in the
 service.
+
+The router exposes the frozen Issue #112 §"Lease Renewal" 7-stage
+lifecycle as a separate surface:
+
+    POST /api/v1/renewals/scan                      -> DETECT_EXPIRY
+    POST /api/v1/renewals/proposals/{id}/contact    -> CONTACT_TENANT
+    POST /api/v1/renewals/proposals/{id}/respond    -> TENANT_RESPONSE
+    POST /api/v1/renewals/proposals/{id}/owner-decide -> OWNER_DECISION
+    POST /api/v1/renewals/proposals/{id}/execute    -> EXECUTED (legacy)
+    POST /api/v1/renewals/proposals/{id}/verify     -> VERIFY
+    POST /api/v1/renewals/proposals/{id}/close      -> CLOSED
 """
 from __future__ import annotations
 
@@ -33,11 +44,19 @@ from app.v1.schemas.renewal import (
     OperationRead,
     RenewalActivityRead,
     RenewalCancelRequest,
+    RenewalCloseRequest,
+    RenewalContactRequest,
     RenewalDecisionRequest,
     RenewalExecuteResponse,
     RenewalFollowUpCreate,
+    RenewalOwnerDecisionRequest,
     RenewalProposeRequest,
     RenewalRead,
+    RenewalResponseRequest,
+    RenewalScanRead,
+    RenewalScanRequest,
+    RenewalScanResponse,
+    RenewalVerifyRequest,
     TaskRead,
 )
 from app.v1.services.errors import (
@@ -324,3 +343,203 @@ def complete_follow_up(
             principal, org_id=org_id, task_id=task_id,
         )
     return TaskRead.model_validate(task)
+
+
+# =========================================================================
+# Frozen Issue #112 §"Lease Renewal" 7-stage pipeline endpoints
+# DETECT_EXPIRY → CONTACT_TENANT → TENANT_RESPONSE → OWNER_DECISION
+#     → EXECUTED → VERIFY → CLOSED
+# =========================================================================
+
+
+# ---- DETECT_EXPIRY (system scan entry point) --------------------------
+
+
+@router.post(
+    "/scan",
+    response_model=RenewalScanResponse,
+)
+def scan_renewals(
+    body: RenewalScanRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalScanResponse:
+    """Run the renewal scan: emit (or replay) one ``DETECT_EXPIRY``
+    renewal per ACTIVE lease whose ``end_date`` is within the next
+    ``window_days`` days.
+
+    Idempotent on ``(org_id, source_lease_id, scan_window_days)``:
+    re-running the scan for the same window never duplicates a
+    renewal. Replays are returned with ``is_new=False``.
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        result = service.detect_upcoming(
+            principal,
+            org_id=org_id,
+            window_days=body.window_days,
+        )
+    return RenewalScanResponse(
+        window_days=body.window_days,
+        replayed=result.replayed,
+        count=len(result.renewals),
+        renewals=[
+            RenewalScanRead(
+                id=d.renewal.id,
+                state=d.renewal.state,
+                source_lease_id=d.renewal.source_lease_id,
+                proposed_start_date=d.renewal.proposed_start_date,
+                proposed_end_date=d.renewal.proposed_end_date,
+                scan_window_days=d.renewal.scan_window_days,
+                is_new=d.is_new,
+            )
+            for d in result.renewals
+        ],
+    )
+
+
+# ---- CONTACT_TENANT ---------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/contact",
+    response_model=RenewalRead,
+)
+def contact_tenant(
+    renewal_id: int,
+    body: RenewalContactRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """``DETECT_EXPIRY → CONTACT_TENANT``."""
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.contact_tenant(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            channel=body.channel,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- TENANT_RESPONSE --------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/respond",
+    response_model=RenewalRead,
+)
+def record_response(
+    renewal_id: int,
+    body: RenewalResponseRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """``CONTACT_TENANT → TENANT_RESPONSE``.
+
+    ``response`` is one of ``RENEW``, ``TERMINATE``, ``DEFER``.
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.record_response(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            response=body.response,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- OWNER_DECISION ---------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/owner-decide",
+    response_model=RenewalRead,
+)
+def decide_owner(
+    renewal_id: int,
+    body: RenewalOwnerDecisionRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """``TENANT_RESPONSE → OWNER_DECISION`` (or ``REJECTED`` if
+    ``decision=TERMINATE``).
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.decide_owner(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            decision=body.decision,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- VERIFY -----------------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/verify",
+    response_model=RenewalRead,
+)
+def verify_execution(
+    renewal_id: int,
+    body: RenewalVerifyRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """``EXECUTED → VERIFY``. Owner confirms the executed change
+    matches the recorded decision. Idempotent.
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.verify_execution(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)
+
+
+# ---- CLOSED -----------------------------------------------------------
+
+
+@router.post(
+    "/proposals/{renewal_id}/close",
+    response_model=RenewalRead,
+)
+def close_renewal(
+    renewal_id: int,
+    body: RenewalCloseRequest,
+    org_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> RenewalRead:
+    """``VERIFY → CLOSED``. Terminal administrative closure.
+
+    Resolves the linked Operation when the renewal was created via
+    the new pipeline (DETECT_EXPIRY → ... → CLOSED). Legacy renewals
+    keep their existing semantics (operation already resolved at
+    ``EXECUTED``).
+    """
+    service = LeaseRenewalService(db)
+    with _mapped_errors():
+        renewal = service.close(
+            principal,
+            org_id=org_id,
+            renewal_id=renewal_id,
+            note=body.note,
+        )
+    return RenewalRead.model_validate(renewal)

@@ -22,11 +22,48 @@ AGENTS.md §4 invariants enforced here:
   lease-state mutations to avoid duplicate state machines.
 - ``Reminder != Completion``. ``complete_follow_up`` NEVER resolves the
   Operation.
+
+Frozen Issue #112 §"Lease Renewal" 7-stage pipeline
+===================================================
+
+The class exposes both the legacy 5-state proposal pipeline (PROPOSED
+→ APPROVED → EXECUTED) and the frozen Issue #112 pipeline
+DETECT_EXPIRY → CONTACT_TENANT → TENANT_RESPONSE → OWNER_DECISION →
+EXECUTED → VERIFY → CLOSED. The two pipelines share the same EXECUTED
+closure gate (the only place that mutates the source lease and creates
+the new lease).
+
+Method → state transition map (frozen pipeline):
+
+- ``detect_upcoming(window_days)`` → system emits a fresh renewal at
+  ``DETECT_EXPIRY`` for each ACTIVE lease whose ``end_date`` falls in
+  the next ``window_days`` days. Idempotent on
+  ``(org_id, source_lease_id, scan_window_days)``: a replay returns the
+  existing row with ``replayed=True``.
+- ``contact_tenant(renewal_id, channel=None, note=None)`` → DETECT_EXPIRY
+  → CONTACT_TENANT. Logs ``TENANT_CONTACTED`` activity with the channel
+  (e.g. "telegram") and an optional human note.
+- ``record_response(renewal_id, response=...)`` → CONTACT_TENANT →
+  TENANT_RESPONSE. ``response`` ∈ {RENEW, TERMINATE, DEFER}.
+- ``decide_owner(renewal_id, decision=..., note=None)`` → TENANT_RESPONSE
+  → OWNER_DECISION. ``decision`` ∈ {RENEW, TERMINATE, DEFER}.
+  - decision=RENEW → owner has decided to renew (must then be EXECUTED).
+  - decision=TERMINATE → transitions to REJECTED (terminal, source lease
+    untouched).
+  - decision=DEFER → stays in OWNER_DECISION; no business effect.
+- ``verify_execution(renewal_id, note=None)`` → EXECUTED → VERIFY. Owner
+  confirms the executed change matches the decision. Idempotent.
+- ``close(renewal_id, note=None)`` → VERIFY → CLOSED. Terminal
+  administrative closure; resolves the linked Operation.
+
+The legacy 5-state pipeline (``propose``/``approve``/``reject``/``execute``/
+``cancel``) is unchanged. The two pipelines converge on the EXECUTED
+state and diverge again at VERIFY/CLOSED.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -49,9 +86,13 @@ from app.v1.models.base import LeaseState, OperationState
 from app.v1.models.renewal import (
     OPERATION_KIND_LEASE_RENEWAL,
     OPERATION_SUBJECT_LEASE_RENEWAL,
+    RENEWAL_OWNER_DECISIONS,
+    RENEWAL_TENANT_RESPONSES,
     RenewalActivity,
     RenewalActivityKind,
+    RenewalOwnerDecision,
     RenewalState,
+    RenewalTenantResponse,
     TASK_KIND_RENEWAL_FOLLOW_UP,
 )
 from app.v1.models.rent_payment import Operation, Task
@@ -85,6 +126,96 @@ class RenewalProposeResult:
 from app.v1.models.renewal import LeaseRenewal  # noqa: E402
 
 
+@dataclass(frozen=True)
+class RenewalScanResult:
+    """Result of ``detect_upcoming`` (system scan).
+
+    ``replayed=True`` means an identical
+    ``(org_id, source_lease_id, scan_window_days)`` triple was already
+    stored; the existing renewal is returned.
+
+    ``detected`` lists every renewal that was created or replayed during
+    this scan call, so the caller (Telegram / scheduler / API) can echo
+    the actual work it accomplished back to the user.
+    """
+
+    replayed: bool
+    renewals: list["RenewalDetection"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RenewalDetection:
+    """One row emitted (or replayed) by ``detect_upcoming``."""
+
+    renewal: LeaseRenewal
+    is_new: bool
+
+
+# ---------- frozen 7-stage pipeline state machine helpers ---------------
+
+
+# State groups used to guard transitions cleanly without duplicating
+# long if/else chains across the service methods.
+_NEW_PIPELINE_STATES: frozenset[str] = frozenset({
+    RenewalState.DETECT_EXPIRY.value,
+    RenewalState.CONTACT_TENANT.value,
+    RenewalState.TENANT_RESPONSE.value,
+    RenewalState.OWNER_DECISION.value,
+    RenewalState.EXECUTED.value,
+    RenewalState.VERIFY.value,
+    RenewalState.CLOSED.value,
+})
+
+
+_LEGACY_PROPOSAL_STATES: frozenset[str] = frozenset({
+    RenewalState.PROPOSED.value,
+    RenewalState.APPROVED.value,
+})
+
+
+_TERMINAL_STATES: frozenset[str] = frozenset({
+    RenewalState.EXECUTED.value,
+    RenewalState.REJECTED.value,
+    RenewalState.CANCELLED.value,
+    RenewalState.CLOSED.value,
+})
+
+
+def _is_new_pipeline_state(state: str) -> bool:
+    return state in _NEW_PIPELINE_STATES
+
+
+def _is_legacy_proposal_state(state: str) -> bool:
+    return state in _LEGACY_PROPOSAL_STATES
+
+
+def _is_terminal(state: str) -> bool:
+    return state in _TERMINAL_STATES
+
+
+def _validate_tenant_response(response: str) -> str:
+    """Coerce + validate a tenant-response vocabulary value."""
+    try:
+        return RenewalTenantResponse(response).value
+    except ValueError as exc:
+        raise ValidationError(
+            f"tenant_response must be one of {RENEWAL_TENANT_RESPONSES}; "
+            f"got {response!r}",
+        ) from exc
+
+
+def _validate_owner_decision(decision: str) -> str:
+    """Coerce + validate an owner-decision vocabulary value."""
+    try:
+        return RenewalOwnerDecision(decision).value
+    except ValueError as exc:
+        raise ValidationError(
+            f"owner_decision must be one of {RENEWAL_OWNER_DECISIONS}; "
+            f"got {decision!r}",
+        ) from exc
+
+
+# Reopen the original dataclass block after the new helpers above.
 @dataclass(frozen=True)
 class RenewalExecuteResult:
     """Result of executing an APPROVED renewal."""
@@ -477,7 +608,13 @@ class LeaseRenewalService:
         org_id: int,
         renewal_id: int,
     ) -> RenewalExecuteResult:
-        """APPROVED → EXECUTED. The single closure gate.
+        """APPROVED → EXECUTED (or OWNER_DECISION → EXECUTED for the
+        frozen 7-stage pipeline).
+
+        The single closure gate. Accepts renewals created via either
+        the legacy 5-state proposal pipeline (PROPOSED → APPROVED) or
+        the frozen 7-stage pipeline (DETECT_EXPIRY → CONTACT_TENANT →
+        TENANT_RESPONSE → OWNER_DECISION).
 
         Action:
           1. Verify no overlapping ACTIVE lease on the same unit at the
@@ -488,17 +625,22 @@ class LeaseRenewalService:
           4. Activate the new lease (DRAFT → ACTIVE, unit becomes
              OCCUPIED).
           5. Attach ``renewal.new_lease_id`` + ``renewal.executed_at``.
-          6. Resolve the Operation. Cancel open follow-ups.
+          6. Resolve the Operation (legacy path) OR leave it OPEN
+             (new pipeline; CLOSED will resolve it).
         """
         require_org_scope(principal, org_id)
         _ensure_role(principal, Role.OWNER, Role.SECRETARY)
         renewal = self.get_renewal(
             principal, org_id=org_id, renewal_id=renewal_id,
         )
-        if renewal.state != RenewalState.APPROVED.value:
+        if renewal.state not in (
+            RenewalState.APPROVED.value,
+            RenewalState.OWNER_DECISION.value,
+        ):
             raise ConflictError(
                 f"renewal {renewal_id} cannot be executed from "
-                f"state {renewal.state!r} (must be APPROVED first)",
+                f"state {renewal.state!r} "
+                f"(must be APPROVED or OWNER_DECISION first)",
             )
         source_lease = self.db.get(Lease, renewal.source_lease_id)
         if (
@@ -583,6 +725,8 @@ class LeaseRenewalService:
         # 4) Attach to renewal + state transition.
         renewal.new_lease_id = new_lease_obj.id
         renewal.executed_at = utcnow()
+        # Capture the prior state so we know which pipeline we are in.
+        prior_state = renewal.state
         renewal.state = RenewalState.EXECUTED.value
         _log_activity(
             self.db,
@@ -591,13 +735,16 @@ class LeaseRenewalService:
             kind=RenewalActivityKind.EXECUTED,
             actor_user_id=principal.user_id,
         )
-        # 5) Resolve Operation.
+        # 5) Resolve Operation only on the legacy path (APPROVED → EXECUTED).
+        # The frozen 7-stage pipeline (OWNER_DECISION → EXECUTED) keeps
+        # the Operation OPEN until CLOSED; ``close`` will resolve it.
         op = self.get_operation(
             principal, org_id=org_id, renewal_id=renewal_id,
         )
-        _close_operation(
-            self.db, operation=op, actor_user_id=principal.user_id,
-        )
+        if prior_state == RenewalState.APPROVED.value:
+            _close_operation(
+                self.db, operation=op, actor_user_id=principal.user_id,
+            )
         self.db.commit()
         self.db.refresh(new_lease_obj)
         return RenewalExecuteResult(renewal=renewal, new_lease=new_lease_obj)
@@ -763,9 +910,419 @@ class LeaseRenewalService:
         self.db.commit()
         return task
 
+    # =========================================================================
+    # Frozen Issue #112 §"Lease Renewal" 7-stage pipeline
+    # DETECT_EXPIRY → CONTACT_TENANT → TENANT_RESPONSE → OWNER_DECISION
+    #     → EXECUTED → VERIFY → CLOSED
+    # =========================================================================
+
+    def detect_upcoming(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        window_days: int,
+        as_of: Optional[date] = None,
+    ) -> RenewalScanResult:
+        """System scan: emit one ``DETECT_EXPIRY`` renewal per ACTIVE lease
+        whose ``end_date`` falls in the next ``window_days`` days.
+
+        Idempotent on ``(org_id, source_lease_id, scan_window_days)``:
+        a replay returns the existing row (flagged ``is_new=False``).
+
+        ``as_of`` defaults to today (UTC); provided so tests / cron
+        jobs can drive the scan with a deterministic clock without
+        monkey-patching ``utcnow``.
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER, Role.SECRETARY)
+        if window_days <= 0:
+            raise ValidationError(
+                "window_days must be a positive integer",
+            )
+        today = as_of or utcnow().date()
+        cutoff = today + timedelta(days=window_days)
+        # 1) Find ACTIVE leases inside the window.
+        leases_in_window: list[Lease] = (
+            self.db.query(Lease)
+            .filter(
+                Lease.org_id == org_id,
+                Lease.state == LeaseState.ACTIVE.value,
+                Lease.end_date >= today,
+                Lease.end_date <= cutoff,
+            )
+            .order_by(Lease.id.asc())
+            .all()
+        )
+        detections: list[RenewalDetection] = []
+        any_replay = False
+        for source_lease in leases_in_window:
+            existing = (
+                self.db.query(LeaseRenewal)
+                .filter(
+                    LeaseRenewal.org_id == org_id,
+                    LeaseRenewal.source_lease_id == source_lease.id,
+                    LeaseRenewal.scan_window_days == window_days,
+                )
+                .one_or_none()
+            )
+            if existing is not None:
+                _log_activity(
+                    self.db,
+                    org_id=org_id,
+                    renewal_id=existing.id,
+                    kind=RenewalActivityKind.SCAN_REPLAYED,
+                    actor_user_id=principal.user_id,
+                    detail=f"window={window_days}",
+                )
+                detections.append(
+                    RenewalDetection(renewal=existing, is_new=False),
+                )
+                any_replay = True
+                continue
+            # Default proposed terms: keep the same rent + deposit, push
+            # the renewal 1 year past the current end_date. The OWNER
+            # later adjusts the proposed terms during OWNER_DECISION
+            # before calling ``execute``.
+            proposed_start = source_lease.end_date
+            proposed_end = proposed_start + timedelta(days=365)
+            renewal = LeaseRenewal(
+                org_id=org_id,
+                source_lease_id=source_lease.id,
+                new_lease_id=None,
+                state=RenewalState.DETECT_EXPIRY.value,
+                proposed_start_date=proposed_start,
+                proposed_end_date=proposed_end,
+                proposed_monthly_rent=Decimal(source_lease.monthly_rent),
+                proposed_deposit=Decimal(source_lease.deposit),
+                proposed_by_user_id=principal.user_id,
+                idempotency_key=_scan_idempotency_key(
+                    source_lease.id, window_days,
+                ),
+                payload_hash=_scan_payload_hash(
+                    source_lease.id, window_days, proposed_start, proposed_end,
+                ),
+                scan_window_days=window_days,
+                scan_key=f"{source_lease.id}:{window_days}",
+            )
+            self.db.add(renewal)
+            self.db.flush()
+            # The Operation is created up-front (mirror of ``propose``):
+            # DETECT_EXPIRY is the first business state, so the Operation
+            # is born here and remains OPEN through EXECUTED → VERIFY,
+            # resolving only at CLOSED (or REJECTED / CANCELLED).
+            op = Operation(
+                org_id=org_id,
+                kind=OPERATION_KIND_LEASE_RENEWAL,
+                subject_type=OPERATION_SUBJECT_LEASE_RENEWAL,
+                subject_id=renewal.id,
+                state=OperationState.OPEN.value,
+            )
+            self.db.add(op)
+            self.db.flush()
+            _log_activity(
+                self.db,
+                org_id=org_id,
+                renewal_id=renewal.id,
+                kind=RenewalActivityKind.DETECTED,
+                actor_user_id=principal.user_id,
+                detail=(
+                    f"lease={source_lease.id} window={window_days}d "
+                    f"ends={source_lease.end_date.isoformat()}"
+                ),
+            )
+            detections.append(
+                RenewalDetection(renewal=renewal, is_new=True),
+            )
+        self.db.commit()
+        return RenewalScanResult(replayed=any_replay, renewals=detections)
+
+    def contact_tenant(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        renewal_id: int,
+        channel: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> LeaseRenewal:
+        """``DETECT_EXPIRY → CONTACT_TENANT``."""
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER, Role.SECRETARY)
+        renewal = self.get_renewal(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        if renewal.state != RenewalState.DETECT_EXPIRY.value:
+            raise ConflictError(
+                f"renewal {renewal_id} cannot transition to "
+                f"CONTACT_TENANT from state {renewal.state!r}",
+            )
+        renewal.state = RenewalState.CONTACT_TENANT.value
+        op = self.get_operation(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        _bump_to_in_progress(op)
+        detail_parts = []
+        if channel:
+            detail_parts.append(f"channel={channel}")
+        if note:
+            detail_parts.append(note)
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            renewal_id=renewal.id,
+            kind=RenewalActivityKind.TENANT_CONTACTED,
+            actor_user_id=principal.user_id,
+            detail="; ".join(detail_parts) or None,
+        )
+        self.db.commit()
+        return renewal
+
+    def record_response(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        renewal_id: int,
+        response: str,
+        note: Optional[str] = None,
+    ) -> LeaseRenewal:
+        """``CONTACT_TENANT → TENANT_RESPONSE``. ``response`` is one of
+        ``{RENEW, TERMINATE, DEFER}``.
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER, Role.SECRETARY)
+        response_value = _validate_tenant_response(response)
+        renewal = self.get_renewal(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        if renewal.state != RenewalState.CONTACT_TENANT.value:
+            raise ConflictError(
+                f"renewal {renewal_id} cannot transition to "
+                f"TENANT_RESPONSE from state {renewal.state!r}",
+            )
+        renewal.state = RenewalState.TENANT_RESPONSE.value
+        renewal.tenant_response = response_value
+        renewal.tenant_response_at = utcnow()
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            renewal_id=renewal.id,
+            kind=RenewalActivityKind.TENANT_RESPONDED,
+            actor_user_id=principal.user_id,
+            detail=(
+                f"response={response_value}"
+                + (f"; {note}" if note else "")
+            ),
+        )
+        self.db.commit()
+        return renewal
+
+    def decide_owner(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        renewal_id: int,
+        decision: str,
+        note: Optional[str] = None,
+    ) -> LeaseRenewal:
+        """``TENANT_RESPONSE → OWNER_DECISION`` (or ``REJECTED`` if
+        ``decision=TERMINATE``).
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER)
+        decision_value = _validate_owner_decision(decision)
+        renewal = self.get_renewal(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        if renewal.state != RenewalState.TENANT_RESPONSE.value:
+            raise ConflictError(
+                f"renewal {renewal_id} cannot transition to "
+                f"OWNER_DECISION from state {renewal.state!r}",
+            )
+        renewal.owner_decision = decision_value
+        renewal.owner_decision_at = utcnow()
+        renewal.decided_by_user_id = principal.user_id
+        renewal.decided_at = utcnow()
+        if decision_value == RenewalOwnerDecision.TERMINATE.value:
+            # Terminal branch: equivalent to the legacy REJECTED outcome.
+            renewal.state = RenewalState.REJECTED.value
+            renewal.decision_reason = note or "owner decided to terminate"
+            op = self.get_operation(
+                principal, org_id=org_id, renewal_id=renewal_id,
+            )
+            _close_operation(
+                self.db, operation=op, actor_user_id=principal.user_id,
+            )
+            _log_activity(
+                self.db,
+                org_id=org_id,
+                renewal_id=renewal.id,
+                kind=RenewalActivityKind.REJECTED,
+                actor_user_id=principal.user_id,
+                detail=(
+                    f"decision={decision_value}"
+                    + (f"; {note}" if note else "")
+                ),
+            )
+        else:
+            # RENEW or DEFER: enter OWNER_DECISION. For RENEW the
+            # caller must then invoke ``execute`` to advance to
+            # EXECUTED. For DEFER the caller may re-enter
+            # ``decide_owner`` later with a different value.
+            renewal.state = RenewalState.OWNER_DECISION.value
+            op = self.get_operation(
+                principal, org_id=org_id, renewal_id=renewal_id,
+            )
+            _bump_to_in_progress(op)
+            _log_activity(
+                self.db,
+                org_id=org_id,
+                renewal_id=renewal.id,
+                kind=RenewalActivityKind.OWNER_DECIDED,
+                actor_user_id=principal.user_id,
+                detail=(
+                    f"decision={decision_value}"
+                    + (f"; {note}" if note else "")
+                ),
+            )
+        self.db.commit()
+        return renewal
+
+    def verify_execution(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        renewal_id: int,
+        note: Optional[str] = None,
+    ) -> LeaseRenewal:
+        """``EXECUTED → VERIFY``. Owner confirms the executed change
+        matches the recorded decision. Idempotent.
+
+        The legacy ``execute`` closure gate continues to resolve the
+        Operation. ``verify_execution`` is a post-execution
+        reconciliation step that advances the renewal state but does
+        NOT mutate the Operation.
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER)
+        renewal = self.get_renewal(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        if renewal.state == RenewalState.VERIFY.value:
+            # Idempotent: re-confirming a verification is a no-op.
+            return renewal
+        if renewal.state != RenewalState.EXECUTED.value:
+            raise ConflictError(
+                f"renewal {renewal_id} cannot transition to "
+                f"VERIFY from state {renewal.state!r} "
+                f"(must be EXECUTED)",
+            )
+        renewal.state = RenewalState.VERIFY.value
+        renewal.verified_at = utcnow()
+        renewal.verified_by_user_id = principal.user_id
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            renewal_id=renewal.id,
+            kind=RenewalActivityKind.EXECUTION_VERIFIED,
+            actor_user_id=principal.user_id,
+            detail=note,
+        )
+        self.db.commit()
+        return renewal
+
+    def close(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+        renewal_id: int,
+        note: Optional[str] = None,
+    ) -> LeaseRenewal:
+        """``VERIFY → CLOSED``. Terminal administrative closure.
+
+        Resolves the linked Operation when the renewal was created via
+        the new pipeline. Legacy renewals (``PROPOSED → EXECUTED``) keep
+        their pre-existing semantics: the Operation is already
+        resolved at ``EXECUTED``, so this is a no-op for them.
+        """
+        require_org_scope(principal, org_id)
+        _ensure_role(principal, Role.OWNER)
+        renewal = self.get_renewal(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        if renewal.state == RenewalState.CLOSED.value:
+            return renewal
+        if renewal.state != RenewalState.VERIFY.value:
+            raise ConflictError(
+                f"renewal {renewal_id} cannot transition to "
+                f"CLOSED from state {renewal.state!r} "
+                f"(must be VERIFY)",
+            )
+        renewal.state = RenewalState.CLOSED.value
+        renewal.closed_at = utcnow()
+        renewal.closed_by_user_id = principal.user_id
+        # The Operation only resolves here for the new pipeline
+        # (created at DETECT_EXPIRY). Legacy renewals already
+        # resolved at EXECUTED — the close below is a defensive no-op.
+        op = self.get_operation(
+            principal, org_id=org_id, renewal_id=renewal_id,
+        )
+        _close_operation(
+            self.db, operation=op, actor_user_id=principal.user_id,
+        )
+        _log_activity(
+            self.db,
+            org_id=org_id,
+            renewal_id=renewal.id,
+            kind=RenewalActivityKind.CLOSED,
+            actor_user_id=principal.user_id,
+            detail=note,
+        )
+        self.db.commit()
+        return renewal
+
+
+# ---------- scan-key helpers -------------------------------------------
+
+
+def _scan_idempotency_key(source_lease_id: int, window_days: int) -> str:
+    """Deterministic ``idempotency_key`` for ``detect_upcoming``.
+
+    The ``propose`` and ``detect_upcoming`` entry points must not
+    collide: ``propose`` accepts an opaque client-supplied key, while
+    ``detect_upcoming`` synthesizes its own from
+    ``(source_lease_id, window_days)``. Prefix ``scan:`` keeps the two
+    namespaces disjoint.
+    """
+    return normalize_idempotency_key(
+        f"scan:{source_lease_id}:{window_days}",
+    )
+
+
+def _scan_payload_hash(
+    source_lease_id: int,
+    window_days: int,
+    proposed_start: date,
+    proposed_end: date,
+) -> str:
+    """Deterministic ``payload_hash`` for scan-generated renewals."""
+    payload = {
+        "source_lease_id": source_lease_id,
+        "scan_window_days": window_days,
+        "proposed_start_date": proposed_start.isoformat(),
+        "proposed_end_date": proposed_end.isoformat(),
+    }
+    return compute_payload_hash(payload)
+
 
 __all__ = [
     "LeaseRenewalService",
+    "RenewalDetection",
     "RenewalExecuteResult",
     "RenewalProposeResult",
+    "RenewalScanResult",
 ]

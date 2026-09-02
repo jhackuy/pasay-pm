@@ -84,6 +84,102 @@ class RenewalFollowUpCreate(BaseModel):
     due_at: Optional[datetime] = None
 
 
+# ---- frozen 7-stage pipeline (Issue #112 §"Lease Renewal") ------------
+
+
+class RenewalScanRequest(BaseModel):
+    """Body for ``POST /api/v1/renewals/scan``.
+
+    ``window_days`` is the size of the lookahead window: every ACTIVE
+    lease whose ``end_date`` is between today (inclusive) and today +
+    ``window_days`` (inclusive) becomes a candidate renewal at
+    ``DETECT_EXPIRY``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    window_days: int = Field(gt=0, le=365)
+
+
+class RenewalContactRequest(BaseModel):
+    """Body for ``POST /api/v1/renewals/proposals/{id}/contact``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel: Optional[str] = Field(default=None, max_length=32)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalResponseRequest(BaseModel):
+    """Body for ``POST /api/v1/renewals/proposals/{id}/respond``.
+
+    ``response`` is one of ``RENEW``, ``TERMINATE``, ``DEFER`` (see
+    ``RenewalTenantResponse``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    response: str = Field(min_length=1, max_length=16)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalOwnerDecisionRequest(BaseModel):
+    """Body for ``POST /api/v1/renewals/proposals/{id}/owner-decide``.
+
+    ``decision`` is one of ``RENEW``, ``TERMINATE``, ``DEFER`` (see
+    ``RenewalOwnerDecision``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: str = Field(min_length=1, max_length=16)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalVerifyRequest(BaseModel):
+    """Body for ``POST /api/v1/renewals/proposals/{id}/verify``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalCloseRequest(BaseModel):
+    """Body for ``POST /api/v1/renewals/proposals/{id}/close``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class RenewalScanRead(BaseModel):
+    """Read-only summary of a single renewal emitted by a scan.
+
+    Returned by ``POST /api/v1/renewals/scan`` so the caller (cron /
+    Telegram adapter / API client) can show the actual work it
+    accomplished.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    state: str
+    source_lease_id: int
+    proposed_start_date: date
+    proposed_end_date: date
+    scan_window_days: Optional[int] = None
+    is_new: bool
+
+
+class RenewalScanResponse(BaseModel):
+    """Response shape for ``POST /api/v1/renewals/scan``."""
+
+    window_days: int
+    replayed: bool
+    count: int
+    renewals: list[RenewalScanRead]
+
+
 # ---- read ------------------------------------------------------------
 
 
@@ -122,6 +218,16 @@ class RenewalRead(BaseModel):
     decision_reason: Optional[str] = None
     executed_at: Optional[datetime] = None
     idempotency_key: str
+    # Frozen 7-stage pipeline (Issue #112 §"Lease Renewal") fields.
+    scan_window_days: Optional[int] = None
+    tenant_response: Optional[str] = None
+    tenant_response_at: Optional[datetime] = None
+    owner_decision: Optional[str] = None
+    owner_decision_at: Optional[datetime] = None
+    verified_at: Optional[datetime] = None
+    verified_by_user_id: Optional[int] = None
+    closed_at: Optional[datetime] = None
+    closed_by_user_id: Optional[int] = None
 
 
 class RenewalActivityRead(BaseModel):
@@ -156,11 +262,19 @@ __all__ = [
     "OperationRead",
     "RenewalActivityRead",
     "RenewalCancelRequest",
+    "RenewalCloseRequest",
+    "RenewalContactRequest",
     "RenewalDecisionRequest",
     "RenewalExecuteRequest",
     "RenewalExecuteResponse",
     "RenewalFollowUpCreate",
+    "RenewalOwnerDecisionRequest",
     "RenewalProposeRequest",
     "RenewalRead",
+    "RenewalResponseRequest",
+    "RenewalScanRead",
+    "RenewalScanRequest",
+    "RenewalScanResponse",
+    "RenewalVerifyRequest",
     "TaskRead",
 ]
