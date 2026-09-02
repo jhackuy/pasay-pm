@@ -36,7 +36,7 @@ export class PasayContainer extends Container {
 
 interface Env {
   PASAY_QUEUE: Queue;
-  PASAY_CONTAINER?: DurableObjectNamespace;
+  PASAY_CONTAINER?: DurableObjectNamespace<PasayContainer>;
   TELEGRAM_WEBHOOK_SECRET?: string;
   PASAY_CONTAINER_INGEST_TOKEN?: string;
   DATABASE_URL?: string;
@@ -48,6 +48,12 @@ function now_iso(): string {
   return new Date().toISOString();
 }
 
+/** Opaque request id used to correlate enqueue failures without leaking internals. */
+function make_req_id(): string {
+  // Web Crypto API is available in both Cloudflare Workers and Node >= 19.
+  return `r_${crypto.randomUUID()}`;
+}
+
 function header_eq(a: string | null, b: string): boolean {
   if (!a) return !b;
   if (a.length !== b.length) return false;
@@ -56,17 +62,57 @@ function header_eq(a: string | null, b: string): boolean {
   return diff === 0;
 }
 
-/** Redact configured secret values before server-side logging. */
-export function mask_sensitive(input: unknown, env: Env): string {
+/**
+ * Redact configured secret values + structurally redact key/value pairs and
+ * bare long-hex tokens before server-side logging.
+ *
+ * Layered strategy (each layer is idempotent and side-effect safe):
+ *   1. Value-based: redact any configured secret verbatim (back-compat).
+ *   2. Unquoted KEY=value style (uppercase KEY, value without hyphens/colons
+ *      so canonical UUIDs / ISO timestamps survive).
+ *   3. Double-quoted JSON "KEY":"value" style (uppercase KEY).
+ *   4. Single-quoted 'KEY':'value' style (uppercase KEY).
+ *   5. Bare long-hex tokens (>= 20 contiguous hex chars, word-bounded so
+ *      hyphenated UUIDs and colon-separated timestamps are skipped).
+ *
+ * `env` is OPTIONAL so unit tests can exercise the structural layer without
+ * injecting a full Worker environment.
+ */
+export function mask_sensitive(input: unknown, env?: Partial<Env>): string {
   let text = input instanceof Error ? input.stack ?? input.message : String(input);
   const secrets = [
-    env.DATABASE_URL,
-    env.DATABASE_URL_UNPOOLED,
-    env.TELEGRAM_BOT_TOKEN,
-    env.TELEGRAM_WEBHOOK_SECRET,
-    env.PASAY_CONTAINER_INGEST_TOKEN,
+    env?.DATABASE_URL,
+    env?.DATABASE_URL_UNPOOLED,
+    env?.TELEGRAM_BOT_TOKEN,
+    env?.TELEGRAM_WEBHOOK_SECRET,
+    env?.PASAY_CONTAINER_INGEST_TOKEN,
   ].filter((value): value is string => Boolean(value && value.trim()));
   for (const secret of secrets) text = text.split(secret).join("[REDACTED]");
+
+  // 2. Unquoted KEY=value (uppercase KEY; value must not contain hyphens or
+  //    colons so canonical hyphenated UUIDs and ISO timestamps survive).
+  text = text.replace(
+    /([A-Z_][A-Z0-9_]*)=([^\s,;|'"\]\-:]+)/g,
+    "$1=***",
+  );
+
+  // 3. Double-quoted JSON "KEY":"value" (uppercase KEY).
+  text = text.replace(
+    /("([A-Z_][A-Z0-9_]*)"\s*:\s*)"([^"\\]*(?:\\.[^"\\]*)*)"/g,
+    '$1"***"',
+  );
+
+  // 4. Single-quoted 'KEY':'value' (uppercase KEY).
+  text = text.replace(
+    /('([A-Z_][A-Z0-9_]*)'\s*:\s*)'([^'\\]*(?:\\.[^'\\]*)*)'/g,
+    "$1'***'",
+  );
+
+  // 5. Bare long-hex tokens (>= 20 contiguous hex chars, word-bounded).
+  //    Hyphenated UUIDs and colon-separated timestamps are excluded by the
+  //    word-boundary + all-hex requirement.
+  text = text.replace(/\b([0-9a-fA-F]{20,})\b/g, "***");
+
   return text;
 }
 
@@ -111,6 +157,7 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
   if (!Number.isFinite(meta.update_id) || meta.update_id <= 0) return json(400, { ok: false, error: "missing_update_id" });
 
   const occurred_at = now_iso();
+  const req_id = make_req_id();
   const envelope: PasayQueueEnvelope = {
     version: ENVELOPE_VERSION,
     kind: "telegram_update",
@@ -123,9 +170,9 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
     await env.PASAY_QUEUE.send(envelope as unknown as MessageSendRequest);
   } catch (err) {
     log_error("enqueue", err, env);
-    return json(503, { ok: false, error: "enqueue_failed" });
+    return json(503, { ok: false, error: "enqueue_failed", req_id });
   }
-  return json(200, { ok: true, state: "enqueued", event_id: envelope.event_id });
+  return json(200, { ok: true, state: "enqueued", event_id: envelope.event_id, req_id });
 }
 
 async function deliver_envelope_to_container(env: Env, envelope: PasayQueueEnvelope): Promise<"ack" | "retry" | "terminal"> {
@@ -134,7 +181,7 @@ async function deliver_envelope_to_container(env: Env, envelope: PasayQueueEnvel
   if (!token || !token.trim()) return "retry";
   let handle: { fetch: (req: Request) => Promise<Response> } | undefined;
   try {
-    handle = getContainer(env.PASAY_CONTAINER as unknown as any, PASAY_CONTAINER_INSTANCE_ID) as unknown as { fetch: (req: Request) => Promise<Response> };
+    handle = getContainer(env.PASAY_CONTAINER, PASAY_CONTAINER_INSTANCE_ID);
   } catch (err) {
     log_error("container-handle", err, env);
     return "retry";

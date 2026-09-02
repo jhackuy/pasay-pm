@@ -11,12 +11,12 @@ instance_type = "basic"
 region = "APAC"
 
 [[durable_objects.bindings]]
-class_name = "PasayContainer"
 name = "PASAY_CONTAINER"
+class_name = "PasayContainer"
 
 [[migrations]]
-tag = "v1-pasay-container"
 new_sqlite_classes = ["PasayContainer"]
+tag = "v1-pasay-container"
 
 [[queues.producers]]
 queue = "pasay-events"

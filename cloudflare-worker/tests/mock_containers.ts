@@ -15,12 +15,14 @@
  *   - getContainer(binding, name?)  -> second arg is OPTIONAL (REAL)
  *
  * TYPE BRAND NOTE:
- *   The Cloudflare workers-types package uses a PACKAGE-LOCAL unique symbol
- *   for `Rpc.DurableObjectBranded`.  This mock cannot replicate the EXACT
- *   same unique symbol (by definition of "unique symbol"), so for the TEST
- *   tsconfig build we widen the generic signatures with `any` to keep the
- *   structural contract test-friendly while the REAL build (tsconfig.json,
- *   no mock) exercises the exact branded generics.
+ *   The Cloudflare workers-types package exposes `Rpc.__DURABLE_OBJECT_BRAND`
+ *   as a `unique symbol`.  PasayContainer extends this Container, and src/
+ *   Env bindings use `DurableObjectNamespace<PasayContainer>` — so this
+ *   Container MUST carry the SAME unique-symbol brand.  The mock uses the
+ *   real workers-types symbol so the brand check works in both the test
+ *   and production builds (no per-build widening required).  Runtime
+ *   semantics are unchanged: tests still assert behaviour through the
+ *   mutable globals (lastGetContainerArgs, containerInstances).
  *
  * Test callers drive behaviour via the exported mutable globals:
  *   - lastGetContainerArgs: capture (doNamespace, instanceId) tuples
@@ -46,6 +48,14 @@ export abstract class Container {
    * from env + 1 static PASAY_RUNTIME_MODE).
    */
   envVars: Record<string, string> = {};
+
+  /**
+   * Durable Object brand — mirrors `Rpc.__DURABLE_OBJECT_BRAND` from
+   * @cloudflare/workers-types so PasayContainer satisfies the
+   * `T extends Rpc.DurableObjectBranded` constraint required by
+   * `getContainer<T extends Container>`.
+   */
+  declare readonly [Rpc.__DURABLE_OBJECT_BRAND]: never;
 
   constructor(public ctx: unknown = {}, public env: unknown = {}, public options?: ContainerOptions) {}
 }
