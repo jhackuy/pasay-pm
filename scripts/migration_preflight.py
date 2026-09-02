@@ -27,11 +27,12 @@ check (run #354 / PR #117 review) with a graph-aware check that:
      legacy relation objects are removed (same scope as the original
      inline preflight in deploy.yml).
 
-   * ``FAIL_CLOSED`` — multi-row ``alembic_version``, or a single
-     recorded revision that is neither an ancestor/head of the rewrite
-     chain nor the exact retired legacy revision. The script raises
-     ``SystemExit`` and writes nothing destructive to the database so
-     the deploy step refuses to continue.
+   * ``FAIL_CLOSED`` — ambiguous rewrite graph (zero or multiple heads
+     on disk), multi-row ``alembic_version``, or a single recorded
+     revision that is neither an ancestor/head of the rewrite chain nor
+     the exact retired legacy revision. The script raises ``SystemExit``
+     and writes nothing destructive to the database so the deploy step
+     refuses to continue.
 
 The single decision line is printed on stdout as
 ``preflight_decision=<PROCEED|LEGACY_RESET> reason=<...> head=<revision>``
@@ -298,6 +299,18 @@ def _run_preflight_against(
     dry_run: bool,
 ) -> PreflightDecision:
     """Pure DB-bound preflight; reused by tests via a synthetic engine."""
+    # Case 0: ambiguous rewrite graph (zero or multiple heads on disk).
+    # Issue #112 requires fail-closed without mutation in this state, so
+    # we refuse BEFORE touching the legacy schema even when the recorded
+    # revision happens to equal LEGACY_REVISION. The deploy step's
+    # ``set -euo pipefail`` will catch the SystemExit and abort without
+    # running ``alembic upgrade head``.
+    if head is None:
+        raise SystemExit(
+            "Refusing destructive reset: ambiguous rewrite graph "
+            "(zero or multiple heads on disk)."
+        )
+
     with engine.begin() as connection:
         recorded = _read_recorded_revisions(connection)
 

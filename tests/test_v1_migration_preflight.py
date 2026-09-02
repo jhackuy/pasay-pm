@@ -564,6 +564,123 @@ class TestFailClosed:
             f"before={before!r} after={after!r}"
         )
 
+    def test_ambiguous_graph_with_legacy_revision_fails_closed(
+        self, preflight_db, monkeypatch,
+    ):
+        """Issue #112 / PR #117 review comment 5514571187:
+
+        When the on-disk rewrite graph is **ambiguous** (``head is None``
+        — zero or multiple heads in ``alembic/versions/``) AND the
+        recorded ``alembic_version`` row is the exact retired legacy
+        revision, the preflight MUST fail closed BEFORE touching the
+        legacy schema. The previous implementation incorrectly fell
+        through to the LEGACY_RESET drop path on this input and wiped
+        ``public`` (including ``alembic_version`` itself) before
+        ``alembic upgrade head`` failed naturally on the multi-head
+        graph — the exact "weaken safety / restore legacy migrations
+        in a graph state that must not mutate" failure mode the spec
+        forbids.
+
+        We force the ambiguous graph by monkey-patching
+        ``_load_rewrite_chain`` to return the real rewrite revisions
+        with ``head=None``, plant the exact ``LEGACY_REVISION`` row
+        plus the legacy relation objects the LEGACY_RESET drop would
+        normally consume, and assert:
+
+        1. ``SystemExit`` is raised (no decision returned).
+        2. The legacy relation objects survive — the drop path must
+           NOT have been entered.
+        3. ``alembic_version`` still exists and still records the
+           exact legacy revision.
+        """
+        # 1) Plant the exact legacy revision + legacy relation objects.
+        _plant_alembic_version(preflight_db, [LEGACY_REVISION])
+        created = _create_legacy_fixture(preflight_db)
+        # ``_plant_alembic_version`` also created the ``alembic_version``
+        # table (one TABLE relation), so the total before the run is
+        # ``created + 1`` — same baseline the LEGACY_RESET drop test
+        # uses.
+        before = sum(_count_relations(preflight_db).values())
+        assert before == created + 1, (
+            f"unexpected preflight relation count: {before!r}"
+        )
+
+        # Sanity: legacy relations are visible before the preflight.
+        before_kinds = _count_relations(preflight_db)
+        assert before_kinds.get("r", 0) >= 2, (
+            f"expected at least 2 tables (legacy_table + alembic_version); "
+            f"got {before_kinds!r}"
+        )
+        assert before_kinds.get("v", 0) >= 1, (
+            f"expected at least 1 view (legacy_view); got {before_kinds!r}"
+        )
+        assert before_kinds.get("S", 0) >= 1, (
+            f"expected at least 1 sequence (legacy_seq); got {before_kinds!r}"
+        )
+
+        # 2) Force the on-disk graph into an ambiguous (multi-head)
+        # state by monkey-patching ``_load_rewrite_chain``. The chain
+        # itself still contains the real rewrite revisions (the
+        # monkey-patch is structural: it simulates what alembic sees
+        # on a multi-head graph, not a missing graph); only ``head`` is
+        # forced to ``None`` so the production contract
+        # ``(chain, head)`` from ``scripts/migration_preflight.py`` is
+        # honoured exactly.
+        real_chain, _ = _load_rewrite_chain()
+
+        def _force_ambiguous_graph(*_args, **_kwargs):
+            return real_chain, None
+
+        monkeypatch.setattr(
+            "scripts.migration_preflight._load_rewrite_chain",
+            _force_ambiguous_graph,
+        )
+
+        # 3) Run the preflight — must raise SystemExit, never return
+        # a PreflightDecision.
+        url = preflight_db.url.render_as_string(hide_password=False)
+        with pytest.raises(SystemExit) as excinfo:
+            run_preflight(url)
+        msg = str(excinfo.value)
+        assert "ambiguous" in msg.lower(), (
+            f"unexpected SystemExit message; expected the ambiguous-graph "
+            f"failure mode, got: {msg!r}"
+        )
+
+        # 4) All planted relations — including ``alembic_version`` —
+        # must be unchanged. The LEGACY_RESET drop path must NOT have
+        # been entered.
+        after_kinds = _count_relations(preflight_db)
+        assert after_kinds == before_kinds, (
+            f"FAIL_CLOSED must not mutate the public schema on an "
+            f"ambiguous graph; before={before_kinds!r} after={after_kinds!r}"
+        )
+
+        # ``alembic_version`` still exists and still records the exact
+        # legacy revision. This is the specific proof that the
+        # preflight refused to enter the LEGACY_RESET drop path: the
+        # previous bug wiped ``alembic_version`` itself.
+        with preflight_db.begin() as conn:
+            has_av = conn.execute(
+                sa.text("SELECT to_regclass('public.alembic_version')"),
+            ).scalar()
+        assert has_av is not None, (
+            "alembic_version was dropped on FAIL_CLOSED — LEGACY_RESET "
+            "drop path was entered on an ambiguous graph"
+        )
+
+        with preflight_db.begin() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT version_num FROM alembic_version "
+                    "ORDER BY version_num"
+                ),
+            ).scalars().all()
+        assert tuple(row) == (LEGACY_REVISION,), (
+            f"recorded alembic_version row was mutated on FAIL_CLOSED; "
+            f"expected ({LEGACY_REVISION!r},) got {row!r}"
+        )
+
 
 # ----------------------------------------------------------------------
 # Decision dataclass shape
