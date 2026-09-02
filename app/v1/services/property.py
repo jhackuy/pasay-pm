@@ -34,6 +34,57 @@ from app.v1.services.errors import (
 )
 
 
+# Issue #112 GAP-P1: frozen product rule "Units <= 15 per property".
+# Both the service-layer guard (this module) and the PostgreSQL
+# BEFORE INSERT/UPDATE trigger (alembic 0003_units_cap) reference the
+# same constant. The trigger is the source of truth and the race-safe
+# enforcement boundary; this constant lets the service raise a clean
+# ``ConflictError`` (HTTP 409) before commit, instead of letting the
+# raw ``IntegrityError`` bubble up to the caller.
+UNITS_PER_PROPERTY_CAP = 15
+
+
+def _count_units_for_property(db: Session, *, org_id: int, property_id: int) -> int:
+    """Return the live unit count for ``property_id`` (org-scoped).
+
+    Used as a service-layer pre-check before ``create_unit``. The DB
+    trigger still fires after this — see ``alembic/versions/0003_units_cap.py``
+    — but pre-checking here produces a clean ``ConflictError`` mapped
+    to HTTP 409 in the common case. ``org_id`` is intentionally part
+    of the filter so a hostile caller cannot influence another org's
+    count.
+    """
+    return (
+        db.query(Unit)
+        .filter(Unit.property_id == property_id, Unit.org_id == org_id)
+        .count()
+    )
+
+
+def assert_units_within_cap(
+    db: Session, *, org_id: int, property_id: int,
+) -> None:
+    """Raise ``ConflictError`` if ``property_id`` already has
+    ``UNITS_PER_PROPERTY_CAP`` units in ``org_id``.
+
+    Idempotent: returns silently when the property is below the cap.
+    The PostgreSQL trigger ``trg_v1_units_units_per_property_cap`` is
+    the ultimate enforcement boundary (race-safe, applied uniformly
+    to every code path). This guard exists so the application can
+    surface a domain-shaped error code before the SQL statement is
+    even issued.
+    """
+    current = _count_units_for_property(
+        db, org_id=org_id, property_id=property_id,
+    )
+    if current >= UNITS_PER_PROPERTY_CAP:
+        raise ConflictError(
+            f"property {property_id} already has {current} units; "
+            f"the product cap is {UNITS_PER_PROPERTY_CAP} units per "
+            f"property"
+        )
+
+
 def _principal_from(
     user_id: int, org_id: int, role: str | Role,
 ) -> Principal:
@@ -117,6 +168,11 @@ def create_unit(
     The unit starts at ``UnitStatus.AVAILABLE``. ``unit_number`` is
     NOT NULL on the Unit model — it is stored in the ``label`` column
     (single-unit-per-row design). ``monthly_rent`` defaults to 0.
+
+    Issue #112 GAP-P1: refuses to create when the target property
+    already has ``UNITS_PER_PROPERTY_CAP`` (15) units. The PostgreSQL
+    trigger ``trg_v1_units_units_per_property_cap`` is the race-safe
+    authority; this guard produces a clean ``ConflictError``.
     """
     if not isinstance(unit_number, str) or not unit_number.strip():
         raise ValidationError(
@@ -133,6 +189,9 @@ def create_unit(
         raise NotFoundError(
             f"property {property_id} not found in org {org_id}",
         )
+    assert_units_within_cap(
+        db, org_id=org_id, property_id=property_id,
+    )
     final_label = (label or unit_number).strip()
     u = Unit(
         property_id=property_id,
@@ -276,6 +335,14 @@ class PropertyService:
             raise ConflictError(
                 f"property {property_id} belongs to a different org",
             )
+        # Issue #112 GAP-P1: enforce Units <= 15 per property before
+        # the INSERT. The PostgreSQL trigger
+        # ``trg_v1_units_units_per_property_cap`` is the race-safe
+        # authority; this guard exists to surface a clean
+        # ``ConflictError`` → HTTP 409 in the common case.
+        assert_units_within_cap(
+            self.db, org_id=org_id, property_id=property_id,
+        )
         rent = parse_money(monthly_rent)
         u = Unit(
             property_id=property_id,
@@ -473,6 +540,8 @@ class PropertyService:
 
 __all__ = [
     "PropertyService",
+    "UNITS_PER_PROPERTY_CAP",
+    "assert_units_within_cap",
     "create_property",
     "create_unit",
     "get_property",
