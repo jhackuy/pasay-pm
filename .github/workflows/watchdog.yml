@@ -1,0 +1,189 @@
+name: pasay-watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_run:
+    workflows: [rewrite-ci, rewrite-deploy]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  issues: read
+  pull-requests: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+
+concurrency:
+  group: pasay-watchdog
+  cancel-in-progress: true
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      MINI_APP_URL: ${{ vars.PASAY_MINI_APP_URL }}
+    steps:
+      - name: Collect project state without AI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, urllib.request, urllib.parse
+          from datetime import datetime, timezone
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+
+          def api(path):
+              req = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}{path}',
+                  headers={
+                      'Authorization': f'Bearer {token}',
+                      'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=15) as r:
+                  return json.load(r)
+
+          repo_meta = api('')
+          branch = repo_meta['default_branch']
+          ref = api(f'/branches/{urllib.parse.quote(branch, safe="")}')
+          head = ref['commit']['sha']
+          issue119 = api('/issues/119')
+          pulls = api('/pulls?state=open&per_page=20')
+          runs = api(f'/actions/runs?branch={urllib.parse.quote(branch, safe="")}&per_page=30')['workflow_runs']
+
+          def latest(name):
+              xs = [r for r in runs if r.get('name') == name]
+              if not xs:
+                  return None
+              r = xs[0]
+              return {
+                  'id': r['id'], 'status': r['status'], 'conclusion': r.get('conclusion'),
+                  'head_sha': r.get('head_sha'), 'html_url': r.get('html_url'),
+                  'updated_at': r.get('updated_at'),
+              }
+
+          state = {
+              'checked_at': datetime.now(timezone.utc).isoformat(),
+              'branch': branch,
+              'head': head,
+              'issue_119': {'state': issue119['state'], 'title': issue119['title'], 'url': issue119['html_url']},
+              'open_prs': [{'number': p['number'], 'title': p['title'], 'head_sha': p['head']['sha'], 'url': p['html_url']} for p in pulls],
+              'rewrite_ci': latest('rewrite-ci'),
+              'rewrite_deploy': latest('rewrite-deploy'),
+          }
+
+          for key in ('rewrite_ci', 'rewrite_deploy'):
+              r = state[key]
+              state[key + '_exact_head'] = bool(r and r.get('head_sha') == head and r.get('conclusion') == 'success')
+
+          print(json.dumps(state, ensure_ascii=False, indent=2))
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('# PASAY watchdog\n\n')
+              f.write(f"- Branch/HEAD: `{branch}` / `{head[:12]}`\n")
+              f.write(f"- #119: **{state['issue_119']['state']}** — {state['issue_119']['title']}\n")
+              f.write(f"- Open PRs: {len(state['open_prs'])}\n")
+              for k, label in [('rewrite_ci','CI'), ('rewrite_deploy','Deploy')]:
+                  r = state[k]
+                  if r:
+                      exact = 'exact-head' if r.get('head_sha') == head else 'OLD-SHA'
+                      f.write(f"- {label}: `{r.get('status')}/{r.get('conclusion')}` ({exact}, `{(r.get('head_sha') or '')[:12]}`)\n")
+                  else:
+                      f.write(f'- {label}: no run found\n')
+          PY
+
+      - name: Probe Cloudflare Worker health
+        id: worker
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${CLOUDFLARE_API_TOKEN:-}"
+          test -n "${CLOUDFLARE_ACCOUNT_ID:-}"
+          SUB="$(python - <<'PY'
+          import json, os, urllib.request
+          req=urllib.request.Request(
+            f"https://api.cloudflare.com/client/v4/accounts/{os.environ['CLOUDFLARE_ACCOUNT_ID']}/workers/subdomain",
+            headers={'Authorization':f"Bearer {os.environ['CLOUDFLARE_API_TOKEN']}",'Accept':'application/json'})
+          with urllib.request.urlopen(req, timeout=15) as r: d=json.load(r)
+          print((d.get('result') or {}).get('subdomain') or '')
+          PY
+          )"
+          test -n "$SUB"
+          URL="https://pasay-cloudflare-worker.${SUB}.workers.dev/health"
+          body="$(curl -fsS --max-time 20 "$URL")"
+          python -c 'import json,sys; d=json.loads(sys.argv[1]); assert d.get("worker")=="alive"' "$body"
+          echo "- Worker health: **PASS**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe real Telegram webhook configuration
+        id: telegram
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${TELEGRAM_BOT_TOKEN:-}"
+          curl -fsS --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe" > /tmp/getme.json
+          curl -fsS --max-time 20 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo" > /tmp/webhook.json
+          python - <<'PY'
+          import json, os
+          me=json.load(open('/tmp/getme.json'))
+          wh=json.load(open('/tmp/webhook.json'))
+          assert me.get('ok') and wh.get('ok')
+          username=(me.get('result') or {}).get('username') or ''
+          info=wh.get('result') or {}
+          url=info.get('url') or ''
+          pending=int(info.get('pending_update_count') or 0)
+          err=info.get('last_error_message') or ''
+          assert username.lower() == 'sellandrentbot', f'bot identity mismatch: @{username}'
+          assert url.endswith('/telegram/webhook'), f'unexpected webhook path: {url}'
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+              f.write(f'- Telegram identity: **PASS** `@{username}`\n')
+              f.write(f'- Telegram webhook configured: **PASS**; pending updates: `{pending}`\n')
+              if err:
+                  f.write(f'- Telegram last error: `{err[:180]}`\n')
+          if err:
+              raise SystemExit('Telegram reports last_error_message')
+          PY
+
+      - name: Probe Mini App production URL
+        id: miniapp
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${MINI_APP_URL:-}" ]; then
+            echo "- Mini App: **NOT_CONFIGURED** (`PASAY_MINI_APP_URL` missing)" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          html="$(curl -fsSL --max-time 20 "$MINI_APP_URL")"
+          test -n "$html"
+          printf '%s' "$html" | grep -qi '<html\|<!doctype'
+          echo "- Mini App URL: **PASS** `${MINI_APP_URL}`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Classify watchdog result
+        shell: bash
+        env:
+          WORKER_OUTCOME: ${{ steps.worker.outcome }}
+          TELEGRAM_OUTCOME: ${{ steps.telegram.outcome }}
+          MINIAPP_OUTCOME: ${{ steps.miniapp.outcome }}
+        run: |
+          set -euo pipefail
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Machine-only verdict" >> "$GITHUB_STEP_SUMMARY"
+          echo "Worker=${WORKER_OUTCOME} Telegram=${TELEGRAM_OUTCOME} MiniApp=${MINIAPP_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$WORKER_OUTCOME" != success ] || [ "$TELEGRAM_OUTCOME" != success ] || [ "$MINIAPP_OUTCOME" != success ]; then
+            echo "WATCHDOG_BLOCKED"
+            exit 1
+          fi
+          echo "WATCHDOG_PASS"
