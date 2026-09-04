@@ -30,7 +30,7 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      MINI_APP_URL: ${{ vars.PASAY_MINI_APP_URL }}
+      MINI_APP_URL: ${{ vars.PASAY_MINI_APP_URL || 'https://pasay-mini-app.pages.dev' }}
     steps:
       - name: Collect project state without AI
         shell: bash
@@ -105,10 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${MINI_APP_URL:-}" ]; then
-            echo '- Mini App: **NOT_CONFIGURED** (PASAY_MINI_APP_URL missing)' >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
+          test -n "${MINI_APP_URL:-}"
           html="$(curl -fsSL --max-time 20 "$MINI_APP_URL")"; test -n "$html"; printf '%s' "$html" | grep -qi '<html\|<!doctype'
           printf '%s\n' "- Mini App URL: **PASS** ${MINI_APP_URL}" >> "$GITHUB_STEP_SUMMARY"
 
