@@ -6,15 +6,9 @@ on:
   pull_request_review_comment:
     types: [created]
 
-# Only a new authorized Owner /oc or /opencode command for the same issue/PR
-# may supersede an earlier actionable run. Bots, unauthorized humans, and
-# non-command comments get a run-unique group, so they cannot cancel legitimate work.
-# Concurrency truth table with cancel-in-progress=true:
-# - Owner /oc on #N              -> opencode-N            -> actionable
-# - second Owner /oc on same #N  -> opencode-N            -> intentionally supersedes
-# - github-actions/CodeRabbit bot -> opencode-ignored-RUN  -> cannot cancel actionable run
-# - unauthorized human /oc       -> opencode-ignored-RUN  -> cannot cancel actionable run
-# - human non-command comment     -> opencode-ignored-RUN  -> cannot cancel actionable run
+# Owner commands are the only actionable entry point. Bot/non-command runs use
+# unique groups and cannot cancel real work. Keep Builder authority deliberately
+# below workflow/secrets/deploy authority.
 concurrency:
   group: >-
     ${{ github.event.comment.user.type != 'Bot' &&
@@ -37,9 +31,13 @@ jobs:
        contains(github.event.comment.body, ' /opencode') ||
        startsWith(github.event.comment.body, '/opencode'))
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
+    env:
+      # Avoid OpenCode runs sharing SQLite/session state on a runner.
+      XDG_DATA_HOME: ${{ runner.temp }}/opencode-data-${{ github.run_id }}-${{ github.run_attempt }}
+      XDG_CACHE_HOME: ${{ runner.temp }}/opencode-cache-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Create PASAY OpenCode GitHub App token
         id: app-token
@@ -73,6 +71,7 @@ jobs:
           set -euo pipefail
           test -n "${MINIMAX_API_KEY:-}"
           test -z "$(git status --porcelain)"
+          mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
 
       - name: Install verified OpenCode V1 runtime
         shell: bash
@@ -95,7 +94,7 @@ jobs:
           "$HOME/.opencode/bin/opencode" --version
           test "$("$HOME/.opencode/bin/opencode" --version | tr -d '[:space:]')" = "$OPENCODE_VERSION"
 
-      - name: Verify effective OpenCode routing
+      - name: Verify effective OpenCode routing and headless permissions
         shell: bash
         env:
           OPENCODE_CONFIG_CONTENT: '{"default_agent":"pasay-lead"}'
@@ -115,6 +114,15 @@ jobs:
           permissions = lead.get('permission') or {}
           assert permissions.get('edit') == 'allow', permissions.get('edit')
           assert permissions.get('bash') == 'allow', permissions.get('bash')
+          # Headless Actions must never stop for an interactive permission prompt.
+          def walk(v, path='permission'):
+              if isinstance(v, dict):
+                  for k, x in v.items(): walk(x, f'{path}.{k}')
+              elif isinstance(v, list):
+                  for i, x in enumerate(v): walk(x, f'{path}[{i}]')
+              elif isinstance(v, str) and v.lower() == 'ask':
+                  raise AssertionError(f'headless permission cannot be ask: {path}')
+          walk(permissions)
           prompt = lead.get('prompt') or ''
           assert 'PASAY-OC-QUAL-001' not in prompt
           assert 'never edits the repository directly' not in prompt.lower()
@@ -132,6 +140,31 @@ jobs:
         run: |
           set -euo pipefail
           opencode github run
+
+      - name: Guard Builder workflow boundary and capture recovery patch
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          mkdir -p /tmp/opencode-recovery
+          git status --porcelain=v1 > /tmp/opencode-recovery/status.txt
+          git diff --binary > /tmp/opencode-recovery/worktree.patch
+          git diff --cached --binary > /tmp/opencode-recovery/index.patch
+          git diff --name-only HEAD > /tmp/opencode-recovery/changed-files.txt
+          git ls-files --others --exclude-standard > /tmp/opencode-recovery/untracked-files.txt
+          if grep -q '^\.github/workflows/' /tmp/opencode-recovery/changed-files.txt /tmp/opencode-recovery/untracked-files.txt; then
+            echo 'Builder modified .github/workflows/**; refusing to treat run as valid.' >&2
+            exit 1
+          fi
+
+      - name: Upload OpenCode recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/opencode-recovery/
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Record exact OpenCode runtime version evidence
         if: always()
