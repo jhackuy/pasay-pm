@@ -35,9 +35,10 @@ jobs:
     permissions:
       contents: read
     env:
-      # Avoid OpenCode runs sharing SQLite/session state on a runner.
-      XDG_DATA_HOME: ${{ runner.temp }}/opencode-data-${{ github.run_id }}-${{ github.run_attempt }}
-      XDG_CACHE_HOME: ${{ runner.temp }}/opencode-cache-${{ github.run_id }}-${{ github.run_attempt }}
+      # Isolate OpenCode session/cache state per Actions run without relying on
+      # runner context, which is unavailable at job-level env evaluation.
+      XDG_DATA_HOME: /tmp/opencode-data-${{ github.run_id }}-${{ github.run_attempt }}
+      XDG_CACHE_HOME: /tmp/opencode-cache-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Create PASAY OpenCode GitHub App token
         id: app-token
