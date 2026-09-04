@@ -2,24 +2,16 @@
 # ────────────────────────────────────────────────────────────────────────────
 # PASAY Mini App — Cloudflare Pages publish (Issue #119 trusted-lane).
 #
-# This script is the Owner-controlled, non-workflow publication path for
-# mini_app/dist.  It is intentionally NOT wired into any GitHub workflow
-# file — the GitHub App in this repo does not have workflow-scope on
-# `.github/workflows/**`, and Cloudflare API tokens must NEVER enter CI
-# step inputs or workflow logs.
+# This script is the trusted production publication path for mini_app/dist.
+# It may be invoked by the production deploy workflow or manually by an
+# operator that already has the Cloudflare production credentials in scope.
 #
 # Steps:
-#   1. Verify prerequisites (wrangler, CLOUDFLARE_API_TOKEN, ACCOUNT_ID).
-#   2. Re-run `npm run build` so `dist/` matches the latest TypeScript
-#      (the CI build artifact is intentionally NOT reused — the deployer
-#      sees the exact bytes it is shipping).
-#   3. Run the JSDOM smoke gate locally so a broken bundle cannot ship.
-#   4. Invoke `wrangler pages deploy dist --project-name=pasay-mini-app`
-#      which creates the project on first run and returns the
-#      `https://pasay-mini-app.pages.dev` URL on every run.
-#   5. Print the canonical production URL so the operator can paste it
-#      into the `PASAY_MINI_APP_URL` repo variable + BotFather menu
-#      configuration.
+#   1. Verify prerequisites and required Cloudflare environment.
+#   2. Install the exact locked Mini App dependencies with npm ci.
+#   3. Re-run `npm run build` so `dist/` matches the latest TypeScript.
+#   4. Run the JSDOM smoke gate so a broken bundle cannot ship.
+#   5. Invoke `wrangler pages deploy dist --project-name=pasay-mini-app`.
 #
 # Required environment:
 #   CLOUDFLARE_API_TOKEN    — Pages edit scope
@@ -27,12 +19,10 @@
 #
 # Exit codes:
 #   0 = published (or already published) successfully
-#   non-zero = failed at any gate; dist is NOT mutated on failure.
+#   non-zero = failed at any gate; publish is not attempted after a failed gate.
 # ────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-# Resolve the directory holding this script (so the script works regardless
-# of the caller's cwd — npm's `deploy:pages` invokes it from mini_app/).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &> /dev/null && pwd)"
 MINI_APP_DIR="${REPO_ROOT}/mini_app"
@@ -50,10 +40,17 @@ command -v npx   >/dev/null 2>&1 || die "npx is required on PATH"
 [ -n "${CLOUDFLARE_API_TOKEN:-}" ]  || die "CLOUDFLARE_API_TOKEN env var is required"
 [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || die "CLOUDFLARE_ACCOUNT_ID env var is required"
 [ -f "${MINI_APP_DIR}/package.json" ] || die "mini_app/package.json missing under ${MINI_APP_DIR}"
+[ -f "${MINI_APP_DIR}/package-lock.json" ] || die "mini_app/package-lock.json missing — reproducible deploy unavailable"
 [ -f "${MINI_APP_DIR}/wrangler.toml" ] || die "mini_app/wrangler.toml missing — Issue #119 Pages config absent"
 [ -f "${MINI_APP_DIR}/public/_redirects" ] || die "mini_app/public/_redirects missing — Pages SPA fallback absent"
 
-# ── Gate 1: build the bundle the operator is about to ship ────────────────
+# ── Gate 1: locked dependencies ───────────────────────────────────────────
+# GitHub setup-node cache does not populate node_modules. Production deploys
+# must explicitly materialize the lockfile-pinned dependency tree before tsc.
+log "Installing locked Mini App dependencies"
+( cd "${MINI_APP_DIR}" && npm ci --no-audit --no-fund )
+
+# ── Gate 2: build the bundle the operator is about to ship ────────────────
 log "Rebuilding mini_app/dist from current TypeScript sources"
 ( cd "${MINI_APP_DIR}" && npm run build )
 
@@ -61,11 +58,11 @@ log "Rebuilding mini_app/dist from current TypeScript sources"
 [ -d "${DIST_DIR}/assets" ]     || die "build did not produce ${DIST_DIR}/assets/"
 [ -f "${DIST_DIR}/_redirects" ]  || die "build did not copy public/_redirects into dist/ — Vite publicDir missing?"
 
-# ── Gate 2: JSDOM smoke gate (fail-closed: broken bundle never ships) ─────
+# ── Gate 3: JSDOM smoke gate (fail-closed: broken bundle never ships) ─────
 log "Running JSDOM smoke gate against the rebuilt bundle"
 ( cd "${MINI_APP_DIR}" && npm run test:smoke )
 
-# ── Gate 3: publish to Cloudflare Pages ───────────────────────────────────
+# ── Gate 4: publish to Cloudflare Pages ───────────────────────────────────
 log "Publishing to Cloudflare Pages project '${PROJECT_NAME}'"
 (
   cd "${MINI_APP_DIR}"
@@ -78,7 +75,4 @@ log "Publishing to Cloudflare Pages project '${PROJECT_NAME}'"
 )
 
 log "Publish OK. Canonical production URL: ${CANONICAL_URL}"
-log "Wire this URL into:"
-log "  - PASAY_MINI_APP_URL repo variable (watchdog probe target)"
-log "  - Telegram MenuButton WebAppInfo (set by pasay-telegram-bot)"
 exit 0
