@@ -39,21 +39,16 @@ log "Running JSDOM smoke gate against the rebuilt bundle"
 ( cd "${MINI_APP_DIR}" && npm run test:smoke )
 
 # Gate 4: ensure the Direct Upload Pages project exists.
-# `pages deploy` is non-interactive in CI only after the project exists. The
-# production credentials are already scoped to this trusted deploy lane, so
-# bootstrap the named project here instead of requiring an Owner dashboard step.
+# Wrangler v3 `pages project list` does not support --json, so use its stable
+# human-readable output only as an existence probe. Creation remains idempotent.
 log "Ensuring Cloudflare Pages project '${PROJECT_NAME}' exists"
-PROJECTS_JSON="$(
+PROJECTS_LIST="$(
   cd "${MINI_APP_DIR}"
   CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}" \
   CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID}" \
-    npx --yes wrangler@3 pages project list --json
+    npx --yes wrangler@3 pages project list
 )"
-if ! printf '%s' "${PROJECTS_JSON}" | node -e '
-  let s=""; process.stdin.on("data",d=>s+=d); process.stdin.on("end",()=>{
-    const projects=JSON.parse(s); process.exit(projects.some(p=>p.name===process.argv[1]) ? 0 : 1);
-  });
-' "${PROJECT_NAME}"; then
+if ! printf '%s\n' "${PROJECTS_LIST}" | grep -Fq "${PROJECT_NAME}"; then
   log "Pages project missing; creating '${PROJECT_NAME}' with production branch main"
   (
     cd "${MINI_APP_DIR}"
