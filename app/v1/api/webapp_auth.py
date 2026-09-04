@@ -101,14 +101,21 @@ def _check_init_data_signature(init_data: str, bot_token: str) -> dict[str, str]
 
     Raises ``ValueError`` with a stable code (suitable for the HTTP layer
     to surface) on any malformed input or signature mismatch.  The
-    returned dict is the raw field map with ``user`` and ``hash``
-    left as the original string forms so callers can decode ``user``
-    JSON explicitly.
+    returned dict is the parsed field map (URL-decoded by ``parse_qs``)
+    with ``hash`` already removed so callers receive the full set of
+    business fields plus the signature payload out-of-band.
     """
     if not init_data:
         raise ValueError("init_data_empty")
     # Telegram's on-the-wire format is a URL-encoded query string.
-    # ``parse_qs`` returns a dict of lists; we collapse to first values.
+    # ``parse_qs`` returns a dict of lists AND URL-decodes each value;
+    # we collapse to first values.  Per Telegram's documented
+    # data-check-string semantics (see
+    # https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app),
+    # the check string is built from the RECEIVED, DECODED field values
+    # (the spec example shows ``user={"id":279058397,...}`` not the raw
+    # percent-encoded form), so we keep ``parse_qs`` as the source of
+    # truth and feed the resulting dict into the check-string builder.
     try:
         parsed_pairs = parse_qs(
             init_data, keep_blank_values=True, strict_parsing=False,
@@ -122,13 +129,14 @@ def _check_init_data_signature(init_data: str, bot_token: str) -> dict[str, str]
     if not received_hash:
         raise ValueError("init_data_missing_hash")
     secret_key = _telegram_webapp_secret_key(bot_token)
-    # The check string is the remaining fields, alphabetically sorted,
-    # each rendered as ``key=value`` and joined with ``\n``.  Telegram
-    # uses the ORIGINAL (undecoded) values for signing — we therefore
-    # rebuild the string from the raw query string rather than from
-    # the parsed dict (decode round-trip can change ``+`` / ``%20`` /
-    # unicode forms and invalidate the signature).
-    check_string = _build_check_string(init_data)
+    # The check string is the remaining fields, alphabetically sorted by
+    # key, each rendered as ``key=<decoded value>`` and joined with
+    # ``\n`` — NOT from the raw query chunks.  Using raw percent-encoded
+    # values here (the prior implementation) is a regression of the
+    # documented semantics: real Telegram clients send ``user=...``
+    # with the JSON object percent-encoded, and the signed check string
+    # is the decoded JSON.
+    check_string = _build_check_string(fields)
     computed_hash = hmac.new(
         secret_key, check_string.encode("utf-8"), hashlib.sha256,
     ).hexdigest()
@@ -137,24 +145,28 @@ def _check_init_data_signature(init_data: str, bot_token: str) -> dict[str, str]
     return fields
 
 
-def _build_check_string(init_data: str) -> str:
-    """Rebuild the Telegram ``data-check-string`` from the raw query string.
+def _build_check_string(fields: dict[str, str]) -> str:
+    """Build the Telegram ``data-check-string`` from URL-decoded fields.
 
-    Splits on ``&`` (Telegram does not allow nested ampersands in field
-    values for initData), strips any trailing ``hash=...`` pair, sorts
-    the rest alphabetically by key, and joins with ``\n``.
+    Telegram documents the check string as ``key=<value>`` joined by
+    ``\n`` and sorted alphabetically by key.  The values are the
+    DECODED form (so a percent-encoded JSON user payload becomes a
+    raw JSON string), NOT the raw percent-encoded query chunks.
+    Mirrors python-telegram-bot's ``check_signature`` helper, which
+    uses ``parse_qsl`` (URL-decoded) for the same reason.
+
+    ``fields`` MUST NOT contain ``hash`` — the caller pops it before
+    calling us.  Passing ``hash`` here would re-introduce the prior
+    bug where the verifier signed its own input.
     """
-    pairs: list[tuple[str, str]] = []
-    for chunk in init_data.split("&"):
-        if not chunk:
-            continue
-        if "=" not in chunk:
-            continue
-        key, _, value = chunk.partition("=")
-        if key == "hash":
-            continue
-        pairs.append((key, value))
-    pairs.sort(key=lambda kv: kv[0])
+    if "hash" in fields:
+        # Defensive: never sign a self-supplied hash.  The caller is
+        # expected to pop it before reaching here, but a regression
+        # that re-introduces the raw-chunk builder would slip hash back
+        # in via the raw chunk path.  Treat it as a hard failure rather
+        # than silently computing a wrong signature.
+        raise ValueError("init_data_hash_in_check_string")
+    pairs = sorted(fields.items())
     return "\n".join(f"{k}={v}" for k, v in pairs)
 
 

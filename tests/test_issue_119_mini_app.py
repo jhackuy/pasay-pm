@@ -44,10 +44,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 import pytest
 
@@ -175,6 +177,13 @@ def _build_init_data(
     Mirrors ``_check_init_data_signature`` server-side — keep these two
     implementations in sync (or the test passes while the production
     path rejects everything).
+
+    Wire format: percent-encoded field values, joined by ``&``.
+    HMAC input (Telegram data-check-string): the DECODED field values
+    (sorted alphabetically by key, formatted as ``key=value``, joined
+    by ``\n``).  This matches Telegram's documented validation
+    semantics — see
+    https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
     """
     auth_date = auth_date or int(time.time())
     user_json = (
@@ -185,22 +194,30 @@ def _build_init_data(
     # matches what Telegram delivers.
     from urllib.parse import quote
     user_encoded = quote(user_json, safe="")
-    pairs = [
-        f"query_id=AAEh",
-        f"user={user_encoded}",
-        f"auth_date={auth_date}",
-    ]
-    # Compute the secret key + hash exactly like Telegram's spec.
+    # Build the wire-format pairs in dict form so we can compute the
+    # data-check-string from DECODED values (per Telegram spec).
+    raw_pairs: dict[str, str] = {
+        "query_id": "AAEh",
+        "user": user_encoded,
+        "auth_date": str(auth_date),
+    }
     secret_key = hmac.new(
         b"WebAppData", bot_token.encode("utf-8"), hashlib.sha256
     ).digest()
-    # The check string is sorted by key with hash excluded, joined by \n.
-    check_string = "\n".join(sorted(pairs))
+    # Build the data-check-string from DECODED values, sorted by key,
+    # formatted ``key=value``, joined by ``\n``.  This mirrors
+    # server-side ``_build_check_string`` exactly.
+    decoded_pairs: dict[str, str] = {
+        key: (unquote(value) if value else value) for key, value in raw_pairs.items()
+    }
+    check_string = "\n".join(
+        f"{k}={v}" for k, v in sorted(decoded_pairs.items())
+    )
     expected_hash = hmac.new(
         secret_key, check_string.encode("utf-8"), hashlib.sha256
     ).hexdigest()
-    pairs.append(f"hash={expected_hash}")
-    return "&".join(pairs)
+    raw_pairs["hash"] = expected_hash
+    return "&".join(f"{k}={v}" for k, v in raw_pairs.items())
 
 
 @pytest.fixture
@@ -373,6 +390,177 @@ def test_webapp_auth_stale_auth_date_returns_401(webapp_client):
     )
     response = client.post("/api/v1/webapp/auth", json={"init_data": init_data})
     assert response.status_code == 401, response.text
+
+
+def test_webapp_auth_accepts_realistic_percent_encoded_user_json(webapp_client):
+    """Regression guardrail for the documented Telegram data-check-string
+    semantics (https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
+
+    Real Telegram clients deliver ``user=`` as a percent-encoded JSON
+    object.  The HMAC input MUST be built from the DECODED JSON, not
+    from the raw percent-encoded chunk — the prior implementation
+    rebuilt the check string from raw query chunks and accepted self-
+    consistent test fixtures while rejecting real Telegram initData.
+
+    This test:
+      1. Constructs a realistic user JSON object (commas, quotes,
+         unicode escape points, a colon, and a boolean — all the
+         characters a real Telegram client percent-encodes);
+      2. Percent-encodes it with ``quote(safe="")`` to mirror the
+         on-the-wire form Telegram delivers;
+      3. Independently computes the expected hash from the DECODED
+         values (sorted alphabetically by key, ``key=value`` joined
+         by ``\n``);
+      4. Posts the resulting initData to /webapp/auth and asserts a
+         200 + OWNER bearer — proving the verifier actually consumes
+         decoded values.
+
+    A regression that re-introduces the raw-chunk check-string builder
+    fails step 4 with 401 (the wire-format hash no longer matches
+    what the verifier computes from decoded fields).
+    """
+    client, workspace, _ = webapp_client
+
+    # 1) Realistic user payload.  Includes a comma, both quote styles,
+    #    nested escapes, a colon, and a boolean — every byte Telegram
+    #    would percent-encode on the wire.
+    user_obj = {
+        "id": TEST_OWNER_TELEGRAM_ID,
+        "first_name": "Test O'Owner",
+        "last_name": "Doe, Jr.",
+        "username": "tester.user",
+        "language_code": "en-US",
+        "is_premium": True,
+        "photo_url": "https://t.me/i/avatar.png",
+    }
+    user_json = json.dumps(user_obj, separators=(",", ":"))
+    # Sanity: confirm the raw JSON contains the characters that
+    # percent-encoding must escape.  If a future change tightens the
+    # payload, this assertion makes the regression visible.
+    for must_contain in ('"', ":", ","):
+        assert must_contain in user_json
+
+    # 2) Percent-encode for the on-the-wire form (Telegram's wire
+    #    format).  ``safe=""`` so ``/``, ``?``, ``:``, ``,``, ``"``,
+    #    ``'`` and every other reserved character is escaped — same as
+    #    what the Mini App's WebView produces.
+    user_encoded = quote(user_json, safe="")
+    assert "%" in user_encoded, (
+        "user payload MUST be percent-encoded for the wire format "
+        "to be a realistic Telegram initData; this regression would "
+        "silently weaken the test by feeding the verifier unencoded "
+        "JSON."
+    )
+
+    auth_date = int(time.time())
+    raw_pairs: dict[str, str] = {
+        "query_id": "AAHdF6MQAAAAAN0XmD",
+        "user": user_encoded,
+        "auth_date": str(auth_date),
+    }
+
+    # 3) Independently compute the expected hash from DECODED values
+    #    (no shared helper — we want to prove the spec, not the test
+    #    mirror, is what the verifier obeys).
+    secret_key = hmac.new(
+        b"WebAppData", TEST_BOT_TOKEN.encode("utf-8"), hashlib.sha256,
+    ).digest()
+    decoded_pairs: dict[str, str] = {
+        key: unquote(value) for key, value in raw_pairs.items()
+    }
+    check_string = "\n".join(
+        f"{k}={v}" for k, v in sorted(decoded_pairs.items())
+    )
+    expected_hash = hmac.new(
+        secret_key, check_string.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+    # Sanity: independently recompute the hash over the RAW
+    # percent-encoded chunks.  This MUST differ from the decoded hash
+    # (a regression where the verifier uses raw chunks would silently
+    # match this second hash and break real Telegram initData).
+    raw_check_string = "\n".join(
+        f"{k}={v}" for k, v in sorted(raw_pairs.items())
+    )
+    raw_hash = hmac.new(
+        secret_key, raw_check_string.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+    assert expected_hash != raw_hash, (
+        "decoded-hash and raw-hash MUST differ for a percent-encoded "
+        "user JSON; if they ever match, this test no longer exercises "
+        "the Telegram semantics regression."
+    )
+
+    raw_pairs["hash"] = expected_hash
+    init_data = "&".join(f"{k}={v}" for k, v in raw_pairs.items())
+
+    # 4) Verifier must accept the decoded-value hash and reject the
+    #    raw-chunk hash.  We exercise the accepted path; the rejected
+    #    path is covered by test_webapp_auth_bad_signature_returns_401
+    #    and the negative test below.
+    response = client.post("/api/v1/webapp/auth", json={"init_data": init_data})
+    assert response.status_code == 200, (
+        f"verifier MUST accept an initData whose hash was computed "
+        f"from URL-decoded parsed fields (Telegram spec); got "
+        f"{response.status_code} {response.text}"
+    )
+    body = response.json()
+    assert body["role"] == "OWNER"
+    assert body["org_id"] == workspace.org_id
+    assert body["user_id"] == workspace.owner_user_id
+
+
+def test_webapp_auth_rejects_raw_percent_encoded_hash(webapp_client):
+    """Companion negative test for the regression guardrail above.
+
+    Forging the hash from the RAW percent-encoded chunks (the prior
+    implementation's semantics) MUST be rejected with 401 — the
+    verifier signs the decoded fields, not the wire bytes.  Without
+    this test, a future refactor could silently flip the verifier
+    back to the raw-chunk builder and ``test_webapp_auth_..._issu
+    es_bearer`` would still pass (because ``_build_init_data`` is
+    rewritten to match whichever side is wrong).
+    """
+    client, _, _ = webapp_client
+
+    # Same realistic payload as the positive case.
+    user_obj = {
+        "id": TEST_OWNER_TELEGRAM_ID,
+        "first_name": "Test O'Owner",
+        "last_name": "Doe, Jr.",
+        "username": "tester.user",
+        "language_code": "en-US",
+        "is_premium": True,
+    }
+    user_json = json.dumps(user_obj, separators=(",", ":"))
+    user_encoded = quote(user_json, safe="")
+    auth_date = int(time.time())
+    raw_pairs: dict[str, str] = {
+        "query_id": "AAHdF6MQAAAAAN0XmD",
+        "user": user_encoded,
+        "auth_date": str(auth_date),
+    }
+
+    # Forged hash from RAW percent-encoded chunks — this is what the
+    # prior (buggy) verifier computed.  The fixed verifier MUST
+    # reject it because its own hash input is the decoded fields.
+    secret_key = hmac.new(
+        b"WebAppData", TEST_BOT_TOKEN.encode("utf-8"), hashlib.sha256,
+    ).digest()
+    raw_check_string = "\n".join(
+        f"{k}={v}" for k, v in sorted(raw_pairs.items())
+    )
+    forged_hash = hmac.new(
+        secret_key, raw_check_string.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+    raw_pairs["hash"] = forged_hash
+    init_data = "&".join(f"{k}={v}" for k, v in raw_pairs.items())
+
+    response = client.post("/api/v1/webapp/auth", json={"init_data": init_data})
+    assert response.status_code == 401, (
+        f"verifier MUST reject an initData whose hash was forged over "
+        f"raw percent-encoded chunks; got {response.status_code} "
+        f"{response.text}"
+    )
 
 
 # ===========================================================================
