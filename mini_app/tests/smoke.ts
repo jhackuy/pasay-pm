@@ -231,6 +231,194 @@ test("dist build artifacts contain view modules", async () => {
   expect(jsBundle).toBeTruthy();
 });
 
+// ─────────────────────────────────────────────────────────────────────────
+// Issue #119 Mini App production half — app shell / assets guardrails
+// ─────────────────────────────────────────────────────────────────────────
+
+test("dist app shell: html doctype + #app mount + meta viewport", async () => {
+  // The Cloudflare Pages origin serves dist/index.html; every smoke
+  // probe and the Playwright browser-smoke gate asserts the SPA shell
+  // is the bytes we shipped.  Missing or stale shell markers here
+  // would surface as a 200 page with a blank body — exactly the
+  // "PASAY Mini App URL returns 200/assets" failure the issue calls out.
+  const distDir = path.resolve(process.cwd(), "dist");
+  const indexHtml = path.join(distDir, "index.html");
+  if (!fs.existsSync(indexHtml)) throw new Error("dist/index.html missing — run npm run build first");
+  const html = fs.readFileSync(indexHtml, "utf-8");
+  expect(html.toLowerCase()).toContain("<!doctype html");
+  expect(html).toContain('id="app"');
+  expect(html).toContain('name="viewport"');
+  expect(html).toContain("/assets/");
+  // The script tag must reference a real asset so Cloudflare Pages can
+  // serve the bundle (relative paths must resolve from dist/).
+  const scriptMatch = html.match(/src="([^"]+\.js)"/);
+  expect(scriptMatch).toBeTruthy();
+  if (scriptMatch) {
+    const relPath = scriptMatch[1].replace(/^\.?\/+/, "");
+    const target = path.join(distDir, relPath);
+    expect(fs.existsSync(target)).toBeTruthy();
+  }
+});
+
+test("dist _redirects file ships the SPA fallback for Pages", async () => {
+  // mini_app/public/_redirects MUST be copied verbatim into dist/ so
+  // Cloudflare Pages picks up the SPA fallback (any non-asset path
+  // resolves to index.html and the hash router takes over).
+  const distDir = path.resolve(process.cwd(), "dist");
+  const redirects = path.join(distDir, "_redirects");
+  if (!fs.existsSync(redirects)) {
+    throw new Error(
+      `dist/_redirects missing — Vite publicDir did not mirror mini_app/public/; `
+      + `Pages SPA fallback will 404 on refresh`,
+    );
+  }
+  const text = fs.readFileSync(redirects, "utf-8");
+  expect(text).toContain("/index.html");
+});
+
+test("dist assets include js + css bundles", async () => {
+  // Cloudflare Pages serves dist/assets/* with the right Content-Type
+  // automatically; the bundle MUST contain at least one JS file (the
+  // TS sources) and at least one CSS file (the bundled style.css).
+  const distDir = path.resolve(process.cwd(), "dist");
+  const assetsDir = path.join(distDir, "assets");
+  if (!fs.existsSync(assetsDir)) {
+    throw new Error("dist/assets/ missing — Vite build did not emit any assets");
+  }
+  const files = fs.readdirSync(assetsDir);
+  expect(files.some((entry) => entry.endsWith(".js"))).toBeTruthy();
+  expect(files.some((entry) => entry.endsWith(".css"))).toBeTruthy();
+});
+
+test("bundle references the Home and Properties view modules", async () => {
+  // The Home / Properties surfaces are the two Owner-acceptance entry
+  // points the issue enumerates.  The compiled bundle MUST carry
+  // enough material for both views to render — a regression that
+  // strips one would surface as a 200 page with a broken nav.
+  //
+  // After Vite's minification the function names (renderHome /
+  // renderProperties) collapse to short identifiers, so the
+  // guardrail checks the route-name string literals ("home",
+  // "properties") + the API method names (listProperties,
+  // getDashboardHome — these are property access strings that survive
+  // minification because they appear verbatim in the PasayClient call
+  // site) instead.  A regression that strips a view will fail this
+  // guardrail via the route string.
+  const distDir = path.resolve(process.cwd(), "dist");
+  const assetsDir = path.join(distDir, "assets");
+  const jsBundle = fs
+    .readdirSync(assetsDir)
+    .find((entry) => entry.endsWith(".js"));
+  if (!jsBundle) throw new Error("dist/assets/*.js missing");
+  const bundle = fs.readFileSync(path.join(assetsDir, jsBundle), "utf-8");
+  // Route-name string literals (hash routing keys the Mini App uses
+  // for navigation).  Both must be present for the SPA to reach Home
+  // and Properties on a click.
+  expect(bundle).toContain('"home"');
+  expect(bundle).toContain('"properties"');
+  // API method names — these survive minification as object property
+  // access on the PasayClient instance.
+  expect(bundle).toContain("listProperties");
+  expect(bundle).toContain("getDashboardHome");
+});
+
+test("telegram initData reader returns disabled state when Telegram absent", async () => {
+  // The Mini App gracefully degrades to the bootstrap form when opened
+  // outside Telegram (dev preview, Playwright harness, CI smoke).  The
+  // reader MUST return a "disabled" status rather than throwing.
+  const { readTelegramInitData } = await import(
+    pathToFileURL(path.resolve(process.cwd(), "src/telegram.ts")).href
+  );
+  // Ensure no window.Telegram is set.
+  const original = (globalThis as { Telegram?: unknown }).Telegram;
+  delete (globalThis as { Telegram?: unknown }).Telegram;
+  try {
+    const status = readTelegramInitData();
+    expect(status.kind).toBe("disabled");
+  } finally {
+    if (original !== undefined) {
+      (globalThis as { Telegram?: unknown }).Telegram = original;
+    }
+  }
+});
+
+test("telegram initData reader returns error state when WebApp lacks initData", async () => {
+  // Telegram's WebApp object exists but initData is empty (an
+  // improperly-initialised bot, a stale embedded web view).  The
+  // reader MUST surface a stable error code so the SPA renders the
+  // Owner-only error screen — never silently fall through.
+  const { readTelegramInitData } = await import(
+    pathToFileURL(path.resolve(process.cwd(), "src/telegram.ts")).href
+  );
+  // The reader looks at `window.Telegram.WebApp.initData`; we
+  // install both the window and the globalThis reference so the test
+  // is robust to whichever object the JSDOM `window` binding sees.
+  const w = (globalThis as { window?: { Telegram?: unknown } }).window;
+  const originalWindow = w?.Telegram;
+  const originalGlobal = (globalThis as { Telegram?: unknown }).Telegram;
+  if (w) w.Telegram = { WebApp: { initData: "" } };
+  (globalThis as { Telegram?: unknown }).Telegram = {
+    WebApp: { initData: "" },
+  };
+  try {
+    const status = readTelegramInitData();
+    expect(status.kind).toBe("error");
+    if (status.kind === "error") {
+      expect(status.code).toBe("init_data_empty");
+    }
+  } finally {
+    if (w && originalWindow !== undefined) {
+      w.Telegram = originalWindow;
+    } else if (w) {
+      delete w.Telegram;
+    }
+    if (originalGlobal !== undefined) {
+      (globalThis as { Telegram?: unknown }).Telegram = originalGlobal;
+    } else {
+      delete (globalThis as { Telegram?: unknown }).Telegram;
+    }
+  }
+});
+
+test("telegram initData reader returns ok state with initData present", async () => {
+  // The Mini App MUST be able to read the signed initData string
+  // verbatim from Telegram.WebApp.initData and forward it to
+  // /api/v1/webapp/auth.  Reader surfaces the raw string so the
+  // backend can re-verify the HMAC.
+  const { readTelegramInitData } = await import(
+    pathToFileURL(path.resolve(process.cwd(), "src/telegram.ts")).href
+  );
+  const w = (globalThis as { window?: { Telegram?: unknown } }).window;
+  const originalWindow = w?.Telegram;
+  const originalGlobal = (globalThis as { Telegram?: unknown }).Telegram;
+  const payload = {
+    WebApp: {
+      initData:
+        "query_id=AAEh&user=%7B%22id%22%3A5177241442%7D&auth_date=1700000000&hash=deadbeef",
+    },
+  };
+  if (w) w.Telegram = payload;
+  (globalThis as { Telegram?: unknown }).Telegram = payload;
+  try {
+    const status = readTelegramInitData();
+    expect(status.kind).toBe("ok");
+    if (status.kind === "ok") {
+      expect(status.initData).toContain("hash=deadbeef");
+    }
+  } finally {
+    if (w && originalWindow !== undefined) {
+      w.Telegram = originalWindow;
+    } else if (w) {
+      delete w.Telegram;
+    }
+    if (originalGlobal !== undefined) {
+      (globalThis as { Telegram?: unknown }).Telegram = originalGlobal;
+    } else {
+      delete (globalThis as { Telegram?: unknown }).Telegram;
+    }
+  }
+});
+
 let passed = 0;
 let failed = 0;
 const errors: Array<{ name: string; error: Error }> = [];

@@ -6,13 +6,22 @@
  *
  *  No bundler-time magic, no extra plugins: just the default Vite TS/ESM
  *  build. Production deployment is expected to serve `dist/` from a CDN
- *  or from the FastAPI container.
+ *  (Cloudflare Pages, see mini_app/wrangler.toml) or from the FastAPI
+ *  container (the SPA fallback in app/v1/main.py still applies).
  */
 import { defineConfig } from "vite";
 
 export default defineConfig({
   root: ".",
+  // Issue #119: ``./`` keeps the asset URLs relative so the bundle
+  // works both at the Cloudflare Pages root (https://pasay-mini-app.pages.dev/)
+  // AND behind the FastAPI container path / Mini App mount — absolute
+  // paths would break the second deployment shape.
   base: "./",
+  // Issue #119: mirror every entry under `public/` (notably `_redirects`)
+  // into the build output so Cloudflare Pages picks up the SPA fallback
+  // without a custom Pages Function.
+  publicDir: "public",
   build: {
     outDir: "dist",
     emptyOutDir: true,

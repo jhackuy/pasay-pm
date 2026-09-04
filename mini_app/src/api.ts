@@ -9,6 +9,7 @@ import type {
   ApiKey,
   AuditEvent,
   BootstrapResponse,
+  WebappAuthResponse,
   DashboardHome,
   DepositDisposition,
   DepositSettlement,
@@ -126,6 +127,17 @@ export class PasayClient {
     owner_display_name?: string | null;
   }): Promise<BootstrapResponse> {
     return this.request<BootstrapResponse>("/bootstrap", { method: "POST", body });
+  }
+
+  // Issue #119 Mini App — exchange a signed Telegram initData string for
+  // a bearer session.  Backend: app/v1/api/webapp_auth.py
+  // (POST /api/v1/webapp/auth).  Owner-only by policy; the Mini App MUST
+  // surface the failure with a clear message rather than retry silently.
+  webappAuth(initData: string): Promise<WebappAuthResponse> {
+    return this.request<WebappAuthResponse>("/webapp/auth", {
+      method: "POST",
+      body: { init_data: initData },
+    });
   }
 
   // Workspaces + members

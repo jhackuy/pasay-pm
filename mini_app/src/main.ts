@@ -5,6 +5,7 @@
  *  localStorage (AGENTS.md §4).
  */
 
+import "./style.css";
 import { PasayClient } from "./api";
 import { router } from "./router";
 import { SessionStore } from "./state";
@@ -18,6 +19,7 @@ import { renderMore } from "./views/more";
 import { renderMoveOutDetail } from "./views/move_out";
 import { renderRentClaimDetail } from "./views/rent_payment";
 import { renderRepairDetail } from "./views/repair";
+import { readTelegramInitData, renderWebappError } from "./telegram";
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Mini App mount point #app is missing");
@@ -52,11 +54,69 @@ function setLocale(next: Locale): void {
   paint();
 }
 
+/** Issue #119 Mini App — Telegram initData → bearer exchange attempt.
+ *
+ *  Runs exactly once per page load (see ``initDataAttempted``): every
+ *  subsequent paint reuses the in-memory SessionStore or falls back to
+ *  the bootstrap form.  A failed exchange surfaces the Owner-only
+ *  error screen so a leaked / misconfigured initData can never silently
+ *  degrade to the dev-only bootstrap form.
+ */
+let initDataAttempted = false;
+async function tryTelegramWebAppAuth(): Promise<boolean> {
+  if (initDataAttempted) return session.isAuthenticated();
+  initDataAttempted = true;
+  const status = readTelegramInitData();
+  if (status.kind === "disabled") return false;  // dev / browser test
+  if (status.kind === "error") {
+    renderWebappError(root!, status, locale);
+    return false;
+  }
+  // status.kind === "ok"
+  try {
+    const response = await client.webappAuth(status.initData);
+    session.bootstrap(response.api_key, response.org_id, response.user_id, response.role);
+    window.__PASAY_SESSION__ = {
+      api_key: response.api_key,
+      org_id: response.org_id,
+      user_id: response.user_id,
+      role: response.role,
+    };
+    return true;
+  } catch (err) {
+    const code = (err as { detail?: string })?.detail ?? (err as Error)?.message ?? "unknown";
+    renderWebappError(
+      root!,
+      {
+        kind: "error",
+        code: String(code).slice(0, 64),
+        message: locale === "zh"
+          ? `Telegram 登录被拒绝：${String(code).slice(0, 120)}`
+          : `Telegram login rejected: ${String(code).slice(0, 120)}`,
+      },
+      locale,
+    );
+    return false;
+  }
+}
+
 async function paint(): Promise<void> {
   const route = router.current;
   if (!session.isAuthenticated()) {
-    renderBootstrap();
-    return;
+    // Try Telegram WebApp initData first; only fall back to the dev
+    // bootstrap form when Telegram is absent OR the exchange was
+    // attempted and refused.
+    const ok = await tryTelegramWebAppAuth();
+    if (!ok) {
+      if (initDataAttempted && window.Telegram?.WebApp) {
+        // Telegram is present but refused the initData — the
+        // tryTelegramWebAppAuth call already rendered the error
+        // screen; do not clobber it with the bootstrap form.
+        return;
+      }
+      renderBootstrap();
+      return;
+    }
   }
   const orgId = session.orgId ?? 0;
   renderShell(
