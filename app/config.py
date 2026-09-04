@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # container startup (fail-fast). Application runtime continues to use
     # ``database_url`` (pooled, Neon-recommended). Scope E contract.
     database_url_unpooled: str = ""
+    # Issue #119 Mini App — Owner-only allowlist for the
+    # ``/api/v1/webapp/auth`` initData exchange endpoint.  Comma-separated
+    # Telegram user ids.  Empty = the SPA stays locked (every initData is
+    # rejected with 503) so the policy is fail-closed at deploy time.
+    pasay_owner_telegram_user_ids: str = ""
 
 
 settings = Settings()

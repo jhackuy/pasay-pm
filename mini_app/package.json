@@ -7,7 +7,8 @@
     "build": "tsc --noEmit && vite build",
     "test:smoke": "node --experimental-vm-modules --import tsx tests/smoke.ts",
     "test:browser": "node tests/run_browser_smoke.mjs",
-    "test": "npm run test:smoke && npm run test:browser"
+    "test": "npm run test:smoke && npm run test:browser",
+    "deploy:pages": "../scripts/deploy_mini_app_pages.sh"
   },
   "devDependencies": {
     "typescript": "5.9.2",

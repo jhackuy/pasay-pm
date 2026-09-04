@@ -1,0 +1,17 @@
+# ────────────────────────────────────────────────────────────────────────────
+# PASAY Mini App SPA fallback for Cloudflare Pages (Issue #119).
+#
+# The Mini App is a hash-routed SPA (`#/home`, `#/properties`, ...).  When
+# the Owner refreshes the page on a deep hash, the static asset server
+# MUST return `index.html` so the bundle boots and the router takes over
+# (the hash fragment is never sent to the server).  Anything under
+# `/assets/*` and `/api/*` keeps its default passthrough; only the SPA
+# shell paths are forced to the index.
+#
+# This file is committed at mini_app/public/_redirects so it ends up at
+# dist/_redirects after `npm run build` — Cloudflare Pages reads it from
+# the build output directory automatically.
+#
+# Reference: https://developers.cloudflare.com/pages/configuration/redirects/
+# ────────────────────────────────────────────────────────────────────────────
+/*    /index.html   200

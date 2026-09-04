@@ -1,0 +1,38 @@
+# ────────────────────────────────────────────────────────────────────────────
+# PASAY Mini App — Cloudflare Pages deploy configuration (Issue #119).
+#
+# Cloudflare Pages provides a stable HTTPS origin at
+# https://<project>.pages.dev that is reachable from Telegram's Mini App
+# WebView (which requires an https:// origin).  This file is consumed by
+# `wrangler pages deploy ../mini_app/dist --project-name=pasay-mini-app`
+# (see scripts/deploy_mini_app_pages.sh and the npm `deploy:pages` script).
+#
+# Scope:
+#   * NO workers / NO Durable Objects — this is a Pages project, distinct
+#     from cloudflare-worker/ which owns the Worker + Container binding.
+#   * The build artifact is mini_app/dist (produced by `npm run build`
+#     in CI's `build-core-smoke` job).  CI never invokes this deploy — a
+#     trusted-lane operator runs scripts/deploy_mini_app_pages.sh from a
+#     machine that has CLOUDFLARE_API_TOKEN in scope.
+#   * A SPA fallback is enforced via mini_app/public/_redirects (also
+#     bundled into dist by the Vite build) so the hash-routed Mini App
+#     gets a single canonical shell page on every refresh.
+#
+# Variables the deploy script must inject:
+#   CLOUDFLARE_API_TOKEN  — Pages write scope (not committed)
+#   CLOUDFLARE_ACCOUNT_ID — Pages project owner (not committed)
+# ────────────────────────────────────────────────────────────────────────────
+name = "pasay-mini-app"
+compatibility_date = "2026-08-20"
+pages_build_output_dir = "dist"
+
+# Pages deployment metadata — surfaces in the Cloudflare dashboard.
+# The committed production URL surface is the one returned by
+# `wrangler pages deploy` on first run: https://pasay-mini-app.pages.dev
+# (Owner binds that URL into the Telegram MenuButton / WebAppInfo).
+
+[build]
+command = "npm run build"
+
+[build.environment]
+NODE_VERSION = "20"

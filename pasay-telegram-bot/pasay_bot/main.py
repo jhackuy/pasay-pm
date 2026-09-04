@@ -246,7 +246,97 @@ def build_application(
         except Exception as exc:  # noqa: BLE001 - cosmetic, never fatal
             logger.warning("set_my_commands (empty) failed: %s", exc)
 
-    app.post_init = _set_rescue_command_menu
+    async def _set_owner_mini_app_menu_button(app_):
+        """Issue #119 Mini App — register the per-user Telegram MenuButton
+        pointing at the Owner Console (`打开管理后台`).
+
+        Telegram's ``setChatMenuButton`` is per-user: each bound Telegram
+        user id (default: the OWNER role id from TELEGRAM_USER_ID_TO_ROLE)
+        gets the WebApp entry pinned on the bot's chat.  Empty /
+        unconfigured ``PASSAY_MINI_APP_URL`` disables the menu button (the
+        persistent Reply Keyboard stays usable).
+
+        Fail-closed: every API call is wrapped; a bot-api rejection must
+        NEVER abort startup (the rest of the bot stays functional even if
+        Telegram refuses the menu button for a brand-new chat that has no
+        history with the bot yet).
+
+        The ``settings`` argument is passed in explicitly so this helper
+        stays testable in isolation from the rest of ``build_application``
+        rather than relying on the module-level lru_cache that would
+        silently leak across tests.
+        """
+        from telegram import BotCommandScopeChat, MenuButtonWebApp, WebAppInfo
+
+        from pasay_bot.roles import TELEGRAM_USER_ID_TO_ROLE
+
+        _settings = settings
+        mini_app_url = (_settings.pasay_mini_app_url or "").strip()
+        if not mini_app_url:
+            logger.info(
+                "mini-app MenuButton disabled: PASSAY_MINI_APP_URL not set"
+            )
+            return
+        if not mini_app_url.lower().startswith("https://"):
+            logger.warning(
+                "mini-app MenuButton skipped: PASSAY_MINI_APP_URL is not "
+                "an https:// origin (got %r); Telegram WebApp requires https",
+                mini_app_url,
+            )
+            return
+        # Resolve the bound Telegram user ids.  Default to the OWNER role
+        # id from TELEGRAM_USER_ID_TO_ROLE when the operator didn't set
+        # PASSAY_MINI_APP_OWNER_TELEGRAM_IDS explicitly.
+        ids_raw = (_settings.pasay_mini_app_owner_telegram_ids or "").strip()
+        if ids_raw:
+            bound_ids: list[int] = []
+            for chunk in ids_raw.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                try:
+                    bound_ids.append(int(chunk))
+                except ValueError:
+                    logger.warning(
+                        "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS: skipping "
+                        "non-integer entry %r",
+                        chunk,
+                    )
+        else:
+            bound_ids = [
+                uid for uid, role in TELEGRAM_USER_ID_TO_ROLE.items()
+                if role.value == "owner"
+            ]
+        if not bound_ids:
+            logger.warning(
+                "mini-app MenuButton skipped: no OWNER Telegram id bound "
+                "(set PASSAY_MINI_APP_OWNER_TELEGRAM_IDS or extend "
+                "TELEGRAM_USER_ID_TO_ROLE in pasay_bot/roles.py)"
+            )
+            return
+
+        menu_button = MenuButtonWebApp(
+            text="打开管理后台",
+            web_app=WebAppInfo(url=mini_app_url),
+        )
+        for user_id in bound_ids:
+            try:
+                await app_.bot.set_chat_menu_button(
+                    menu_button=menu_button,
+                    scope=BotCommandScopeChat(chat_id=user_id),
+                )
+            except Exception as exc:  # noqa: BLE001 — cosmetic, never fatal
+                logger.warning(
+                    "set_chat_menu_button (user_id=%s) failed: %s",
+                    user_id,
+                    exc,
+                )
+
+    async def _post_init(app_):
+        await _set_rescue_command_menu(app_)
+        await _set_owner_mini_app_menu_button(app_)
+
+    app.post_init = _post_init
     return app
 
 

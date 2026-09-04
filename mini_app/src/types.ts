@@ -13,6 +13,20 @@ export type BootstrapResponse = {
   role: string;
 };
 
+/** Response from POST /api/v1/webapp/auth — Telegram initData exchange.
+ *
+ *  Mirror of app.v1.api.webapp_auth.WebappAuthResponse.  The Mini App
+ *  treats `expires_at` as opaque (Unix-seconds; the SPA simply forgets
+ *  the bearer when the in-memory store is cleared, no localStorage).
+ */
+export type WebappAuthResponse = {
+  org_id: number;
+  user_id: number;
+  api_key: string;
+  role: string;
+  expires_at: number;
+};
+
 export type Organization = {
   id: number;
   name: string;

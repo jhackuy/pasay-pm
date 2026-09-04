@@ -32,6 +32,7 @@ from app.v1.api.rent_payments import router as rent_payments_router
 from app.v1.api.renewals import router as renewals_router
 from app.v1.api.repairs import router as repairs_router
 from app.v1.api.tenants import router as tenants_router
+from app.v1.api.webapp_auth import router as webapp_auth_router
 from app.v1.api.workspaces import router as workspaces_router
 
 
@@ -105,6 +106,9 @@ def create_v1_app() -> FastAPI:
     app.include_router(operations_router, prefix="/api/v1")
     app.include_router(dashboard_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")
+    # Issue #119 Mini App — exchange signed Telegram initData for a
+    # bearer session.  Owner-only by policy (see webapp_auth.py docstring).
+    app.include_router(webapp_auth_router, prefix="/api/v1")
 
     # Optional Mini App static mount (used by the Playwright browser smoke
     # and by container deployments that serve the SPA from the API host).

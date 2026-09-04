@@ -35,6 +35,16 @@ class Settings(BaseSettings):
     # jobs never impersonate a HUMAN Owner. Empty disables the jobs (fail
     # closed — the jobs never fall back to any other identity).
     pasay_job_api_key: str = ""
+    # Issue #119 Mini App — stable HTTPS URL of the Owner Console.  Wired
+    # into the Telegram MenuButton (button text "打开管理后台") when set;
+    # empty disables the MenuButton (the persistent Reply Keyboard stays
+    # usable as the only entry point).  The URL must be https:// and
+    # reachable from the Telegram WebView (Pages or Worker origin).
+    pasay_mini_app_url: str = ""
+    # Issue #119 Mini App — Telegram user id(s) that the MenuButton is
+    # registered for.  Defaults to the OWNER id from TELEGRAM_USER_ID_TO_ROLE
+    # when empty.  Comma-separated.
+    pasay_mini_app_owner_telegram_ids: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env", extra="ignore", case_sensitive=False
@@ -57,6 +67,7 @@ def _env() -> dict:
             "STATE_DB", "HOOK_TOKEN", "CALLBACK_TTL_SECONDS",
             "PASSAY_HTTP_TIMEOUT_SECONDS", "PASSAY_ARCHIVE_CHAT_ID",
             "PASSAY_JOB_API_KEY",
+            "PASSAY_MINI_APP_URL", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
         }:
             data[key] = val
     return data
@@ -78,4 +89,6 @@ def get_settings() -> Settings:
         pasay_http_timeout_seconds=float(e.get("PASSAY_HTTP_TIMEOUT_SECONDS", "30") or "30"),
         archive_chat_id=(e.get("PASSAY_ARCHIVE_CHAT_ID") or "").strip(),
         pasay_job_api_key=(e.get("PASSAY_JOB_API_KEY") or "").strip(),
+        pasay_mini_app_url=(e.get("PASSAY_MINI_APP_URL") or "").strip(),
+        pasay_mini_app_owner_telegram_ids=(e.get("PASSAY_MINI_APP_OWNER_TELEGRAM_IDS") or "").strip(),
     )
