@@ -207,6 +207,150 @@ function json(status: number, body: unknown, extra: Record<string, string> = {})
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...extra } });
 }
 
+/**
+ * CORS allow-origin for the Mini App Issue #119 SPA. Only the canonical
+ * ``https://pasay-mini-app.pages.dev`` Pages origin is permitted; every
+ * other Origin is *echoed* back unchanged (NOT ``*``) so the SPA still
+ * gets a working CORS handshake without us lifting credentials.
+ */
+function cors_headers_for_request(request: Request): Headers {
+  const headers = new Headers();
+  const origin = request.headers.get("Origin") ?? "";
+  // Pages preview / custom domains: only the canonical Pages URL is trusted.
+  // Echoing the origin back is permitted because we never set
+  // ``Access-Control-Allow-Credentials`` and the SPA does not include
+  // credentials on this fetch (see ``mini_app/src/api.ts``).
+  if (
+    origin === "https://pasay-mini-app.pages.dev" ||
+    origin === "https://pasay-mini-app.pages.dev/"
+  ) {
+    headers.set("Access-Control-Allow-Origin", "https://pasay-mini-app.pages.dev");
+  } else if (origin !== "") {
+    headers.set("Access-Control-Allow-Origin", origin);
+  } else {
+    headers.set("Access-Control-Allow-Origin", "https://pasay-mini-app.pages.dev");
+  }
+  headers.set("Vary", "Origin");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With, X-Idempotency-Key, Idempotency-Key",
+  );
+  headers.set("Access-Control-Max-Age", "86400");
+  return headers;
+}
+
+function apply_cors_to_response(resp: Response, request: Request): Response {
+  const outgoing = new Headers(resp.headers);
+  const cors = cors_headers_for_request(request);
+  cors.forEach((v, k) => {
+    if (k.toLowerCase() === "access-control-allow-origin") {
+      outgoing.set(k, v);
+    } else if (!outgoing.has(k)) {
+      outgoing.set(k, v);
+    }
+  });
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: outgoing,
+  });
+}
+
+/**
+ * Forward the inbound ``/api/v1/*`` request straight into the Container over
+ * the same native binding the queue path uses. Purpose: make the FastAPI V1
+ * surface reachable from the public Worker hostname so the Cloudflare Pages
+ * Mini App (``https://pasay-mini-app.pages.dev``) can mount its WebAppAuth
+ * + Properties + Home flows against the real backend without a Pages Function
+ * proxy or a custom hostname on the Container.
+ *
+ * The Container itself is NOT publicly exposed (Containers do not bind a
+ * public hostname by default — see ``app/main.py:do not expose /internal/*``
+ * note); this proxy is the ONLY publicly reachable path to it.
+ *
+ * Defence-in-depth (no silent auth removal, fail closed):
+ *   * No bypass of the Container's own auth/rbac — the bearer header set
+ *     by ``POST /api/v1/webapp/auth`` is forwarded verbatim. The FastAPI
+ *     dependency ``get_api_key`` + ``require_org_scope`` own every
+ *     ownership check; this Worker MUST NOT relax any of them.
+ *   * ``PASAY_CONTAINER_INGEST_TOKEN`` is NOT required for ``/api/v1/*``
+ *     because the Container's Bearer / membership middleware ALREADY trusts
+ *     ``Authorization: Bearer <api_key>`` and ``X-Telegram-User-Id``. The
+ *     internal ``/internal/ingest`` token is for the queue path only.
+ *   * Cloudflare Container binding allows ANY HTTP method on the forwarded
+ *     request (GET, POST, PATCH, PUT, DELETE, OPTIONS); we forward
+ *     method + body + (most) headers as-is. The Host header is rewritten
+ *     to the Container's origin so routing is stable.
+ *   * CORS is appended on the Worker boundary because the SPA is hosted
+ *     on Pages (``https://pasay-mini-app.pages.dev``) and the API surfaces
+ *     here — the cross-origin fetch needs ``Access-Control-Allow-Origin``
+ *     or the browser will refuse the response.
+ */
+async function forward_api_v1_to_container(
+  env: Env,
+  request: Request,
+): Promise<Response> {
+  // Preflight: respond immediately so we don't wake the Container for a
+  // header-only handshake.
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: cors_headers_for_request(request) });
+  }
+  if (!env.PASAY_CONTAINER) {
+    const r = json(503, { ok: false, error: "container_unbound" });
+    return apply_cors_to_response(r, request);
+  }
+  let handle: { fetch: (req: Request) => Promise<Response> };
+  try {
+    handle = getContainer(env.PASAY_CONTAINER, PASAY_CONTAINER_INSTANCE_ID);
+  } catch (err) {
+    log_error("api-v1-container-handle", err, env);
+    const r = json(503, { ok: false, error: "container_handle_failed" });
+    return apply_cors_to_response(r, request);
+  }
+  // Build the forwarded URL on the Container origin. Preserve query string;
+  // keep path identical so FastAPI mounts (/api/v1/*) resolve natively.
+  const incoming = new URL(request.url);
+  const forward_url = `${PASAY_CONTAINER_ORIGIN}${incoming.pathname}${incoming.search}`;
+
+  // Forward every header except Hop-by-hop + Host (the latter would either be
+  // the Worker hostname — useless inside the Container — or trip Cloudflare's
+  // host-equality invariant on a few sensitive endpoints).
+  const headers = new Headers(request.headers);
+  headers.delete("host");
+  headers.delete("cf-connecting-ip");
+  headers.delete("origin");
+  headers.set("X-Forwarded-Proto", incoming.protocol.replace(":", ""));
+  headers.set("X-Forwarded-Host", incoming.host);
+
+  let body: ArrayBuffer | undefined;
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    try {
+      body = await request.arrayBuffer();
+    } catch (err) {
+      log_error("api-v1-body-read", err, env);
+      const r = json(400, { ok: false, error: "body_read_failed" });
+      return apply_cors_to_response(r, request);
+    }
+  }
+
+  const fwd_req = new Request(forward_url, {
+    method: request.method,
+    headers,
+    body: body as BodyInit | undefined,
+  });
+  let resp: Response;
+  try {
+    resp = await handle.fetch(fwd_req);
+  } catch (err) {
+    log_error("api-v1-container-fetch", err, env);
+    const r = json(503, { ok: false, error: "container_fetch_failed" });
+    return apply_cors_to_response(r, request);
+  }
+  // Append CORS so the SPA's cross-origin fetch sees the response.
+  return apply_cors_to_response(resp, request);
+}
+
 export default {
   async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -223,6 +367,15 @@ export default {
         container_instance_id: PASAY_CONTAINER_INSTANCE_ID,
         envelope_version: ENVELOPE_VERSION,
       });
+    }
+    // Public V1 API surface for the Mini App (Issue #119 acceptance evidence
+    // — Owner signs in via Telegram initData on POST /api/v1/webapp/auth,
+    // then the SPA uses the issued bearer for /api/v1/properties,
+    // /api/v1/dashboard/home, …). Without this hop the SPA cannot reach the
+    // Container from the Pages origin (Pages is static; the Container is not
+    // publicly addressable).
+    if (url.pathname.startsWith("/api/v1/")) {
+      return forward_api_v1_to_container(env, request);
     }
     return json(404, { ok: false, error: "not_found" });
   },
