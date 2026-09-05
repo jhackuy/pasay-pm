@@ -214,8 +214,24 @@ async def get_ptb_application():
             # build_application() returns an *uninitialized* Application. We need
             # the store + api clients so handlers reach the backend; we do NOT call
             # run_polling() here — inbound updates come from the HTTP webhook.
+            #
+            # Issue #119 P0 ACCEPTANCE-ITEM-1: ``StateStore.__init__`` already
+            # runs ``self.migrate()`` (see pasay_telegram_bot/state/store.py:
+            # the constructor opens the sqlite3 connection, sets WAL, and calls
+            # migrate() unconditionally). A leftover ``store.init()`` call
+            # would raise ``AttributeError: 'StateStore' object has no attribute
+            # 'init'`` on every webhook — get_ptb_application would fail with
+            # AttributeError, ``_classify_ptb_boot_exception`` classifies it as
+            # TEMPORARY (the default fallback after the sentinel short-circuits
+            # miss), so the webhook returns HTTP 503 → Telegram retries → the
+            # same AttributeError fires again → cross-attempt budget exhausted
+            # → the update is marked ``failed`` and Telegram stops replaying.
+            # The Owner never sees a visible reply for /start OR any
+            # persistent-keyboard action. The watchdog stays green because
+            # watchdog probes only getMe / getWebhookInfo / /health — none of
+            # which exercise ``StateStore`` or any handler-driven
+            # ``bot.send_message``.
             store = StateStore(bot_settings.state_db)
-            store.init()
             # Recovery: any stale in-flight idempotency marks in the bot's OWN
             # idempotency table (conversation/daily marks) are reset on startup so
             # crashes do not permanently pin a conversation key.
