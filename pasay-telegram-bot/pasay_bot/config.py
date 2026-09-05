@@ -59,6 +59,22 @@ def _env() -> dict:
             "PASSAY_MINI_APP_URL", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
         }:
             data[key] = val
+    # Issue #119 P0 Telegram-runtime defensive fallback: the Cloudflare
+    # Worker historically only forwarded the raw Telegram token under the
+    # upstream name ``TELEGRAM_BOT_TOKEN``; the bot reads it under
+    # ``PASSAY_TG_BOT_TOKEN``. If the operator has not provisioned a
+    # dedicated ``PASSAY_TG_BOT_TOKEN`` Worker secret yet, accept the
+    # upstream token as a fallback so ``builder.token("")"`` does not
+    # silently default to ``"0:UNSET"`` (every send_message would then hit
+    # api.telegram.org/bot0:UNSET/sendMessage, Telegram returns
+    # InvalidToken, the handler fails PERMANENTLY, the update is marked
+    # ``failed`` and the Owner sees NO visible reply — the exact user-visible
+    # failure mode from Issue #119). The Cloudflare Worker now also forwards
+    # ``TELEGRAM_BOT_TOKEN`` as ``PASSAY_TG_BOT_TOKEN`` directly (see
+    # ``cloudflare-worker/src/index.ts::PasayContainer.envVars``) so this
+    # fallback is purely a second line of defence.
+    if not data.get("PASSAY_TG_BOT_TOKEN") and os.environ.get("TELEGRAM_BOT_TOKEN"):
+        data["PASSAY_TG_BOT_TOKEN"] = os.environ["TELEGRAM_BOT_TOKEN"]
     return data
 
 

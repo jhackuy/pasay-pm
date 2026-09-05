@@ -23,10 +23,47 @@ export class PasayContainer extends Container {
 
   constructor(ctx: any = {}, env: Env = {} as Env, options?: any) {
     super(ctx, env, options);
+    // Issue #119 P0 Telegram-runtime: the bot's pasay_bot.config.Settings
+    // loader reads the env vars under their `PASSAY_*` names (e.g.
+    // `PASSAY_TG_BOT_TOKEN`, `PASSAY_API_KEY`, `PASSAY_JOB_API_KEY`). Until
+    // these were not forwarded into the Container, the bot was built with an
+    // empty `pasay_tg_bot_token` (PTB ApplicationBuilder fell back to
+    // "0:UNSET"), every `bot.send_message` call hit api.telegram.org/bot
+    // 0:UNSET/sendMessage, Telegram returned InvalidToken, the handler
+    // failed PERMANENTLY, the Worker marked the update `failed`, Telegram
+    // stopped replaying — the user-visible result was "Owner previously got
+    // no visible replies". Forwarding the Worker secret `TELEGRAM_BOT_TOKEN`
+    // as both names (`TELEGRAM_BOT_TOKEN` for back-compat and the new
+    // `PASSAY_TG_BOT_TOKEN` that the bot actually reads) closes the loop
+    // without requiring any new secret provisioning. The other bot env vars
+    // (API key, job key, optional URLs, archive id, timeout, …) are sourced
+    // from dedicated Worker secrets so the operator can provision them with
+    // `wrangler secret put <NAME>`. The pasay-telegram-bot runtime
+    // defaults already cover everything that has a default (pasay_api_base,
+    // pasay_http_timeout_seconds, pasay_mini_app_url, archive_chat_id,
+    // admin_api_key); see pasay_bot/config.py::DEFAULT_MINI_APP_URL for the
+    // canonical Pages origin.
+    const tg_token = env.TELEGRAM_BOT_TOKEN ?? "";
     this.envVars = {
       DATABASE_URL: env.DATABASE_URL ?? "",
       DATABASE_URL_UNPOOLED: env.DATABASE_URL_UNPOOLED ?? "",
-      TELEGRAM_BOT_TOKEN: env.TELEGRAM_BOT_TOKEN ?? "",
+      // PTB token is sourced under BOTH names — existing secret covers both.
+      TELEGRAM_BOT_TOKEN: tg_token,
+      PASSAY_TG_BOT_TOKEN: tg_token,
+      // Backend-bound keys / endpoints (operator provisions these as Worker
+      // secrets; default to "" so an unprovisioned bot fails closed on its
+      // first API call instead of silently impersonating anyone).
+      PASSAY_API_BASE: env.PASSAY_API_BASE ?? "",
+      PASSAY_API_KEY: env.PASSAY_API_KEY ?? "",
+      PASSAY_ADMIN_API_KEY: env.PASSAY_ADMIN_API_KEY ?? "",
+      PASSAY_JOB_API_KEY: env.PASSAY_JOB_API_KEY ?? "",
+      // Optional / with-defaults (worker secret can override; bot keeps its
+      // own defaults so an unprovisioned Worker still boots).
+      PASSAY_HTTP_TIMEOUT_SECONDS: env.PASSAY_HTTP_TIMEOUT_SECONDS ?? "",
+      PASSAY_ARCHIVE_CHAT_ID: env.PASSAY_ARCHIVE_CHAT_ID ?? "",
+      PASSAY_MINI_APP_URL: env.PASSAY_MINI_APP_URL ?? "",
+      PASSAY_MINI_APP_OWNER_TELEGRAM_IDS: env.PASSAY_MINI_APP_OWNER_TELEGRAM_IDS ?? "",
+      // Internal ingestion boundary (Worker → Container auth) — unchanged.
       TELEGRAM_WEBHOOK_SECRET: env.TELEGRAM_WEBHOOK_SECRET ?? "",
       CONTAINER_INGEST_TOKEN: env.PASAY_CONTAINER_INGEST_TOKEN ?? "",
       PASAY_RUNTIME_MODE: "cloudflare-container",
@@ -42,6 +79,17 @@ interface Env {
   DATABASE_URL?: string;
   DATABASE_URL_UNPOOLED?: string;
   TELEGRAM_BOT_TOKEN?: string;
+  // Issue #119 P0 Telegram-runtime: the bot's pasay_bot.config.Settings
+  // loader reads these under their `PASSAY_*` names. Provisioned via
+  // `wrangler secret put` and forwarded verbatim into the Container.
+  PASSAY_API_BASE?: string;
+  PASSAY_API_KEY?: string;
+  PASSAY_ADMIN_API_KEY?: string;
+  PASSAY_JOB_API_KEY?: string;
+  PASSAY_HTTP_TIMEOUT_SECONDS?: string;
+  PASSAY_ARCHIVE_CHAT_ID?: string;
+  PASSAY_MINI_APP_URL?: string;
+  PASSAY_MINI_APP_OWNER_TELEGRAM_IDS?: string;
 }
 
 function now_iso(): string {

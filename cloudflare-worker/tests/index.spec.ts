@@ -771,9 +771,34 @@ run("CLOSEOUT#6: Container status codes → EXACT ack/retry/terminal mapping (20
   }
 });
 
-run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL 6 unique keys (5 mapped from env + 1 static PASAY_RUNTIME_MODE)", () => {
-  const envVarEntries = [...WORKER_SRC.matchAll(/(?:PASAY_RUNTIME_MODE|DATABASE_URL(?:_UNPOOLED)?|TELEGRAM_BOT_TOKEN|TELEGRAM_WEBHOOK_SECRET|CONTAINER_INGEST_TOKEN)\s*:/g)].length;
-  assert(envVarEntries >= 6, `source should list the 6-keys envVars map (found ${envVarEntries} key assignments)`);
+run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL 15 unique keys (5 mapped from env + 1 static + 9 PASSAY_ bot keys forwarded under their canonical pasay_bot names)", () => {
+  // Issue #119 P0: the bot's pasay_bot.config.Settings loader reads env vars
+  // under their `PASSAY_*` names. The Worker must forward them under those
+  // names so the runtime bot can find the token / API key / job key it
+  // actually needs. Source-level guardrail: the key assignments in the
+  // PasayContainer constructor body must cover every name the bot reads.
+  const requiredNames = [
+    "PASAY_RUNTIME_MODE",
+    "DATABASE_URL",
+    "DATABASE_URL_UNPOOLED",
+    "TELEGRAM_BOT_TOKEN",
+    "PASSAY_TG_BOT_TOKEN",
+    "PASSAY_API_BASE",
+    "PASSAY_API_KEY",
+    "PASSAY_ADMIN_API_KEY",
+    "PASSAY_JOB_API_KEY",
+    "PASSAY_HTTP_TIMEOUT_SECONDS",
+    "PASSAY_ARCHIVE_CHAT_ID",
+    "PASSAY_MINI_APP_URL",
+    "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
+    "TELEGRAM_WEBHOOK_SECRET",
+    "CONTAINER_INGEST_TOKEN",
+  ];
+  for (const name of requiredNames) {
+    const re = new RegExp(`${name}\\s*:`);
+    assert(re.test(WORKER_SRC),
+      `PasayContainer envVars must assign ${name} (Issue #119 P0 bot-env forwarding)`);
+  }
 });
 
 run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env → exact keyset + per-key mapping source verified", () => {
@@ -785,12 +810,28 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     DATABASE_URL: "postgres://u:p@h/d",
     DATABASE_URL_UNPOOLED: "postgres://u:p@h/d_direct",
     TELEGRAM_BOT_TOKEN: "123:abc",
+    // Issue #119 P0: bot env vars the operator provisions as Worker secrets
+    // (separate `wrangler secret put <NAME>` per var). Empty defaults are
+    // intentional: an unprovisioned Worker still boots, the bot fails closed
+    // on its first API call instead of impersonating anyone.
+    PASSAY_API_BASE: "http://127.0.0.1:8000/api/v1",
+    PASSAY_API_KEY: "manager-key",
+    PASSAY_ADMIN_API_KEY: "admin-key",
+    PASSAY_JOB_API_KEY: "system-key",
+    PASSAY_HTTP_TIMEOUT_SECONDS: "45",
+    PASSAY_ARCHIVE_CHAT_ID: "-1001234567890",
+    PASSAY_MINI_APP_URL: "https://pasay-mini-app.pages.dev",
+    PASSAY_MINI_APP_OWNER_TELEGRAM_IDS: "111,222",
   };
   const inst = new (PasayContainer as any)({ id: "stub" }, fullEnv);
   const keys = Object.keys(inst.envVars).sort();
   const expected = [
     "CONTAINER_INGEST_TOKEN", "DATABASE_URL", "DATABASE_URL_UNPOOLED",
-    "PASAY_RUNTIME_MODE", "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
+    "PASSAY_ADMIN_API_KEY", "PASSAY_API_BASE", "PASSAY_API_KEY",
+    "PASSAY_ARCHIVE_CHAT_ID", "PASSAY_HTTP_TIMEOUT_SECONDS",
+    "PASSAY_JOB_API_KEY", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
+    "PASSAY_MINI_APP_URL", "PASAY_RUNTIME_MODE", "PASSAY_TG_BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
   ].sort();
   assert_eq(keys.length, expected.length,
     `envVars keys length = ${expected.length} unique — got ${keys.length}: ${keys}`);
@@ -798,7 +839,7 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     assert(k in inst.envVars, `envVars must contain key ${k}`);
   }
   // Per-key exact mapping source:
-  //   4 keys = direct 1:1 from Env → envVars
+  //   4 keys = direct 1:1 from Env → envVars (legacy Worker secrets)
   assert_eq(inst.envVars.DATABASE_URL, fullEnv.DATABASE_URL,
     "DATABASE_URL <-- env.DATABASE_URL (1:1)");
   assert_eq(inst.envVars.DATABASE_URL_UNPOOLED, fullEnv.DATABASE_URL_UNPOOLED,
@@ -812,6 +853,30 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
   //     "container_ingest_token" Settings key.
   assert_eq(inst.envVars.CONTAINER_INGEST_TOKEN, fullEnv.PASAY_CONTAINER_INGEST_TOKEN,
     "CONTAINER_INGEST_TOKEN <-- env.PASAY_CONTAINER_INGEST_TOKEN (NAME MAPPING: PASAY_ prefix stripped)");
+  //   1 key = SHARED SOURCE (TELEGRAM_BOT_TOKEN in Env → BOTH
+  //     TELEGRAM_BOT_TOKEN and PASSAY_TG_BOT_TOKEN in envVars). The bot
+  //     reads PASSAY_TG_BOT_TOKEN; we forward the same Worker secret under
+  //     both names so the operator needs to provision only ONE secret.
+  assert_eq(inst.envVars.PASSAY_TG_BOT_TOKEN, fullEnv.TELEGRAM_BOT_TOKEN,
+    "PASSAY_TG_BOT_TOKEN <-- env.TELEGRAM_BOT_TOKEN (shared source: operator provisions only TELEGRAM_BOT_TOKEN)");
+  //   7 keys = direct 1:1 from Env → envVars (new bot env vars the operator
+  //     provisions as dedicated Worker secrets).
+  assert_eq(inst.envVars.PASSAY_API_BASE, fullEnv.PASSAY_API_BASE,
+    "PASSAY_API_BASE <-- env.PASSAY_API_BASE (1:1)");
+  assert_eq(inst.envVars.PASSAY_API_KEY, fullEnv.PASSAY_API_KEY,
+    "PASSAY_API_KEY <-- env.PASSAY_API_KEY (1:1)");
+  assert_eq(inst.envVars.PASSAY_ADMIN_API_KEY, fullEnv.PASSAY_ADMIN_API_KEY,
+    "PASSAY_ADMIN_API_KEY <-- env.PASSAY_ADMIN_API_KEY (1:1)");
+  assert_eq(inst.envVars.PASSAY_JOB_API_KEY, fullEnv.PASSAY_JOB_API_KEY,
+    "PASSAY_JOB_API_KEY <-- env.PASSAY_JOB_API_KEY (1:1)");
+  assert_eq(inst.envVars.PASSAY_HTTP_TIMEOUT_SECONDS, fullEnv.PASSAY_HTTP_TIMEOUT_SECONDS,
+    "PASSAY_HTTP_TIMEOUT_SECONDS <-- env.PASSAY_HTTP_TIMEOUT_SECONDS (1:1)");
+  assert_eq(inst.envVars.PASSAY_ARCHIVE_CHAT_ID, fullEnv.PASSAY_ARCHIVE_CHAT_ID,
+    "PASSAY_ARCHIVE_CHAT_ID <-- env.PASSAY_ARCHIVE_CHAT_ID (1:1)");
+  assert_eq(inst.envVars.PASSAY_MINI_APP_URL, fullEnv.PASSAY_MINI_APP_URL,
+    "PASSAY_MINI_APP_URL <-- env.PASSAY_MINI_APP_URL (1:1)");
+  assert_eq(inst.envVars.PASSAY_MINI_APP_OWNER_TELEGRAM_IDS, fullEnv.PASSAY_MINI_APP_OWNER_TELEGRAM_IDS,
+    "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS <-- env.PASSAY_MINI_APP_OWNER_TELEGRAM_IDS (1:1)");
   //   1 key = STATIC (not from env, never changes regardless of env values)
   assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
     "PASAY_RUNTIME_MODE is STATIC (NOT from env) == cloudflare-container");
@@ -819,6 +884,32 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
   // super() as-is, so DurableObject storage / bindings (PASAY_QUEUE, PASAY_CONTAINER)
   // remain accessible through Container.env. The extra keys are intentionally
   // NOT forwarded into envVars because they are platform bindings, not env vars.
+});
+
+run("Issue#119 P0 TELEGRAM-RUNTIME: when TELEGRAM_BOT_TOKEN is the ONLY token env, PASSAY_TG_BOT_TOKEN in envVars MUST equal it (bot must not boot with token '0:UNSET')", () => {
+  // This is the exact user-visible failure mode from Issue #119: the bot
+  // was built with pasay_tg_bot_token="" → PTB ApplicationBuilder fell
+  // back to "0:UNSET" → every bot.send_message hit api.telegram.org/bot
+  // 0:UNSET/sendMessage → Telegram returned InvalidToken → handler failed
+  // PERMANENTLY → update marked failed → Owner saw NOTHING. This regression
+  // guardrail asserts the Worker's PasayContainer.forwarder covers the
+  // bot's expected env var name out of the SAME Worker secret.
+  const fullEnv = {
+    PASAY_QUEUE: makeFakeQueue(),
+    PASAY_CONTAINER: { x: 1 },
+    TELEGRAM_WEBHOOK_SECRET: "wh_sec",
+    PASAY_CONTAINER_INGEST_TOKEN: "ingest_v",
+    DATABASE_URL: "postgres://u@h/d",
+    DATABASE_URL_UNPOOLED: "postgres://u@h/d_direct",
+    TELEGRAM_BOT_TOKEN: "555:REAL_PROD_TOKEN",
+  };
+  const inst = new (PasayContainer as any)({ id: "stub" }, fullEnv);
+  assert_eq(inst.envVars.PASSAY_TG_BOT_TOKEN, "555:REAL_PROD_TOKEN",
+    "PASSAY_TG_BOT_TOKEN in envVars MUST equal env.TELEGRAM_BOT_TOKEN " +
+    "(bot reads PASSAY_TG_BOT_TOKEN, not TELEGRAM_BOT_TOKEN)");
+  assert(inst.envVars.PASSAY_TG_BOT_TOKEN !== "",
+    "PASSAY_TG_BOT_TOKEN in envVars MUST NOT be empty (would cause " +
+    "PTB.ApplicationBuilder.token fallback to '0:UNSET')");
 });
 
 run("CLOSEOUT#7c: PasayContainer envVars — partial/missing env → empty strings, no crash, no undefined", () => {
@@ -829,6 +920,24 @@ run("CLOSEOUT#7c: PasayContainer envVars — partial/missing env → empty strin
   }
   assert_eq(inst.envVars.PASAY_RUNTIME_MODE, "cloudflare-container",
     "static tag still present with empty env");
+  // Issue #119 P0 regression guardrail: even when the operator has not
+  // provisioned any Worker secrets yet, the envVars map must still expose
+  // every name the bot reads (defaulting to "" so the bot fails closed on
+  // its first API call instead of silently impersonating anyone). The one
+  // exception is PASAY_RUNTIME_MODE which is the STATIC tag — it is always
+  // "cloudflare-container" regardless of any operator provisioning.
+  const dynamicRequiredNames = [
+    "PASSAY_TG_BOT_TOKEN", "PASSAY_API_BASE", "PASSAY_API_KEY",
+    "PASSAY_ADMIN_API_KEY", "PASSAY_JOB_API_KEY",
+    "PASSAY_HTTP_TIMEOUT_SECONDS", "PASSAY_ARCHIVE_CHAT_ID",
+    "PASSAY_MINI_APP_URL", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
+    "DATABASE_URL", "DATABASE_URL_UNPOOLED", "CONTAINER_INGEST_TOKEN",
+  ];
+  for (const k of dynamicRequiredNames) {
+    assert(k in inst.envVars, `envVars must expose ${k} even with empty env`);
+    assert_eq(inst.envVars[k], "", `${k} must default to empty string with empty env`);
+  }
 });
 
 // ---------------------------------------------------------------------------
