@@ -17,6 +17,26 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MINI_APP_URL = "https://pasay-mini-app.pages.dev"
 
+# Issue #119 P0 ACCEPTANCE-ITEM-1: the legacy V1.1 native launchd bot ran as
+# ``jhackuy`` on macOS where ``/opt/pasay-pm`` was the operator-owned deploy
+# target (PRODUCTION_REVIEW.md / NATIVE_BOT_DESIGN.md). The Cloudflare
+# Container production runtime instead runs as the unprivileged ``appuser``
+# (uid 10000) on a slim Python image — see ``Dockerfile`` step 5/6/7:
+# ``/opt`` is root:root and ``appuser`` has no write access there, while
+# ``/app/uploads`` is the only directory chowned to ``appuser``. Without a
+# Container-compatible default, the first webhook would raise
+# ``PermissionError: [Errno 13] Permission denied: '/opt/pasay-pm'`` from
+# :class:`pasay_bot.state.store.StateStore` and every bot.boot.send_message
+# (including the canonical ``/start`` greeting + every persistent-keyboard
+# action) would silently fail (webhook layer classifies PermissionError as
+# TEMPORARY → HTTP 503 → Telegram redelivery; after the cross-attempt budget
+# is exhausted Telegram marks the update ``failed`` and stops replaying).
+# ``/tmp`` is sticky-bit world-writable on every POSIX image including the
+# Cloudflare Container one, and the Container is the ``pasay-singleton``
+# instance (``sleepAfter=15m``), so conversation/idempotency state survives
+# all normal wake/sleep cycles. Operators still can override with ``STATE_DB``.
+DEFAULT_BOT_STATE_DB = "/tmp/pasay-telegram-bot/state/bot_state.db"
+
 
 class Settings(BaseSettings):
     pasay_tg_bot_token: str = ""
@@ -25,7 +45,7 @@ class Settings(BaseSettings):
     pasay_admin_api_key: str = ""
     hermes_api_base: str = "http://127.0.0.1:8642"
     hermes_api_key: str = ""
-    state_db: str = "/opt/pasay-pm/pasay-telegram-bot/state/bot_state.db"
+    state_db: str = DEFAULT_BOT_STATE_DB
     hook_token: str = ""
     callback_ttl_seconds: int = 900
     pasay_http_timeout_seconds: float = 30.0
@@ -88,7 +108,7 @@ def get_settings() -> Settings:
         pasay_admin_api_key=e.get("PASSAY_ADMIN_API_KEY", ""),
         hermes_api_base=e.get("HERMES_API_BASE", "http://127.0.0.1:8642"),
         hermes_api_key=e.get("HERMES_API_KEY", ""),
-        state_db=e.get("STATE_DB", "/opt/pasay-pm/pasay-telegram-bot/state/bot_state.db"),
+        state_db=(e.get("STATE_DB") or DEFAULT_BOT_STATE_DB).strip(),
         hook_token=e.get("HOOK_TOKEN", ""),
         callback_ttl_seconds=int(e.get("CALLBACK_TTL_SECONDS", "900") or "900"),
         pasay_http_timeout_seconds=float(e.get("PASSAY_HTTP_TIMEOUT_SECONDS", "30") or "30"),
