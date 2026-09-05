@@ -8,6 +8,7 @@ MINI_APP_DIR="${REPO_ROOT}/mini_app"
 DIST_DIR="${MINI_APP_DIR}/dist"
 PROJECT_NAME="pasay-mini-app"
 CANONICAL_URL="https://${PROJECT_NAME}.pages.dev"
+WORKER_NAME="pasay-cloudflare-worker"
 
 log() { printf '[deploy:pages] %s\n' "$*" >&2; }
 die() { printf '[deploy:pages][FATAL] %s\n' "$*" >&2; exit 1; }
@@ -22,6 +23,25 @@ command -v npx  >/dev/null 2>&1 || die "npx is required on PATH"
 [ -f "${MINI_APP_DIR}/package-lock.json" ] || die "mini_app/package-lock.json missing — reproducible deploy unavailable"
 [ -f "${MINI_APP_DIR}/wrangler.toml" ] || die "mini_app/wrangler.toml missing — Issue #119 Pages config absent"
 [ -f "${MINI_APP_DIR}/public/_redirects" ] || die "mini_app/public/_redirects missing — Pages SPA fallback absent"
+
+# Issue #119 Mini App production wiring: discover the Cloudflare account
+# workers subdomain and bake ``VITE_API_ROOT`` into the build so the SPA's
+# PasayClient targets the Worker ``/api/v1/*`` proxy (the Worker forwards to
+# the Container's FastAPI V1 surface; see cloudflare-worker/src/index.ts).
+# ``pages.dev`` is static and cannot serve ``/api/v1/*``, and the Container
+# itself is NOT publicly addressable, so the Worker is the only reachable
+# hostname for the SPA's authenticated requests.
+log "Resolving Cloudflare workers subdomain for VITE_API_ROOT"
+WORKERS_SUBDOMAIN="$(
+  curl -fsS \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain" \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); sub=(d.get("result") or {}).get("subdomain") or ""; print(sub)'
+)"
+[ -n "${WORKERS_SUBDOMAIN}" ] || die "Cloudflare API did not return a workers subdomain for the account"
+export VITE_API_ROOT="https://${WORKER_NAME}.${WORKERS_SUBDOMAIN}.workers.dev/api/v1"
+log "VITE_API_ROOT=${VITE_API_ROOT}"
 
 # Gate 1: locked dependencies
 log "Installing locked Mini App dependencies"

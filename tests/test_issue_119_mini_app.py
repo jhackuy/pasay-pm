@@ -147,13 +147,32 @@ def test_mini_app_deploy_script_is_executable_and_self_contained():
 def test_mini_app_pages_project_url_is_canonical():
     """The deploy script MUST surface the canonical Pages URL so the
     operator can wire it into ``PASAY_MINI_APP_URL`` and the Telegram
-    MenuButton."""
+    MenuButton.
+
+    Implementation note: PR #130 (5ade85d) replaced the hard-coded
+    literal with the ``${PROJECT_NAME}`` interpolation so the canonical
+    URL survives a future rename. The script MUST still emit the
+    resolved https://pasay-mini-app.pages.dev form once executed; here
+    we accept either the literal OR a bash interpolation that builds to
+    the same string (the trusted deploy lane's print at the end of the
+    script)."""
     script = (REPO_ROOT / "scripts" / "deploy_mini_app_pages.sh").read_text(
         encoding="utf-8"
     )
-    assert "https://pasay-mini-app.pages.dev" in script, (
-        "deploy script MUST echo the canonical Pages URL — the "
+    literal_url = "https://pasay-mini-app.pages.dev"
+    interpolated_url = 'https://${PROJECT_NAME}.pages.dev'
+    assert (literal_url in script) or (interpolated_url in script), (
+        "deploy script MUST echo the canonical Pages URL "
+        "(literal or ${PROJECT_NAME} interpolation) — the "
         "operator wires this into PASAY_MINI_APP_URL + BotFather."
+    )
+    # The Issue #119 production wiring for the SPA backend is the VITE_API_ROOT
+    # block that resolves the Cloudflare workers subdomain and points the SPA
+    # at the Worker ``/api/v1/*`` proxy (see cloudflare-worker/src/index.ts).
+    assert "VITE_API_ROOT" in script, (
+        "deploy script MUST set VITE_API_ROOT so the Mini App SPA talks to "
+        "the Worker /api/v1/* proxy (Pages is static; the Container itself "
+        "is not publicly addressable)."
     )
 
 
@@ -714,10 +733,15 @@ def test_bot_menu_button_registers_owner_mini_app(monkeypatch):
 
 
 def test_bot_menu_button_skipped_when_mini_app_url_unset(monkeypatch):
-    """If PASAY_MINI_APP_URL is unset, the bot MUST NOT call
-    set_chat_menu_button at all — the persistent Reply Keyboard
-    remains the only Owner entry point, and no orphaned WebApp button
-    can appear in the bot's chat."""
+    """If PASSAY_MINI_APP_URL resolves to an empty string, the bot MUST
+    NOT call ``set_chat_menu_button`` at all — the persistent Reply
+    Keyboard remains the only Owner entry point, and no orphaned WebApp
+    button can appear in the bot's chat.
+
+    Note: pasay_bot.config.DEFAULT_MINI_APP_URL is the production Pages
+    URL — the production default ALWAYS registers the menu button. This
+    test exercises the operator-overridden ``PASSAY_MINI_APP_URL=""``
+    path (the only way to disable the menu button)."""
     import asyncio
 
     from pasay_bot.main import build_application
@@ -729,7 +753,9 @@ def test_bot_menu_button_skipped_when_mini_app_url_unset(monkeypatch):
         pasay_tg_bot_token="0:DUMMY",
         pasay_api_base="http://127.0.0.1:1/api/v1",
         pasay_api_key="dummy",
-        # pasay_mini_app_url intentionally empty
+        pasay_mini_app_url="",  # explicit empty — must NOT register
+        # pasay_mini_app_owner_telegram_ids left empty → no bound ids →
+        # also defensively no calls would be made.
     )
     api_client = PasayApiClient(
         settings.pasay_api_base, settings.pasay_api_key,

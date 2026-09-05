@@ -832,6 +832,170 @@ run("CLOSEOUT#7c: PasayContainer envVars — partial/missing env → empty strin
 });
 
 // ---------------------------------------------------------------------------
+// 8. Issue #119 Mini App public API proxy — Worker forwards /api/v1/* to
+//    the Container over the same native binding the queue path uses, so
+//    the Cloudflare Pages Mini App (pasay-mini-app.pages.dev) can reach
+//    the FastAPI V1 surface for the Owner-only initData exchange + Home +
+//    Properties. Without this hop the SPA cannot reach the backend
+//    because Pages is static and the Container is not publicly bound.
+// ---------------------------------------------------------------------------
+
+run("Issue#119 P0-A: worker.fetch GET /api/v1/properties → container.forward (no ingest token, no /internal prefix)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = { properties: [{ id: 1, name: "Pioneer" }] };
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/api/v1/properties?org_id=42", {
+    method: "GET",
+    headers: { Authorization: "Bearer test-key" },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "container 200 → 200 pass-through");
+  assert_eq(container.fetch_calls.length, 1, "container.fetch called exactly once");
+  const fc = container.fetch_calls[0];
+  assert_eq(fc.method, "GET", "forwarded method GET");
+  assert_eq(fc.url, "https://pasay-container/api/v1/properties?org_id=42",
+    "forwarded URL preserves path + query on Container origin");
+  // No /internal/ingest token must ever leak into the /api/v1 path —
+  // the Container's Bearer / membership middleware is the only auth gate.
+  assert_eq(fc.headers["x-pasay-ingest-token"], undefined,
+    "/api/v1 must NOT carry internal ingest token");
+  assert_eq(fc.headers["authorization"], "Bearer test-key",
+    "Authorization header forwarded verbatim");
+  const body = await resp.json() as any;
+  assert_eq(body.properties[0].name, "Pioneer",
+    "Container body returned unchanged to SPA");
+});
+
+run("Issue#119 P0-B: worker.fetch POST /api/v1/webapp/auth → container.forward with JSON body + boundary headers", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = { api_key: "ak_xxx", org_id: 7, user_id: 99, role: "owner" };
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/api/v1/webapp/auth", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: { init_data: "query_id=abc&user=%7B%7D" },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "/api/v1/webapp/auth pass-through → 200");
+  assert_eq(container.fetch_calls.length, 1, "container called once");
+  const fc = container.fetch_calls[0];
+  assert_eq(fc.method, "POST", "POST preserved");
+  assert_eq(fc.url, "https://pasay-container/api/v1/webapp/auth",
+    "POST forwarded to Container /api/v1/webapp/auth");
+  // Body must reach the Container verbatim for HMAC-SHA256 verification.
+  const body_text = typeof fc.body === "string" ? fc.body : JSON.stringify(fc.body);
+  assert(body_text.includes("init_data") && body_text.includes("query_id=abc"),
+    "Container received the JSON body intact");
+  assert_eq(fc.headers["x-pasay-ingest-token"], undefined,
+    "/api/v1 never carries the internal ingest token");
+});
+
+run("Issue#119 P0-C: worker.fetch /api/v1/* with container cold-boot throw → 503 (no silent 200, no silent 404)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  (container as any).fetch_throw = new Error("Container cold boot timeout");
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/api/v1/dashboard/home", {
+    method: "GET",
+    headers: { Authorization: "Bearer test-key" },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503,
+    "container transient → 503 (the SPA surfaces a clear retry signal)");
+  const body = await resp.json() as any;
+  assert_eq(body.ok, false, "fail-closed body");
+  assert_eq(body.error, "container_fetch_failed",
+    "stable error code for the SPA retry path");
+});
+
+run("Issue#119 P0-D: worker.fetch /api/v1/* with NO PASAY_CONTAINER binding → 503 container_unbound (fail closed)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv({ PASAY_CONTAINER: undefined as any });
+  const req = makeWorkerRequest("/api/v1/properties", {
+    method: "GET",
+    headers: { Authorization: "Bearer test-key" },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503, "no binding → 503");
+  const body = await resp.json() as any;
+  assert_eq(body.error, "container_unbound",
+    "stable error code (operator fix: configure PASAY_CONTAINER binding)");
+});
+
+run("Issue#119 P0-E: worker.fetch /api/v1/* response set-cookie / content-type from Container pass through unchanged", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  containerInstances.set("pasay-singleton", container);
+  // Override the mock to attach a non-JSON Content-Type + a custom header.
+  (container as any).fetch = async (req: Request) => {
+    container.fetch_calls.push({
+      url: req.url, method: req.method, headers: { "content-type": "application/json" },
+      body: null,
+    });
+    return new Response("plain-text response", {
+      status: 200,
+      headers: { "Content-Type": "text/plain", "X-Pasay-Trace": "ok" },
+    });
+  };
+  const req = makeWorkerRequest("/api/v1/health/extended", {
+    method: "GET",
+    headers: { Authorization: "Bearer test-key" },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "passthrough 200");
+  assert_eq(resp.headers.get("Content-Type"), "text/plain",
+    "non-JSON Content-Type propagated");
+  assert_eq(resp.headers.get("X-Pasay-Trace"), "ok",
+    "custom upstream header propagated");
+  assert_eq(await resp.text(), "plain-text response",
+    "upstream body propagated verbatim");
+});
+
+run("Issue#119 P0-F: worker.fetch OPTIONS /api/v1/* preflight returns 204 + CORS for the Pages Mini App", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  // No container call expected — preflight must short-circuit.
+  const req = makeWorkerRequest("/api/v1/properties", {
+    method: "OPTIONS",
+    headers: {
+      Origin: "https://pasay-mini-app.pages.dev",
+      "Access-Control-Request-Method": "GET",
+      "Access-Control-Request-Headers": "Authorization,Content-Type",
+    },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 204, "preflight → 204 No Content (no Container wake)");
+  assert_eq(resp.headers.get("Access-Control-Allow-Origin"), "https://pasay-mini-app.pages.dev",
+    "preflight Allow-Origin matches Pages origin");
+  assert_eq(resp.headers.get("Vary"), "Origin", "Vary: Origin set for cache key");
+});
+
+run("Issue#119 P0-G: worker.fetch GET /api/v1/* from Pages origin → CORS Allow-Origin echoed", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = { hello: "world" };
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/api/v1/properties", {
+    method: "GET",
+    headers: {
+      Authorization: "Bearer test-key",
+      Origin: "https://pasay-mini-app.pages.dev",
+    },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "200 from Container");
+  assert_eq(resp.headers.get("Access-Control-Allow-Origin"), "https://pasay-mini-app.pages.dev",
+    "Allow-Origin set on the proxied response too");
+});
+
+// ---------------------------------------------------------------------------
 // 7. Execute async tests + report summary
 // ---------------------------------------------------------------------------
 
