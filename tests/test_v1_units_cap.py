@@ -40,8 +40,10 @@ This file proves both surfaces:
   (``alembic upgrade head``, not a copy of the trigger SQL):
   - direct ORM insert at cap is rejected with
     ``IntegrityError`` + ``units_per_property_cap_exceeded`` text;
-  - ``alembic downgrade -1`` cleanly removes the trigger +
-    helper function and a 16th insert succeeds again;
+   - ``alembic downgrade 0002_renewal_pipeline`` cleanly removes
+     the trigger + helper function (must downgrade through
+     ``0003_units_cap`` because ``0004_legacy_telegram_runtime`` sits
+     on top of it) and a 16th insert succeeds again;
   - two concurrent INSERTs targeting the same property
     deterministically serialize: exactly one commits, exactly
     one is rejected, final count = 15;
@@ -428,9 +430,11 @@ def _alembic(args: list[str], *, url: str) -> None:
 @pytest.fixture
 def migrated_db_engine():
     """Return an Engine bound to a fresh schema where the **real**
-    Alembic chain (``upgrade head``) has been applied. ``downgrade -1``
-    followed by ``upgrade head`` is part of the fixture contract so
-    any future trigger-edit cycle is exercised end-to-end.
+    Alembic chain (``upgrade head``) has been applied. ``downgrade
+    0002_renewal_pipeline`` (down through ``0003_units_cap``, since
+    ``0004_legacy_telegram_runtime`` sits on top of it) followed by
+    ``upgrade head`` is part of the fixture contract so any future
+    trigger-edit cycle is exercised end-to-end.
     """
     url = _postgres_url_or_skip()
     reset_engine_cache()
@@ -538,11 +542,13 @@ class TestDBTrigger:
     def test_trigger_rejects_direct_orm_insert_at_cap(self, migrated_db_engine):
         """At cap=15 the next raw-SQL insert (bypassing the service
         guard AND the ORM) must be rejected with
-        ``units_per_property_cap_exceeded``. After ``downgrade -1``
-        the trigger is gone and the same insert succeeds; after
-        ``upgrade head`` the trigger is back and the cap is enforced
-        again. This is the round-trip contract from the migration
-        review.
+        ``units_per_property_cap_exceeded``. After
+        ``downgrade 0002_renewal_pipeline`` (down through
+        ``0003_units_cap``, since ``0004_legacy_telegram_runtime`` sits
+        on top of it) the trigger is gone and the same insert
+        succeeds; after ``upgrade head`` the trigger is back and the
+        cap is enforced again. This is the round-trip contract from
+        the migration review.
 
         The seed/insert use raw SQL against the
         ``alembic upgrade head`` schema on purpose: the V1 ORM
@@ -626,8 +632,13 @@ class TestDBTrigger:
             ).scalar_one()
         assert cnt == UNITS_CAP
 
-        # 4) Round-trip: downgrade -1 drops the trigger + function.
-        _alembic(["downgrade", "-1"], url=url)
+        # 4) Round-trip: downgrade through 0003 to 0002 drops the
+        # trigger + function. ``downgrade -1`` is no longer
+        # sufficient because ``0004_legacy_telegram_runtime`` now
+        # sits on top of ``0003_units_cap``; we must downgrade
+        # explicitly to ``0002_renewal_pipeline`` so the trigger
+        # installed by ``0003_units_cap`` is uninstalled.
+        _alembic(["downgrade", "0002_renewal_pipeline"], url=url)
         with engine.begin() as conn:
             row = conn.execute(
                 sa.text(
@@ -636,7 +647,8 @@ class TestDBTrigger:
                 )
             ).first()
             assert row is None, (
-                "trigger still present after alembic downgrade -1"
+                "trigger still present after alembic downgrade "
+                "0002_renewal_pipeline"
             )
             row = conn.execute(
                 sa.text(
@@ -645,7 +657,8 @@ class TestDBTrigger:
                 )
             ).first()
             assert row is None, (
-                "function still present after alembic downgrade -1"
+                "function still present after alembic downgrade "
+                "0002_renewal_pipeline"
             )
 
         # 5) Without the trigger, the same INSERT now succeeds.
