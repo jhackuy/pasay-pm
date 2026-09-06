@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 DEFAULT_MINI_APP_URL = "https://pasay-mini-app.pages.dev"
+DEFAULT_PASAY_API_BASE = "http://127.0.0.1:8000/api/v1"
 
 # Issue #119 P0 ACCEPTANCE-ITEM-1: the legacy V1.1 native launchd bot ran as
 # ``jhackuy`` on macOS where ``/opt/pasay-pm`` was the operator-owned deploy
@@ -40,7 +41,7 @@ DEFAULT_BOT_STATE_DB = "/tmp/pasay-telegram-bot/state/bot_state.db"
 
 class Settings(BaseSettings):
     pasay_tg_bot_token: str = ""
-    pasay_api_base: str = "http://127.0.0.1:8000/api/v1"
+    pasay_api_base: str = DEFAULT_PASAY_API_BASE
     pasay_api_key: str = ""
     pasay_admin_api_key: str = ""
     hermes_api_base: str = "http://127.0.0.1:8642"
@@ -103,7 +104,10 @@ def get_settings() -> Settings:
     e = _env()
     return Settings(
         pasay_tg_bot_token=e.get("PASSAY_TG_BOT_TOKEN", ""),
-        pasay_api_base=e.get("PASSAY_API_BASE", "http://127.0.0.1:8000/api/v1"),
+        # Cloudflare Container currently forwards PASSAY_API_BASE even when
+        # the Worker secret is absent, producing an empty string. Treat blank
+        # as unconfigured so the same-container loopback API default survives.
+        pasay_api_base=(e.get("PASSAY_API_BASE") or DEFAULT_PASAY_API_BASE).strip(),
         pasay_api_key=e.get("PASSAY_API_KEY", ""),
         pasay_admin_api_key=e.get("PASSAY_ADMIN_API_KEY", ""),
         hermes_api_base=e.get("HERMES_API_BASE", "http://127.0.0.1:8642"),
