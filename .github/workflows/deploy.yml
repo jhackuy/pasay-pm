@@ -72,6 +72,9 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      PASSAY_API_KEY: ${{ secrets.PASSAY_API_KEY }}
+      PASSAY_ADMIN_API_KEY: ${{ secrets.PASSAY_ADMIN_API_KEY }}
+      PASSAY_JOB_API_KEY: ${{ secrets.PASSAY_JOB_API_KEY }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,8 +86,21 @@ jobs:
           cache-dependency-path: cloudflare-worker/package-lock.json
       - name: Wrangler deploy
         working-directory: cloudflare-worker
+        shell: bash
         run: |
+          set -euo pipefail
           npm ci --no-audit --no-fund
+          if [ -z "${PASSAY_API_KEY}" ]; then
+            echo "::error::production environment secret PASSAY_API_KEY is missing"
+            exit 1
+          fi
+          printf '%s' "${PASSAY_API_KEY}" | npx wrangler secret put PASSAY_API_KEY
+          if [ -n "${PASSAY_ADMIN_API_KEY}" ]; then
+            printf '%s' "${PASSAY_ADMIN_API_KEY}" | npx wrangler secret put PASSAY_ADMIN_API_KEY
+          fi
+          if [ -n "${PASSAY_JOB_API_KEY}" ]; then
+            printf '%s' "${PASSAY_JOB_API_KEY}" | npx wrangler secret put PASSAY_JOB_API_KEY
+          fi
           npx wrangler deploy --containers-rollout=immediate
 
   mini-app-deploy:
