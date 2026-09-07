@@ -76,5 +76,16 @@ exec \"$@\"\
 #   • No `python -m pasay_bot.main run_polling`.
 #   • No subprocess shell-out that could spawn a getUpdates loop.
 # Scope D explicitly requires: "不在 Container 内启动 PTB long polling".
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", \
+#
+# Issue #119 P0 fix: the production FastAPI entrypoint is the V1
+# rewrite (``app.v1.main:app``). The V1 app mounts the legacy
+# ``/telegram/webhook`` + ``/internal/ingest`` + ``/health`` surfaces
+# so the Worker → Container queue contract and the watchdog probe
+# stay byte-identical. The V1 clean rewrite uses the production
+# ``v1_*`` schema (no legacy ``users`` / ``principals`` /
+# ``api_credentials``); credentials are now issued via
+# ``scripts/create_v1_api_key.py`` and authenticated by
+# ``app.v1.deps.get_current_principal`` /
+# ``app.v1.deps.get_system_principal``.
+CMD ["uvicorn", "app.v1.main:app", "--host", "0.0.0.0", "--port", "8000", \
      "--proxy-headers", "--forwarded-allow-ips", "*"]

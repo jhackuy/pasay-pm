@@ -1,7 +1,29 @@
 """FastAPI app factory for the V1 rewrite.
 
-Mounts thin routers under `/api/v1`. Bootstrap is dev/test only.
-The legacy `app/main.py` is untouched.
+This module is the **production FastAPI entrypoint** in the Cloudflare
+Container. The Dockerfile CMD (``uvicorn app.v1.main:app``) runs this
+app. The legacy ``app/main.py`` is no longer the production entrypoint
+but is kept importable for the legacy test harness; the legacy
+routers are now mounted INSIDE this V1 app under their original top-level
+paths so the Cloudflare Worker / queue / container production surfaces
+(``/telegram/webhook``, ``/internal/ingest``, ``/health``) keep working
+without duplicating the PTB ingest / Worker integration code.
+
+Mounts:
+
+  * thin V1 routers under ``/api/v1`` (Issue #99 / PR #100)
+  * V1 SYSTEM scheduled-job endpoints under ``/api/v1/operations``
+    (``/operations/digest`` + ``/operations/quick/tasks``) — Issue #119
+    P0 fix, registered BEFORE the HUMAN ``operations`` router so the
+    literal paths take precedence over the ``/{operation_id}`` path
+    parameter
+  * legacy ``/telegram/webhook`` (PTB ingest, top-level so Telegram can
+    deliver directly; auth via ``X-Telegram-Bot-Api-Secret-Token``)
+  * legacy ``/internal/ingest`` (Cloudflare Container queue delivery;
+    not public-internet-routable by design)
+  * legacy ``/health`` snapshot endpoint (the watchdog probes this
+    surface and expects the architecture / telegram_webhook
+    sub-snapshots the legacy implementation exposes)
 
 Optional Mini App static serving (Issue #99 / Spec Kit T-066):
   When `PASAY_MINIAPP_DIST` points to a built `mini_app/dist/` directory,
@@ -31,6 +53,7 @@ from app.v1.api.properties import router as properties_router
 from app.v1.api.rent_payments import router as rent_payments_router
 from app.v1.api.renewals import router as renewals_router
 from app.v1.api.repairs import router as repairs_router
+from app.v1.api.system_ops import router as system_ops_router
 from app.v1.api.tenants import router as tenants_router
 from app.v1.api.webapp_auth import router as webapp_auth_router
 from app.v1.api.workspaces import router as workspaces_router
@@ -85,14 +108,98 @@ def create_v1_app() -> FastAPI:
         version="1.0.0",
         description=(
             "Clean rewrite of PASAY property-management API "
-            "(Issue #99, PR #100)."
+            "(Issue #99, PR #100). "
+            "Production entrypoint per Issue #119 P0 fix."
         ),
     )
 
-    @app.get("/health", tags=["health"])
-    def health() -> dict[str, str]:
-        return {"status": "ok", "version": "1.0.0"}
+    # ── Top-level production runtime surfaces ─────────────────────────
+    # Mount the legacy /telegram/webhook + /internal/ingest routers so
+    # the Worker → Container queue contract stays unchanged. The
+    # legacy code paths use the legacy ``users`` / ``principals`` /
+    # ``api_credentials`` tables that DO NOT exist in the production
+    # ``v1_*`` schema; that is fine for /telegram/webhook and
+    # /internal/ingest which only need to enqueue / dispatch a Telegram
+    # update and never authenticate against the legacy tables
+    # (X-Telegram-Bot-Api-Secret-Token + PASAY_CONTAINER_INGEST_TOKEN
+    # are the only auth checks those endpoints perform).
+    try:
+        from app.api.routers.telegram_webhook import router as telegram_webhook_router
+        from app.api.routers.internal_ingest import router as internal_ingest_router
+        # The /health snapshot helpers live in the legacy app.main
+        # module (Issue #135's /health architecture snapshot). Import
+        # them from there so the watchdog contract is preserved
+        # byte-for-byte after the entrypoint switch.
+        from app.main import _webhook_health_snapshot, _architecture_health_snapshot
+    except Exception:  # noqa: BLE001 - keep V1 tests runnable in isolation
+        telegram_webhook_router = None
+        internal_ingest_router = None
+        _webhook_health_snapshot = None
+        _architecture_health_snapshot = None
 
+    if telegram_webhook_router is not None:
+        # Telegram delivers to the public hostname; path is top-level
+        # so the secret-token + JSON parse + enqueue flow stays
+        # byte-identical to the legacy production wiring.
+        app.include_router(telegram_webhook_router)
+    if internal_ingest_router is not None:
+        # Container queue delivery; top-level path; not public-routable
+        # by design (Cloudflare Container does not expose /internal/*).
+        app.include_router(internal_ingest_router)
+
+    if (
+        _webhook_health_snapshot is not None
+        and _architecture_health_snapshot is not None
+    ):
+        from fastapi import Depends
+        from fastapi.responses import JSONResponse
+        from sqlalchemy import text
+        from sqlalchemy.orm import Session
+
+        from app.config import settings  # type: ignore[import-not-found]
+        from app.database import get_db  # type: ignore[import-not-found]
+
+        @app.get("/health", summary="Health check (no auth)")
+        def health(db: Session = Depends(get_db)) -> JSONResponse:
+            """Legacy-compatible /health surface for the watchdog.
+
+            Returns the same fields the legacy ``app/main.py::health``
+            exposed (``status`` / ``telegram_webhook`` /
+            ``architecture``) so the existing watchdog contract is
+            preserved when the production entrypoint switches from
+            ``app.main:app`` to ``app.v1.main:app``.
+            """
+            db_ok = True
+            err_class: str | None = None
+            try:
+                db.execute(text("SELECT 1"))
+            except Exception as exc:  # noqa: BLE001
+                db_ok = False
+                err_class = type(exc).__name__
+            if not db_ok:
+                return JSONResponse(
+                    status_code=503,
+                    content={"status": "unavailable", "db_error_type": err_class},
+                )
+            body: dict = {"status": "ok", "version": "1.0.0"}
+            try:
+                body["telegram_webhook"] = _webhook_health_snapshot(db)
+            except Exception:  # noqa: BLE001
+                body["telegram_webhook"] = {"error": "snapshot_unavailable"}
+            try:
+                body["architecture"] = _architecture_health_snapshot()
+            except Exception:  # noqa: BLE001
+                body["architecture"] = {"error": "snapshot_unavailable"}
+            return JSONResponse(status_code=200, content=body)
+
+    # ── /api/v1 V1 surface ────────────────────────────────────────────
+    # SYSTEM scheduled-job endpoints MUST be registered BEFORE the
+    # HUMAN ``operations`` router so the literal paths
+    # (``/operations/digest`` and ``/operations/quick/tasks``) take
+    # precedence over the ``/{operation_id}`` path parameter; otherwise
+    # the legacy ``/operations/{operation_id}`` pattern would match
+    # ``/operations/digest`` first and FastAPI would 422-parse
+    # ``operation_id="digest"`` as an int.
     app.include_router(bootstrap_router, prefix="/api/v1")
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(properties_router, prefix="/api/v1")
@@ -103,6 +210,10 @@ def create_v1_app() -> FastAPI:
     app.include_router(repairs_router, prefix="/api/v1")
     app.include_router(renewals_router, prefix="/api/v1")
     app.include_router(move_outs_router, prefix="/api/v1")
+    # Issue #119 P0: SYSTEM endpoints FIRST so the literal paths
+    # ``/operations/digest`` and ``/operations/quick/tasks`` win over
+    # the ``/{operation_id}`` parameter pattern below.
+    app.include_router(system_ops_router, prefix="/api/v1")
     app.include_router(operations_router, prefix="/api/v1")
     app.include_router(dashboard_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")

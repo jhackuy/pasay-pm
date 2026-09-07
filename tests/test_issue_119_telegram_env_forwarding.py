@@ -45,6 +45,14 @@ from __future__ import annotations
 
 import importlib
 import os
+import sys
+
+# Make the pasay-telegram-bot package importable when this test file
+# is collected by pytest from the repo root.
+_BOT_DIR = os.path.join(os.path.dirname(__file__), "..", "pasay-telegram-bot")
+_BOT_DIR = os.path.abspath(_BOT_DIR)
+if os.path.isdir(_BOT_DIR) and _BOT_DIR not in sys.path:
+    sys.path.insert(0, _BOT_DIR)
 
 import pytest
 
@@ -72,6 +80,7 @@ def _isolate_bot_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "PASSAY_HTTP_TIMEOUT_SECONDS",
         "PASSAY_ARCHIVE_CHAT_ID",
         "PASSAY_JOB_API_KEY",
+        "PASSAY_SYSTEM_ORG_ID",
         "PASSAY_MINI_APP_URL",
         "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
         # Issue #119 P0 defensive-fallback source: the bot ALSO accepts
@@ -89,6 +98,7 @@ def _build_pasay_container_env_vars(
     passay_api_key: str = "",
     passay_admin_api_key: str = "",
     passay_job_api_key: str = "",
+    passay_system_org_id: str = "",
     passay_http_timeout_seconds: str = "",
     passay_archive_chat_id: str = "",
     passay_mini_app_url: str = "",
@@ -119,6 +129,11 @@ def _build_pasay_container_env_vars(
         "PASSAY_API_KEY": passay_api_key,
         "PASSAY_ADMIN_API_KEY": passay_admin_api_key,
         "PASSAY_JOB_API_KEY": passay_job_api_key,
+        # Issue #119 P0 (independent review follow-up): the SYSTEM
+        # scheduled-job client is bound to a single canonical org. The
+        # Worker secret is forwarded verbatim; an empty value keeps the
+        # jobs disabled (fail closed) on the bot side.
+        "PASSAY_SYSTEM_ORG_ID": passay_system_org_id,
         # Optional / with-defaults (worker secret can override; bot keeps
         # its own defaults so an unprovisioned Worker still boots).
         "PASSAY_HTTP_TIMEOUT_SECONDS": passay_http_timeout_seconds,
@@ -334,6 +349,7 @@ def test_issue_119_p0_bot_loader_keys_are_exactly_what_worker_forwards():
         "PASSAY_HTTP_TIMEOUT_SECONDS",
         "PASSAY_ARCHIVE_CHAT_ID",
         "PASSAY_JOB_API_KEY",
+        "PASSAY_SYSTEM_ORG_ID",
         "PASSAY_MINI_APP_URL",
         "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
         "TELEGRAM_BOT_TOKEN",  # defensive fallback only — bot reads under
@@ -351,6 +367,7 @@ def test_issue_119_p0_bot_loader_keys_are_exactly_what_worker_forwards():
         "PASSAY_API_KEY",
         "PASSAY_ADMIN_API_KEY",
         "PASSAY_JOB_API_KEY",
+        "PASSAY_SYSTEM_ORG_ID",
         "PASSAY_HTTP_TIMEOUT_SECONDS",
         "PASSAY_ARCHIVE_CHAT_ID",
         "PASSAY_MINI_APP_URL",

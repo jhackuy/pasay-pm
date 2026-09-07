@@ -57,6 +57,12 @@ export class PasayContainer extends Container {
       PASSAY_API_KEY: env.PASSAY_API_KEY ?? "",
       PASSAY_ADMIN_API_KEY: env.PASSAY_ADMIN_API_KEY ?? "",
       PASSAY_JOB_API_KEY: env.PASSAY_JOB_API_KEY ?? "",
+      // Issue #119 P0 (independent review follow-up): the SYSTEM
+      // scheduled-job client must be bound to a single canonical
+      // organization. The Worker secret `PASSAY_SYSTEM_ORG_ID` is
+      // forwarded as-is; the bot's `_build_job_api` keeps the jobs
+      // disabled when this is empty / 0 (fail closed).
+      PASSAY_SYSTEM_ORG_ID: env.PASSAY_SYSTEM_ORG_ID ?? "",
       // Optional / with-defaults (worker secret can override; bot keeps its
       // own defaults so an unprovisioned Worker still boots).
       PASSAY_HTTP_TIMEOUT_SECONDS: env.PASSAY_HTTP_TIMEOUT_SECONDS ?? "",
@@ -86,6 +92,8 @@ interface Env {
   PASSAY_API_KEY?: string;
   PASSAY_ADMIN_API_KEY?: string;
   PASSAY_JOB_API_KEY?: string;
+  // Issue #119 P0 follow-up: SYSTEM scheduled-job org binding.
+  PASSAY_SYSTEM_ORG_ID?: string;
   PASSAY_HTTP_TIMEOUT_SECONDS?: string;
   PASSAY_ARCHIVE_CHAT_ID?: string;
   PASSAY_MINI_APP_URL?: string;
