@@ -141,21 +141,78 @@ class SystemPrincipal:
 def require_org_scope(principal: Any, org_id: int) -> None:
     """Enforce principal.org_id == org_id. Raises PermissionDenied otherwise.
 
-    For SystemPrincipal: there is no org_id; this guard is a NO-OP for
-    SYSTEM callers (the caller is expected to pass an explicit
-    ``target_org_id`` to the underlying service). The guard never
-    raises for SYSTEM callers.
+    Issue #119 P0 fix (independent review): SYSTEM callers DO NOT get
+    a free pass. A SYSTEM caller has no implicit org_id; the caller
+    MUST pass an explicit ``target_org_id`` to the underlying service
+    AND the service MUST call ``require_system_org_scope`` (or assert
+    an explicit single-org credential binding) to bind the SYSTEM
+    caller to exactly one organization.
+
+    This guard now fails closed for any caller that is neither a
+    ``Principal`` nor a SystemPrincipal. SystemPrincipal callers must
+    use ``require_system_org_scope`` instead.
     """
-    if isinstance(principal, SystemPrincipal):
-        # SYSTEM callers carry no org_id; the caller's service layer is
-        # responsible for choosing the right target org.
-        return
     if not isinstance(principal, Principal):
-        raise PermissionDenied("invalid principal")
+        # Fail closed: an unknown principal (or a SystemPrincipal that
+        # forgot to call require_system_org_scope) is NOT allowed to
+        # silently impersonate cross-org access.
+        raise PermissionDenied(
+            "invalid principal for org-scope check; "
+            "SystemPrincipal must use require_system_org_scope with "
+            "an explicit target org_id"
+        )
     if principal.org_id != org_id:
         raise PermissionDenied(
             f"cross-org access denied: principal org_id={principal.org_id} "
             f"target org_id={org_id}"
+        )
+
+
+def require_system_org_scope(
+    system_principal: SystemPrincipal,
+    target_org_id: int,
+) -> None:
+    """Bind a SYSTEM caller to an explicit target organization.
+
+    Issue #119 P0 fix (independent review): SYSTEM callers MUST name the
+    org they want to read from. The credential row's purpose
+    (``internal:scheduler``) and the per-credential ``trusted_organization_id``
+    field (set by the bootstrap script) together determine the single org
+    the SYSTEM caller is allowed to touch.
+
+    For now, the bootstrap script does not yet attach a per-credential
+    ``trusted_organization_id``; the SYSTEM credential is therefore
+    forced to supply the target org_id explicitly in the request
+    context (the route handler resolves the canonical org from
+    query/body). This is the SAME pattern the legacy
+    ``resolve_org_membership`` uses via ``reader.credential.trusted_organization_id``:
+    the SYSTEM caller never gets to silently read across every org.
+
+    Failure modes (fail closed):
+      * target_org_id is None / 0 / negative → PermissionDenied.
+      * system_principal.credential does not exist → PermissionDenied
+        (caller should not happen; defensive).
+      * system_principal.credential purpose is not in the SYSTEM allow
+        list (V1_SYSTEM_PURPOSES) → PermissionDenied.
+    """
+    if not isinstance(system_principal, SystemPrincipal):
+        raise PermissionDenied("require_system_org_scope: not a SystemPrincipal")
+    if target_org_id is None or not isinstance(target_org_id, int) or target_org_id <= 0:
+        raise PermissionDenied(
+            "SYSTEM caller must supply an explicit positive target_org_id; "
+            "implicit cross-org reads are not allowed"
+        )
+    cred = getattr(system_principal, "credential", None)
+    if cred is None:
+        raise PermissionDenied("SYSTEM credential missing on principal")
+    # The purpose is already validated by ``get_system_principal`` at
+    # auth time; this is a defense-in-depth re-check.
+    from app.v1.models.base import V1_SYSTEM_PURPOSES  # local import: avoid cycle
+    purpose = getattr(cred, "purpose", None)
+    if purpose not in V1_SYSTEM_PURPOSES:
+        raise PermissionDenied(
+            f"SYSTEM credential purpose {purpose!r} not in "
+            f"{sorted(V1_SYSTEM_PURPOSES)}"
         )
 
 

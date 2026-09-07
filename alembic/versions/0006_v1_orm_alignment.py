@@ -27,14 +27,21 @@ Specific drift and the reconciliation this migration performs:
      outside the scope of credential bootstrap, so this migration
      stops and demands an operator decision rather than silently
      destroying tenant data).
-  4. ``v1_memberships.state`` migrates ``SUSPENDED`` → ``ACTIVE``.
-     The new CHECK ``state IN ('ACTIVE','REMOVED')`` is the V1
-     contract. SUSPENDED is removed entirely (DATA_CONTRACT §2.5).
-     A pre-flight guard aborts if any non-``{ACTIVE,SUSPENDED,
-     REMOVED}`` state value exists (defensive — should be a no-op
-     given the previous CHECK constraint, but the guard makes the
-     failure mode explicit instead of leaving a confusing
-     string-truncation error from PostgreSQL).
+  4. ``v1_memberships.state`` is FAIL-CLOSED for SUSPENDED rows
+     (Issue #119 P0 fix). The previous implementation silently
+     reactivated SUSPENDED memberships, which is a privilege
+     escalation footgun — a HUMAN who was deliberately suspended
+     would silently regain their role on the next migration run.
+     A new pre-flight guard ``_check_suspended_no_silent_reactivation``
+     aborts the migration if any SUSPENDED row exists; the operator
+     MUST resolve each row explicitly. The new CHECK
+     ``state IN ('ACTIVE','REMOVED')`` is the V1 contract. SUSPENDED
+     is removed entirely (DATA_CONTRACT §2.5). A separate pre-flight
+     guard aborts if any non-``{ACTIVE,SUSPENDED,REMOVED}`` state
+     value exists (defensive — should be a no-op given the previous
+     CHECK constraint, but the guard makes the failure mode
+     explicit instead of leaving a confusing string-truncation
+     error from PostgreSQL).
 
 Round-trip safety:
   * Every ALTER TABLE is additive or a rename with an explicit
@@ -129,6 +136,52 @@ def _check_state_no_unknown(conn) -> None:
         )
 
 
+def _check_suspended_no_silent_reactivation(conn) -> None:
+    """Pre-flight (Issue #119 P0 fix): refuse to silently reactivate
+    SUSPENDED memberships.
+
+    V1 has no SUSPENDED state (DATA_CONTRACT §2.5). The previous
+    implementation of this migration mapped ``SUSPENDED`` → ``ACTIVE``
+    automatically, which is a privilege escalation footgun: a HUMAN
+    who was deliberately suspended would silently regain their role
+    the next time the migration ran.
+
+    We now refuse the migration if any SUSPENDED rows exist; the
+    operator must explicitly resolve them before 0006 will run. This
+    is a hard fail-closed — there is no opt-out flag, no downgrade
+    shortcut, no silent fallback. The operator can:
+
+      * update the rows to ACTIVE manually (``UPDATE v1_memberships
+        SET state = 'ACTIVE' WHERE state = 'SUSPENDED'``) AFTER
+        reviewing each affected user_id / org_id pair, or
+      * update the rows to REMOVED (no privilege to lose) if the
+        suspension was intentional and should be permanent, or
+      * contact PASAY engineering for an explicit one-off data fix.
+
+    The pre-flight is intentionally loud so a future migration author
+    cannot revert the silent-reactivation behaviour without breaking
+    this guard.
+    """
+    rows = conn.execute(
+        sa.text(
+            "SELECT id, user_id, org_id FROM v1_memberships "
+            "WHERE state = 'SUSPENDED' ORDER BY id"
+        )
+    ).fetchall()
+    if rows:
+        ids = [r[0] for r in rows]
+        # Hard stop.  No silent reactivation.
+        raise RuntimeError(
+            f"v1_memberships has {len(rows)} SUSPENDED rows "
+            f"(id(s)={ids[:10]}); this migration does NOT silently "
+            f"reactivate SUSPENDED memberships (Issue #119 P0 fix). "
+            f"Operator must resolve each SUSPENDED row manually "
+            f"before applying 0006 — set state to ACTIVE explicitly "
+            f"after review, or set to REMOVED if the suspension "
+            f"should be permanent. No automated mapping is allowed."
+        )
+
+
 def upgrade() -> None:
     conn = op.get_bind()
 
@@ -136,6 +189,7 @@ def upgrade() -> None:
     #    safely migrate.
     _check_role_no_tenant_or_unknown(conn)
     _check_state_no_unknown(conn)
+    _check_suspended_no_silent_reactivation(conn)
 
     # 1) Rename v1_users.telegram_id → telegram_user_id to match the
     #    V1 ORM. PostgreSQL preserves the column type and data across
@@ -204,16 +258,19 @@ def upgrade() -> None:
         "role IN ('OWNER','SECRETARY')",
     )
 
-    # 5) Migrate v1_memberships.state SUSPENDED → ACTIVE.
-    #    V1 has no SUSPENDED state (DATA_CONTRACT §2.5). Mapping to
-    #    ACTIVE is the conservative choice — the row stays usable,
-    #    operator can re-suspend via a future product feature if
-    #    needed.
-    op.execute(
-        sa.text(
-            "UPDATE v1_memberships SET state = 'ACTIVE' WHERE state = 'SUSPENDED'"
-        )
-    )
+    # 5) v1_memberships.state: SUSPENDED rows are no longer silently
+    #    reactivated (Issue #119 P0 fix). The pre-flight guard
+    #    ``_check_suspended_no_silent_reactivation`` already aborted the
+    #    migration if any SUSPENDED row exists. We therefore do NOT
+    #    emit an ``UPDATE ... SET state = 'ACTIVE' WHERE state =
+    #    'SUSPENDED'`` here; the new CHECK (step 6) refuses to
+    #    validate with any remaining SUSPENDED rows so a future
+    #    operator who bypasses the pre-flight will still get a clean
+    #    constraint-violation error instead of a silent privilege
+    #    escalation.
+    #
+    #    V1 has no SUSPENDED state (DATA_CONTRACT §2.5); the historical
+    #    rows are operator responsibility.
 
     # 6) Replace the baseline state CHECK without SUSPENDED.
     op.drop_constraint(

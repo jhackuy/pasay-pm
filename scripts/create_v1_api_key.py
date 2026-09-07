@@ -429,9 +429,13 @@ def main(argv: list[str] | None = None) -> int:
         db.close()
         reset_engine_cache()
 
-    # ONE-TIME operator output. Never log this anywhere; the raw key
-    # is shown on stdout exactly once and then dropped from memory.
-    print(f"API key: {raw_key}")
+    # ONE-TIME operator output. The raw key is emitted exactly ONCE
+    # to stdout, in the canonical ``Authorization: Bearer <key>``
+    # form. AGENTS.md §3: never log, never commit, never echo beyond
+    # this single line. The Python ``raw_key`` binding is dropped when
+    # ``main`` returns — there is no recovery path; operators MUST
+    # capture the key from the terminal / redirect it into their secret
+    # store before the script exits.
     print(f"Authorization: Bearer {raw_key}")
     return 0
 
