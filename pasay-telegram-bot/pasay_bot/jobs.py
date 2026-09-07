@@ -131,13 +131,33 @@ def _build_job_api(settings: Settings) -> PasayApiClient | None:
 
     The client is never bound to a Telegram user id: every request carries
     only the SYSTEM credential, so the backend sees the SYSTEM principal.
+
+    Issue #119 P0 (independent review follow-up): the client is
+    constructed with ``system_org_id=settings.pasay_system_org_id`` so
+    the canonical org id is sent as ``?org_id=...`` on every
+    ``/api/v1/operations/*`` call. The server is the single source of
+    truth — the org id MUST match the SYSTEM credential's
+    ``trusted_organization_id`` or the request is rejected (403).
+    A missing ``pasay_system_org_id`` keeps the jobs disabled (fail
+    closed) so a job client without a known org cannot accidentally
+    bypass the single-org binding.
     """
     if not getattr(settings, "pasay_job_api_key", ""):
+        return None
+    canonical_org = int(getattr(settings, "pasay_system_org_id", 0) or 0)
+    if canonical_org <= 0:
+        logger.warning(
+            "PASSAY_SYSTEM_ORG_ID is not configured; "
+            "v2_daily_digest / v2_next_check jobs disabled "
+            "(fail closed — a SYSTEM credential without a canonical "
+            "org id cannot reach /api/v1/operations/* safely)"
+        )
         return None
     return PasayApiClient(
         settings.pasay_api_base,
         settings.pasay_job_api_key,
         timeout=settings.pasay_http_timeout_seconds,
+        system_org_id=canonical_org,
     )
 
 

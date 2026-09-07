@@ -105,6 +105,15 @@ class ApiCredential(V1Base, TimestampMixin):
             "ix_v1_api_credentials_principal_type_purpose",
             "principal_type", "purpose",
         ),
+        # Issue #119 P0 (independent review follow-up): the SYSTEM
+        # credentials must be bound to exactly one organization. The
+        # compound (principal_type, purpose, trusted_organization_id)
+        # index serves both the auth-time lookup and the org-bound
+        # reader query.
+        Index(
+            "ix_v1_api_credentials_system_org_binding",
+            "principal_type", "purpose", "trusted_organization_id",
+        ),
         CheckConstraint(
             "principal_type IN ('HUMAN','SYSTEM')",
             name="ck_v1_api_credentials_principal_type",
@@ -126,8 +135,19 @@ class ApiCredential(V1Base, TimestampMixin):
         server_default=V1PrincipalType.HUMAN.value,
     )
     purpose: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Issue #119 P0 (independent review follow-up): the SYSTEM credential
+    # is bound to exactly one organization. A NULL binding is rejected by
+    # ``get_system_principal`` (fail closed) — the bootstrap script must
+    # set this for every SYSTEM credential it creates. HUMAN credentials
+    # leave this NULL (their org scope comes from the membership).
+    trusted_organization_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("v1_organizations.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
 
     user = relationship("User", back_populates="credentials")
+    trusted_organization = relationship("Organization")
 
 
 class SecretaryInvite(V1Base, TimestampMixin):

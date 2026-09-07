@@ -102,8 +102,8 @@ def test_alembic_heads_single_revision_at_0006(fresh_db):
     assert len(head_lines) == 1, (
         f"alembic heads must report exactly one revision; got {head_lines}"
     )
-    assert head_lines[0].startswith("0006_v1_orm_alignment"), (
-        f"head must be the new 0006 migration, got {head_lines[0]!r}"
+    assert head_lines[0].startswith("0007_v1_system_trusted_org"), (
+        f"head must be the new 0007 migration, got {head_lines[0]!r}"
     )
 
 
@@ -253,5 +253,84 @@ def test_0006_round_trip_downgrade_then_upgrade(fresh_db):
     try:
         assert _has_column(engine, "v1_users", "telegram_user_id")
         assert _has_column(engine, "v1_users", "default_language")
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# 0007_v1_system_trusted_org (Issue #119 P0 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_alembic_heads_single_revision_at_0007(fresh_db):
+    """Fresh DB upgrade head → exactly one head (0007_v1_system_trusted_org)."""
+    result = _alembic("upgrade", "head")
+    assert result.returncode == 0, result.stderr
+    heads = _alembic("heads")
+    assert heads.returncode == 0, heads.stderr
+    head_lines = [
+        line.strip() for line in heads.stdout.splitlines() if line.strip()
+    ]
+    assert len(head_lines) == 1, (
+        f"alembic heads must report exactly one revision; got {head_lines}"
+    )
+    assert head_lines[0].startswith("0007_v1_system_trusted_org"), (
+        f"head must be 0007_v1_system_trusted_org, got {head_lines[0]!r}"
+    )
+
+
+def test_0007_adds_trusted_organization_id_with_fk_and_index(fresh_db):
+    """0007 must add the trusted_organization_id column with a FK to
+    v1_organizations and the (principal_type, purpose,
+    trusted_organization_id) compound index."""
+    _alembic("upgrade", "head")
+    engine = sa.create_engine(fresh_db)
+    try:
+        assert _has_column(
+            engine, "v1_api_credentials", "trusted_organization_id",
+        )
+        insp = sa.inspect(engine)
+        idx = {ix["name"] for ix in insp.get_indexes("v1_api_credentials")}
+        assert "ix_v1_api_credentials_system_org_binding" in idx
+        fks = {
+            fk["name"]
+            for fk in insp.get_foreign_keys("v1_api_credentials")
+        }
+        assert "fk_v1_api_credentials_trusted_organization_id" in fks
+    finally:
+        engine.dispose()
+
+
+def test_0007_round_trip_downgrade_then_upgrade(fresh_db):
+    """0007 must upgrade, downgrade, and re-upgrade without errors.
+    On downgrade, the column, FK, and index are dropped in inverse
+    order. Re-upgrade brings them back.
+    """
+    _alembic("upgrade", "0006_v1_orm_alignment")
+    assert _alembic("upgrade", "0007_v1_system_trusted_org").returncode == 0
+    engine = sa.create_engine(fresh_db)
+    try:
+        assert _has_column(
+            engine, "v1_api_credentials", "trusted_organization_id",
+        )
+    finally:
+        engine.dispose()
+    assert _alembic("downgrade", "0006_v1_orm_alignment").returncode == 0
+    engine = sa.create_engine(fresh_db)
+    try:
+        assert not _has_column(
+            engine, "v1_api_credentials", "trusted_organization_id",
+        )
+        insp = sa.inspect(engine)
+        idx = {ix["name"] for ix in insp.get_indexes("v1_api_credentials")}
+        assert "ix_v1_api_credentials_system_org_binding" not in idx
+    finally:
+        engine.dispose()
+    assert _alembic("upgrade", "0007_v1_system_trusted_org").returncode == 0
+    engine = sa.create_engine(fresh_db)
+    try:
+        assert _has_column(
+            engine, "v1_api_credentials", "trusted_organization_id",
+        )
     finally:
         engine.dispose()

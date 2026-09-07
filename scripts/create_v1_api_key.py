@@ -22,6 +22,16 @@ The mapping is enforced by the script: ``--purpose=manager`` requires
 ``--purpose=job`` requires ``--principal-type=SYSTEM`` (the role is
 ignored for SYSTEM credentials — they never bind a HUMAN membership).
 
+Issue #119 P0 (independent review follow-up): every SYSTEM credential
+created or rotated by this script MUST be bound to exactly one
+organization. The binding is supplied via ``--workspace`` (looked up
+by name) or ``--trusted-organization-id`` (direct numeric). The
+binding is persisted in ``v1_api_credentials.trusted_organization_id``
+and becomes the single authoritative org scope for the credential —
+``get_system_principal`` rejects SYSTEM credentials with a NULL
+binding, and ``require_system_org_scope`` rejects any caller who
+supplies a different ``org_id``.
+
 Security invariants (AGENTS.md §3 + §4):
 
   * The raw API key is generated ONCE via ``secrets.token_urlsafe(32)``
@@ -61,6 +71,7 @@ Usage (HUMAN interactive admin — PASSAY_ADMIN_API_KEY):
 Usage (SYSTEM scheduled job — PASSAY_JOB_API_KEY):
 
     python scripts/create_v1_api_key.py \\
+        --workspace "Pasay Holdings" \\
         --principal-type SYSTEM \\
         --purpose job \\
         --apply
@@ -116,6 +127,61 @@ PURPOSE_TO_DB_VALUE = {
     "admin": None,                     # HUMAN: no purpose
     "job": "internal:scheduler",       # SYSTEM
 }
+
+
+def _resolve_trusted_organization_id(
+    db: Session,
+    *,
+    workspace: str | None,
+    trusted_organization_id: int | None,
+) -> int:
+    """Resolve the SYSTEM credential's server-side org binding.
+
+    Issue #119 P0 (independent review follow-up): a SYSTEM credential
+    MUST be bound to exactly one organization. The script accepts
+    either ``--workspace <name>`` (looked up by name) or
+    ``--trusted-organization-id <id>`` (direct numeric) — at least
+    one is required, and they must agree if both are supplied.
+
+    Returns the resolved org id. Raises ``SystemExit`` on any
+    ambiguity / missing input / non-existent org.
+    """
+    if workspace is None and trusted_organization_id is None:
+        raise SystemExit(
+            "--purpose=job requires an explicit org binding: pass "
+            "either --workspace <name> or --trusted-organization-id <id>"
+        )
+    if trusted_organization_id is not None:
+        if not isinstance(trusted_organization_id, int) or trusted_organization_id <= 0:
+            raise SystemExit(
+                f"--trusted-organization-id must be a positive integer; "
+                f"got {trusted_organization_id!r}"
+            )
+        org = db.get(Organization, trusted_organization_id)
+        if org is None:
+            raise SystemExit(
+                f"--trusted-organization-id {trusted_organization_id} does "
+                f"not match any v1_organizations row"
+            )
+        if workspace is not None and org.name != workspace:
+            raise SystemExit(
+                f"--workspace {workspace!r} and "
+                f"--trusted-organization-id {trusted_organization_id} "
+                f"disagree (org row has name={org.name!r})"
+            )
+        return int(org.id)
+    # workspace only — look it up.
+    org = (
+        db.query(Organization)
+        .filter(Organization.name == workspace)
+        .one_or_none()
+    )
+    if org is None:
+        raise SystemExit(
+            f"--workspace {workspace!r} does not match any "
+            f"v1_organizations row; create the workspace first"
+        )
+    return int(org.id)
 
 
 def _coerce_role(raw: str) -> Role:
@@ -272,9 +338,19 @@ def _ensure_system_credential(
     raw_key: str,
     key_hash: str,
     purpose_db: str,
+    trusted_organization_id: int,
     rotate: bool,
 ) -> tuple[User, ApiCredential]:
-    """Create/find the SYSTEM sentinel user + rotate/create the credential."""
+    """Create/find the SYSTEM sentinel user + rotate/create the credential.
+
+    The credential is bound to exactly one organization via
+    ``trusted_organization_id``; ``get_system_principal`` rejects
+    SYSTEM credentials with a NULL binding, so the binding is
+    mandatory. The binding is also immutable on rotation: rotating a
+    SYSTEM credential re-uses the existing bound org unless the
+    operator explicitly requests a re-bind (out of scope for this
+    helper — the operator can re-create from scratch instead).
+    """
     user = (
         db.query(User)
         .filter(User.username == SYSTEM_SENTINEL_USERNAME)
@@ -301,9 +377,13 @@ def _ensure_system_credential(
     )
     if existing_active and not rotate:
         names = [c.id for c in existing_active]
+        existing_bindings = sorted({
+            c.trusted_organization_id for c in existing_active
+        })
         raise SystemExit(
-            f"system credential(s) already active id(s)={names}; "
-            f"pass --rotate to supersede"
+            f"system credential(s) already active id(s)={names} "
+            f"bound to org(s)={existing_bindings}; pass --rotate to "
+            f"supersede"
         )
     for old in existing_active:
         old.is_active = False
@@ -313,6 +393,7 @@ def _ensure_system_credential(
         is_active=True,
         principal_type=V1PrincipalType.SYSTEM.value,
         purpose=purpose_db,
+        trusted_organization_id=int(trusted_organization_id),
     )
     db.add(cred)
     db.flush()
@@ -363,6 +444,15 @@ def main(argv: list[str] | None = None) -> int:
         "--rotate", action="store_true",
         help="supersede any existing active credential(s) for this identity",
     )
+    parser.add_argument(
+        "--trusted-organization-id", type=int, default=None,
+        help=(
+            "explicit org binding for SYSTEM credentials (Issue #119 P0 "
+            "follow-up). Use this when the credential belongs to a "
+            "workspace whose numeric id is known; otherwise pass "
+            "--workspace <name> and the script looks it up."
+        ),
+    )
     args = parser.parse_args(argv)
 
     # Pre-flight: enforce the purpose ↔ principal_type ↔ role alignment.
@@ -393,24 +483,35 @@ def main(argv: list[str] | None = None) -> int:
                 rotate=args.rotate,
             )
         else:
+            # SYSTEM path: the org binding is mandatory.
+            trusted_org_id = _resolve_trusted_organization_id(
+                db,
+                workspace=args.workspace,
+                trusted_organization_id=args.trusted_organization_id,
+            )
             user, cred = _ensure_system_credential(
                 db,
                 raw_key=raw_key,
                 key_hash=key_hash,
                 purpose_db=purpose_db,
+                trusted_organization_id=trusted_org_id,
                 rotate=args.rotate,
             )
-            org = None
+            org = db.get(Organization, trusted_org_id)
 
         if args.apply:
             db.commit()
             verb = "rotated" if args.rotate else "created"
-            scope = (
-                f"workspace={args.workspace!r} username={args.username!r} "
-                f"role={args.role!r}"
-                if args.principal_type == V1PrincipalType.HUMAN.value
-                else f"principal_type=SYSTEM purpose={purpose_db!r}"
-            )
+            if args.principal_type == V1PrincipalType.HUMAN.value:
+                scope = (
+                    f"workspace={args.workspace!r} username={args.username!r} "
+                    f"role={args.role!r}"
+                )
+            else:
+                scope = (
+                    f"principal_type=SYSTEM purpose={purpose_db!r} "
+                    f"trusted_organization_id={trusted_org_id}"
+                )
             print(
                 f"V1 credential {verb}: id={cred.id} ({scope}); "
                 f"user_id={user.id}"

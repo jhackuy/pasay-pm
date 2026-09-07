@@ -79,7 +79,11 @@ def test_jobs_disabled_without_system_credential():
 def test_jobs_registered_with_system_credential():
     from pasay_bot.jobs import _build_job_api, register_jobs
 
-    settings = Settings(pasay_job_api_key="sys-job-key", pasay_api_base="http://test/api/v1")
+    settings = Settings(
+        pasay_job_api_key="sys-job-key",
+        pasay_api_base="http://test/api/v1",
+        pasay_system_org_id=1,
+    )
     job_api = _build_job_api(settings)
     assert job_api is not None
     try:
@@ -104,6 +108,23 @@ def test_jobs_registered_with_system_credential():
         asyncio.run(job_api.aclose())
 
 
+def test_jobs_disabled_when_passay_system_org_id_is_unset():
+    """Issue #119 P0 (independent review follow-up): a SYSTEM job client
+    without a canonical org id cannot safely reach
+    /api/v1/operations/* — the server would reject it. Fail closed."""
+    from pasay_bot.jobs import _build_job_api
+
+    settings = Settings(
+        pasay_job_api_key="sys-job-key",
+        pasay_api_base="http://test/api/v1",
+        pasay_system_org_id=0,
+    )
+    assert _build_job_api(settings) is None, (
+        "a SYSTEM job client without pasay_system_org_id must be "
+        "rejected so it cannot accidentally bypass the single-org binding"
+    )
+
+
 def _requests_for(backend, method, path):
     return [
         (m, p, tg, auth)
@@ -114,10 +135,24 @@ def _requests_for(backend, method, path):
     ]
 
 
+def _build_request_urls(backend, method: str) -> list[str]:
+    """Return the list of full request URLs the fake backend received
+    for the given method. The FakeBackend records the full URL
+    (including query string) in ``backend.url_calls`` for tests that
+    need to assert on ``?org_id=...`` or other query parameters.
+    """
+    return [
+        url
+        for call, url in zip(backend.calls, backend.url_calls)
+        if call[0] == method
+    ]
+
+
 def test_next_check_job_reads_as_system_never_binds_owner():
     backend = FakeBackend()
     backend.quick_tasks = []  # no due tasks -> no sends, but the read happens
-    api = _real_client(backend)
+    api = _real_client(backend, key="sys-job-key")
+    api.system_org_id = 1
     try:
         asyncio.run(_send_next_check_reminders(_HeadlessBot(), api, _EmptyStore()))
     finally:
@@ -130,12 +165,16 @@ def test_next_check_job_reads_as_system_never_binds_owner():
     assert calls[0][3] == "Bearer sys-job-key", calls[0]
     # The shared client was never bound to any Telegram identity.
     assert api._telegram_user_id.get() is None
+    # Issue #119 P0 follow-up: the canonical org id is forwarded.
+    urls = _build_request_urls(backend, "GET")
+    assert any("org_id=1" in u for u in urls), urls
 
 
 def test_digest_job_reads_as_system_never_binds_owner():
     backend = FakeBackend()
     backend.digest = {"pending": [], "in_progress": []}
-    api = _real_client(backend)
+    api = _real_client(backend, key="sys-job-key")
+    api.system_org_id = 1
     try:
         asyncio.run(_send_digest(_HeadlessBot(), api, _EmptyStore()))
     finally:
@@ -146,6 +185,9 @@ def test_digest_job_reads_as_system_never_binds_owner():
     assert calls[0][2] is None, calls[0]  # never X-Telegram-User-Id
     assert calls[0][3] == "Bearer sys-job-key", calls[0]
     assert api._telegram_user_id.get() is None
+    # Issue #119 P0 follow-up: the canonical org id is forwarded.
+    urls = _build_request_urls(backend, "GET")
+    assert any("org_id=1" in u for u in urls), urls
 
 
 def test_job_401_is_swallowed_not_fatal():

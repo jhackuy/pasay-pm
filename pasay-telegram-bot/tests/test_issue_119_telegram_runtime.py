@@ -581,8 +581,11 @@ def test_jobs_register_with_system_credential():
     daily digest and the repeating next_check reminder."""
     from pasay_bot.jobs import _build_job_api, register_jobs
 
-    settings = Settings(pasay_job_api_key="sys-job-key",
-                        pasay_api_base="http://test/api/v1")
+    settings = Settings(
+        pasay_job_api_key="sys-job-key",
+        pasay_api_base="http://test/api/v1",
+        pasay_system_org_id=1,
+    )
     job_api = _build_job_api(settings)
     assert job_api is not None
 

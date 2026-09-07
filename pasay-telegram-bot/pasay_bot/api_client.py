@@ -982,10 +982,34 @@ class PasayApiClient:
         api_key: str,
         timeout: float = 10.0,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        *,
+        system_org_id: Optional[int] = None,
     ):
+        """Construct a typed PASAY API client.
+
+        Issue #119 P0 (independent review follow-up): ``system_org_id``
+        is the canonical ``trusted_organization_id`` for the SYSTEM
+        scheduled-job endpoints (``/api/v1/operations/digest`` and
+        ``/api/v1/operations/quick/tasks``). The V1 endpoints are
+        server-side bound to a single org per SYSTEM credential; the
+        client just needs to know the right id to pass in the query.
+        A value of 0 (or ``None``) is treated as "no canonical org" —
+        the bot-side ``PasayApiClient.get_digest`` and
+        ``get_quick_tasks`` will then NOT inject any ``org_id`` and
+        the server will reject the request. The value MUST be set
+        for the SYSTEM job path (``PASSAY_SYSTEM_ORG_ID`` Worker
+        env).
+        """
         self._telegram_user_id: ContextVar[int | None] = ContextVar(
             f"telegram_user_id_{id(self)}", default=None)
         self.base_url = base_url.rstrip("/")
+        # Normalise system_org_id: only positive ints are honoured.
+        if isinstance(system_org_id, bool) or not isinstance(system_org_id, int):
+            self.system_org_id: Optional[int] = (
+                int(system_org_id) if isinstance(system_org_id, int) and system_org_id > 0 else None
+            )
+        else:
+            self.system_org_id = system_org_id if system_org_id > 0 else None
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
@@ -1515,14 +1539,46 @@ class PasayApiClient:
         )
         return TaskFollowupDelivery.from_dict(data)
 
-    async def get_quick_tasks(self, scope: Optional[str] = None) -> list[dict]:
+    async def get_quick_tasks(
+        self,
+        scope: Optional[str] = None,
+        *,
+        system_org_id: Optional[int] = None,
+    ) -> list[dict]:
         """GET /operations/quick/tasks: deterministic active-task quick view.
-        ``scope="owner"`` applies the Owner attention filter."""
+
+        Issue #119 P0 (independent review follow-up): for the SYSTEM
+        scheduled-job client, ``system_org_id`` (or the
+        ``system_org_id`` bound to the client) is sent as the
+        ``?org_id=...`` query parameter so the server can enforce the
+        single-org binding. ``scope="owner"`` applies the Owner
+        attention filter (HUMAN only — SYSTEM callers must not pass
+        ``scope="owner"``).
+
+        The V1 SYSTEM response is a structured dict
+        ``{"items": [...], "total": ..., "limit": ..., "offset": ...}``;
+        this method returns the flat ``items`` list so the bot's
+        ``_send_next_check_reminders`` loop continues to iterate over
+        ``task.get("next_check_at")`` rows unchanged.
+        """
         params: dict[str, Any] = {}
         if scope:
             params["scope"] = scope
-        data = await self._request("GET", "/operations/quick/tasks", params=params)
-        return data if isinstance(data, list) else []
+        canonical_org = system_org_id if system_org_id is not None else self.system_org_id
+        if canonical_org is not None and canonical_org > 0:
+            params["org_id"] = int(canonical_org)
+        data = await self._request(
+            "GET", "/operations/quick/tasks", params=params,
+        )
+        if isinstance(data, dict):
+            # V1 SYSTEM contract: structured response with an
+            # ``items`` list. Return the flat list so the bot code
+            # does not need to change.
+            return list(data.get("items") or [])
+        if isinstance(data, list):
+            # Legacy contract: flat list. Pass through unchanged.
+            return data
+        return []
 
     async def get_quick_properties(self) -> list[dict]:
         """GET /operations/quick/properties: deterministic property status."""
@@ -1557,9 +1613,33 @@ class PasayApiClient:
             body["notes"] = notes
         return await self._request("POST", "/viewings", json=body, timeout=15.0)
 
-    async def get_digest(self) -> dict:
-        """GET /operations/digest: daily Active Tasks Digest."""
-        data = await self._request("GET", "/operations/digest")
+    async def get_digest(
+        self,
+        *,
+        system_org_id: Optional[int] = None,
+    ) -> dict:
+        """GET /operations/digest: daily Active Tasks Digest.
+
+        Issue #119 P0 (independent review follow-up): for the SYSTEM
+        scheduled-job client, the canonical org id (the
+        ``trusted_organization_id`` of the SYSTEM credential) is
+        automatically sent as the ``?org_id=...`` query parameter
+        when the client is constructed with ``system_org_id`` set.
+        The server is the single source of truth — the client
+        merely forwards the configured id.
+
+        The bot's ``base_url`` already carries the ``/api/v1`` prefix
+        (see ``pasay_bot.config.DEFAULT_PASAY_API_BASE``), so the
+        path is the relative form ``/operations/digest`` — identical
+        to the legacy call site.
+        """
+        canonical_org = system_org_id if system_org_id is not None else self.system_org_id
+        params: dict[str, Any] = {}
+        if canonical_org is not None and canonical_org > 0:
+            params["org_id"] = int(canonical_org)
+        data = await self._request(
+            "GET", "/operations/digest", params=params,
+        )
         return data or {}
 
     async def get_operations_summary(self, scope: Optional[str] = None) -> dict:

@@ -130,7 +130,7 @@ def _bootstrap_human_credential(db, *, username, workspace, role, raw_key=None):
     return user, membership, cred, raw
 
 
-def _bootstrap_system_credential(db, *, raw_key=None):
+def _bootstrap_system_credential(db, *, raw_key=None, trusted_organization_id=None):
     raw = raw_key or generate_api_key()
     user = (
         db.query(User).filter(User.username == SYSTEM_SENTINEL_USERNAME).one_or_none()
@@ -150,6 +150,7 @@ def _bootstrap_system_credential(db, *, raw_key=None):
         is_active=True,
         principal_type=V1PrincipalType.SYSTEM.value,
         purpose="internal:scheduler",
+        trusted_organization_id=trusted_organization_id,
     )
     db.add(cred)
     db.commit()
@@ -216,14 +217,37 @@ def test_fresh_db_system_credential_authenticates_via_get_system_principal():
     The V1 SYSTEM principal has NO Principal.role; get_current_principal
     must REJECT it so a scheduled job can never impersonate a HUMAN on
     a write endpoint.
+
+    Issue #119 P0 (independent review follow-up): a SYSTEM credential
+    without a ``trusted_organization_id`` binding is REJECTED — the
+    bind is mandatory.
     """
+    from fastapi import HTTPException
+    from app.v1.models.foundation import Organization
     with v1_engine_ctx():
         factory = get_session_factory()
         db = factory()
         try:
-            user, cred, raw = _bootstrap_system_credential(db)
+            org = Organization(name=f"sys-{uuid.uuid4().hex[:8]}")
+            db.add(org)
+            db.flush()
+            org_id = int(org.id)
+
+            # A SYSTEM credential WITHOUT a binding is rejected.
+            _, cred_no_bind, raw_no_bind = _bootstrap_system_credential(db)
+            with pytest.raises(HTTPException) as exc:
+                get_system_principal(
+                    authorization=f"Bearer {raw_no_bind}", db=db,
+                )
+            assert exc.value.status_code == 401
+
+            # A SYSTEM credential WITH a binding authenticates.
+            user, cred, raw = _bootstrap_system_credential(
+                db, trusted_organization_id=org_id,
+            )
             assert cred.principal_type == V1PrincipalType.SYSTEM.value
             assert cred.purpose == "internal:scheduler"
+            assert cred.trusted_organization_id == org_id
             system = get_system_principal(
                 authorization=f"Bearer {raw}",
                 db=db,
@@ -313,11 +337,19 @@ def test_rotation_old_human_key_rejected_new_accepted():
 
 
 def test_rotation_old_system_key_rejected_new_accepted():
+    from fastapi import HTTPException
+    from app.v1.models.foundation import Organization
     with v1_engine_ctx():
         factory = get_session_factory()
         db = factory()
         try:
-            _, _, old_raw = _bootstrap_system_credential(db)
+            org = Organization(name=f"sysrot-{uuid.uuid4().hex[:8]}")
+            db.add(org)
+            db.flush()
+            org_id = int(org.id)
+            _, _, old_raw = _bootstrap_system_credential(
+                db, trusted_organization_id=org_id,
+            )
             old_system = get_system_principal(
                 authorization=f"Bearer {old_raw}", db=db,
             )
@@ -345,6 +377,7 @@ def test_rotation_old_system_key_rejected_new_accepted():
                 is_active=True,
                 principal_type=V1PrincipalType.SYSTEM.value,
                 purpose="internal:scheduler",
+                trusted_organization_id=org_id,
             ))
             db.flush()
             for old in actives:
@@ -352,7 +385,6 @@ def test_rotation_old_system_key_rejected_new_accepted():
             db.commit()
 
             # Old system key: 401.
-            from fastapi import HTTPException
             with pytest.raises(HTTPException) as exc:
                 get_system_principal(authorization=f"Bearer {old_raw}", db=db)
             assert exc.value.status_code == 401
@@ -558,8 +590,12 @@ def test_owner_can_read_dashboard_secretary_can_too_system_cannot():
             )
             assert r.status_code == 200, r.text
 
-            # SYSTEM credential: bootstrap one + try to read dashboard
-            _, _, sys_raw = _bootstrap_system_credential(db)
+            # SYSTEM credential: bootstrap one + try to read dashboard.
+            # Even with a valid trusted_organization_id binding, the
+            # SYSTEM dep rejects HUMAN-membership paths outright.
+            _, _, sys_raw = _bootstrap_system_credential(
+                db, trusted_organization_id=workspace.org_id,
+            )
             r = client.get(
                 f"/api/v1/dashboard/home?org_id={workspace.org_id}",
                 headers={"Authorization": f"Bearer {sys_raw}"},
@@ -579,7 +615,9 @@ def test_owner_only_endpoint_rejects_secretary_and_system():
             workspace = seed_workspace(db, name=f"po-{uuid.uuid4().hex[:6]}")
             client = _v1_client()
             sec_raw = workspace.secretary_api_key
-            _, _, sys_raw = _bootstrap_system_credential(db)
+            _, _, sys_raw = _bootstrap_system_credential(
+                db, trusted_organization_id=workspace.org_id,
+            )
 
             # SECRETARY → 403 (role check)
             r = client.post(

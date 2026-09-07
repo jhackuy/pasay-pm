@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     pasay_http_timeout_seconds: float = 30.0
     archive_chat_id: str = ""
     pasay_job_api_key: str = ""
+    # Issue #119 P0 (independent review follow-up): the SYSTEM
+    # scheduled-job client is server-side bound to a single
+    # organization. The canonical id is sourced from
+    # ``PASSAY_SYSTEM_ORG_ID`` and forwarded through the Cloudflare
+    # Worker to the Container. A missing / 0 value keeps the jobs
+    # disabled (fail closed).
+    pasay_system_org_id: int = 0
     # Issue #119 Mini App — canonical production Pages origin. Environment
     # can override this, but production does not require an operator to wire
     # a non-secret URL manually after every deploy.
@@ -76,7 +83,7 @@ def _env() -> dict:
             "PASSAY_ADMIN_API_KEY", "HERMES_API_BASE", "HERMES_API_KEY",
             "STATE_DB", "HOOK_TOKEN", "CALLBACK_TTL_SECONDS",
             "PASSAY_HTTP_TIMEOUT_SECONDS", "PASSAY_ARCHIVE_CHAT_ID",
-            "PASSAY_JOB_API_KEY",
+            "PASSAY_JOB_API_KEY", "PASSAY_SYSTEM_ORG_ID",
             "PASSAY_MINI_APP_URL", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
         }:
             data[key] = val
@@ -118,6 +125,12 @@ def get_settings() -> Settings:
         pasay_http_timeout_seconds=float(e.get("PASSAY_HTTP_TIMEOUT_SECONDS", "30") or "30"),
         archive_chat_id=(e.get("PASSAY_ARCHIVE_CHAT_ID") or "").strip(),
         pasay_job_api_key=(e.get("PASSAY_JOB_API_KEY") or "").strip(),
+        # Issue #119 P0 follow-up: parse the canonical SYSTEM org id
+        # from the environment. An empty / non-numeric value becomes 0
+        # so the jobs stay disabled (fail closed).
+        pasay_system_org_id=int(
+            (e.get("PASSAY_SYSTEM_ORG_ID") or "0").strip() or "0",
+        ),
         pasay_mini_app_url=(e.get("PASSAY_MINI_APP_URL") or DEFAULT_MINI_APP_URL).strip(),
         pasay_mini_app_owner_telegram_ids=(e.get("PASSAY_MINI_APP_OWNER_TELEGRAM_IDS") or "").strip(),
     )

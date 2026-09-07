@@ -787,6 +787,7 @@ run("CLOSEOUT#7a: PasayContainer envVars keyset — SOURCE-LEVEL 15 unique keys 
     "PASSAY_API_KEY",
     "PASSAY_ADMIN_API_KEY",
     "PASSAY_JOB_API_KEY",
+    "PASSAY_SYSTEM_ORG_ID",
     "PASSAY_HTTP_TIMEOUT_SECONDS",
     "PASSAY_ARCHIVE_CHAT_ID",
     "PASSAY_MINI_APP_URL",
@@ -818,6 +819,7 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     PASSAY_API_KEY: "manager-key",
     PASSAY_ADMIN_API_KEY: "admin-key",
     PASSAY_JOB_API_KEY: "system-key",
+    PASSAY_SYSTEM_ORG_ID: "42",
     PASSAY_HTTP_TIMEOUT_SECONDS: "45",
     PASSAY_ARCHIVE_CHAT_ID: "-1001234567890",
     PASSAY_MINI_APP_URL: "https://pasay-mini-app.pages.dev",
@@ -830,7 +832,7 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     "PASSAY_ADMIN_API_KEY", "PASSAY_API_BASE", "PASSAY_API_KEY",
     "PASSAY_ARCHIVE_CHAT_ID", "PASSAY_HTTP_TIMEOUT_SECONDS",
     "PASSAY_JOB_API_KEY", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
-    "PASSAY_MINI_APP_URL", "PASAY_RUNTIME_MODE", "PASSAY_TG_BOT_TOKEN",
+    "PASSAY_MINI_APP_URL", "PASSAY_SYSTEM_ORG_ID", "PASAY_RUNTIME_MODE", "PASSAY_TG_BOT_TOKEN",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",
   ].sort();
   assert_eq(keys.length, expected.length,
@@ -869,6 +871,8 @@ run("CLOSEOUT#7b: PasayContainer envVars — runtime instantiated with full Env 
     "PASSAY_ADMIN_API_KEY <-- env.PASSAY_ADMIN_API_KEY (1:1)");
   assert_eq(inst.envVars.PASSAY_JOB_API_KEY, fullEnv.PASSAY_JOB_API_KEY,
     "PASSAY_JOB_API_KEY <-- env.PASSAY_JOB_API_KEY (1:1)");
+  assert_eq(inst.envVars.PASSAY_SYSTEM_ORG_ID, fullEnv.PASSAY_SYSTEM_ORG_ID,
+    "PASSAY_SYSTEM_ORG_ID <-- env.PASSAY_SYSTEM_ORG_ID (1:1)");
   assert_eq(inst.envVars.PASSAY_HTTP_TIMEOUT_SECONDS, fullEnv.PASSAY_HTTP_TIMEOUT_SECONDS,
     "PASSAY_HTTP_TIMEOUT_SECONDS <-- env.PASSAY_HTTP_TIMEOUT_SECONDS (1:1)");
   assert_eq(inst.envVars.PASSAY_ARCHIVE_CHAT_ID, fullEnv.PASSAY_ARCHIVE_CHAT_ID,
@@ -928,7 +932,7 @@ run("CLOSEOUT#7c: PasayContainer envVars — partial/missing env → empty strin
   // "cloudflare-container" regardless of any operator provisioning.
   const dynamicRequiredNames = [
     "PASSAY_TG_BOT_TOKEN", "PASSAY_API_BASE", "PASSAY_API_KEY",
-    "PASSAY_ADMIN_API_KEY", "PASSAY_JOB_API_KEY",
+    "PASSAY_ADMIN_API_KEY", "PASSAY_JOB_API_KEY", "PASSAY_SYSTEM_ORG_ID",
     "PASSAY_HTTP_TIMEOUT_SECONDS", "PASSAY_ARCHIVE_CHAT_ID",
     "PASSAY_MINI_APP_URL", "PASSAY_MINI_APP_OWNER_TELEGRAM_IDS",
     "TELEGRAM_BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET",

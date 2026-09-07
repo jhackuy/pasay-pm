@@ -255,16 +255,19 @@ class TestRewriteChainDiscovery:
         assert "0004_legacy_telegram_runtime" in chain
         assert "0005_v1_api_cred_system" in chain
         assert "0006_v1_orm_alignment" in chain
+        assert "0007_v1_system_trusted_org" in chain
 
     def test_head_is_the_latest_known_revision(self):
         _, head = _load_rewrite_chain()
         # Issue #119 P0 v1_api_credential_bootstrap added 0005 (principal_type
-        # + purpose on v1_api_credentials) and 0006 (v1_users /
-        # v1_memberships ↔ V1 ORM alignment); the rewrite chain's HEAD
-        # advances with each merge. We pin the head dynamically through
-        # ``_load_rewrite_chain`` so the assertion below matches whatever
-        # is the highest-revision migration on disk.
-        assert head == "0006_v1_orm_alignment"
+        # + purpose on v1_api_credentials), 0006 (v1_users /
+        # v1_memberships ↔ V1 ORM alignment), and 0007
+        # (trusted_organization_id binding for SYSTEM credentials);
+        # the rewrite chain's HEAD advances with each merge. We pin
+        # the head dynamically through ``_load_rewrite_chain`` so the
+        # assertion below matches whatever is the highest-revision
+        # migration on disk.
+        assert head == "0007_v1_system_trusted_org"
 
     def test_legacy_revision_is_not_in_rewrite_chain(self):
         """The retired legacy revision must NOT be discoverable from
@@ -295,19 +298,19 @@ class TestProceedOutcomes:
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
         assert decision.action == PROCEED
         assert decision.reason == "empty_alembic_version"
-        assert decision.head == "0006_v1_orm_alignment"
+        assert decision.head == "0007_v1_system_trusted_org"
         assert decision.recorded == ()
         assert decision.dropped == 0
 
     def test_recorded_rewrite_head_proceeds(self, preflight_db):
-        """Recorded revision = current head ``0006_v1_orm_alignment`` →
+        """Recorded revision = current head ``0007_v1_system_trusted_org`` →
         PROCEED with reason ``valid_rewrite_head`` (already at head).
         """
-        _plant_alembic_version(preflight_db, ["0006_v1_orm_alignment"])
+        _plant_alembic_version(preflight_db, ["0007_v1_system_trusted_org"])
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
         assert decision.action == PROCEED
         assert decision.reason == "valid_rewrite_head"
-        assert decision.recorded == ("0006_v1_orm_alignment",)
+        assert decision.recorded == ("0007_v1_system_trusted_org",)
         assert decision.dropped == 0
 
     def test_recorded_first_ancestor_proceeds(self, preflight_db):
@@ -346,6 +349,7 @@ class TestProceedOutcomes:
             "0004_legacy_telegram_runtime",
             "0005_v1_api_cred_system",
             "0006_v1_orm_alignment",
+            "0007_v1_system_trusted_org",
         ],
     )
     def test_each_rewrite_ancestor_or_head_proceeds(self, preflight_db, rev):
@@ -356,7 +360,7 @@ class TestProceedOutcomes:
         _plant_alembic_version(preflight_db, [rev])
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
         assert decision.action == PROCEED
-        assert decision.head == "0006_v1_orm_alignment"
+        assert decision.head == "0007_v1_system_trusted_org"
         assert decision.recorded == (rev,)
         assert decision.dropped == 0
 
@@ -436,7 +440,7 @@ class TestLegacyReset:
         # ``alembic current`` must report the new head.
         proc = _alembic("current", url=url)
         assert proc.returncode == 0, proc.stderr
-        assert "0006_v1_orm_alignment" in proc.stdout, (
+        assert "0007_v1_system_trusted_org" in proc.stdout, (
             f"unexpected alembic current output: {proc.stdout!r}"
         )
 
@@ -771,4 +775,4 @@ class TestFreshDatabaseEndToEnd:
         decision = run_preflight(url)
         assert decision.action == PROCEED
         assert decision.reason == "valid_rewrite_head"
-        assert decision.recorded == ("0006_v1_orm_alignment",)
+        assert decision.recorded == ("0007_v1_system_trusted_org",)

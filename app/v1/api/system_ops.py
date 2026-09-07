@@ -134,7 +134,14 @@ def _row_from_task(
 
 @router.get("/quick/tasks")
 def quick_tasks(
-    org_id: int = Query(..., gt=0, description="explicit target org_id (SYSTEM scope)"),
+    org_id: int | None = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Optional caller-supplied target org_id. MUST match the "
+            "credential's trusted_organization_id; otherwise 403."
+        ),
+    ),
     scope: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
@@ -143,16 +150,16 @@ def quick_tasks(
 ) -> dict[str, Any]:
     """Active tasks (PENDING + IN_PROGRESS) for the SYSTEM scheduled job.
 
-    Issue #119 P0 fix: SYSTEM callers must supply an explicit
-    ``org_id`` query parameter; the dep then calls
-    ``require_system_org_scope`` so a SYSTEM credential cannot read
-    across multiple orgs in a single request (the legacy
-    ``get_operations_reader`` global read-scope behaviour is NOT
-    carried over — SYSTEM reads are now explicitly bound to the
-    org_id the caller names in the request).
+    Issue #119 P0 (independent review follow-up): the canonical target
+    org is the SYSTEM credential's ``trusted_organization_id``. The
+    ``org_id`` query parameter is OPTIONAL — when supplied it MUST
+    match the bound org (mismatch → 403). When absent, the server
+    uses the credential's bound org directly. This is the
+    single-source-of-truth binding that prevents a leaked SYSTEM key
+    from reading across every org in the database.
     """
     try:
-        require_system_org_scope(system, org_id)
+        canonical_org_id = require_system_org_scope(system, org_id)
     except PermissionDenied as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
@@ -173,7 +180,7 @@ def quick_tasks(
     q = (
         db.query(Task)
         .filter(
-            Task.org_id == org_id,
+            Task.org_id == canonical_org_id,
             Task.state == TaskState.OPEN.value,
         )
         .order_by(Task.due_at.is_(None), Task.due_at, Task.id)
@@ -337,23 +344,38 @@ def _done_today_rows(
 
 @router.get("/digest")
 def daily_digest(
-    org_id: int = Query(..., gt=0, description="explicit target org_id (SYSTEM scope)"),
+    org_id: int | None = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Optional caller-supplied target org_id. MUST match the "
+            "credential's trusted_organization_id; otherwise 403."
+        ),
+    ),
     system: SystemPrincipal = Depends(get_system_principal),
     db: Session = Depends(get_db_dep),
 ) -> dict[str, Any]:
     """Daily Tasks Digest — three sections (act_now / upcoming / done_today)
     plus the legacy ``pending`` / ``in_progress`` / ``recently_completed``
     keys the bot's ``active_tasks_digest_card`` reads as a fallback.
+
+    Issue #119 P0 (independent review follow-up): the canonical target
+    org is the SYSTEM credential's ``trusted_organization_id``. The
+    ``org_id`` query parameter is OPTIONAL — when supplied it MUST
+    match the bound org (mismatch → 403). When absent, the server
+    uses the credential's bound org directly. The bot's
+    ``PasayApiClient.get_digest()`` therefore does not need to know
+    the org id at all; the credential carries it.
     """
     try:
-        require_system_org_scope(system, org_id)
+        canonical_org_id = require_system_org_scope(system, org_id)
     except PermissionDenied as exc:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
     now = datetime.now(timezone.utc)
-    act_now = _act_now_rows(db, org_id, now=now)
-    upcoming = _upcoming_rows(db, org_id, now=now)
-    done_today = _done_today_rows(db, org_id, now=now)
+    act_now = _act_now_rows(db, canonical_org_id, now=now)
+    upcoming = _upcoming_rows(db, canonical_org_id, now=now)
+    done_today = _done_today_rows(db, canonical_org_id, now=now)
 
     act_hidden = max(len(act_now) - _MAX_DIGEST_ACT, 0)
     upcoming_hidden = max(len(upcoming) - _MAX_DIGEST_UPCOMING, 0)

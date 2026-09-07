@@ -170,43 +170,37 @@ def require_org_scope(principal: Any, org_id: int) -> None:
 
 def require_system_org_scope(
     system_principal: SystemPrincipal,
-    target_org_id: int,
-) -> None:
-    """Bind a SYSTEM caller to an explicit target organization.
+    target_org_id: int | None = None,
+) -> int:
+    """Bind a SYSTEM caller to its single server-side trusted organization.
 
-    Issue #119 P0 fix (independent review): SYSTEM callers MUST name the
-    org they want to read from. The credential row's purpose
-    (``internal:scheduler``) and the per-credential ``trusted_organization_id``
-    field (set by the bootstrap script) together determine the single org
-    the SYSTEM caller is allowed to touch.
+    Issue #119 P0 (independent review follow-up): the
+    ``trusted_organization_id`` column on the SYSTEM ApiCredential is
+    the SINGLE authoritative org scope. The function returns that
+    canonical ``target_org_id`` so the route handler can use it
+    without re-deriving the binding.
 
-    For now, the bootstrap script does not yet attach a per-credential
-    ``trusted_organization_id``; the SYSTEM credential is therefore
-    forced to supply the target org_id explicitly in the request
-    context (the route handler resolves the canonical org from
-    query/body). This is the SAME pattern the legacy
-    ``resolve_org_membership`` uses via ``reader.credential.trusted_organization_id``:
-    the SYSTEM caller never gets to silently read across every org.
+    A ``target_org_id`` argument MAY be supplied (the caller can
+    pre-emptively name the org via query / body) — when supplied, it
+    MUST equal the credential's bound org. When absent (``None``), the
+    canonical org is used directly. Either way, a mismatch is
+    PermissionDenied so an attacker who replays a SYSTEM key with
+    ``?org_id=<other>`` cannot read across orgs.
 
     Failure modes (fail closed):
-      * target_org_id is None / 0 / negative → PermissionDenied.
-      * system_principal.credential does not exist → PermissionDenied
-        (caller should not happen; defensive).
-      * system_principal.credential purpose is not in the SYSTEM allow
-        list (V1_SYSTEM_PURPOSES) → PermissionDenied.
+      * caller is not a SystemPrincipal → PermissionDenied.
+      * credential has no bound ``trusted_organization_id`` →
+        PermissionDenied (the dep ``get_system_principal`` already
+        refuses NULL; this is defence in depth).
+      * caller-supplied ``target_org_id`` does not match the bound org
+        → PermissionDenied.
+      * purpose is not in V1_SYSTEM_PURPOSES → PermissionDenied.
     """
     if not isinstance(system_principal, SystemPrincipal):
         raise PermissionDenied("require_system_org_scope: not a SystemPrincipal")
-    if target_org_id is None or not isinstance(target_org_id, int) or target_org_id <= 0:
-        raise PermissionDenied(
-            "SYSTEM caller must supply an explicit positive target_org_id; "
-            "implicit cross-org reads are not allowed"
-        )
     cred = getattr(system_principal, "credential", None)
     if cred is None:
         raise PermissionDenied("SYSTEM credential missing on principal")
-    # The purpose is already validated by ``get_system_principal`` at
-    # auth time; this is a defense-in-depth re-check.
     from app.v1.models.base import V1_SYSTEM_PURPOSES  # local import: avoid cycle
     purpose = getattr(cred, "purpose", None)
     if purpose not in V1_SYSTEM_PURPOSES:
@@ -214,6 +208,24 @@ def require_system_org_scope(
             f"SYSTEM credential purpose {purpose!r} not in "
             f"{sorted(V1_SYSTEM_PURPOSES)}"
         )
+    bound_org_id = getattr(cred, "trusted_organization_id", None)
+    if bound_org_id is None:
+        raise PermissionDenied(
+            "SYSTEM credential is not bound to any organization; "
+            "re-run scripts/create_v1_api_key.py --purpose job to bind it"
+        )
+    if target_org_id is not None:
+        if not isinstance(target_org_id, int) or target_org_id <= 0:
+            raise PermissionDenied(
+                "SYSTEM caller must supply a positive target_org_id when "
+                "one is provided; cross-org reads are not allowed"
+            )
+        if int(target_org_id) != int(bound_org_id):
+            raise PermissionDenied(
+                f"SYSTEM credential is bound to org_id={bound_org_id}; "
+                f"requested org_id={target_org_id} is not allowed"
+            )
+    return int(bound_org_id)
 
 
 def assert_not_bootstrap_for_secretary(

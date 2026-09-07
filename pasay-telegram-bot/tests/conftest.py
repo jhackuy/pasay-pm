@@ -257,6 +257,11 @@ class FakeBackend:
         self.calls: list[tuple[str, str, Optional[dict]]] = []
         self.auth_calls: list[str] = []
         self.telegram_user_calls: list[Optional[str]] = []
+        # Issue #119 P0 follow-up: full URL (path + query string)
+        # recording for tests that need to assert on ``?org_id=...``
+        # or other query parameters. Kept as a separate list so the
+        # existing ``calls`` (method, path, body) shape is unchanged.
+        self.url_calls: list[str] = []
         self.properties = [
             {"id": 1, "name": "Pasay Premier Residences", "address": "5 Roxas Blvd",
              "city": "Pasay", "total_units": 2, "is_active": True},
@@ -539,6 +544,10 @@ class FakeBackend:
         self.calls.append((method, path, body))
         self.auth_calls.append(request.headers.get("authorization") or "")
         self.telegram_user_calls.append(request.headers.get("x-telegram-user-id"))
+        # Issue #119 P0 follow-up: also record the full URL (with any
+        # query string) so tests can assert that the SYSTEM scheduled-
+        # job client forwards the canonical org id via ``?org_id=...``.
+        self.url_calls.append(str(request.url))
 
         if path in self.raise_on_paths:
             raise RuntimeError(f"forced unexpected error on {method} {path}")
@@ -1750,7 +1759,8 @@ def make_app(tmp_path):
     created: list[tuple[Any, Any, Any]] = []
 
     def _make(backend=None, api_key="manager-key", admin_api_key="admin-key",
-              callback_ttl=900, state_db=None, bot=None, job_api_key="", store_path=None):
+              callback_ttl=900, state_db=None, bot=None, job_api_key="",
+              store_path=None, system_org_id=1):
         backend = backend or FakeBackend()
         settings = Settings(
             state_db=store_path or state_db or str(tmp_path / f"state_{len(created)}.db"),
@@ -1759,6 +1769,7 @@ def make_app(tmp_path):
             callback_ttl_seconds=callback_ttl,
             pasay_admin_api_key=admin_api_key,
             pasay_job_api_key=job_api_key,
+            pasay_system_org_id=system_org_id,
         )
         store = StateStore(settings.state_db)
         guard = IdempotencyGuard(store)
@@ -1779,6 +1790,9 @@ def make_app(tmp_path):
         # JOB-SERVICE-AUTH-002: background jobs use a dedicated SYSTEM-keyed
         # client (never the human-bound interactive client). Tests opt in with
         # job_api_key; the default disables the jobs (fail closed).
+        # Issue #119 P0 (independent review follow-up): the SYSTEM client is
+        # constructed with system_org_id so /api/v1/operations/* is called
+        # with the canonical org id.
         job_api = None
         if job_api_key:
             job_api = PasayApiClient(
@@ -1786,6 +1800,7 @@ def make_app(tmp_path):
                 job_api_key,
                 timeout=1.0,
                 transport=httpx.MockTransport(backend.handler),
+                system_org_id=system_org_id,
             )
         bot = bot or FakeBot()
         backend.bot = bot

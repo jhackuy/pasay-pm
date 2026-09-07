@@ -150,7 +150,9 @@ def _bootstrap_human(
     return user, mship, cred, raw
 
 
-def _bootstrap_system(db, *, raw: str | None = None) -> tuple[User, ApiCredential, str]:
+def _bootstrap_system(
+    db, *, raw: str | None = None, trusted_organization_id: int | None = None,
+) -> tuple[User, ApiCredential, str]:
     raw = raw or generate_api_key()
     user = (
         db.query(User)
@@ -181,6 +183,7 @@ def _bootstrap_system(db, *, raw: str | None = None) -> tuple[User, ApiCredentia
         is_active=True,
         principal_type=V1PrincipalType.SYSTEM.value,
         purpose="internal:scheduler",
+        trusted_organization_id=trusted_organization_id,
     )
     db.add(cred)
     db.commit()
@@ -396,12 +399,18 @@ def test_production_app_job_key_reads_digest_and_quick_tasks():
     endpoints, which read REAL V1 data (overdue rent + open task) and
     return the contract the bot's ``cards.active_tasks_digest_card``
     already consumes.
+
+    Issue #119 P0 (independent review follow-up): the SYSTEM credential
+    is bound to the workspace's org id; both endpoints accept the
+    caller-supplied ``org_id`` because it matches the binding.
     """
     with v1_engine_ctx():
         db = get_session_factory()()
         try:
             workspace = _seed_workspace_with_real_data(db, name="e2e-job")
-            _, _, job_raw = _bootstrap_system(db)
+            _, _, job_raw = _bootstrap_system(
+                db, trusted_organization_id=workspace.org_id,
+            )
             client = _production_app_client()
             # /operations/digest
             r = client.get(
@@ -447,13 +456,21 @@ def test_production_app_job_key_cannot_write_or_reach_human_endpoints():
       * HUMAN owner-only write     → 401 (SYSTEM rejected outright)
       * HUMAN owner/secretary read → 401
       * SYSTEM digest              → 200 (the only allowed surface)
-      * SYSTEM digest without org_id → 403 (explicit org scope required)
+      * SYSTEM digest without org_id → 200 (the credential's
+        trusted_organization_id is the canonical scope, so the
+        server is happy without a caller-supplied org_id)
+
+    Issue #119 P0 (independent review follow-up): the SYSTEM credential
+    is bound to the workspace's org id, so the bound-org read works
+    with or without a caller-supplied ``org_id`` query.
     """
     with v1_engine_ctx():
         db = get_session_factory()()
         try:
             workspace = _seed_workspace_with_real_data(db, name="e2e-job-deny")
-            _, _, job_raw = _bootstrap_system(db)
+            _, _, job_raw = _bootstrap_system(
+                db, trusted_organization_id=workspace.org_id,
+            )
             client = _production_app_client()
             # (a) OWNER-only write → 401
             r = client.post(
@@ -474,15 +491,16 @@ def test_production_app_job_key_cannot_write_or_reach_human_endpoints():
                 headers={"Authorization": f"Bearer {job_raw}"},
             )
             assert r.status_code == 200, r.text
-            # (d) SYSTEM read WITHOUT explicit org_id → 422 (FastAPI
-            # validates the org_id Query as required-int) — confirms
-            # the SYSTEM caller can never read across all orgs
-            # implicitly.
+            # (d) SYSTEM read WITHOUT caller-supplied org_id → 200.
+            # The credential's trusted_organization_id is the
+            # authoritative scope, so the canonical org is used
+            # directly. This is the real-world bot path: the bot
+            # does not need to know the org id.
             r = client.get(
                 "/api/v1/operations/digest",
                 headers={"Authorization": f"Bearer {job_raw}"},
             )
-            assert r.status_code in (422, 400), r.text
+            assert r.status_code == 200, r.text
         finally:
             db.close()
             reset_engine_cache()
@@ -619,14 +637,15 @@ def test_migration_0006_fails_closed_on_suspended_memberships():
     test_url = parsed.set(database=test_db)
     test_url_str = test_url.render_as_string(hide_password=False)
     repo_root = Path(__file__).resolve().parent.parent
-    venv_alembic = repo_root / ".venv" / "bin" / "alembic"
+    alembic_ini = repo_root / "alembic.ini"
     env = os.environ.copy()
     env["DATABASE_URL"] = test_url_str
     try:
         # 1) Upgrade through 0005 (state CHECK still allows SUSPENDED)
         r = subprocess.run(
             [
-                str(venv_alembic),
+                sys.executable, "-m", "alembic",
+                "-c", str(alembic_ini),
                 "-x", f"db_url={test_url_str}",
                 "upgrade", "0005_v1_api_cred_system",
             ],
@@ -675,7 +694,8 @@ def test_migration_0006_fails_closed_on_suspended_memberships():
         # 3) Run 0006 — must fail with the explicit guard error
         r = subprocess.run(
             [
-                str(venv_alembic),
+                sys.executable, "-m", "alembic",
+                "-c", str(alembic_ini),
                 "-x", f"db_url={test_url_str}",
                 "upgrade", "0006_v1_orm_alignment",
             ],

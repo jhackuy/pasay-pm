@@ -175,6 +175,14 @@ def get_system_principal(
     themselves enforce read-only / org-scope semantics — see
     ``app.v1.api.system_ops`` for the canonical pattern.
 
+    Issue #119 P0 (independent review follow-up): the credential MUST
+    carry a non-null ``trusted_organization_id`` — a SYSTEM credential
+    without a server-side org binding is rejected with 401 so a
+    leaked credential cannot enumerate every org in the database.
+    The org id is the SINGLE authoritative scope for the credential;
+    SYSTEM endpoints derive the target org strictly from this column
+    and ignore any caller-supplied ``org_id`` that does not match.
+
     Failure modes (fail closed):
     - Missing / malformed Authorization header → 401 ``invalid credentials``.
     - Active HUMAN credential → 401 ``invalid credentials`` (never
@@ -182,6 +190,9 @@ def get_system_principal(
     - Active SYSTEM credential with an unknown purpose → 401
       ``invalid credentials``.
     - Inactive / revoked SYSTEM credential → 401 ``invalid credentials``.
+    - Active SYSTEM credential with NULL ``trusted_organization_id`` →
+      401 ``invalid credentials`` (the bootstrap script must bind the
+      credential to exactly one org before it can authenticate).
     """
     raw_key = _extract_bearer(authorization)
     cred = _resolve_active_credential(
@@ -190,6 +201,24 @@ def get_system_principal(
     if cred.purpose not in V1_SYSTEM_PURPOSES:
         # Fail closed: an active SYSTEM credential with an unknown /
         # mistyped purpose is indistinguishable from a forged one.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid credentials",
+        )
+    if cred.trusted_organization_id is None:
+        # Issue #119 P0 follow-up: refuse SYSTEM callers without a
+        # server-side single-org binding. The bootstrap script
+        # (``scripts/create_v1_api_key.py --purpose job``) requires an
+        # explicit workspace / organization; this guard is the second
+        # line of defence.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid credentials",
+        )
+    # Validate the org actually exists. The FK should keep this
+    # consistent, but a missing org is a 401 (the credential is
+    # not usable) not a 5xx.
+    from app.v1.models.foundation import Organization
+    org = db.get(Organization, cred.trusted_organization_id)
+    if org is None:
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED, "invalid credentials",
         )
