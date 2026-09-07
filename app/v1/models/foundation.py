@@ -4,7 +4,11 @@ DATA_CONTRACT invariants:
 - Organization: BIGSERIAL-compatible primary key, name UNIQUE.
 - User: telegram_user_id UNIQUE NULLABLE; default_language is constrained.
 - Membership: UNIQUE (org_id, user_id), exact OWNER/SECRETARY roles and ACTIVE/REMOVED states.
-- ApiCredential: key_hash UNIQUE; user_id indexed.
+- ApiCredential: key_hash UNIQUE; user_id indexed. Issue #119 P0
+  v1_api_credential_bootstrap adds ``principal_type`` (HUMAN/SYSTEM,
+  default HUMAN) and ``purpose`` (nullable; ``internal:scheduler`` is the
+  only SYSTEM purpose) so the scheduled jobs authenticate as a SYSTEM
+  principal without binding any Telegram id, mirroring JOB-SERVICE-AUTH-002.
 - SecretaryInvite: 4-state lifecycle (PENDING/ACCEPTED/CANCELLED/EXPIRED) keyed by
   (org_id, invite_token) UNIQUE; invitee_telegram_id nullable for non-telegram invites.
 """
@@ -24,7 +28,13 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.v1.models.base import BigPK, MembershipState, TimestampMixin, V1Base
+from app.v1.models.base import (
+    BigPK,
+    MembershipState,
+    TimestampMixin,
+    V1Base,
+    V1PrincipalType,
+)
 
 
 class Organization(V1Base, TimestampMixin):
@@ -88,6 +98,17 @@ class ApiCredential(V1Base, TimestampMixin):
     __table_args__ = (
         UniqueConstraint("key_hash", name="uq_v1_api_credentials_key_hash"),
         Index("ix_v1_api_credentials_user_id", "user_id"),
+        # Issue #119 P0 v1_api_credential_bootstrap: the SYSTEM lookup is
+        # the hot path for the JOB-SERVICE-AUTH-002 carryover, so the
+        # (principal_type, purpose) compound is indexed explicitly.
+        Index(
+            "ix_v1_api_credentials_principal_type_purpose",
+            "principal_type", "purpose",
+        ),
+        CheckConstraint(
+            "principal_type IN ('HUMAN','SYSTEM')",
+            name="ck_v1_api_credentials_principal_type",
+        ),
     )
 
     id: Mapped[BigPK]
@@ -96,6 +117,15 @@ class ApiCredential(V1Base, TimestampMixin):
     )
     key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Issue #119 P0 v1_api_credential_bootstrap: HUMAN (default) is the
+    # interactive manager/secretary/admin key. SYSTEM is the scheduled-job
+    # credential (purpose MUST be 'internal:scheduler').
+    principal_type: Mapped[str] = mapped_column(
+        String(16), nullable=False,
+        default=V1PrincipalType.HUMAN.value,
+        server_default=V1PrincipalType.HUMAN.value,
+    )
+    purpose: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     user = relationship("User", back_populates="credentials")
 

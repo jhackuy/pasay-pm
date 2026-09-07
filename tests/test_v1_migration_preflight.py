@@ -10,9 +10,10 @@ and rejected the legitimate rewrite chain once a second migration
 (``0002_renewal_pipeline``) was added (run #354). This file pins the
 graph-aware behaviour the recovery script preserves:
 
-* PROCEED for the recorded rewrite head (``0004_legacy_telegram_runtime``).
+* PROCEED for the recorded rewrite head (``0006_v1_orm_alignment``).
 * PROCEED for any recorded rewrite ancestor (``0001_baseline``,
-  ``0002_renewal_pipeline`` or ``0003_units_cap``).
+  ``0002_renewal_pipeline``, ``0003_units_cap``,
+  ``0004_legacy_telegram_runtime``, ``0005_v1_api_cred_system``).
 * PROCEED for an empty ``alembic_version`` table (first-time bootstrap).
 * LEGACY_RESET for the exact retired revision
   ``r3_grant_all_public_20260828`` — and a real PostgreSQL
@@ -246,16 +247,24 @@ class TestRewriteChainDiscovery:
         # branch. Adding a new migration is a deliberate developer
         # action; the test does NOT pin the *exact* set because we do
         # not want CI to fail every time a migration is added — but it
-        # DOES pin that the baseline + the three follow-ups that were
+        # DOES pin that the baseline + the follow-ups that were
         # already merged are present.
         assert EXPECTED_REVISION in chain
         assert "0002_renewal_pipeline" in chain
         assert "0003_units_cap" in chain
         assert "0004_legacy_telegram_runtime" in chain
+        assert "0005_v1_api_cred_system" in chain
+        assert "0006_v1_orm_alignment" in chain
 
     def test_head_is_the_latest_known_revision(self):
         _, head = _load_rewrite_chain()
-        assert head == "0004_legacy_telegram_runtime"
+        # Issue #119 P0 v1_api_credential_bootstrap added 0005 (principal_type
+        # + purpose on v1_api_credentials) and 0006 (v1_users /
+        # v1_memberships ↔ V1 ORM alignment); the rewrite chain's HEAD
+        # advances with each merge. We pin the head dynamically through
+        # ``_load_rewrite_chain`` so the assertion below matches whatever
+        # is the highest-revision migration on disk.
+        assert head == "0006_v1_orm_alignment"
 
     def test_legacy_revision_is_not_in_rewrite_chain(self):
         """The retired legacy revision must NOT be discoverable from
@@ -286,19 +295,19 @@ class TestProceedOutcomes:
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
         assert decision.action == PROCEED
         assert decision.reason == "empty_alembic_version"
-        assert decision.head == "0004_legacy_telegram_runtime"
+        assert decision.head == "0006_v1_orm_alignment"
         assert decision.recorded == ()
         assert decision.dropped == 0
 
     def test_recorded_rewrite_head_proceeds(self, preflight_db):
-        """Recorded revision = current head ``0004_legacy_telegram_runtime`` →
+        """Recorded revision = current head ``0006_v1_orm_alignment`` →
         PROCEED with reason ``valid_rewrite_head`` (already at head).
         """
-        _plant_alembic_version(preflight_db, ["0004_legacy_telegram_runtime"])
+        _plant_alembic_version(preflight_db, ["0006_v1_orm_alignment"])
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
         assert decision.action == PROCEED
         assert decision.reason == "valid_rewrite_head"
-        assert decision.recorded == ("0004_legacy_telegram_runtime",)
+        assert decision.recorded == ("0006_v1_orm_alignment",)
         assert decision.dropped == 0
 
     def test_recorded_first_ancestor_proceeds(self, preflight_db):
@@ -317,8 +326,9 @@ class TestProceedOutcomes:
     def test_recorded_intermediate_ancestor_proceeds(self, preflight_db):
         """Recorded revision = ``0002_renewal_pipeline`` (intermediate
         ancestor) → PROCEED so ``alembic upgrade head`` can apply the
-        remaining ``0003_units_cap`` and
-        ``0004_legacy_telegram_runtime`` migrations.
+        remaining ``0003_units_cap``, ``0004_legacy_telegram_runtime``,
+        ``0005_v1_api_cred_system`` and ``0006_v1_orm_alignment``
+        migrations.
         """
         _plant_alembic_version(preflight_db, ["0002_renewal_pipeline"])
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
@@ -334,6 +344,8 @@ class TestProceedOutcomes:
             "0002_renewal_pipeline",
             "0003_units_cap",
             "0004_legacy_telegram_runtime",
+            "0005_v1_api_cred_system",
+            "0006_v1_orm_alignment",
         ],
     )
     def test_each_rewrite_ancestor_or_head_proceeds(self, preflight_db, rev):
@@ -344,7 +356,7 @@ class TestProceedOutcomes:
         _plant_alembic_version(preflight_db, [rev])
         decision = run_preflight(preflight_db.url.render_as_string(hide_password=False))
         assert decision.action == PROCEED
-        assert decision.head == "0004_legacy_telegram_runtime"
+        assert decision.head == "0006_v1_orm_alignment"
         assert decision.recorded == (rev,)
         assert decision.dropped == 0
 
@@ -424,7 +436,7 @@ class TestLegacyReset:
         # ``alembic current`` must report the new head.
         proc = _alembic("current", url=url)
         assert proc.returncode == 0, proc.stderr
-        assert "0004_legacy_telegram_runtime" in proc.stdout, (
+        assert "0006_v1_orm_alignment" in proc.stdout, (
             f"unexpected alembic current output: {proc.stdout!r}"
         )
 
@@ -759,4 +771,4 @@ class TestFreshDatabaseEndToEnd:
         decision = run_preflight(url)
         assert decision.action == PROCEED
         assert decision.reason == "valid_rewrite_head"
-        assert decision.recorded == ("0004_legacy_telegram_runtime",)
+        assert decision.recorded == ("0006_v1_orm_alignment",)
