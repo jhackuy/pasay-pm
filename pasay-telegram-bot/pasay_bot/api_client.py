@@ -984,9 +984,10 @@ class PasayApiClient:
         transport: Optional[httpx.AsyncBaseTransport] = None,
         *,
         system_org_id: Optional[int] = None,
+        enable_http2: Optional[bool] = None,
     ):
         """Construct a typed PASAY API client.
-
+        
         Issue #119 P0 (independent review follow-up): ``system_org_id``
         is the canonical ``trusted_organization_id`` for the SYSTEM
         scheduled-job endpoints (``/api/v1/operations/digest`` and
@@ -999,6 +1000,15 @@ class PasayApiClient:
         the server will reject the request. The value MUST be set
         for the SYSTEM job path (``PASSAY_SYSTEM_ORG_ID`` Worker
         env).
+
+        Issue #119 P0 LATENCY: HTTP/2 is enabled by default when the
+        ``h2`` package is available (the production image installs
+        ``httpx[http2]``). Cloudflare's edge terminates HTTP/2 on the
+        Worker-to-Container hop and on the V1 backend; multiplexing
+        concurrent V1 reads (e.g. the Home/five-quick-view paths)
+        onto ONE HTTP/2 stream cuts the per-tap p50 backend-fetch
+        latency in production. ``enable_http2=False`` forces the
+        legacy HTTP/1.1 transport (tests + opt-out).
         """
         self._telegram_user_id: ContextVar[int | None] = ContextVar(
             f"telegram_user_id_{id(self)}", default=None)
@@ -1010,11 +1020,31 @@ class PasayApiClient:
             )
         else:
             self.system_org_id = system_org_id if system_org_id > 0 else None
+        # HTTP/2 default-on when the optional ``h2`` package is importable.
+        # ``enable_http2`` may override (e.g. a future regression test
+        # wants to force HTTP/1.1 to compare).
+        if enable_http2 is None:
+            try:
+                import h2  # noqa: F401  -- probe-only import
+                enable_http2 = True
+            except ImportError:
+                enable_http2 = False
+        # Sized keepalive pool: small in absolute terms (Cloudflare Container
+        # is single-process; PTB also runs as a single worker). Cap the
+        # keepalive conn pool to 16 and the overall concurrency to 32 so a
+        # pathological burst can never exhaust the FDs.
+        _limits = httpx.Limits(
+            max_connections=32,
+            max_keepalive_connections=16,
+            keepalive_expiry=30.0,
+        )
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
             timeout=httpx.Timeout(timeout),
             transport=transport,
+            limits=_limits,
+            http2=bool(enable_http2),
         )
 
     async def aclose(self) -> None:
@@ -1589,6 +1619,38 @@ class PasayApiClient:
         """GET /operations/quick/rent: overdue + outstanding."""
         data = await self._request("GET", "/operations/quick/rent")
         return data or {}
+
+    # --- Issue #119 P0 latency: ``*_safe`` wrappers for parallel gathers ----
+    # The fixed bottom-menu paths use ``asyncio.gather(..., return_exceptions=True)``
+    # to fire several V1 reads concurrently. The ``*_safe`` variants below
+    # NEVER raise — they translate ``PasayApiError`` into the exception object
+    # so callers can branch on ``isinstance(...)`` without try/except noise,
+    # while keeping the existing typed ``get_quick_rent`` / ``get_units`` etc.
+    # available for callers that prefer the raise-fast path.
+
+    async def get_quick_rent_safe(self) -> dict:
+        try:
+            return await self.get_quick_rent()
+        except PasayApiError as exc:
+            return exc
+
+    async def get_units_safe(self) -> list:
+        try:
+            return await self.get_units()
+        except PasayApiError as exc:
+            return exc
+
+    async def get_leases_safe(self) -> list:
+        try:
+            return await self.get_leases()
+        except PasayApiError as exc:
+            return exc
+
+    async def get_operational_tasks_safe(self, **kwargs) -> list:
+        try:
+            return await self.get_operational_tasks(**kwargs)
+        except PasayApiError as exc:
+            return exc
 
     async def get_quick_expense(self) -> dict:
         """GET /operations/quick/expense: month total + this month's expense
