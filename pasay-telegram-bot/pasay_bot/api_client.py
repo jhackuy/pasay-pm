@@ -6,6 +6,7 @@ handlers can implement the "uncertain write" reconciliation path.
 """
 from __future__ import annotations
 
+import logging
 import time as _time_module
 from dataclasses import dataclass, field
 from datetime import date
@@ -14,6 +15,12 @@ from typing import Any, Optional
 from contextvars import ContextVar
 
 import httpx
+
+# Issue #119 P0 WARM-PATH TRACE: module-level logger so per-V1-request
+# observability lines (``pasay_v1_request ...``) surface under the
+# ``pasay_bot.api_client`` namespace. Operators can filter with
+# ``grep 'pasay_v1_request'``.
+_logger = logging.getLogger("pasay_bot.api_client")
 
 MAX_TELEGRAM_USER_ID = 2**63 - 1
 
@@ -1057,11 +1064,56 @@ class PasayApiClient:
             headers["X-Telegram-User-Id"] = str(user_id)
             kwargs["headers"] = headers
         _pstart = _time_ms()
+        # Issue #119 P0 WARM-PATH TRACE: pull the per-update trace_id off
+        # the ContextVar so this V1 request can be correlated with the
+        # Worker ingress / Container dispatch / PTB handler that triggered
+        # it. The fallback ``""`` keeps the log line shape stable for
+        # callers that ran outside the webhook path (legacy tests).
+        _trace_id = ""
+        try:
+            from app.services.telegram_webhook import current_trace_id  # type: ignore
+            _trace_id = current_trace_id() or ""
+        except Exception:  # noqa: BLE001 - instrumentation never breaks the request
+            _trace_id = ""
+        # Path-only: the URL builder already attached the base_url; we only
+        # log the relative path + the sanitised query string (V1 endpoints
+        # never carry the bearer in the path — the bearer is in the
+        # ``Authorization`` header which we never log).
+        _log_path = str(path)
+        try:
+            if "params" in kwargs and kwargs["params"]:
+                from urllib.parse import urlencode
+                _log_path = f"{_log_path}?{urlencode(kwargs['params'], doseq=True)}"
+        except Exception:  # noqa: BLE001 - path logging is best-effort
+            pass
         try:
             resp = await self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
+            # Issue #119 P0 WARM-PATH TRACE: log the per-call latency with
+            # the trace_id so a timeout on the V1 leg is visible next to the
+            # PTB handler that triggered it.
+            try:
+                _elapsed = _time_ms() - _pstart
+                _logger.info(
+                    "pasay_v1_request trace_id=%s method=%s path=%s status=timeout "
+                    "elapsed_ms=%.2f error=%s",
+                    _trace_id, str(method).upper(), _log_path, _elapsed,
+                    type(exc).__name__,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             raise PasayApiTimeoutError() from exc
         except httpx.HTTPError as exc:
+            try:
+                _elapsed = _time_ms() - _pstart
+                _logger.info(
+                    "pasay_v1_request trace_id=%s method=%s path=%s status=error "
+                    "elapsed_ms=%.2f error=%s",
+                    _trace_id, str(method).upper(), _log_path, _elapsed,
+                    type(exc).__name__,
+                )
+            except Exception:  # noqa: BLE001
+                pass
             raise PasayApiError(None, f"network error: {exc}") from exc
         finally:
             try:
@@ -1072,6 +1124,19 @@ class PasayApiClient:
                     probe.add_backend(_time_ms() - _pstart)
             except Exception:  # noqa: BLE001 - instrumentation never breaks requests
                 pass
+        # Issue #119 P0 WARM-PATH TRACE: one structured log line per V1
+        # request so operator grep can compute the per-call V1 hop latency
+        # and join it with the Worker / Container records on ``trace_id``.
+        try:
+            _elapsed = _time_ms() - _pstart
+            _logger.info(
+                "pasay_v1_request trace_id=%s method=%s path=%s status=%d "
+                "elapsed_ms=%.2f",
+                _trace_id, str(method).upper(), _log_path,
+                int(resp.status_code), _elapsed,
+            )
+        except Exception:  # noqa: BLE001 - observability never breaks the request
+            pass
         if resp.status_code >= 400:
             detail, error_code = _extract_detail(resp)
             if resp.status_code == 401:

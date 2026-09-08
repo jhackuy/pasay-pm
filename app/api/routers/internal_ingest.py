@@ -239,22 +239,35 @@ async def internal_ingest(
         status, body = await wh_service.process_telegram_update_payload(
             db,
             envelope.payload,
+            trace_id=trace_id,
         )
         dispatch_ms = (time.monotonic() - t_before_dispatch) * 1000.0
         container_ingress_ms = (time.monotonic() - t_container_arrival) * 1000.0
+        # Issue #119 P0 WARM-PATH TRACE: the underlying service now reports
+        # claim_ms / ptb_process_ms in the body (telegram_webhook.process
+        # _telegram_update_payload added per-hop timing in #119 warm-path
+        # observability). We surface them so operator grep can split the
+        # ``dispatch_ms`` total into the two pieces the Owner-visible
+        # latency actually depends on. Older service versions / test
+        # monkeypatches that do not yet return the keys fall back to 0.0.
+        body_dict = body if isinstance(body, dict) else {}
+        claim_ms = float(body_dict.get("claim_ms") or 0.0)
+        ptb_process_ms = float(body_dict.get("ptb_process_ms") or 0.0)
         # Issue #119 P0 LATENCY telemetry: structured single-line record
         # keyed by trace_id so operator grep can compute Worker→Container
         # → PTB→Telegram hop-by-hop latency without a shared clock.
         logger.info(
             "pasay_ingest_latency trace_id=%s source=%s kind=telegram_update "
-            "container_ingress_ms=%.2f dispatch_ms=%.2f http_status=%s "
-            "state=%s update_id=%s",
+            "container_ingress_ms=%.2f dispatch_ms=%.2f claim_ms=%.2f "
+            "ptb_process_ms=%.2f http_status=%s state=%s update_id=%s",
             trace_id,
             trace_source,
             container_ingress_ms,
             dispatch_ms,
+            claim_ms,
+            ptb_process_ms,
             status,
-            (body or {}).get("state") if isinstance(body, dict) else None,
+            body_dict.get("state"),
             envelope.payload.get("update_id") if isinstance(envelope.payload, dict) else None,
         )
         # Map existing service HTTP codes onto the Queue ack/retry/terminal

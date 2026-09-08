@@ -113,7 +113,7 @@ def test_telegram_update_direct_source_emits_latency_record(
         "dur_ms": 53, "attempts": 1, "cross_attempt": 1,
     }
 
-    async def fake_process(db, raw_json, *, now=None):
+    async def fake_process(db, raw_json, *, now=None, trace_id=None):
         return 200, sentinel_body
 
     monkeypatch.setattr(ii.wh_service, "process_telegram_update_payload", fake_process)
@@ -163,7 +163,7 @@ def test_telegram_update_queue_source_emits_latency_record(
 ):
     from app.api.routers import internal_ingest as ii
 
-    async def fake_process(db, raw_json, *, now=None):
+    async def fake_process(db, raw_json, *, now=None, trace_id=None):
         return 200, {"ok": True, "state": "done", "update_id": 9002}
 
     monkeypatch.setattr(ii.wh_service, "process_telegram_update_payload", fake_process)
@@ -232,7 +232,7 @@ def test_legacy_caller_without_trace_headers_uses_envelope_event_id(
 ):
     from app.api.routers import internal_ingest as ii
 
-    async def fake_process(db, raw_json, *, now=None):
+    async def fake_process(db, raw_json, *, now=None, trace_id=None):
         return 200, {"ok": True, "state": "done", "update_id": 9003}
 
     monkeypatch.setattr(ii.wh_service, "process_telegram_update_payload", fake_process)
@@ -265,7 +265,7 @@ def test_telegram_update_503_still_emits_latency_record(
 ):
     from app.api.routers import internal_ingest as ii
 
-    async def fake_process(db, raw_json, *, now=None):
+    async def fake_process(db, raw_json, *, now=None, trace_id=None):
         return 503, {"ok": False, "state": "retryable", "error": "db_transient"}
 
     monkeypatch.setattr(ii.wh_service, "process_telegram_update_payload", fake_process)
@@ -306,7 +306,7 @@ def test_dispatch_ms_is_finite_non_negative(
 
     from app.api.routers import internal_ingest as ii
 
-    async def fake_process_slow(db, raw_json, *, now=None):
+    async def fake_process_slow(db, raw_json, *, now=None, trace_id=None):
         # tiny await so dispatch_ms > 0 in the record
         await _asyncio.sleep(0.005)
         return 200, {"ok": True, "state": "done", "update_id": 9005}

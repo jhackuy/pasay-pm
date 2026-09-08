@@ -1367,6 +1367,176 @@ run("Issue#119 P0-LATENCY-I: source-level — direct_forward_envelope_to_contain
 });
 
 // ---------------------------------------------------------------------------
+// 10. Issue #119 P0 WARM-PATH TRACE — observability-only instrumentation
+//     that proves the Worker-side ``pasay_worker_latency`` structured
+//     log line is emitted with the required field set + token redaction.
+//     PR scope is observability ONLY (no latency fix); these tests guard
+//     against accidental leaks of secrets and ensure the operator-side
+//     grep contract stays stable.
+// ---------------------------------------------------------------------------
+
+run("Issue#119 P0-WARM-A: Worker emits ``pasay_worker_latency`` log on direct-forward ack path with all required fields", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = {
+    ok: true, state: "done", dur_ms: 53, attempts: 1, cross_attempt: 1,
+  };
+  containerInstances.set("pasay-singleton", container);
+
+  const captured: string[] = [];
+  const orig_log = console.log;
+  const orig_err = console.error;
+  console.log = (...args: any[]) => { captured.push(args.map(String).join(" ")); };
+  console.error = (...args: any[]) => { captured.push(args.map(String).join(" ")); };
+  try {
+    const req = makeWorkerRequest("/telegram/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+      },
+      body: { update_id: 7101, message: { chat: { id: 5177241442 }, text: "🏠 首页" } },
+    });
+    const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+    assert_eq(resp.status, 200, "direct forward ack → 200");
+  } finally {
+    console.log = orig_log;
+    console.error = orig_err;
+  }
+
+  const line = captured.find((l) => l.includes("pasay_worker_latency"));
+  if (!line) {
+    throw new Error(
+      "Worker MUST emit exactly one 'pasay_worker_latency' line on direct-forward ack path; got:\n"
+      + captured.join("\n"),
+    );
+  }
+  // Required fields per the observability contract:
+  assert(/trace_id=tg:7101/.test(line), `trace_id (=envelope.event_id) present: ${line}`);
+  assert(/path=direct/.test(line), `path tag (direct) present: ${line}`);
+  assert(/outcome=ack/.test(line), `outcome=ack present: ${line}`);
+  assert(/status=200/.test(line), `status field present: ${line}`);
+  assert(/worker_arrival_iso=/.test(line), `worker_arrival_iso present: ${line}`);
+  assert(/worker_arrival_ms=/.test(line), `worker_arrival_ms present: ${line}`);
+  assert(/worker_total_ms=/.test(line), `worker_total_ms present: ${line}`);
+  assert(/container_fetch_ms=/.test(line), `container_fetch_ms present: ${line}`);
+  // container_fetch_ms must be a non-negative number — proves the timer
+  // was attached, not a literal zero placeholder.
+  const cfm = line.match(/container_fetch_ms=(-?\d+(?:\.\d+)?)/);
+  if (!cfm) throw new Error(`container_fetch_ms not numeric: ${line}`);
+  assert(parseFloat(cfm[1]) >= 0, `container_fetch_ms must be >= 0 (got ${cfm[1]})`);
+});
+
+run("Issue#119 P0-WARM-B: Worker emits ``pasay_worker_latency`` log on enqueued_fallback path", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(503);
+  containerInstances.set("pasay-singleton", container);
+
+  const captured: string[] = [];
+  const orig_log = console.log;
+  const orig_err = console.error;
+  console.log = (...args: any[]) => { captured.push(args.map(String).join(" ")); };
+  console.error = (...args: any[]) => { captured.push(args.map(String).join(" ")); };
+  try {
+    const req = makeWorkerRequest("/telegram/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+      },
+      body: { update_id: 7102, message: { chat: { id: 5177241442 }, text: "🏘 房源" } },
+    });
+    const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+    assert_eq(resp.status, 503, "direct forward fails → 503 (Telegram retries)");
+  } finally {
+    console.log = orig_log;
+    console.error = orig_err;
+  }
+
+  const line = captured.find((l) => l.includes("pasay_worker_latency"));
+  if (!line) {
+    throw new Error("Worker MUST emit 'pasay_worker_latency' on fallback path; got:\n" + captured.join("\n"));
+  }
+  assert(/trace_id=tg:7102/.test(line), `trace_id present: ${line}`);
+  assert(/path=enqueued_fallback/.test(line), `path tag (enqueued_fallback): ${line}`);
+  assert(/outcome=enqueued_fallback/.test(line), `outcome tag matches: ${line}`);
+  assert(/status=503/.test(line), `status=503: ${line}`);
+});
+
+run("Issue#119 P0-WARM-C: Worker pasay_worker_latency NEVER leaks bot token / webhook secret / ingest token (regression guard)", async () => {
+  beforeEachPerTestCleanup();
+  // Custom env with UNIQUE secret values we can grep for.
+  const env = makeEnv({
+    TELEGRAM_WEBHOOK_SECRET: "warm-trace-secret-NEVER-LEAK-9182",
+    PASAY_CONTAINER_INGEST_TOKEN: "warm-trace-ingest-NEVER-LEAK-7381",
+  });
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = {
+    ok: true, state: "done", dur_ms: 11, attempts: 1, cross_attempt: 1,
+  };
+  containerInstances.set("pasay-singleton", container);
+
+  const captured: string[] = [];
+  const orig_log = console.log;
+  const orig_err = console.error;
+  console.log = (...args: any[]) => { captured.push(args.map(String).join(" ")); };
+  console.error = (...args: any[]) => { captured.push(args.map(String).join(" ")); };
+  try {
+    const req = makeWorkerRequest("/telegram/webhook", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        // Bot token injected via the secret header (which is normally
+        // header_eq compared) — pick a value that would be catastrophic
+        // if it leaked.
+        "X-Telegram-Bot-Api-Secret-Token": "warm-trace-secret-NEVER-LEAK-9182",
+      },
+      body: { update_id: 7103, message: { chat: { id: 5177241442 }, text: "💸 支出" } },
+    });
+    await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  } finally {
+    console.log = orig_log;
+    console.error = orig_err;
+  }
+
+  const line = captured.find((l) => l.includes("pasay_worker_latency"));
+  if (!line) {
+    throw new Error("Worker MUST emit 'pasay_worker_latency' on direct-forward ack path; got:\n" + captured.join("\n"));
+  }
+  // The structured log line MUST NOT contain the configured secrets —
+  // mask_sensitive is applied at log time so even an accidental value
+  // injection cannot leak. Any regression here means a future PR can
+  // ship an accidentally-tokened observability surface.
+  assert(!line.includes("warm-trace-secret-NEVER-LEAK-9182"),
+    `webhook secret leaked into pasay_worker_latency: ${line}`);
+  assert(!line.includes("warm-trace-ingest-NEVER-LEAK-7381"),
+    `ingest token leaked into pasay_worker_latency: ${line}`);
+});
+
+run("Issue#119 P0-WARM-D: source-level — pasay_worker_latency emits via mask_sensitive so accidental token leaks are redacted", () => {
+  // Source-level guardrail: the Worker MUST route the structured log
+  // line through ``mask_sensitive`` so a regression that accidentally
+  // injects a secret value into a future field still has the
+  // redaction layer in place.
+  assert(/function log_worker_latency\s*\(/.test(WORKER_SRC),
+    "Worker MUST define log_worker_latency helper");
+  assert(/mask_sensitive\(line, args\.env\)/.test(WORKER_SRC)
+      || /mask_sensitive\(line,\s*args\.env\)/.test(WORKER_SRC),
+    "log_worker_latency MUST call mask_sensitive with the full line and env");
+  // The line MUST carry the canonical token-redaction marker:
+  assert(/pasay_worker_latency trace_id=/.test(WORKER_SRC),
+    "Worker source MUST contain the pasay_worker_latency structured line shape");
+  assert(/worker_arrival_iso=/.test(WORKER_SRC),
+    "Worker source MUST emit worker_arrival_iso");
+  assert(/worker_total_ms=/.test(WORKER_SRC),
+    "Worker source MUST emit worker_total_ms");
+  assert(/container_fetch_ms=/.test(WORKER_SRC),
+    "Worker source MUST emit container_fetch_ms");
+});
+
+// ---------------------------------------------------------------------------
 // 7. Execute async tests + report summary
 // ---------------------------------------------------------------------------
 

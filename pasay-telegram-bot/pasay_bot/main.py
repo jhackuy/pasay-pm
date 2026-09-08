@@ -99,6 +99,155 @@ def _ipv4_httpx_request(timeout: float) -> HTTPXRequest:
     )
 
 
+def _redact_telegram_token(url: str) -> str:
+    """Replace the ``/bot<TOKEN>/`` path segment of an api.telegram.org URL
+    with ``/bot<REDACTED>/`` so structured observability logs never carry
+    the raw bot token. Returns the URL unchanged when the pattern does
+    not match (e.g. localhost URLs in unit tests)."""
+    try:
+        return re.sub(
+            r"(://api\.telegram\.org/bot)[^/]+", r"\1<REDACTED>", str(url),
+        )
+    except Exception:  # noqa: BLE001 - redaction must never raise
+        return ""
+
+
+def _telegram_method_from_url(url: str) -> str:
+    """Extract the Telegram Bot API method name from a request URL.
+
+    ``https://api.telegram.org/bot<TOKEN>/sendMessage`` → ``sendMessage``.
+    Returns ``"unknown"`` when the URL is malformed / local-test shaped.
+    """
+    try:
+        s = str(url)
+        if not s or "://api.telegram.org/bot" not in s:
+            return "unknown"
+        # Strip the bot<TOKEN> segment first so the method name is the
+        # last path segment, regardless of token length.
+        stripped = re.sub(
+            r"(://api\.telegram\.org/bot)[^/]+", r"\1", s,
+        )
+        # Last non-empty path segment is the method name.
+        parts = [p for p in stripped.split("/") if p]
+        return parts[-1] if parts else "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+class _ObservingTelegramRequest(HTTPXRequest):
+    """Issue #119 P0 WARM-PATH TRACE: wrap the IPv4-forced HTTPXRequest so
+    every Telegram Bot API call emits a single ``pasay_telegram_request``
+    structured log line.
+
+    CONTRACT:
+      * Preserves the IPv4 forcing from ``_ipv4_httpx_request`` (Windows
+        host workaround that production keeps because Cloudflare Container
+        image already supports IPv4 and the latency cost of switching is
+        still unproven — DO NOT remove without timing proof).
+      * Records wall-clock per method call.
+      * Reads the per-update trace_id from the
+        ``app.services.telegram_webhook._pasay_trace_id_var`` ContextVar
+        so every Telegram request can be joined with the Worker ingress
+        record on the SAME ``trace_id``.
+      * Redacts the bot token from the URL via ``_redact_telegram_token``
+        before the log line is written.
+      * Logs success / failure / timeout with the same line shape so
+        operator grep can join on ``trace_id``.
+      * Observability failures NEVER break the Telegram request (each
+        ``try/except`` boundary is independent).
+    """
+
+    def __init__(self, timeout: float) -> None:
+        super().__init__(
+            connect_timeout=timeout,
+            read_timeout=timeout,
+            write_timeout=timeout,
+            pool_timeout=timeout,
+            httpx_kwargs={"transport": _force_ipv4_transport()},
+        )
+
+    def _resolve_trace_id(self) -> str:
+        # Issue #119 P0 WARM-PATH TRACE: the trace_id lives in the
+        # backend's ContextVar. ``app.services.telegram_webhook`` may
+        # not be importable when the bot runs in isolation (e.g. the
+        # dry-run getMe self-check), so the lookup is best-effort.
+        try:
+            from app.services.telegram_webhook import current_trace_id  # type: ignore
+            return current_trace_id() or ""
+        except Exception:  # noqa: BLE001 - never raise from observability
+            return ""
+
+    async def do_request(
+        self,
+        url,
+        method: str | None = None,
+        request_data=None,
+        connect_timeout=HTTPXRequest.DEFAULT_NONE,
+        read_timeout=HTTPXRequest.DEFAULT_NONE,
+        write_timeout=HTTPXRequest.DEFAULT_NONE,
+        pool_timeout=HTTPXRequest.DEFAULT_NONE,
+    ):
+        redacted_url = _redact_telegram_token(str(url))
+        method_name = (
+            _telegram_method_from_url(str(url))
+            if "://api.telegram.org/bot" in str(url)
+            else (str(method).lower() if method else "unknown")
+        )
+        trace_id = self._resolve_trace_id()
+        t_start = time.monotonic()
+        status: int | str = "no_response"
+        error_cls: str | None = None
+        try:
+            result = await super().do_request(
+                url,
+                method,
+                request_data=request_data,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                write_timeout=write_timeout,
+                pool_timeout=pool_timeout,
+            )
+            # PTB returns (status_code, body_bytes); pull the status code.
+            try:
+                if isinstance(result, tuple) and result:
+                    status = int(result[0])
+                else:
+                    status = "ok"
+            except Exception:  # noqa: BLE001
+                status = "ok"
+            return result
+        except Exception as exc:  # noqa: BLE001 - observability never re-raises differently
+            error_cls = type(exc).__name__
+            status = "error"
+            raise
+        finally:
+            try:
+                elapsed_ms = (time.monotonic() - t_start) * 1000.0
+                if error_cls is not None:
+                    logger.info(
+                        "pasay_telegram_request trace_id=%s method=%s "
+                        "status=%s elapsed_ms=%.2f error=%s",
+                        trace_id, method_name, status, elapsed_ms, error_cls,
+                    )
+                else:
+                    logger.info(
+                        "pasay_telegram_request trace_id=%s method=%s "
+                        "status=%s elapsed_ms=%.2f",
+                        trace_id, method_name, status, elapsed_ms,
+                    )
+                # Only the FULL URL log line below also includes the
+                # redacted path so an operator can disambiguate method
+                # variants like getChat vs getChatMember. The token is
+                # NEVER included — only the redacted URL is.
+                if redacted_url:
+                    logger.debug(
+                        "pasay_telegram_request_url trace_id=%s url=%s",
+                        trace_id, redacted_url,
+                    )
+            except Exception:  # noqa: BLE001 - observability never breaks the request
+                pass
+
+
 class _TraceUpdatesRequest(HTTPXRequest):
     """Official getUpdates request transport, forced onto IPv4.
 
@@ -182,7 +331,14 @@ def build_application(
             # below. The request object carries the timeouts, so no separate
             # .connect_timeout/.read_timeout/.write_timeout/.pool_timeout calls
             # (PTB raises if both a request instance and timeouts are given).
-            .request(_ipv4_httpx_request(timeout))
+            # Issue #119 P0 WARM-PATH TRACE: the observing subclass wraps
+            # the IPv4-forced transport with per-method latency logging so
+            # the operator can correlate every Telegram sendMessage /
+            # editMessageText call with the Worker ingress on the same
+            # trace_id. The IPv4 forcing itself is PRESERVED (the Windows
+            # workaround stays in place until timing evidence proves it is
+            # safe to remove on Cloudflare Linux).
+            .request(_ObservingTelegramRequest(timeout))
             # Keep the official getUpdates poller on the IPv4-forced tracing
             # transport so polling stays reconnectable.
             .get_updates_request(_TraceUpdatesRequest())
