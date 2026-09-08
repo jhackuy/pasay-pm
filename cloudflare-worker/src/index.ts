@@ -1,5 +1,17 @@
 /**
- * PASAY Cloudflare Worker — ingress → queue → container → Neon.
+ * PASAY Cloudflare Worker — interactive Telegram path bypasses the Queue.
+ *
+ * Architecture (Issue #119 P0 latency):
+ *   * Interactive Telegram updates: webhook → direct Container
+ *     /internal/ingest forward (no Queue) — eliminates the
+ *     max_batch_timeout=1s scheduling + queue consumer overhead that was
+ *     dominating the >10s tap→reply round-trip.
+ *   * Scheduled / background / retry work: scheduled cron → PASAY_QUEUE →
+ *     queue consumer → Container /internal/ingest (unchanged contract).
+ *   * Direct-forward transient failure: fallback enqueue to PASAY_QUEUE so
+ *     the queue consumer can pick it up; idempotency is preserved because
+ *     the Container's update_id claim is the single source of truth.
+ *
  * Business logic belongs in the FastAPI application, never in this Worker.
  */
 import {
@@ -15,6 +27,16 @@ const PASAY_CONTAINER_ORIGIN = "https://pasay-container";
 const TELEGRAM_WEBHOOK_PATH = "/telegram/webhook";
 const CONTAINER_INGEST_PATH = "/internal/ingest";
 const INGEST_AUTH_HEADER = "X-Pasay-Ingest-Token";
+// Issue #119 P0 latency: per-update correlation id + arrival timestamp.
+// Worker stamps the request at ingress (T0 = now_iso), forwards the same
+// correlation to the Container via X-Pasay-Trace-Id + X-Pasay-Trace-T0.
+// The Container log emits the matching fields so operator-side grep can
+// compute Worker→Container→PTB→Telegram hop-by-hop latency without any
+// shared clock (both sides emit monotonic offset relative to T0).
+const TRACE_HEADER = "X-Pasay-Trace-Id";
+const TRACE_T0_HEADER = "X-Pasay-Trace-T0";
+const TRACE_PATH_DIRECT = "direct";
+const TRACE_PATH_ENQUEUED_FALLBACK = "enqueued_fallback";
 
 export class PasayContainer extends Container {
   defaultPort = 8000;
@@ -195,22 +217,22 @@ function extract_telegram_meta(raw: Record<string, unknown>): { update_id: numbe
 async function handle_telegram_ingress(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return json(405, { ok: false, error: "method_not_allowed" }, { Allow: "POST" });
   const ct = request.headers.get("content-type") ?? "";
-  if (!ct.toLowerCase().includes("application/json")) return json(400, { ok: false, error: "bad_content_type" });
+  if (!ct.toLowerCase().includes("application/json")) return json(400, { ok: false, error: "bad_content_type" }, { Allow: "POST" });
   const configured_secret = env.TELEGRAM_WEBHOOK_SECRET ?? "";
-  if (!configured_secret.trim()) return json(401, { ok: false, error: "webhook_not_configured" });
+  if (!configured_secret.trim()) return json(401, { ok: false, error: "webhook_not_configured" }, { Allow: "POST" });
   const received = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
-  if (!header_eq(received, configured_secret)) return json(403, { ok: false, error: "forbidden" });
+  if (!header_eq(received, configured_secret)) return json(403, { ok: false, error: "forbidden" }, { Allow: "POST" });
 
   let raw: unknown;
   try {
     raw = await request.json();
   } catch {
-    return json(400, { ok: false, error: "invalid_json" });
+    return json(400, { ok: false, error: "invalid_json" }, { Allow: "POST" });
   }
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return json(400, { ok: false, error: "malformed_payload" });
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return json(400, { ok: false, error: "malformed_payload" }, { Allow: "POST" });
   const payload = raw as Record<string, unknown>;
   const meta = extract_telegram_meta(payload);
-  if (!Number.isFinite(meta.update_id) || meta.update_id <= 0) return json(400, { ok: false, error: "missing_update_id" });
+  if (!Number.isFinite(meta.update_id) || meta.update_id <= 0) return json(400, { ok: false, error: "missing_update_id" }, { Allow: "POST" });
 
   const occurred_at = now_iso();
   const req_id = make_req_id();
@@ -222,13 +244,204 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
     payload,
     _telegram_meta: meta,
   };
+  // Issue #119 P0 LATENCY: the interactive Telegram fast path now goes
+  // Worker → Container /internal/ingest DIRECTLY (synchronous). The
+  // Cloudflare Queue + queue consumer schedule (max_batch_timeout=1s)
+  // adds ~1–3s of latency on top of the cold-start window the Container
+  // already pays once; routing interactive user taps through it makes
+  // the menu tap → visible reply round-trip visibly slow (Owner measured
+  // >10s warm p50). The Queue stays for scheduled / background /
+  // retry work where the eventual-consistency semantics are correct.
+  //
+  // Idempotency: the Container /internal/ingest endpoint is the SINGLE
+  // owner of Telegram update_id dedup (claim_update_or_short_circuit in
+  // app/services/telegram_webhook.py). Both paths reach the same
+  // handler, so direct + fallback enqueue are idempotent under the same
+  // update_id — Telegram's webhook redelivery contract is preserved
+  // because we return 503 on transient Container failures (Telegram
+  // retries), and the Queue retry/ack contract is unchanged.
+  //
+  // Fallback: a transient direct-forward failure (5xx, container fetch
+  // throws, container not bound) routes to PASAY_QUEUE.send so the
+  // existing queue consumer can pick it up. If the enqueue also fails
+  // we return a hard 503 so Telegram retries via its own redelivery
+  // contract (no PTB state mutated because the Container never received
+  // the envelope).
+  const direct_result = await direct_forward_envelope_to_container(env, envelope, {
+    trace_id: envelope.event_id,
+    trace_t0: occurred_at,
+  });
+  if (direct_result.outcome === "ack") {
+    // Fast path success: latency-critical user-visible Telegram update
+    // hit the Container synchronously without queueing. The reply
+    // (handler sendMessage) reaches Telegram via the Container's HTTP
+    // response, so the user sees it as soon as the handler completes.
+    const merged: Record<string, unknown> =
+      typeof direct_result.body === "object" && direct_result.body !== null
+        ? { ...(direct_result.body as Record<string, unknown>) }
+        : { ok: true };
+    merged.event_id = envelope.event_id;
+    merged.req_id = req_id;
+    merged.path = TRACE_PATH_DIRECT;
+    merged.worker_ingress_ms = direct_result.worker_ingress_ms;
+    return json(direct_result.status, merged, { Allow: "POST" });
+  }
+  // Direct forward failed (transient). Fall back to Queue: the queue
+  // consumer will retry with the SAME envelope (event_id = tg:update_id),
+  // preserving idempotency on the Container side.
+  let enqueued = false;
   try {
     await env.PASAY_QUEUE.send(envelope as unknown as MessageSendRequest);
+    enqueued = true;
   } catch (err) {
-    log_error("enqueue", err, env);
-    return json(503, { ok: false, error: "enqueue_failed", req_id });
+    log_error("fallback-enqueue", err, env);
   }
-  return json(200, { ok: true, state: "enqueued", event_id: envelope.event_id, req_id });
+  if (enqueued) {
+    return json(
+      503,
+      {
+        ok: false,
+        state: "enqueued_fallback",
+        event_id: envelope.event_id,
+        req_id,
+        path: TRACE_PATH_ENQUEUED_FALLBACK,
+        error: direct_result.error || "container_unavailable_fallback_enqueued",
+        retryable: true,
+        worker_ingress_ms: direct_result.worker_ingress_ms,
+      },
+      { Allow: "POST" },
+    );
+  }
+  // Both direct and enqueue failed: hard 503, Telegram retries via its
+  // own redelivery contract (no PTB state mutated because the Container
+  // never received the envelope).
+  return json(
+    503,
+    {
+      ok: false,
+      error: "enqueue_failed",
+      req_id,
+      event_id: envelope.event_id,
+      path: "enqueue_failed",
+      worker_ingress_ms: direct_result.worker_ingress_ms,
+    },
+    { Allow: "POST" },
+  );
+}
+
+interface DirectForwardResult {
+  outcome: "ack" | "transient" | "permanent";
+  status: number;
+  body: unknown;
+  error?: string;
+  /** Wall-clock ms from Worker ingress to Container fetch return (success OR
+   *  failure); used for the latency telemetry surface. */
+  worker_ingress_ms: number;
+}
+
+/**
+ * Issue #119 P0 latency: synchronous Worker → Container /internal/ingest
+ * forward used by the INTERACTIVE Telegram webhook fast path. Returns the
+ * raw Container response (status + parsed body) so the caller can decide
+ * whether to enqueue as a fallback or return directly to Telegram.
+ *
+ * Trace propagation: the caller's `trace_id` and `trace_t0` are stamped on
+ * the forwarded request so the Container-side log line can compute the
+ * Worker→Container hop latency without a shared clock.
+ *
+ * Classification mirrors `deliver_envelope_to_container` (queue consumer)
+ * exactly so the two paths are idempotent and observable from the same
+ * telemetry contract.
+ */
+async function direct_forward_envelope_to_container(
+  env: Env,
+  envelope: PasayQueueEnvelope,
+  trace: { trace_id: string; trace_t0: string },
+): Promise<DirectForwardResult> {
+  const t_start = Date.now();
+  if (!env.PASAY_CONTAINER) {
+    return {
+      outcome: "transient",
+      status: 503,
+      body: { ok: false, error: "container_unbound" },
+      error: "container_unbound",
+      worker_ingress_ms: Date.now() - t_start,
+    };
+  }
+  const token = env.PASAY_CONTAINER_INGEST_TOKEN;
+  if (!token || !token.trim()) {
+    return {
+      outcome: "transient",
+      status: 503,
+      body: { ok: false, error: "ingest_not_configured" },
+      error: "ingest_not_configured",
+      worker_ingress_ms: Date.now() - t_start,
+    };
+  }
+  let handle: { fetch: (req: Request) => Promise<Response> } | undefined;
+  try {
+    handle = getContainer(env.PASAY_CONTAINER, PASAY_CONTAINER_INSTANCE_ID);
+  } catch (err) {
+    log_error("direct-container-handle", err, env);
+    return {
+      outcome: "transient",
+      status: 503,
+      body: { ok: false, error: "container_handle_failed" },
+      error: "container_handle_failed",
+      worker_ingress_ms: Date.now() - t_start,
+    };
+  }
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    [INGEST_AUTH_HEADER]: token,
+    [TRACE_HEADER]: trace.trace_id,
+    [TRACE_T0_HEADER]: trace.trace_t0,
+    "X-Pasay-Trace-Source": "telegram_webhook_direct",
+  };
+  const req = new Request(`${PASAY_CONTAINER_ORIGIN}${CONTAINER_INGEST_PATH}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(envelope),
+  });
+  let resp: Response;
+  try {
+    resp = await handle.fetch(req);
+  } catch (err) {
+    log_error("direct-container-fetch", err, env);
+    return {
+      outcome: "transient",
+      status: 503,
+      body: { ok: false, error: "container_fetch_failed" },
+      error: "container_fetch_failed",
+      worker_ingress_ms: Date.now() - t_start,
+    };
+  }
+  const worker_ingress_ms = Date.now() - t_start;
+  let body: unknown = null;
+  try {
+    body = await resp.json();
+  } catch {
+    body = { ok: resp.status < 400, error: "container_response_not_json" };
+  }
+  if (resp.status === 200 || resp.status === 202 || resp.status === 208) {
+    return { outcome: "ack", status: resp.status, body, worker_ingress_ms };
+  }
+  if (resp.status === 400 || resp.status === 415 || resp.status === 422) {
+    return {
+      outcome: "permanent",
+      status: resp.status,
+      body,
+      error: "container_permanent_reject",
+      worker_ingress_ms,
+    };
+  }
+  return {
+    outcome: "transient",
+    status: resp.status,
+    body,
+    error: "container_transient",
+    worker_ingress_ms,
+  };
 }
 
 async function deliver_envelope_to_container(env: Env, envelope: PasayQueueEnvelope): Promise<"ack" | "retry" | "terminal"> {
@@ -242,9 +455,22 @@ async function deliver_envelope_to_container(env: Env, envelope: PasayQueueEnvel
     log_error("container-handle", err, env);
     return "retry";
   }
+  // Queue consumer path also propagates the trace id so operator-side
+  // logs from the fallback path can correlate with the original Worker
+  // ingress event. The queue-driven path also adds `X-Pasay-Trace-Source`
+  // distinguishing it from the direct webhook forward — useful for
+  // distinguishing "interactive user tap" from "scheduled retry" in
+  // production telemetry without grepping worker logs.
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    [INGEST_AUTH_HEADER]: token,
+    [TRACE_HEADER]: envelope.event_id,
+    [TRACE_T0_HEADER]: envelope.occurred_at,
+    "X-Pasay-Trace-Source": "queue_consumer",
+  };
   const req = new Request(`${PASAY_CONTAINER_ORIGIN}${CONTAINER_INGEST_PATH}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", [INGEST_AUTH_HEADER]: token },
+    headers,
     body: JSON.stringify(envelope),
   });
   let resp: Response;
