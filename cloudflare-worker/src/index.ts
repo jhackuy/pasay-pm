@@ -40,7 +40,32 @@ const TRACE_PATH_ENQUEUED_FALLBACK = "enqueued_fallback";
 
 export class PasayContainer extends Container {
   defaultPort = 8000;
-  sleepAfter = "15m";
+  // Issue #119 P0 LATENCY — singleton Container warm window.
+  //
+  // The interactive Telegram fast path is Worker → direct Container
+  // /internal/ingest (PR #141). After `sleepAfter` of container-idle the
+  // Cloudflare Container runtime STOPS the instance and the NEXT request
+  // pays a cold-boot cost on top of every other hop (image start, PTB
+  // build_application, init/start, DB pool connect, FastAPI listen).
+  // Owner measured that cold path as ~10s on the production build, which
+  // is the dominant source of the >3s FAIL target.
+  //
+  // IMPORTANT: Worker `/health` is Worker-only (it inspects
+  // `env.PASAY_QUEUE?.send === "function"` and PascalContainer binding
+  // shape, it does NOT call `getContainer()`/`container.fetch()`). That
+  // means the production watchdog probing `/health` every minute does
+  // NOT keep the Container warm — the warm window is governed by this
+  // `sleepAfter` value alone. See
+  // `cloudflare-worker/tests/index.spec.ts::Issue#119 P0-LATENCY-J/K`
+  // for the regression guardrail.
+  //
+  // We pick `2h` as the conservative latency-sensitive value that
+  // matches the official Cloudflare Containers example for production
+  // latency-sensitive backends. The previous `15m` was too short for
+  // the dinner/overnight gap real Owner traffic shows; `2h` covers the
+  // longest plausible single break while keeping the monthly Container
+  // usage footprint bounded (single-instance basic, max_instances=1).
+  sleepAfter = "2h";
   envVars: Record<string, string>;
 
   constructor(ctx: any = {}, env: Env = {} as Env, options?: any) {

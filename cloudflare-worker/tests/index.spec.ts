@@ -1367,6 +1367,116 @@ run("Issue#119 P0-LATENCY-I: source-level — direct_forward_envelope_to_contain
 });
 
 // ---------------------------------------------------------------------------
+// 10. Issue #119 P0 LATENCY — singleton Container warm window.
+//
+// Owner evidence: production Telegram tap→visible reply averages ~10s,
+// far above the warm p50 <1s / p95 <2s target. PR #141 removed the
+// Queue from the interactive path, which leaves the Container cold-boot
+// (image start + PTB build + DB pool connect + FastAPI listen) as the
+// dominant remaining cost. Cloudflare Containers stops a singleton
+// after `sleepAfter` of container-idle; the next request pays the
+// full cold-boot. Worker `/health` is Worker-only and does NOT call
+// getContainer()/container.fetch(), so the production watchdog probing
+// `/health` every minute does NOT keep the Container warm — the warm
+// window is governed by the `PasayContainer.sleepAfter` value alone.
+//
+// Regression guardrail: this section pins (a) the singleton warm window
+// to a latency-sensitive value (2h, matches official Cloudflare
+// Containers example for production latency-sensitive backends), and
+// (b) the Worker `/health` handler to NOT call getContainer — both
+// invariants together prove the production watchdog cannot be relied
+// on to keep the Container warm.
+// ---------------------------------------------------------------------------
+
+run("Issue#119 P0-LATENCY-J: PasayContainer.sleepAfter is at least 60m (latency-sensitive warm window — Owner measured ~10s only on the cold-after-idle path)", () => {
+  // Source-level guardrail: the previous `15m` window was too short for
+  // real Owner traffic patterns (dinner/overnight gaps exceed 15m on the
+  // production deployment), and the real Owner-tap cost is only bad on
+  // the cold-after-idle path. We pin the value to a conservative
+  // latency-sensitive value (2h) instead of an arbitrary minute count,
+  // matching the official Cloudflare Containers example.
+  const inst = new (PasayContainer as any)({ id: "stub" }, {});
+  const raw = inst.sleepAfter;
+  assert(typeof raw === "string" || typeof raw === "number",
+    `PasayContainer.sleepAfter must be string|number (got ${typeof raw})`);
+  // Accept both "2h" / "120m" / 7200 number forms; assert ≥ 60m either way.
+  let minutes: number;
+  if (typeof raw === "number") {
+    minutes = raw / 60;
+  } else {
+    const s = String(raw).trim();
+    const m = s.match(/^(\d+)\s*(s|m|h|d)?$/);
+    if (!m) throw new Error(`Unparseable sleepAfter: ${raw}`);
+    const n = parseInt(m[1], 10);
+    const unit = (m[2] || "s").toLowerCase();
+    minutes = unit === "h" ? n * 60
+      : unit === "d" ? n * 60 * 24
+      : unit === "m" ? n
+      : n / 60;
+  }
+  assert(minutes >= 60,
+    `PasayContainer.sleepAfter must be ≥ 60m for latency-sensitive warm window; got ${raw} (=${minutes}m). ` +
+    `Owner evidence: cold-after-idle path averages ~10s; warm path is sub-second.`);
+  // Pin the exact conservative value to catch a regression to e.g. "30m".
+  const s_norm = String(raw).trim().toLowerCase();
+  assert(
+    s_norm === "2h" || s_norm === "120m" || raw === 7200,
+    `PasayContainer.sleepAfter MUST be the canonical latency-sensitive warm window (2h / 120m / 7200); got ${raw}`,
+  );
+});
+
+run("Issue#119 P0-LATENCY-K: source-level — PasayContainer.sleepAfter assignment is present and pinned to a non-trivial value (no fall-back to Container base default)", () => {
+  // Catch a regression where someone removes the `sleepAfter = "2h"`
+  // line entirely and falls back to the @cloudflare/containers base
+  // class default (15m, way too short for Owner traffic patterns).
+  // The exact-match regex anchors on the class body so a stray
+  // `sleepAfter` reference in a comment cannot satisfy this guardrail.
+  const cls_match = WORKER_SRC.match(/export\s+class\s+PasayContainer\s+extends\s+Container\s*\{[\s\S]*?\n\}/);
+  if (!cls_match) {
+    throw new Error("PasayContainer class body not extractable (source-level assertion failed)");
+  }
+  const body: string = cls_match[0];
+  assert(/sleepAfter\s*=/.test(body),
+    "PasayContainer class body MUST contain a `sleepAfter = …` assignment (no fall-through to Container base default)");
+  // Reject the previous too-short value so a rollback to "15m" is
+  // caught immediately.
+  assert(!/sleepAfter\s*=\s*["']15m["']/.test(body),
+    "PasayContainer.sleepAfter MUST NOT be '15m' (regression to the cold-boot-every-15m failure mode)");
+  // The canonical latency-sensitive value MUST be present.
+  assert(/sleepAfter\s*=\s*["']2h["']/.test(body),
+    "PasayContainer.sleepAfter MUST be the pinned '2h' value (matches official Cloudflare Containers example)");
+});
+
+run("Issue#119 P0-LATENCY-L: runtime — Worker /health does NOT touch Container (cannot keep it warm on its own)", async () => {
+  // Owner diagnostic invariant: `/health` is Worker-only (it inspects
+  // Env shape + Queue binding function presence, NOT the Container
+  // binding's getContainer() handle). This means the production
+  // watchdog probing `/health` every minute does NOT keep the
+  // Container warm — the warm window is governed by
+  // PasayContainer.sleepAfter alone. This test catches a regression
+  // where someone "improves" /health by adding a getContainer() call
+  // (which would force a wake on every probe and silently mask the
+  // real cold-boot cost in watchdog evidence).
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  // Pre-arm the mock with a clearly-identifiable Container stub.
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = { should_not_be_called: true };
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/health", { method: "GET" });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "/health returns 200");
+  assert_eq(container.fetch_calls.length, 0,
+    "/health MUST NOT call container.fetch() — watchdog probing /health must not wake the Container");
+  assert_eq(lastGetContainerArgs.length, 0,
+    "/health MUST NOT call getContainer() — same invariant, source-level observable");
+  const body = await resp.json() as any;
+  // Sanity: the response shape is still the canonical Worker health body.
+  assert_eq(body.worker, "alive", "/health body still reports worker:alive");
+  assert_eq(body.bindings.container, true, "/health still reports container binding presence");
+});
+
+// ---------------------------------------------------------------------------
 // 7. Execute async tests + report summary
 // ---------------------------------------------------------------------------
 

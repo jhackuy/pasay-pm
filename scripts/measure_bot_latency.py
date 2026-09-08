@@ -22,9 +22,14 @@ What it does:
      *after* the request has traversed the full Worker -> Container -> V1
      path, so the wall-clock time is the real bot-side per-tap cost.
   4. Reports per-endpoint ``median / p95 / max`` plus a cold-vs-warm split:
-        * the FIRST request per endpoint = cold-Container-wake cost,
-        * the 2nd-4th request per endpoint = warm cost,
-        * the 5th request per endpoint = keepalive-alive cost.
+        * the FIRST request per endpoint = cold-Container-wake cost
+          (when at least one warm-up tap has NOT landed in the previous
+          ``sleepAfter`` window — currently ``2h``);
+        * the 2nd-Nth request per endpoint = warm cost.
+        The watchdog probing ``/health`` does NOT keep the Container
+        warm (``/health`` is Worker-only and never calls
+        ``getContainer``/``container.fetch``); the warm window is
+        governed entirely by ``PasayContainer.sleepAfter``.
   5. Prints a Markdown summary table suitable for pasting into Issue #119
      as the before/after evidence.
 
@@ -240,11 +245,16 @@ def main(argv: list[str] | None = None) -> int:
     print("# Notes")
     print("- The /api/v1/* path traverses Worker -> Container -> V1 -> Neon -> back; "
           "this is the dominant per-tap cost the Owner observes on a WARM Container.")
-    print("- Cold-Container wake (after PASAY_CONTAINER's sleepAfter=15m elapses without "
-          "traffic) is typically 1-2s higher than the first 'cold_ms' shown above, because "
-          "the very first Container wake after sleep takes the same path PLUS a fresh boot; "
-          "the production watchdog probes /health every minute, so Container stays warm for "
-          "any Owner who tucks in within 15m.")
+    print("- Cold-Container wake (after PASAY_CONTAINER's sleepAfter elapses without "
+          "traffic) is typically several seconds higher than the first 'cold_ms' shown above, "
+          "because the very first Container wake after sleep takes the same path PLUS a fresh "
+          "boot (image start + PTB build_application + DB pool connect + FastAPI listen). "
+          "WATCHDOG NOTE: the production watchdog probes Worker /health, but /health is "
+          "Worker-only — it inspects Env shape and binding function presence, it does NOT call "
+          "getContainer() or container.fetch(). That means probing /health does NOT keep the "
+          "Container warm; the warm window is governed ENTIRELY by PasayContainer.sleepAfter "
+          "(see cloudflare-worker/src/index.ts). Currently '2h' to match the official "
+          "Cloudflare Containers latency-sensitive example.")
     print("- All numbers are pure wall-clock httpx-equivalent GETs with NO telegram sendMessage "
           "or answerCallbackQuery — those add a separate ~100-200ms WARM to a tap, but they "
           "are NOT on the latency-critical path because PTB's HTTPXRequest transport pools "
