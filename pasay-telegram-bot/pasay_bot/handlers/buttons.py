@@ -26,6 +26,11 @@ from pasay_bot.roles import (
     role_for_telegram_id,
 )
 
+# Issue #119 P0 WARM-PATH TRACE: dedicated logger so the structured
+# ``pasay_menu_button`` line surfaces under a stable namespace and is
+# filterable in Cloudflare Container log UI.
+_handler_logger = logging.getLogger("pasay_bot.handlers.buttons")
+
 logger = logging.getLogger(__name__)
 
 HTML = "HTML"
@@ -77,6 +82,30 @@ def _track_phases(
         )
     except Exception:  # noqa: BLE001 - instrumentation must never break UX
         logger.debug("latency menu_button phase record failed", exc_info=True)
+    # Issue #119 P0 WARM-PATH TRACE: structured single-line record so
+    # operator grep can join the per-route breakdown with the Worker
+    # ``pasay_worker_latency`` and Container ``pasay_ingest_latency``
+    # records on the SAME ``trace_id``. The trace_id flows from the
+    # Worker via the Container's ``app.services.telegram_webhook``
+    # ContextVar (``current_trace_id``) and is empty when the bot runs
+    # outside the webhook path (legacy tests).
+    try:
+        from app.services.telegram_webhook import current_trace_id  # type: ignore
+        trace_id = current_trace_id() or ""
+    except Exception:  # noqa: BLE001 - observability never breaks the handler
+        trace_id = ""
+    try:
+        _handler_logger.info(
+            "pasay_menu_button trace_id=%s route=%s outcome=%s "
+            "total_ms=%.3f callback_ack_ms=%.3f backend_fetch_ms=%.3f "
+            "render_ms=%.3f telegram_edit_ms=%.3f business_completed_ms=%.3f "
+            "detail=%s",
+            trace_id, route, outcome, total_ms, callback_ack_ms,
+            backend_fetch_ms, render_ms, telegram_edit_ms,
+            business_completed_ms, detail[:200],
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:

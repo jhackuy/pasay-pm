@@ -23,6 +23,7 @@ import asyncio
 import logging
 import sys
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,36 @@ from app.models.telegram_webhook import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Issue #119 P0 WARM-PATH TRACE: per-update correlation id propagated from
+# the Worker (X-Pasay-Trace-Id header → envelope.event_id → here). The
+# Container /internal_ingest handler binds the ContextVar before invoking
+# this service so downstream observability surfaces (pasay_v1_request,
+# pasay_telegram_request, pasay_menu_button) attach the same trace_id
+# without needing to plumb it through every async hop. The default is the
+# empty string so the JSON log formatter still receives a stable key even
+# when the caller did not stamp a trace (legacy / tests).
+_pasay_trace_id_var: ContextVar[str] = ContextVar("pasay_trace_id", default="")
+
+
+def current_trace_id() -> str:
+    """Return the trace_id bound on the current async task (Issue #119 P0
+    warm-path observability). Empty string when no caller has set one."""
+    return _pasay_trace_id_var.get() or ""
+
+
+def _reset_and_return(token, status: int, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    """Helper that resets ``_pasay_trace_id_var`` and returns the canonical
+    (status, body) tuple. Used by every ``return`` in
+    :func:`process_telegram_update_payload` so the trace_id binding is
+    released on every code path (success, replay, malformed, retryable,
+    permanent-failure) without needing a try/finally that wraps the
+    function body (which would re-indent ~250 lines)."""
+    try:
+        _pasay_trace_id_var.reset(token)
+    except Exception:  # noqa: BLE001 - observability cleanup must never break the response
+        pass
+    return status, body
 
 # ---------------------------------------------------------------------------
 # PTB pasay_bot wiring. We import lazily so the test suite / backend can boot
@@ -680,12 +711,28 @@ async def process_telegram_update_payload(
     raw_json: dict[str, Any],
     *,
     now: datetime | None = None,
+    trace_id: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate + idempotency-check + dispatch an inbound webhook payload.
 
     ``db`` is the caller-injected SQLAlchemy Session (from the FastAPI Depends
     pipeline). All state mutations go through this session so test fixtures and
     production share the same wiring.
+
+    ``trace_id`` (Issue #119 P0 warm-path observability) is the per-update
+    correlation id stamped by the Worker on the forwarded envelope. The
+    service binds it on a ContextVar so downstream observability surfaces
+    (``pasay_v1_request``, ``pasay_telegram_request``, ``pasay_menu_button``)
+    attach the same trace id without explicit plumbing through every
+    async hop. Falls back to ``envelope.event_id`` when not supplied.
+
+    Issue #119 P0 warm-path observability — the returned body includes the
+    per-hop duration breakdown so the Container ``pasay_ingest_latency``
+    record can publish the actual claim / PTB / handler ms for operator
+    correlation:
+      * ``claim_ms``        — wall-clock for ``claim_update_or_short_circuit``
+      * ``ptb_process_ms``  — wall-clock for ``ptb_app.process_update``
+      * ``trace_id``        — the correlation id used for this update
 
     HTTP status contract (Issue #18 Owner review F7 — critical):
       * 200 — terminal / delivered: dispatch succeeded, permanent failure,
@@ -698,6 +745,22 @@ async def process_telegram_update_payload(
       * 401 — TELEGRAM_WEBHOOK_SECRET not configured (fail closed).
     """
     now = now or datetime.now(timezone.utc)
+    # Issue #119 P0 warm-path observability: adopt the trace_id for every
+    # downstream observability log line. The bound ContextVar is scoped to
+    # this async task so a concurrent sibling update never inherits our id.
+    effective_trace_id = (trace_id or "").strip()
+    if not effective_trace_id:
+        # Best-effort fallback: derive a stable trace_id from the raw
+        # update_id so legacy callers that didn't propagate one still
+        # produce a single grep'able id per Telegram update.
+        raw_uid = raw_json.get("update_id") if isinstance(raw_json, dict) else None
+        try:
+            effective_trace_id = f"tg:{int(raw_uid)}" if raw_uid is not None else "tg:unknown"
+        except (TypeError, ValueError):
+            effective_trace_id = "tg:unknown"
+    trace_token = _pasay_trace_id_var.set(effective_trace_id)
+    claim_ms: float = 0.0
+    ptb_process_ms: float = 0.0
     # ND_RETURN FIX-3: both budgets floor at 2 so a single NetworkError / temp
     # PTB boot failure does NOT exhaust the cross-request budget on the first
     # HTTP 503. This keeps Telegram's replay loop alive long enough for a
@@ -710,12 +773,17 @@ async def process_telegram_update_payload(
     # response doesn't block Telegram's redelivery timer.
     max_in_process = max_attempts_cross
 
+    # Issue #119 P0 warm-path observability: we reset the trace_id ContextVar
+    # on every return path below (look for ``_pasay_trace_id_var.reset(...)
+    # + return`` pairs). A single try/finally was considered but would have
+    # required re-indenting ~250 lines for very little benefit. The pattern
+    # below is explicit and obvious to any reviewer.
     # 1) Configuration gating: if no secret is set the operator MUST NOT enable
     #    webhooks; fail closed.
     configured_secret = (_backend_settings.telegram_webhook_secret or "").strip()
     if not configured_secret:
         logger.error("TELEGRAM_WEBHOOK_SECRET not configured — rejecting webhook (fail closed)")
-        return 401, {"ok": False, "error": "webhook_not_configured"}
+        return _reset_and_return(trace_token, 401, {"ok": False, "error": "webhook_not_configured"})
 
     # 2) Boot PTB application ONCE before deserialization so we have a bound
     #    Bot object to pass into TelegramUpdate.de_json. This fixes Issue #18
@@ -792,12 +860,12 @@ async def process_telegram_update_payload(
                         uid_int, outcome,
                     )
                     if outcome == ReplayOutcome.DONE:
-                        return 200, {"ok": True, "replay": True, "state": "done"}
+                        return _reset_and_return(trace_token, 200, {"ok": True, "replay": True, "state": "done"})
                     else:
-                        return 200, {
+                        return _reset_and_return(trace_token, 200, {
                             "ok": False, "replay": True, "state": "failed",
                             "error_type": _row.last_error_type if _row else None,
-                        }
+                        })
                 if outcome != ReplayOutcome.DB_TRANSIENT:
                     err_str = str(exc)
                     if len(err_str) > 10_000:
@@ -831,8 +899,11 @@ async def process_telegram_update_payload(
             "error_type": err_type,
             "state": final_state,
             "retryable": temp_fail,
+            "trace_id": effective_trace_id,
+            "claim_ms": round(claim_ms, 3),
+            "ptb_process_ms": round(ptb_process_ms, 3),
         }
-        return http_status, body
+        return _reset_and_return(trace_token, http_status, body)
 
     # 3) Parse payload into a Telegram.Update object bound to ptb_app.bot.
     bot: Bot | None = getattr(ptb_app, "bot", None)
@@ -843,17 +914,24 @@ async def process_telegram_update_payload(
             "webhook malformed update payload: %s: %s",
             type(exc).__name__, exc,
         )
-        return 400, {"ok": False, "error": "malformed_update",
-                     "error_type": type(exc).__name__}
+        return _reset_and_return(trace_token, 400, {"ok": False, "error": "malformed_update",
+                     "error_type": type(exc).__name__,
+                     "trace_id": effective_trace_id,
+                     "claim_ms": round(claim_ms, 3),
+                     "ptb_process_ms": round(ptb_process_ms, 3)})
 
     if tg_update is None:
         logger.warning("webhook payload did not deserialize to a Telegram Update (None)")
-        return 400, {"ok": False, "error": "unsupported_update"}
+        return _reset_and_return(trace_token, 400, {"ok": False, "error": "unsupported_update",
+                                                     "trace_id": effective_trace_id,
+                                                     "claim_ms": round(claim_ms, 3),
+                                                     "ptb_process_ms": round(ptb_process_ms, 3)})
 
     update_id: int = int(tg_update.update_id)
     chat_id, user_id, utype = _effective_chat_user(tg_update)
 
     # 4) Idempotency / staleness decision BEFORE any handler runs.
+    t_claim_start = time.perf_counter()
     outcome, row = claim_update_or_short_circuit(
         db,
         update_id=update_id,
@@ -861,6 +939,7 @@ async def process_telegram_update_payload(
         user_id=user_id,
         update_type=utype,
     )
+    claim_ms = (time.perf_counter() - t_claim_start) * 1000.0
     if outcome == ReplayOutcome.DB_TRANSIENT:
         # Claim layer hit a DB transient → return HTTP 503, Telegram replays.
         # Do NOT persist any row because we can't trust session state.
@@ -868,21 +947,30 @@ async def process_telegram_update_payload(
             "webhook update_id=%s chat_id=%s claim DB transient → returning 503 to Telegram",
             update_id, chat_id,
         )
-        return 503, {"ok": False, "error": "db_transient", "retryable": True,
-                     "state": TelegramWebhookState.retryable.value}
+        return _reset_and_return(trace_token, 503, {"ok": False, "error": "db_transient", "retryable": True,
+                     "state": TelegramWebhookState.retryable.value,
+                     "trace_id": effective_trace_id,
+                     "claim_ms": round(claim_ms, 3),
+                     "ptb_process_ms": round(ptb_process_ms, 3)})
     if outcome == ReplayOutcome.DONE:
         logger.info(
             "webhook replay update_id=%s chat_id=%s state=done short_circuit=yes",
             update_id, chat_id,
         )
-        return 200, {"ok": True, "replay": True, "state": "done"}
+        return _reset_and_return(trace_token, 200, {"ok": True, "replay": True, "state": "done",
+                                                     "trace_id": effective_trace_id,
+                                                     "claim_ms": round(claim_ms, 3),
+                                                     "ptb_process_ms": round(ptb_process_ms, 3)})
     if outcome == ReplayOutcome.FAILED:
         logger.info(
             "webhook replay update_id=%s chat_id=%s state=failed short_circuit=yes last_error_type=%s",
             update_id, chat_id, row.last_error_type if row else None,
         )
-        return 200, {"ok": False, "replay": True, "state": "failed",
-                     "error_type": row.last_error_type if row else None}
+        return _reset_and_return(trace_token, 200, {"ok": False, "replay": True, "state": "failed",
+                     "error_type": row.last_error_type if row else None,
+                     "trace_id": effective_trace_id,
+                     "claim_ms": round(claim_ms, 3),
+                     "ptb_process_ms": round(ptb_process_ms, 3)})
     if outcome == ReplayOutcome.RETRY_ALLOWED and row is None:
         # Concurrent live claim lost — return 200 OK (delivery accepted); the
         # winning peer dispatches and Telegram doesn't need to replay.
@@ -890,7 +978,10 @@ async def process_telegram_update_payload(
             "webhook update_id=%s chat_id=%s claimed elsewhere (not stale) short_circuit=yes",
             update_id, chat_id,
         )
-        return 200, {"ok": True, "replay": False, "state": "claimed_elsewhere"}
+        return _reset_and_return(trace_token, 200, {"ok": True, "replay": False, "state": "claimed_elsewhere",
+                                                     "trace_id": effective_trace_id,
+                                                     "claim_ms": round(claim_ms, 3),
+                                                     "ptb_process_ms": round(ptb_process_ms, 3)})
 
     attempt_cross = int(row.delivery_count) if row else 1
 
@@ -905,6 +996,7 @@ async def process_telegram_update_payload(
         try:
             await ptb_app.process_update(tg_update)
             dur_ms = int((time.perf_counter() - started) * 1000)
+            ptb_process_ms += dur_ms
             transition_update(
                 db,
                 update_id,
@@ -915,10 +1007,14 @@ async def process_telegram_update_payload(
                 "webhook update_id=%s chat_id=%s user_id=%s type=%s state=done attempts_in=%d/%d cross_attempt=%d dur_ms=%d",
                 update_id, chat_id, user_id, utype, attempt_in, max_in_process, attempt_cross, dur_ms,
             )
-            return 200, {"ok": True, "state": "done", "attempts": attempt_in,
-                         "cross_attempt": attempt_cross, "dur_ms": dur_ms}
+            return _reset_and_return(trace_token, 200, {"ok": True, "state": "done", "attempts": attempt_in,
+                         "cross_attempt": attempt_cross, "dur_ms": dur_ms,
+                         "trace_id": effective_trace_id,
+                         "claim_ms": round(claim_ms, 3),
+                         "ptb_process_ms": round(ptb_process_ms, 3)})
         except Exception as exc:  # noqa: BLE001 - 异常隔离: 任何 handler 异常都不能带出进程
             dur_ms = int((time.perf_counter() - started) * 1000)
+            ptb_process_ms += dur_ms
             last_exc = exc
             last_temp = _is_temporary_error(exc)
             err_type = type(exc).__name__
@@ -989,11 +1085,15 @@ async def process_telegram_update_payload(
         update_id, chat_id, final_state, http_status, attempt_cross, max_attempts_cross,
         attempt_in, last_err_type, last_temp,
     )
-    return http_status, {
+    body = {
         "ok": False,
         "state": final_state,
         "error_type": last_err_type,
         "attempts": attempt_in,
         "cross_attempt": attempt_cross,
         "retryable": not force_failed,
+        "trace_id": effective_trace_id,
+        "claim_ms": round(claim_ms, 3),
+        "ptb_process_ms": round(ptb_process_ms, 3),
     }
+    return _reset_and_return(trace_token, http_status, body)

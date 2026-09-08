@@ -215,6 +215,17 @@ function extract_telegram_meta(raw: Record<string, unknown>): { update_id: numbe
 }
 
 async function handle_telegram_ingress(request: Request, env: Env): Promise<Response> {
+  // Issue #119 P0 WARM-PATH TRACE: stamp the worker-arrival wall-clock at
+  // the very first line of the ingress handler so the structured
+  // ``pasay_worker_latency`` log line can publish both the Worker-internal
+  // ms and the Container-fetch ms from a single monotonic reading. The
+  // Container side publishes its own ``pasay_ingest_latency`` with the
+  // SAME ``trace_id`` (= ``envelope.event_id``) so operator grep can join
+  // the two records without a shared clock. ``mask_sensitive`` is applied
+  // unconditionally so a misconfigured env can never leak bot token /
+  // webhook secret / ingest token into the structured log line.
+  const worker_arrival_ms = Date.now();
+  const worker_arrival_iso = now_iso();
   if (request.method !== "POST") return json(405, { ok: false, error: "method_not_allowed" }, { Allow: "POST" });
   const ct = request.headers.get("content-type") ?? "";
   if (!ct.toLowerCase().includes("application/json")) return json(400, { ok: false, error: "bad_content_type" }, { Allow: "POST" });
@@ -236,10 +247,11 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
 
   const occurred_at = now_iso();
   const req_id = make_req_id();
+  const trace_id = make_telegram_event_id(meta.update_id);
   const envelope: PasayQueueEnvelope = {
     version: ENVELOPE_VERSION,
     kind: "telegram_update",
-    event_id: make_telegram_event_id(meta.update_id),
+    event_id: trace_id,
     occurred_at,
     payload,
     _telegram_meta: meta,
@@ -284,6 +296,17 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
     merged.req_id = req_id;
     merged.path = TRACE_PATH_DIRECT;
     merged.worker_ingress_ms = direct_result.worker_ingress_ms;
+    log_worker_latency({
+      event_id: envelope.event_id,
+      path: TRACE_PATH_DIRECT,
+      outcome: "ack",
+      status: direct_result.status,
+      worker_arrival_iso,
+      worker_arrival_ms,
+      worker_total_ms: Date.now() - worker_arrival_ms,
+      container_fetch_ms: direct_result.worker_ingress_ms,
+      env,
+    });
     return json(direct_result.status, merged, { Allow: "POST" });
   }
   // Direct forward failed (transient). Fall back to Queue: the queue
@@ -297,6 +320,17 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
     log_error("fallback-enqueue", err, env);
   }
   if (enqueued) {
+    log_worker_latency({
+      event_id: envelope.event_id,
+      path: TRACE_PATH_ENQUEUED_FALLBACK,
+      outcome: "enqueued_fallback",
+      status: 503,
+      worker_arrival_iso,
+      worker_arrival_ms,
+      worker_total_ms: Date.now() - worker_arrival_ms,
+      container_fetch_ms: direct_result.worker_ingress_ms,
+      env,
+    });
     return json(
       503,
       {
@@ -315,6 +349,17 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
   // Both direct and enqueue failed: hard 503, Telegram retries via its
   // own redelivery contract (no PTB state mutated because the Container
   // never received the envelope).
+  log_worker_latency({
+    event_id: envelope.event_id,
+    path: "enqueue_failed",
+    outcome: "enqueue_failed",
+    status: 503,
+    worker_arrival_iso,
+    worker_arrival_ms,
+    worker_total_ms: Date.now() - worker_arrival_ms,
+    container_fetch_ms: direct_result.worker_ingress_ms,
+    env,
+  });
   return json(
     503,
     {
@@ -327,6 +372,47 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
     },
     { Allow: "POST" },
   );
+}
+
+/**
+ * Issue #119 P0 WARM-PATH TRACE — emit ONE structured ``pasay_worker_latency``
+ * log line per interactive Telegram ingress so operator-side grep can compute
+ * Worker→Container→PTB→Telegram hop-by-hop latency without a shared clock.
+ *
+ * Field budget (all values fit on a single line, no JSON, no secrets):
+ *   * ``event_id``        = ``envelope.event_id`` = ``tg:{update_id}``
+ *   * ``path``            = ``direct`` / ``enqueued_fallback`` / ``enqueue_failed``
+ *   * ``outcome``         = terminal outcome tag (``ack`` / ``enqueued_fallback`` / ``enqueue_failed``)
+ *   * ``status``          = HTTP status returned to Telegram
+ *   * ``worker_arrival_iso`` = ISO-8601 of the request arriving at Worker
+ *   * ``worker_arrival_ms``  = epoch ms of the Worker arrival
+ *   * ``worker_total_ms``    = wall-clock from Worker arrival to this log
+ *   * ``container_fetch_ms`` = wall-clock from Worker arrival to Container.fetch() return
+ *
+ * Redaction: ``mask_sensitive`` is applied to the rendered line so any
+ * configured secret (bot token, webhook secret, ingest token, DATABASE_URL,
+ * bare long-hex tokens) can never leak through this observability surface
+ * even if a future refactor accidentally adds a sensitive field.
+ */
+function log_worker_latency(args: {
+  event_id: string;
+  path: string;
+  outcome: string;
+  status: number;
+  worker_arrival_iso: string;
+  worker_arrival_ms: number;
+  worker_total_ms: number;
+  container_fetch_ms: number;
+  env: Env;
+}): void {
+  const line =
+    `pasay_worker_latency trace_id=${args.event_id} path=${args.path} `
+    + `outcome=${args.outcome} status=${args.status} `
+    + `worker_arrival_iso=${args.worker_arrival_iso} `
+    + `worker_arrival_ms=${args.worker_arrival_ms} `
+    + `worker_total_ms=${args.worker_total_ms} `
+    + `container_fetch_ms=${args.container_fetch_ms}`;
+  console.log(`[pasay-worker:warm-trace] ${mask_sensitive(line, args.env)}`);
 }
 
 interface DirectForwardResult {
