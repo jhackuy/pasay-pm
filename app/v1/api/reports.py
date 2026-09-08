@@ -297,16 +297,33 @@ def overdue_rents(
         unit_label = str(getattr(unit, "label", "") or "") if unit else ""
         tenant_label = str(getattr(tenant, "full_name", "") or "") if tenant else ""
         monthly_rent = Decimal(lease.monthly_rent)
-        total_outstanding = sum(
-            (Decimal(s.amount_due) for s in scheds), Decimal("0"),
-        )
-        oldest = min(s.due_date for s in scheds)
+
+        # Issue #119 P0 (Telegram six-menu V1 contract repair — partial-
+        # payment truth fix): each overdue schedule contributes only its
+        # UNCOVERED amount (``max(amount_due - verified, 0)``) to the
+        # totals + per-period ``amount``. ``quick_rent()`` already uses
+        # this exact rule (see ``app/v1/api/quick_ops.py``); the Home
+        # overdue card must agree — otherwise the Owner sees VERIFIED
+        # partial payments re-counted as outstanding, which is a real
+        # data-truth bug (e.g. 18,000 due / 10,000 verified must show
+        # 8,000 outstanding, not 18,000).
+        total_outstanding = Decimal("0")
+        period_rows: list[tuple[RentDueSchedule, Decimal]] = []
+        for sched in scheds:
+            amount_due = Decimal(sched.amount_due)
+            verified = verified_by_schedule.get(sched.id, Decimal("0"))
+            uncovered = amount_due - verified
+            total_outstanding += uncovered
+            period_rows.append((sched, uncovered))
+        oldest = min(s.due_date for s, _ in period_rows)
         periods = [
             {
                 "month": s.period_start.strftime("%Y-%m"),
-                "amount": _money(s.amount_due),
+                "amount": _money(uncovered),
             }
-            for s in sorted(scheds, key=lambda r: r.period_start)
+            for s, uncovered in sorted(
+                period_rows, key=lambda r: r[0].period_start,
+            )
         ]
         items.append(
             {
@@ -315,7 +332,7 @@ def overdue_rents(
                 "tenant_id": int(lease.tenant_id) if lease.tenant_id is not None else 0,
                 "unit": unit_label,
                 "tenant": tenant_label,
-                "overdue_months": len(scheds),
+                "overdue_months": len(period_rows),
                 "overdue_periods": periods,
                 "amount_per_month": _money(monthly_rent),
                 "total_outstanding": _money(total_outstanding),

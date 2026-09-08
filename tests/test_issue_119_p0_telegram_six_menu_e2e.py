@@ -96,6 +96,7 @@ from app.v1.models.rent_payment import (
     Operation,
     RentDueSchedule,
     RentDueState,
+    RentPayment,
     Task,
 )
 from app.v1.models.tenant_lease import Lease, Tenant
@@ -314,6 +315,51 @@ def _seed_workspace_with_overdue_rent_and_pending_expense(
             claimed_amount=Decimal("2500.00"),
             status=ExpenseClaimStatus.SUBMITTED.value,
             idempotency_key=f"e2e-{workspace.org_id}-pending",
+            payload_hash="0" * 64,
+        )
+    )
+    db.commit()
+    return workspace
+
+
+def _seed_workspace_with_partial_overdue_rent(
+    db, *, name: str, amount_due: Decimal, verified_amount: Decimal,
+) -> Workspace:
+    """Workspace + one OVERDUE ``RentDueSchedule`` + one VERIFIED
+    ``RentPayment`` that covers PART of that schedule.
+
+    Used by the partial-payment regression test for
+    ``/reports/overdue-rents`` to prove the endpoint reports
+    ``uncovered = amount_due - verified`` (not the full ``amount_due``)
+    for ``total_outstanding`` and per-period ``amount``.
+    """
+    workspace = seed_workspace(db, name=name)
+    overdue = RentDueSchedule(
+        org_id=workspace.org_id,
+        lease_id=workspace.lease_id,
+        period_start=date.today().replace(day=1) - timedelta(days=60),
+        due_date=date.today() - timedelta(days=15),
+        amount_due=amount_due,
+        state=RentDueState.OVERDUE.value,
+    )
+    db.add(overdue)
+    db.flush()
+    # Verified partial payment against that schedule.  Bypasses the full
+    # claim/evidence flow (``RentPaymentService.verify_payment`` would
+    # require an Evidence row + an Operation row); the test only cares
+    # that ``overdue_rents()`` subtracts VERIFIED rows correctly, so a
+    # direct ``RentPayment(verified_amount=..., status='VERIFIED')`` is
+    # the minimal seed that exercises the same code path the production
+    # flow writes to.
+    db.add(
+        RentPayment(
+            org_id=workspace.org_id,
+            due_schedule_id=overdue.id,
+            claimed_amount=verified_amount,
+            verified_amount=verified_amount,
+            status="VERIFIED",
+            claimed_by_user_id=workspace.owner_user_id,
+            idempotency_key=f"e2e-{workspace.org_id}-partial-verified",
             payload_hash="0" * 64,
         )
     )
@@ -585,6 +631,70 @@ def test_menu_home_overdue_rents_returns_non_404_with_owner_credential():
                 "outstanding", "days_overdue",
             ):
                 assert key in first, f"overdue-rents row missing key {key!r}"
+        finally:
+            db.close()
+            reset_engine_cache()
+
+
+def test_menu_home_overdue_rents_reports_uncovered_for_partial_payment():
+    """Regression — partial-payment truth on ``/reports/overdue-rents``.
+
+    Issue #119 P0 (Telegram six-menu V1 contract repair): the Owner
+    Home overdue card MUST subtract VERIFIED partial payments from
+    ``amount_due`` for BOTH ``total_outstanding`` AND
+    ``overdue_periods[].amount``. The first revision of this endpoint
+    used ``verified_by_schedule`` only to filter out fully-covered
+    periods, then summed the FULL ``amount_due`` for the rest —
+    double-counting VERIFIED rent as outstanding. This test pins the
+    fix: 18,000 due / 10,000 verified ⇒ 8,000 outstanding (and the
+    single period amount also reads 8,000, not 18,000).
+
+    The companion ``/operations/quick/rent`` already reports the same
+    8,000 (``uncovered`` rule), so the two Owner surfaces must agree.
+    """
+    with v1_engine_ctx():
+        db = get_session_factory()()
+        try:
+            workspace = _seed_workspace_with_partial_overdue_rent(
+                db,
+                name="e2e-menu-home-overdue-partial",
+                amount_due=Decimal("18000.00"),
+                verified_amount=Decimal("10000.00"),
+            )
+            owner_key = _bootstrap_owner(
+                db, workspace=workspace,
+                username="e2e-menu-home-overdue-partial-owner",
+            )
+            client = _production_app_client()
+            r = client.get(
+                f"/api/v1/reports/overdue-rents?org_id={workspace.org_id}",
+                headers={"Authorization": f"Bearer {owner_key}"},
+            )
+            assert r.status_code == 200, r.text
+            rows = r.json()
+            assert isinstance(rows, list), rows
+            assert len(rows) == 1, (
+                f"one partial-covered overdue schedule should produce "
+                f"exactly one row; got {len(rows)}: {rows!r}"
+            )
+            row = rows[0]
+            # total_outstanding must reflect UNCOVERED (8,000), not the
+            # full amount_due (18,000).  The legacy ``outstanding``
+            # alias must match — the bot's OverdueRent dataclass reads
+            # ``total_outstanding`` and renders it via
+            # ``overdue_block(...)``.
+            assert row["total_outstanding"] == "8000.00", row
+            assert row["outstanding"] == "8000.00", row
+            # The single overdue period must also carry the UNCOVERED
+            # amount — this is what the bot would render per-month in
+            # any future per-period breakdown, and what a Mini App
+            # finance panel would compute.
+            assert len(row["overdue_periods"]) == 1, row
+            assert row["overdue_periods"][0]["amount"] == "8000.00", row
+            # Period is still considered overdue (not fully covered), so
+            # the Home overdue counter (rows count) is 1 — Owner still
+            # sees this lease as needing follow-up.
+            assert row["overdue_months"] == 1, row
         finally:
             db.close()
             reset_engine_cache()
