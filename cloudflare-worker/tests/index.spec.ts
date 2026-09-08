@@ -277,10 +277,22 @@ function beforeEachPerTestCleanup() {
   lastGetContainerArgs.length = 0;
 }
 
-// ── Scenario 1: fetch(valid Telegram) → exactly one queue.send ──────────
-run("FIX2#3 S1: worker.fetch valid Telegram → exactly 1 queue.send", async () => {
+// ── Scenario 1: fetch(valid Telegram) → BYPASS Queue, direct forward ────
+// Issue #119 P0 LATENCY: interactive Telegram updates no longer go through
+// the Cloudflare Queue. The Worker must call container.fetch directly
+// (synchronous) so the Owner-visible tap → reply round-trip is no longer
+// dominated by queue max_batch_timeout=1s + consumer scheduling overhead.
+run("FIX2#3 S1: worker.fetch valid Telegram → DIRECT container.forward (NO queue.send)", async () => {
   beforeEachPerTestCleanup();
   const env = makeEnv();
+  // Issue #119 P0 LATENCY: the direct-forward path requires a Container
+  // handle to be available so getContainer() succeeds. Mock it.
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = {
+    ok: true, state: "done", dur_ms: 42,
+    attempts: 1, cross_attempt: 1,
+  };
+  containerInstances.set("pasay-singleton", container);
   const req = makeWorkerRequest("/telegram/webhook", {
     method: "POST",
     headers: {
@@ -290,15 +302,32 @@ run("FIX2#3 S1: worker.fetch valid Telegram → exactly 1 queue.send", async () 
     body: { update_id: 9001, message: { chat: { id: 123, type: "private" }, text: "hi" } },
   });
   const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
-  assert_eq(resp.status, 200, "valid update → 200");
+  assert_eq(resp.status, 200, "valid update → 200 (direct forward success)");
   const body = await resp.json() as any;
   assert_eq(body.ok, true, "body.ok");
-  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 1, "exactly one enqueue call");
-  const envl = (env.PASAY_QUEUE as FakeQueue).send_calls[0] as PasayQueueEnvelope & { kind: string };
-  assert_eq(envl.version, ENVELOPE_VERSION, "envelope.version");
-  assert_eq(envl.kind, "telegram_update", "envelope.kind");
-  assert_eq(envl.event_id, make_telegram_event_id(9001), "envelope.event_id");
-  assert(/^2\d{3}-/.test((envl as any).occurred_at), "occurred_at looks ISO");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 0,
+    "interactive Telegram path BYPASSES Queue (zero queue.send calls)");
+  assert_eq(container.fetch_calls.length, 1,
+    "direct-forward must call container.fetch exactly once");
+  // Verify the forwarded envelope shape and trace headers
+  const fc = container.fetch_calls[0];
+  assert_eq(fc.method, "POST", "direct forward method POST");
+  assert(/\/internal\/ingest$/.test(fc.url),
+    "direct forward URL ends with /internal/ingest");
+  assert_eq(fc.headers["content-type"], "application/json",
+    "Content-Type application/json");
+  assert_eq(typeof fc.headers["x-pasay-trace-id"], "string",
+    "X-Pasay-Trace-Id header propagated to Container");
+  assert_eq(typeof fc.headers["x-pasay-trace-t0"], "string",
+    "X-Pasay-Trace-T0 header propagated to Container");
+  assert_eq(fc.headers["x-pasay-trace-source"], "telegram_webhook_direct",
+    "X-Pasay-Trace-Source marks the direct-forward path");
+  // Body carries the envelope
+  const body_json = fc.body;
+  assert_eq(body_json.version, ENVELOPE_VERSION, "envelope.version");
+  assert_eq(body_json.kind, "telegram_update", "envelope.kind");
+  assert_eq(body_json.event_id, make_telegram_event_id(9001), "envelope.event_id");
+  assert(/^2\d{3}-/.test(body_json.occurred_at), "occurred_at looks ISO");
 });
 
 // ── Scenario 2: bad secret → no enqueue ──────────────────────────────────
@@ -546,9 +575,15 @@ run("CLOSEOUT#3a: enqueue success → 200, no enqueue_failed fields", async () =
   assert_eq(body.event_id, make_telegram_event_id(2001), "success event_id correct");
 });
 
-run("CLOSEOUT#3b: enqueue_failed → fixed body {ok:false, error:'enqueue_failed', req_id} NO err.message", async () => {
+run("CLOSEOUT#3b: direct+enqueue both fail → fixed body {ok:false, error:'enqueue_failed', req_id} NO err.message", async () => {
   beforeEachPerTestCleanup();
   const env = makeEnv();
+  // Issue #119 P0 LATENCY: force the direct-forward path to fail (container
+  // cold-boot / transient) AND the fallback enqueue to also fail. The Worker
+  // must still surface 503 + opaque req_id + NO secret leak.
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  (container as any).fetch_throw = new Error("Container cold boot network error");
+  containerInstances.set("pasay-singleton", container);
   (env.PASAY_QUEUE as any).send = async () => {
     throw new Error("Queue internal error TELEGRAM_BOT_TOKEN=leakme postgres://user:pass@host/db DATABASE_URL_UNPOOLED=xxyyzz112233445566778899");
   };
@@ -561,7 +596,7 @@ run("CLOSEOUT#3b: enqueue_failed → fixed body {ok:false, error:'enqueue_failed
     body: { update_id: 2002, message: { chat: { id: 1 } } },
   });
   const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
-  assert_eq(resp.status, 503, "enqueue failed → 503");
+  assert_eq(resp.status, 503, "both direct + enqueue fail → 503");
   const text = await resp.text();
   const body = JSON.parse(text) as any;
   assert_eq(body.ok, false, "enqueue_failed ok=false");
@@ -577,12 +612,17 @@ run("CLOSEOUT#3b: enqueue_failed → fixed body {ok:false, error:'enqueue_failed
   assert(!text.includes("xxyyzz112233445566778899"), "raw secret token value must NOT appear in output text");
 });
 
-run("CLOSEOUT#3c: mask_sensitive — fabricated secret injection NEVER appears in enqueue_failed response", async () => {
+run("CLOSEOUT#3c: mask_sensitive — fabricated secret injection NEVER appears when both direct + enqueue fail", async () => {
   beforeEachPerTestCleanup();
   const env = makeEnv();
   const FABRICATED_DB = "postgres://admin:SuperSecretPass123!@db.prod.pasay.io:5432/tenant_main_v2";
   const FABRICATED_SECRET = "tg_webhook_XYZ987ABCdef_2026_production";
   const FABRICATED_TOKEN = "ingest_prod_abcdef12345678900987fedcba";
+  // Force the direct-forward path to also fail so the fallback enqueue is
+  // exercised.
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  (container as any).fetch_throw = new Error("Container cold boot network error");
+  containerInstances.set("pasay-singleton", container);
   (env.PASAY_QUEUE as any).send = async () => {
     throw new Error(
       `boom: DATABASE_URL=${FABRICATED_DB}; TELEGRAM_WEBHOOK_SECRET=${FABRICATED_SECRET}; PASAY_CONTAINER_INGEST_TOKEN=${FABRICATED_TOKEN}; random_long_id=0123456789abcdef0123456789abcdef END`
@@ -597,7 +637,7 @@ run("CLOSEOUT#3c: mask_sensitive — fabricated secret injection NEVER appears i
     body: { update_id: 2003, message: { chat: { id: 2 } } },
   });
   const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
-  assert_eq(resp.status, 503, "enqueue failure → 503");
+  assert_eq(resp.status, 503, "both direct + enqueue fail → 503");
   const text = await resp.text();
   const body = JSON.parse(text) as any;
   assert_eq(body.ok, false, "ok=false");
@@ -1106,6 +1146,224 @@ run("Issue#119 P0-G: worker.fetch GET /api/v1/* from Pages origin → CORS Allow
   assert_eq(resp.status, 200, "200 from Container");
   assert_eq(resp.headers.get("Access-Control-Allow-Origin"), "https://pasay-mini-app.pages.dev",
     "Allow-Origin set on the proxied response too");
+});
+
+// ---------------------------------------------------------------------------
+// 9. Issue #119 P0 LATENCY — interactive Telegram path BYPASSES the Queue.
+//    Direct forward → Container (synchronous); Queue reserved for scheduled /
+//    background / retry. Regression suite proves (a) direct happy path
+//    bypasses Queue, (b) direct transient failure FALLBACKs to Queue,
+//    (c) worker.scheduled() still enqueues scheduled_job envelopes to Queue,
+//    (d) the queue consumer still handles BOTH envelope kinds so the
+//    fallback path is exercised end-to-end.
+// ---------------------------------------------------------------------------
+
+run("Issue#119 P0-LATENCY-A: valid Telegram → direct container.fetch (NO queue.send), 200 response carries Container body", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = {
+    ok: true, state: "done", dur_ms: 53, attempts: 1, cross_attempt: 1,
+  };
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 7001, message: { chat: { id: 5177241442 }, text: "🏠 首页" } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 200, "direct forward happy path → 200");
+  const body = await resp.json() as any;
+  assert_eq(body.ok, true, "body.ok=true (Container returned ok)");
+  assert_eq(body.state, "done", "state=done propagated from Container");
+  assert_eq(body.dur_ms, 53, "dur_ms (Container measured) propagated");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 0,
+    "Queue bypassed: zero queue.send calls for interactive path");
+  assert_eq(container.fetch_calls.length, 1, "exactly one container.fetch");
+  const fc = container.fetch_calls[0];
+  assert_eq(fc.url, "https://pasay-container/internal/ingest",
+    "URL = https://pasay-container/internal/ingest (direct path)");
+  assert_eq(fc.headers["x-pasay-ingest-token"], "ingest-token",
+    "internal ingest token forwarded");
+  assert_eq(fc.headers["x-pasay-trace-source"], "telegram_webhook_direct",
+    "trace source = telegram_webhook_direct");
+  assert_eq(typeof body.worker_ingress_ms, "number",
+    "Worker side latency field worker_ingress_ms present in response");
+});
+
+run("Issue#119 P0-LATENCY-B: direct forward fails (503) → FALLBACK to queue.send (1 call), Worker returns 503 to Telegram", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  // Direct forward returns 503 (Container cold-boot / transient).
+  const container: MockContainerHandle = makeMockContainerHandle(503);
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 7002, message: { chat: { id: 5177241442 }, text: "🏘 房源" } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503, "transient direct failure → 503 to Telegram");
+  const body = await resp.json() as any;
+  assert_eq(body.path, "enqueued_fallback",
+    "path tag identifies the fallback-enqueued envelope");
+  assert_eq(body.state, "enqueued_fallback", "state=enqueued_fallback");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 1,
+    "exactly ONE queue.send call (fallback after direct failure)");
+  const envl = (env.PASAY_QUEUE as FakeQueue).send_calls[0] as any;
+  assert_eq(envl.kind, "telegram_update", "fallback envelope is telegram_update");
+  assert_eq(envl.event_id, make_telegram_event_id(7002),
+    "fallback envelope event_id matches the original update_id");
+  assert_eq(envl.payload.update_id, 7002, "fallback payload preserved");
+});
+
+run("Issue#119 P0-LATENCY-C: direct forward fetch throws (cold-boot) → FALLBACK to queue.send (1 call)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  (container as any).fetch_throw = new Error("Container cold boot timeout");
+  containerInstances.set("pasay-singleton", container);
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 7003, message: { chat: { id: 5177241442 } } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503, "container fetch throws → 503 to Telegram (Telegram retries)");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 1,
+    "fallback enqueue still happens after fetch throw (idempotency preserved)");
+});
+
+run("Issue#119 P0-LATENCY-D: NO PASAY_CONTAINER binding → fallback to queue.send (deterministic operator-fix signal)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv({ PASAY_CONTAINER: undefined as any });
+  const req = makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 7004, message: { chat: { id: 5177241442 } } },
+  });
+  const resp = await worker.fetch(req as unknown as Request, env as any, undefined as any);
+  assert_eq(resp.status, 503, "no binding → 503 (still Telegram-retryable)");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 1,
+    "no binding → fallback enqueue (queue consumer takes over once operator fixes binding)");
+});
+
+run("Issue#119 P0-LATENCY-E: scheduled cron STILL enqueues scheduled_job envelopes to the Queue (unchanged)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const controller = { cron: "*/5 * * * *", scheduledTime: new Date(2026, 8, 8, 12, 0, 0).getTime() };
+  await worker.scheduled(controller as any, env as any, undefined as any);
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 1,
+    "scheduled() STILL enqueues scheduled_job (background path unchanged)");
+  const envl = (env.PASAY_QUEUE as FakeQueue).send_calls[0] as any;
+  assert_eq(envl.kind, "scheduled_job", "scheduled_job envelope preserved");
+  assert_eq(envl.payload.job_name, "pasay_heartbeat", "pasay_heartbeat job name");
+});
+
+run("Issue#119 P0-LATENCY-F: queue consumer STILL handles telegram_update (fallback path is exercised end-to-end)", async () => {
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  containerInstances.set("pasay-singleton", container);
+  const envelope: PasayQueueEnvelope = {
+    version: "1", kind: "telegram_update",
+    event_id: make_telegram_event_id(7005), occurred_at: new Date().toISOString(),
+    payload: { update_id: 7005 } as any,
+  } as any;
+  const msg = makeFakeMsg(envelope as any);
+  await worker.queue({ messages: [msg] } as any, env as any, undefined as any);
+  assert_eq(msg.ack_calls, 1, "queue consumer ack on Container 200");
+  assert_eq(msg.retry_calls, 0, "no retry on Container 200");
+  // Verify the trace header on the queue path too.
+  assert_eq(container.fetch_calls[0].headers["x-pasay-trace-source"], "queue_consumer",
+    "queue-driven path stamps x-pasay-trace-source=queue_consumer");
+});
+
+run("Issue#119 P0-LATENCY-G: idempotency — same update_id arriving twice → Container sees ONE state row", async () => {
+  // Two consecutive webhooks with the same update_id (Telegram redelivery
+  // scenario). Both bypass the Queue (direct forward). The Container's
+  // claim_update_or_short_circuit owns the dedup; we assert that BOTH
+  // Worker requests forward to Container and the Queue is never touched.
+  beforeEachPerTestCleanup();
+  const env = makeEnv();
+  const container: MockContainerHandle = makeMockContainerHandle(200);
+  container.fetch_response_body = { ok: true, state: "done" };
+  containerInstances.set("pasay-singleton", container);
+  const mk_req = () => makeWorkerRequest("/telegram/webhook", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-Telegram-Bot-Api-Secret-Token": "correct-secret",
+    },
+    body: { update_id: 7006, message: { chat: { id: 5177241442 }, text: "💰 租金" } },
+  });
+  const r1 = await worker.fetch(mk_req() as unknown as Request, env as any, undefined as any);
+  const r2 = await worker.fetch(mk_req() as unknown as Request, env as any, undefined as any);
+  assert_eq(r1.status, 200, "first webhook → 200");
+  assert_eq(r2.status, 200, "second webhook (same update_id) → 200 (Container dedups)");
+  assert_eq((env.PASAY_QUEUE as FakeQueue).send_calls.length, 0,
+    "NEVER enqueue for interactive path (idempotent redelivery stays direct)");
+  assert_eq(container.fetch_calls.length, 2, "Container saw both direct forwards");
+});
+
+run("Issue#119 P0-LATENCY-H: source-level — Worker has NO unconditional PASAY_QUEUE.send in handle_telegram_ingress (interactive path never enqueues unconditionally)", () => {
+  // Source-level guardrail: the interactive Telegram ingress handler must
+  // NOT call env.PASAY_QUEUE.send unconditionally. The fix removes the
+  // always-enqueue first step and replaces it with direct-forward-first
+  // + Queue-as-fallback. A regression that re-adds an unconditional
+  // enqueue (re-introducing the >1s queue latency on the interactive
+  // path) is caught here without any runtime machinery.
+  // Find handle_telegram_ingress body
+  const fn_match = WORKER_SRC.match(/async function handle_telegram_ingress[\s\S]*?\n\}/);
+  if (!fn_match) {
+    throw new Error("Worker must define handle_telegram_ingress (source-level assertion failed)");
+  }
+  const body: string = fn_match[0];
+  // Count PASAY_QUEUE.send calls inside this function.
+  const send_count = (body.match(/PASAY_QUEUE\.send\(/g) || []).length;
+  assert_eq(send_count, 1,
+    `handle_telegram_ingress must call PASAY_QUEUE.send AT MOST once (the fallback branch only); got ${send_count}`);
+  // And it must NOT be in the success path: the direct-forward success
+  // branch returns BEFORE any queue.send.
+  const success_marker_idx = body.indexOf("if (direct_result.outcome === \"ack\")");
+  const send_idx = body.indexOf("PASAY_QUEUE.send(");
+  assert(success_marker_idx >= 0, "handle_telegram_ingress must have direct-forward ack branch");
+  assert(send_idx >= 0, "handle_telegram_ingress must have a PASAY_QUEUE.send fallback");
+  assert(send_idx > success_marker_idx,
+    "PASAY_QUEUE.send must come AFTER the direct-forward ack branch (not unconditional)");
+});
+
+run("Issue#119 P0-LATENCY-I: source-level — direct_forward_envelope_to_container helper is defined and used by handle_telegram_ingress", () => {
+  // Source-level guardrail: the bypass-Queue contract requires a
+  // dedicated direct-forward helper that synchronously POSTs to the
+  // Container. A regression that breaks the helper (renames it, drops
+  // the import, calls getContainer inside a try-catch that swallows
+  // errors silently) is caught here.
+  assert(/async function direct_forward_envelope_to_container\s*\(/.test(WORKER_SRC),
+    "Worker MUST define direct_forward_envelope_to_container");
+  const fn_match = WORKER_SRC.match(/async function direct_forward_envelope_to_container[\s\S]*?\n\}/);
+  if (!fn_match) {
+    throw new Error("direct_forward_envelope_to_container function body extractable (source-level assertion failed)");
+  }
+  const body: string = fn_match[0];
+  // The function MUST call getContainer + handle.fetch.
+  assert(/getContainer\(/.test(body), "direct_forward must call getContainer()");
+  assert(/handle\.fetch\(/.test(body), "direct_forward must call handle.fetch()");
+  // It MUST stamp the trace headers on the forwarded request.
+  assert(/TRACE_HEADER/.test(body) && /TRACE_T0_HEADER/.test(body),
+    "direct_forward MUST stamp X-Pasay-Trace-Id and X-Pasay-Trace-T0");
 });
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,8 @@
 """Cloudflare Container internal ingestion boundary.
 
-Single internal endpoint used EXCLUSIVELY by the Cloudflare Worker queue
-consumer via the native Container binding.
+Single internal endpoint used EXCLUSIVELY by the Cloudflare Worker
+through the native Container binding (both the interactive direct
+forward and the queue consumer paths).
 
 - Public internet MUST NOT reach this path (Cloudflare Container never
   exposes this publicly; the Worker only hits it via the binding).
@@ -18,10 +19,23 @@ CONTRACT (mirrors cloudflare-worker/src/index.ts deliver_envelope_to_container):
   HTTP 400 → envelope permanently malformed             →  Queue  terminal (drop)
   HTTP 401 → ingest token missing / mismatch            →  Queue  retry (operator fix)
   HTTP 5xx → container runtime transient                →  Queue  retry
+
+Issue #119 P0 LATENCY telemetry:
+
+The Worker stamps ``X-Pasay-Trace-Id`` (= envelope.event_id) and
+``X-Pasay-Trace-T0`` (= envelope.occurred_at) on every forwarded
+request, plus ``X-Pasay-Trace-Source`` distinguishing the
+``telegram_webhook_direct`` (interactive fast path) from the
+``queue_consumer`` path (scheduled / retry). The Container logs a
+single structured line per ingest with the trace id and the
+container_ingress_ms / dispatch_ms numbers so operator grep can
+compute Worker→Container→PTB→Telegram hop-by-hop latency without
+any shared clock (both sides record offsets relative to T0).
 """
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -42,6 +56,16 @@ from app.services import telegram_webhook as wh_service
 logger = logging.getLogger(__name__)
 
 INGEST_TOKEN_HEADER = "X-Pasay-Ingest-Token"
+# Issue #119 P0 latency: trace propagation headers from the Worker.
+TRACE_ID_HEADER = "X-Pasay-Trace-Id"
+TRACE_T0_HEADER = "X-Pasay-Trace-T0"
+TRACE_SOURCE_HEADER = "X-Pasay-Trace-Source"
+# Container-side tag values for the Worker ``X-Pasay-Trace-Source`` field.
+TRACE_SOURCE_DIRECT = "telegram_webhook_direct"
+TRACE_SOURCE_QUEUE = "queue_consumer"
+# Backwards-compatible default for any legacy caller that did not stamp
+# the source header (e.g. older Worker builds, tests).
+TRACE_SOURCE_LEGACY = "legacy_or_unknown"
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -138,9 +162,13 @@ def _gate_ingest_token(header_value: str | None) -> JSONResponse | None:
 async def internal_ingest(
     request: Request,
     x_pasay_ingest_token: str | None = Header(default=None, alias=INGEST_TOKEN_HEADER),
+    x_pasay_trace_id: str | None = Header(default=None, alias=TRACE_ID_HEADER),
+    x_pasay_trace_t0: str | None = Header(default=None, alias=TRACE_T0_HEADER),
+    x_pasay_trace_source: str | None = Header(default=None, alias=TRACE_SOURCE_HEADER),
     db: Session = Depends(get_db),
 ) -> JSONResponse:
-    """Single internal ingestion boundary for the Cloudflare Queue consumer.
+    """Single internal ingestion boundary for the Cloudflare Worker
+    (interactive direct forward + queue consumer share this single path).
 
     Never exposed to the public internet. Token-gated.
     Routes both telegram_update AND scheduled_job envelopes.
@@ -149,10 +177,26 @@ async def internal_ingest(
     if gate_resp is not None:
         return gate_resp
 
+    # Issue #119 P0 latency: capture wall-clock + trace context at the
+    # very first line of the handler so the dispatch_ms we log later is
+    # measured against this same monotonic reading. Trace fields default
+    # to legacy tags so older Worker builds (and tests) still emit a
+    # consistent log shape — operator grep keeps working.
+    t_container_arrival = time.monotonic()
+    trace_source = x_pasay_trace_source or TRACE_SOURCE_LEGACY
+    # The trace_id from the Worker is envelope.event_id for both direct
+    # forward (tg:{update_id}) and queue consumer (sched:{job_name}:...).
+    # We adopt it as the trace_id so the structured log line below ties
+    # the Container dispatch back to the original Worker ingress event.
+    trace_id = x_pasay_trace_id or ""
+
     try:
         raw = await request.json()
     except Exception as exc:  # noqa: BLE001
-        logger.warning("internal ingest body parse failed: %s", exc)
+        logger.warning(
+            "internal ingest body parse failed trace_id=%s source=%s %s: %s",
+            trace_id, trace_source, type(exc).__name__, exc,
+        )
         return JSONResponse(
             status_code=400,
             content={"ok": False, "error": "invalid_json", "error_type": type(exc).__name__},
@@ -169,6 +213,10 @@ async def internal_ingest(
     except ValidationError as exc:
         # Permanently malformed → 400 so Queue consumer marks "terminal"
         # (does not retry forever). See Scope C Queue retry/ack rules.
+        logger.warning(
+            "internal ingest envelope parse failed trace_id=%s source=%s detail=%r",
+            trace_id, trace_source, exc.errors(include_url=False),
+        )
         return JSONResponse(
             status_code=400,
             content={
@@ -179,11 +227,35 @@ async def internal_ingest(
             },
         )
 
+    # Adopt the envelope's canonical event_id as the authoritative trace
+    # id if the Worker didn't propagate one — both direct forward and
+    # queue consumer emit the same envelope.event_id shape.
+    if not trace_id:
+        trace_id = envelope.event_id
+
     # ── Dispatch telegram_update → EXISTING service (ZERO duplication) ──
     if envelope.kind == EnvelopeKind.TELEGRAM_UPDATE:
+        t_before_dispatch = time.monotonic()
         status, body = await wh_service.process_telegram_update_payload(
             db,
             envelope.payload,
+        )
+        dispatch_ms = (time.monotonic() - t_before_dispatch) * 1000.0
+        container_ingress_ms = (time.monotonic() - t_container_arrival) * 1000.0
+        # Issue #119 P0 LATENCY telemetry: structured single-line record
+        # keyed by trace_id so operator grep can compute Worker→Container
+        # → PTB→Telegram hop-by-hop latency without a shared clock.
+        logger.info(
+            "pasay_ingest_latency trace_id=%s source=%s kind=telegram_update "
+            "container_ingress_ms=%.2f dispatch_ms=%.2f http_status=%s "
+            "state=%s update_id=%s",
+            trace_id,
+            trace_source,
+            container_ingress_ms,
+            dispatch_ms,
+            status,
+            (body or {}).get("state") if isinstance(body, dict) else None,
+            envelope.payload.get("update_id") if isinstance(envelope.payload, dict) else None,
         )
         # Map existing service HTTP codes onto the Queue ack/retry/terminal
         # contract.  The service already returns:
@@ -212,7 +284,10 @@ async def internal_ingest(
             )
         except Exception as exc:  # noqa: BLE001
             # DB transient → 503 → Queue retries.
-            logger.error("scheduled ledger claim transient: %s", exc)
+            logger.error(
+                "scheduled ledger claim transient trace_id=%s source=%s %s: %s",
+                trace_id, trace_source, type(exc).__name__, exc,
+            )
             return JSONResponse(
                 status_code=503,
                 content={
@@ -222,8 +297,18 @@ async def internal_ingest(
                     "retryable": True,
                 },
             )
+        container_ingress_ms = (time.monotonic() - t_container_arrival) * 1000.0
+        # Telemetry: scheduled_job dispatch has no PTB handler so dispatch_ms
+        # is effectively the claim step (always <5ms in healthy Postgres).
         if not is_new:
             # Idempotent duplicate → 208 → Queue acks.
+            logger.info(
+                "pasay_ingest_latency trace_id=%s source=%s kind=scheduled_job "
+                "container_ingress_ms=%.2f dispatch_ms=%.2f http_status=208 state=idempotent_duplicate "
+                "job_name=%s",
+                trace_id, trace_source, container_ingress_ms, container_ingress_ms,
+                payload.job_name,
+            )
             return JSONResponse(
                 status_code=208,
                 content={
@@ -236,6 +321,13 @@ async def internal_ingest(
         # First-time claim: today we just log. Future reminder/digest/task
         # wake-up jobs route their dispatch here. Scope F: "本任务只建立基础
         # 通道，不新增运营功能" → NO business jobs are implemented.
+        logger.info(
+            "pasay_ingest_latency trace_id=%s source=%s kind=scheduled_job "
+            "container_ingress_ms=%.2f dispatch_ms=%.2f http_status=202 state=accepted "
+            "job_name=%s scheduled_at=%s",
+            trace_id, trace_source, container_ingress_ms, container_ingress_ms,
+            payload.job_name, payload.scheduled_at,
+        )
         logger.info(
             "scheduled job ingested event_id=%s job_name=%s scheduled_at=%s",
             envelope.event_id, payload.job_name, payload.scheduled_at,
