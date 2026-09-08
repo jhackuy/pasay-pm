@@ -12,7 +12,11 @@ python-telegram-bot==22.8
 
 # testing
 pytest==9.1.1
-httpx==0.28.1
+# httpx[http2] installs the optional `h2` package (HTTP/2 transport for
+# PasayApiClient). Issue #119 P0 latency: HTTP/2 multiplexing on the
+# Worker→Container→V1 hop cuts per-tap backend-fetch latency by removing
+# the per-request HTTP/1.1 cold-handshake cost on each menu button.
+httpx[http2]==0.28.1
 
 # crypto / auth — JWT, HMAC primitives used by app/core/security.py
 PyJWT==2.10.1

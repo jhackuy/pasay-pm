@@ -50,7 +50,39 @@ _QUICK_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense", "ar
 _INLINE_MENU_REFRESH_ROUTES = frozenset({"home", "properties", "tasks", "rent", "expense", "archive"})
 
 
+def _track_phases(
+    context, route: str, *,
+    callback_ack_ms: float, backend_fetch_ms: float,
+    render_ms: float, telegram_edit_ms: float,
+    business_completed_ms: float, total_ms: float,
+    outcome: str = "ok", detail: str = "",
+) -> None:
+    """Issue #119 P0 latency — emit the per-phase breakdown for a frozen
+    bottom-menu tap (callback_ack / backend_fetch / render / telegram_edit /
+    business_completed / total), matching the shape the 007A callback path
+    already emits for inline callbacks."""
+    tracker = context.bot_data.get("latency")
+    if tracker is None:
+        return
+    try:
+        tracker.record_phases(
+            "menu_button", route,
+            callback_ack_ms=callback_ack_ms,
+            backend_fetch_ms=backend_fetch_ms,
+            render_ms=render_ms,
+            telegram_edit_ms=telegram_edit_ms,
+            business_completed_ms=business_completed_ms,
+            total_ms=total_ms,
+            outcome=outcome, detail=detail,
+        )
+    except Exception:  # noqa: BLE001 - instrumentation must never break UX
+        logger.debug("latency menu_button phase record failed", exc_info=True)
+
+
 def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: str = "") -> None:
+    """Backwards-compatible single-elapsed tracker for menu taps that did not
+    run through :func:`handle_fixed_menu_button`'s full phase profile (kept so
+    older callers keep working; new code should call :func:`_track_phases`)."""
     tracker = context.bot_data.get("latency")
     if tracker is not None:
         try:
@@ -60,7 +92,21 @@ def _track(context, route: str, elapsed_ms: float, outcome: str = "ok", detail: 
 
 
 async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE, route: str):
-    """Deterministic dispatch for an exact-matched fixed menu button."""
+    """Deterministic dispatch for an exact-matched fixed menu button.
+
+    Issue #119 P0 latency: a frozen-menu tap is profiled with the SAME phase
+    shape as inline callbacks (callback_ack / backend_fetch / render /
+    telegram_edit / business_completed / total). The probe is bound on the
+    ContextVar so :class:`pasay_bot.api_client.PasayApiClient._request`
+    accumulates the backend round-trip time into the same sample.
+    """
+    # Bind a PhaseProbe BEFORE we await anything, so the V1 backend fetches
+    # below (and the Telegram send) get attributable ms. The bound probe
+    # stays scoped to this single async task thanks to ContextVar isolation.
+    from pasay_bot.state.latency import PhaseProbe, bind_phase
+
+    probe = PhaseProbe()
+    bind_phase(probe)
     started = time.monotonic()
     user = update.effective_user
     role = role_for_telegram_id(user.id if user else None)
@@ -69,7 +115,19 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
     )
     chat_id = update.effective_chat.id if update.effective_chat else (user.id if user else None)
     if chat_id is None:
-        _track(context, route, (time.monotonic() - started) * 1000, outcome="no_chat")
+        total_elapsed_ms = (time.monotonic() - started) * 1000
+        probe.business_completed_ms = total_elapsed_ms
+        _track_phases(
+            context, route,
+            callback_ack_ms=probe.callback_ack_ms,
+            backend_fetch_ms=probe.backend_fetch_ms,
+            render_ms=probe.render_ms,
+            telegram_edit_ms=probe.telegram_edit_ms,
+            business_completed_ms=probe.business_completed_ms,
+            total_ms=total_elapsed_ms,
+            outcome="no_chat",
+        )
+        bind_phase(None)
         return
 
     print(f"[TRACE] button route={route} role={role.value if role else None} locale={locale} chat_id={chat_id} "
@@ -81,7 +139,22 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
             H.escape(t("common.no_permission", locale)),
             parse_mode=HTML,
         )
-        _track(context, route, (time.monotonic() - started) * 1000, outcome="no_permission")
+        # The Telegram send_message above IS the ACK for a bottom-menu tap;
+        # mark the ack moment before we record phases.
+        probe.mark_ack()
+        total_elapsed_ms = (time.monotonic() - started) * 1000
+        probe.business_completed_ms = total_elapsed_ms
+        _track_phases(
+            context, route,
+            callback_ack_ms=probe.callback_ack_ms,
+            backend_fetch_ms=probe.backend_fetch_ms,
+            render_ms=probe.render_ms,
+            telegram_edit_ms=probe.telegram_edit_ms,
+            business_completed_ms=probe.business_completed_ms,
+            total_ms=total_elapsed_ms,
+            outcome="no_permission",
+        )
+        bind_phase(None)
         return
 
     # Telegram persistent keyboards are sticky on the client. A deployed menu
@@ -101,6 +174,8 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
         )
 
     status = None
+    outcome = "ok"
+    detail = ""
     try:
         if route in _SLOW_ROUTES:
             status = await context.bot.send_message(
@@ -165,10 +240,39 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
                     role,
                 ),
             )
-        _track(context, route, (time.monotonic() - started) * 1000)
+        # The PhaseProbe is still bound here; PasayApiClient kept adding
+        # backend_fetch_ms while show_* did its work, and _render() tracked
+        # render_ms + telegram_edit_ms. Close the business-completed
+        # moment and the total-elapsed moment from the SAME monotonic
+        # reading so a test asserting ``business_completed <= total``
+        # never races a 1-microsecond off-by-one (Issue #119 P0).
+        total_elapsed_ms = (time.monotonic() - started) * 1000
+        probe.business_completed_ms = total_elapsed_ms
+        _track_phases(
+            context, route,
+            callback_ack_ms=probe.callback_ack_ms,
+            backend_fetch_ms=probe.backend_fetch_ms,
+            render_ms=probe.render_ms,
+            telegram_edit_ms=probe.telegram_edit_ms,
+            business_completed_ms=probe.business_completed_ms,
+            total_ms=total_elapsed_ms,
+            outcome=outcome, detail=detail,
+        )
     except Exception as exc:  # noqa: BLE001 - fail closed with user feedback
         logger.exception("fixed menu button route %s failed", route)
-        _track(context, route, (time.monotonic() - started) * 1000, outcome="error", detail=str(exc))
+        outcome, detail = "error", str(exc)
+        total_elapsed_ms = (time.monotonic() - started) * 1000
+        probe.business_completed_ms = total_elapsed_ms
+        _track_phases(
+            context, route,
+            callback_ack_ms=probe.callback_ack_ms,
+            backend_fetch_ms=probe.backend_fetch_ms,
+            render_ms=probe.render_ms,
+            telegram_edit_ms=probe.telegram_edit_ms,
+            business_completed_ms=probe.business_completed_ms,
+            total_ms=total_elapsed_ms,
+            outcome=outcome, detail=detail,
+        )
         try:
             if status is not None:
                 # Mutate the processing status into the error state (no junk);
@@ -205,3 +309,11 @@ async def handle_fixed_menu_button(update: Update, context: ContextTypes.DEFAULT
                 )
         except Exception:  # noqa: BLE001
             logger.exception("fixed menu button fallback message failed")
+    finally:
+        # Issue #119 P0 latency: always release the PhaseProbe binding on
+        # this async task so a subsequent sequential handler does not see
+        # our probe and attribute its own backend calls to the wrong route.
+        try:
+            bind_phase(None)
+        except Exception:  # noqa: BLE001 - cleanup never blocks UX
+            logger.debug("bind_phase(None) cleanup failed", exc_info=True)

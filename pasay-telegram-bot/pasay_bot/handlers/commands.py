@@ -767,32 +767,51 @@ async def show_quick_tasks(context, chat_id, role, locale: str, message_id=None)
 async def show_quick_rent(context, chat_id, role, locale: str, message_id=None):
     """💰 Rent Quick View (deterministic, no LLM). Keeps the high-density
     stats + overdue list and adds one ``Follow up`` inline button per overdue
-    unit -> the Rent detail card (TELEGRAM-OPS-UX-CONVERGENCE-001 §7)."""
+    unit -> the Rent detail card (TELEGRAM-OPS-UX-CONVERGENCE-001 §7).
+
+    Issue #119 P0 latency: ALL four V1 reads (``quick_rent`` + ``units`` +
+    ``leases`` + ``operational_tasks``) are fired in ONE
+    ``asyncio.gather`` so the render only waits for the slowest single
+    round-trip, never for two sequential round-trips. Previously the
+    units/leases/tasks set was awaited AFTER ``get_quick_rent`` returned —
+    adding one full V1 round-trip to every overdue Rent tap."""
     api = context.bot_data["api_client"]
-    try:
-        data = await api.get_quick_rent()
-    except PasayApiError as exc:
-        await _render(context, chat_id, message_id, _load_error(exc.detail, locale),
-                      error_keyboard("home", locale))
+    # Fire all four reads in parallel. Any failure surfaces as a tuple
+    # entry on the gathering; we fall back to a friendly empty set without
+    # blowing up the whole page render (no LLM; we just skip the
+    # per-row follow-up badge text).
+    quick_rent_result, units_result, leases_result, tasks_result = await asyncio.gather(
+        api.get_quick_rent_safe(),
+        api.get_units_safe(),
+        api.get_leases_safe(),
+        api.get_operational_tasks_safe(),
+        return_exceptions=True,
+    )
+
+    def _is_api_error(value) -> bool:
+        return isinstance(value, BaseException) or value is None
+
+    if isinstance(quick_rent_result, PasayApiError) or _is_api_error(quick_rent_result):
+        await _render(
+            context, chat_id, message_id,
+            _load_error(
+                str(getattr(quick_rent_result, "detail", "") or "rent"),
+                locale,
+            ),
+            error_keyboard("home", locale),
+        )
         return
-    except Exception as exc:  # noqa: BLE001 - user-visible fallback
-        logger.warning("quick view rent failed: %s", exc)
-        await _render(context, chat_id, message_id, _load_error("rent", locale),
-                      error_keyboard("home", locale))
-        return
-    data = data or {}
+    data = quick_rent_result or {}
     overdue = data.get("overdue") or []
     text = cards.rent_quick_card(data, locale)
     if overdue:
         button_labels: dict[int, str] = {}
-        try:
-            units, leases, tasks = await asyncio.gather(
-                api.get_units(),
-                api.get_leases(),
-                api.get_operational_tasks(),
-            )
-        except PasayApiError:
-            units, leases, tasks = [], [], []
+        # Units / leases / tasks MIGHT have failed individually; treat each
+        # as optional and degrade the per-row follow-up badge rather than
+        # crashing the whole page.
+        units = units_result if not _is_api_error(units_result) else []
+        leases = leases_result if not _is_api_error(leases_result) else []
+        tasks = tasks_result if not _is_api_error(tasks_result) else []
         unit_id_by_code = {}
         for unit in units:
             unit_num = str(getattr(unit, "unit_number", "") or "")
