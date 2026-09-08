@@ -46,10 +46,17 @@ from sqlalchemy.orm import Session
 
 from app.core.permissions import (
     PermissionDenied,
+    Principal,
+    Role,
     SystemPrincipal,
+    require_org_scope,
     require_system_org_scope,
 )
-from app.v1.deps import get_db_dep, get_system_principal
+from app.v1.deps import (
+    get_db_dep,
+    get_human_or_system_principal,
+    get_system_principal,
+)
 from app.v1.models.base import TaskState
 from app.v1.models.expense import (
     ExpenseClaim,
@@ -138,43 +145,65 @@ def quick_tasks(
         default=None,
         gt=0,
         description=(
-            "Optional caller-supplied target org_id. MUST match the "
-            "credential's trusted_organization_id; otherwise 403."
+            "Optional caller-supplied target org_id. For SYSTEM "
+            "credentials it MUST match the credential's "
+            "trusted_organization_id; otherwise 403. For HUMAN "
+            "credentials the org is derived from the credential's "
+            "active membership."
         ),
     ),
     scope: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
-    system: SystemPrincipal = Depends(get_system_principal),
+    principal=Depends(get_human_or_system_principal),
     db: Session = Depends(get_db_dep),
 ) -> dict[str, Any]:
-    """Active tasks (PENDING + IN_PROGRESS) for the SYSTEM scheduled job.
+    """Active tasks (PENDING + IN_PROGRESS) for both the SYSTEM
+    scheduled job and the OWNER menu path.
 
     Issue #119 P0 (independent review follow-up): the canonical target
     org is the SYSTEM credential's ``trusted_organization_id``. The
-    ``org_id`` query parameter is OPTIONAL — when supplied it MUST
-    match the bound org (mismatch → 403). When absent, the server
-    uses the credential's bound org directly. This is the
+    ``org_id`` query parameter is OPTIONAL for SYSTEM — when supplied
+    it MUST match the bound org (mismatch → 403). When absent, the
+    server uses the credential's bound org directly. This is the
     single-source-of-truth binding that prevents a leaked SYSTEM key
     from reading across every org in the database.
-    """
-    try:
-        canonical_org_id = require_system_org_scope(system, org_id)
-    except PermissionDenied as exc:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
 
-    if scope == "owner":
-        # The legacy /operations/quick/tasks?scope=owner path filters
-        # to owner-actionable tasks. The V1 system surface does not
-        # implement the owner-actionable filter (it is a HUMAN-caller
-        # concept); a SYSTEM caller asking for ``scope=owner`` is a
-        # contract mismatch — fail closed rather than silently
-        # returning all tasks.
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            "SYSTEM reader cannot use the owner scope; "
-            "the owner filter requires a HUMAN Principal",
-        )
+    Issue #119 P0 (Telegram six-menu V1 contract repair): the same
+    endpoint also serves the OWNER's ``✅ 待办`` menu path. The
+    ``get_human_or_system_principal`` dep accepts either credential
+    type; for HUMAN callers the active membership row scopes the read.
+    """
+    if isinstance(principal, SystemPrincipal):
+        try:
+            canonical_org_id = require_system_org_scope(principal, org_id)
+        except PermissionDenied as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+        if scope == "owner":
+            # The legacy /operations/quick/tasks?scope=owner path
+            # filters to owner-actionable tasks. The V1 system surface
+            # does not implement the owner-actionable filter (it is a
+            # HUMAN-caller concept); a SYSTEM caller asking for
+            # ``scope=owner`` is a contract mismatch — fail closed.
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "SYSTEM reader cannot use the owner scope; "
+                "the owner filter requires a Human Principal",
+            )
+    else:
+        # HUMAN caller: derive org from membership.
+        canonical_org_id = int(principal.org_id)
+        if org_id is not None and org_id != canonical_org_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"cross-org access denied: principal org_id="
+                f"{principal.org_id} target org_id={org_id}",
+            )
+        if scope == "owner" and principal.role != Role.OWNER.value:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "scope=owner requires OWNER role",
+            )
 
     now = datetime.now(timezone.utc)
     q = (
@@ -348,11 +377,14 @@ def daily_digest(
         default=None,
         gt=0,
         description=(
-            "Optional caller-supplied target org_id. MUST match the "
-            "credential's trusted_organization_id; otherwise 403."
+            "Optional caller-supplied target org_id. For SYSTEM "
+            "credentials it MUST match the credential's "
+            "trusted_organization_id; otherwise 403. For HUMAN "
+            "credentials the org is derived from the credential's "
+            "active membership."
         ),
     ),
-    system: SystemPrincipal = Depends(get_system_principal),
+    principal=Depends(get_human_or_system_principal),
     db: Session = Depends(get_db_dep),
 ) -> dict[str, Any]:
     """Daily Tasks Digest — three sections (act_now / upcoming / done_today)
@@ -361,16 +393,31 @@ def daily_digest(
 
     Issue #119 P0 (independent review follow-up): the canonical target
     org is the SYSTEM credential's ``trusted_organization_id``. The
-    ``org_id`` query parameter is OPTIONAL — when supplied it MUST
-    match the bound org (mismatch → 403). When absent, the server
-    uses the credential's bound org directly. The bot's
+    ``org_id`` query parameter is OPTIONAL for SYSTEM — when supplied
+    it MUST match the bound org (mismatch → 403). When absent, the
+    server uses the credential's bound org directly. The bot's
     ``PasayApiClient.get_digest()`` therefore does not need to know
     the org id at all; the credential carries it.
+
+    Issue #119 P0 (Telegram six-menu V1 contract repair): the same
+    endpoint also serves the OWNER's ``✅ 待办`` menu path. The
+    ``get_human_or_system_principal`` dep accepts either credential
+    type; for HUMAN callers the active membership row scopes the read.
     """
-    try:
-        canonical_org_id = require_system_org_scope(system, org_id)
-    except PermissionDenied as exc:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    if isinstance(principal, SystemPrincipal):
+        try:
+            canonical_org_id = require_system_org_scope(principal, org_id)
+        except PermissionDenied as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    else:
+        # HUMAN caller: derive org from membership.
+        canonical_org_id = int(principal.org_id)
+        if org_id is not None and org_id != canonical_org_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"cross-org access denied: principal org_id="
+                f"{principal.org_id} target org_id={org_id}",
+            )
 
     now = datetime.now(timezone.utc)
     act_now = _act_now_rows(db, canonical_org_id, now=now)

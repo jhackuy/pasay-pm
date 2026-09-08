@@ -1,7 +1,7 @@
 """Property + Unit API — thin router."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import PermissionDenied, Principal, Role
@@ -20,6 +20,9 @@ from app.v1.services.errors import ConflictError, NotFoundError, ValidationError
 from app.v1.services.property import PropertyService
 
 router = APIRouter(prefix="/properties", tags=["properties"])
+
+# See ``units_only_router`` below — exported for top-level ``/units``
+# mounting from ``app.v1.main``.
 
 
 @router.post(
@@ -50,14 +53,21 @@ def create_property(
 
 @router.get("", response_model=list[PropertyRead])
 def list_properties(
-    org_id: int,
+    org_id: int | None = Query(default=None, gt=0),
     principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db_dep),
 ) -> list[PropertyRead]:
+    """Issue #119 P0 (Telegram six-menu V1 contract repair): the
+    bot's ``PasayApiClient.get_properties()`` does NOT send ``org_id``
+    (it derives the org from the credential), so this endpoint
+    defaults to ``principal.org_id`` when the query parameter is
+    absent.
+    """
+    effective_org_id = org_id if org_id is not None else principal.org_id
     svc = PropertyService(db)
     return [
         PropertyRead.model_validate(p)
-        for p in svc.list_properties(principal, org_id=org_id)
+        for p in svc.list_properties(principal, org_id=effective_org_id)
     ]
 
 
@@ -156,6 +166,44 @@ def list_units(
     ]
 
 
+# Issue #119 P0: ``GET /units`` (no ``/properties/`` prefix) — the
+# bot's ``show_home`` calls it as a flat org-scoped unit list.
+# We register a separate router for this single endpoint so it does
+# NOT collide with ``/properties/units/{unit_id}`` on the prefix.
+units_only_router = APIRouter(prefix="/units", tags=["units"])
+
+
+@units_only_router.get(
+    "", response_model=list[UnitRead],
+)
+def list_units_root(
+    org_id: int | None = None,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db_dep),
+) -> list[UnitRead]:
+    """Org-wide unit list at the top-level ``/units`` path. Mirrors
+    the legacy contract the bot's ``show_home`` already calls.
+
+    The endpoint is registered on a dedicated ``units_only_router`` so
+    it is reachable under ``/api/v1/units`` (no ``/properties/``
+    prefix), without colliding with the existing
+    ``/api/v1/properties/units/{unit_id}`` route on the
+    ``properties_router``.
+
+    Issue #119 P0 (Telegram six-menu V1 contract repair): the bot's
+    ``PasayApiClient.get_units()`` does NOT send ``org_id`` (it
+    derives the org from the credential), so this endpoint defaults
+    to ``principal.org_id`` when the query parameter is absent.
+    """
+    effective_org_id = org_id if org_id is not None else principal.org_id
+    svc = PropertyService(db)
+    try:
+        rows = svc.list_units_org(principal, org_id=effective_org_id)
+    except PermissionDenied as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from exc
+    return [UnitRead.model_validate(u) for u in rows]
+
+
 @router.get(
     "/units/{unit_id}",
     response_model=UnitDetailRead,
@@ -241,3 +289,6 @@ def record_unit_event(
     except ValidationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     return UnitLifecycleEventRead.model_validate(event)
+
+
+__all__ = ["router", "units_only_router"]

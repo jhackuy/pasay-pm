@@ -50,9 +50,12 @@ from app.v1.api.leases import router as leases_router
 from app.v1.api.move_outs import router as move_outs_router
 from app.v1.api.operations import router as operations_router
 from app.v1.api.properties import router as properties_router
-from app.v1.api.rent_payments import router as rent_payments_router
+from app.v1.api.properties import units_only_router as units_only_router
+from app.v1.api.quick_ops import router as quick_ops_router
 from app.v1.api.renewals import router as renewals_router
+from app.v1.api.rent_payments import router as rent_payments_router
 from app.v1.api.repairs import router as repairs_router
+from app.v1.api.reports import router as reports_router
 from app.v1.api.system_ops import router as system_ops_router
 from app.v1.api.tenants import router as tenants_router
 from app.v1.api.webapp_auth import router as webapp_auth_router
@@ -203,6 +206,11 @@ def create_v1_app() -> FastAPI:
     app.include_router(bootstrap_router, prefix="/api/v1")
     app.include_router(workspaces_router, prefix="/api/v1")
     app.include_router(properties_router, prefix="/api/v1")
+    # Issue #119 P0 (Telegram six-menu V1 contract repair): the bot's
+    # ``show_home`` calls ``GET /units`` (no ``/properties/`` prefix).
+    # Mounted BEFORE the leases router so the literal ``/units`` path
+    # takes precedence over any pattern match.
+    app.include_router(units_only_router, prefix="/api/v1")
     app.include_router(tenants_router, prefix="/api/v1")
     app.include_router(leases_router, prefix="/api/v1")
     app.include_router(rent_payments_router, prefix="/api/v1")
@@ -214,7 +222,19 @@ def create_v1_app() -> FastAPI:
     # ``/operations/digest`` and ``/operations/quick/tasks`` win over
     # the ``/{operation_id}`` parameter pattern below.
     app.include_router(system_ops_router, prefix="/api/v1")
+    # Issue #119 P0 (Telegram six-menu V1 contract repair): the HUMAN
+    # ``/operations/quick/{properties,rent,expense}`` endpoints also
+    # need literal-path precedence over the ``/{operation_id}``
+    # parameter pattern, so they are registered alongside the SYSTEM
+    # surface and BEFORE the generic operations router.
+    app.include_router(quick_ops_router, prefix="/api/v1")
     app.include_router(operations_router, prefix="/api/v1")
+    # Issue #119 P0 (Telegram six-menu V1 contract repair): the
+    # Owner Home view requires ``/reports/financial-summary`` and
+    # ``/reports/overdue-rents`` (bot's ``show_home``). Mounted on
+    # the same /api/v1 prefix so the bot's ``base_url=/api/v1`` finds
+    # them at ``/api/v1/reports/...``.
+    app.include_router(reports_router, prefix="/api/v1")
     app.include_router(dashboard_router, prefix="/api/v1")
     app.include_router(audit_router, prefix="/api/v1")
     # Issue #119 Mini App — exchange signed Telegram initData for a
