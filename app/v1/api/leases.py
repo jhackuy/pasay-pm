@@ -1,7 +1,7 @@
 """Lease API — thin router."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.permissions import PermissionDenied, Principal, Role
@@ -102,14 +102,20 @@ def create_lease_with_tenant(
 
 @router.get("", response_model=list[LeaseRead])
 def list_leases(
-    org_id: int,
+    org_id: int | None = Query(default=None, gt=0),
     principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db_dep),
 ) -> list[LeaseRead]:
+    """Issue #119 P0 (Telegram six-menu V1 contract repair): the
+    bot's ``PasayApiClient.get_leases()`` does NOT send ``org_id`` (it
+    derives the org from the credential), so this endpoint defaults
+    to ``principal.org_id`` when the query parameter is absent.
+    """
+    effective_org_id = org_id if org_id is not None else principal.org_id
     svc = LeaseService(db)
     return [
         LeaseRead.model_validate(l)
-        for l in svc.list_leases(principal, org_id=org_id)
+        for l in svc.list_leases(principal, org_id=effective_org_id)
     ]
 
 

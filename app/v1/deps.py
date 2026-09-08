@@ -27,7 +27,7 @@ Two distinct auth surfaces, mutually exclusive:
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
@@ -53,7 +53,7 @@ from app.v1.models.base import (
     V1PrincipalType,
     V1_SYSTEM_PURPOSES,
 )
-from app.v1.models.foundation import ApiCredential, Membership
+from app.v1.models.foundation import ApiCredential, Membership, Organization
 
 
 def get_db_dep(db: Session = Depends(get_db)) -> Session:
@@ -225,6 +225,91 @@ def get_system_principal(
     return SystemPrincipal(credential=cred, name=cred.purpose)
 
 
+# Issue #119 P0 (Telegram six-menu V1 contract repair): the Telegram
+# bot's Owner presses ``✅ 待办`` which calls
+# ``PasayApiClient.get_digest()`` -> ``GET /api/v1/operations/digest``
+# using the OWNER's HUMAN bearer. The endpoint is currently served by
+# ``app.v1.api.system_ops`` which requires a SYSTEM principal (so the
+# scheduled-job path stays narrowly scoped). For the Owner/Secretary
+# menu path the same V1 row shape must be reachable through HUMAN
+# auth — both surfaces must coexist (the scheduled job still needs the
+# SYSTEM-only path so a leaked SYSTEM key cannot impersonate a human).
+#
+# The unified dep accepts EITHER a HUMAN Principal (via
+# ``get_current_principal``) OR a SYSTEM Principal (via
+# ``get_system_principal``). SYSTEM is tried first (matches the
+# production scheduled-job path byte-for-byte); only when SYSTEM fails
+# do we try HUMAN. This keeps the production
+# ``pasay_bot/jobs.py`` -> ``/operations/digest`` call exactly as it
+# was (SYSTEM credential), and additionally opens the endpoint to the
+# Telegram OWNER bearer that owns the menu path.
+
+
+def get_human_or_system_principal(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+) -> Union[Principal, SystemPrincipal]:
+    """Auth gate that accepts HUMAN or SYSTEM credentials.
+
+    SYSTEM is tried first so the existing scheduled-job path stays
+    byte-identical. Only when SYSTEM auth fails does the dep try HUMAN
+    (which is what the bot's owner_key carries when the Owner presses
+    ``✅ 待办``).
+    """
+    raw_key = _extract_bearer(authorization)
+    # Try SYSTEM first — narrowest scope, matches the legacy
+    # ``pasay_bot/jobs.py`` call site.
+    try:
+        sys_cred = _resolve_active_credential(
+            db, raw_key, principal_type=V1PrincipalType.SYSTEM.value,
+        )
+        if (
+            sys_cred.purpose in V1_SYSTEM_PURPOSES
+            and sys_cred.trusted_organization_id is not None
+            and db.get(Organization, sys_cred.trusted_organization_id) is not None
+        ):
+            return SystemPrincipal(credential=sys_cred, name=sys_cred.purpose)
+    except HTTPException:
+        pass
+    # Fall through to HUMAN. We do NOT reuse
+    # ``get_current_principal`` because it would itself raise 401 on
+    # a SYSTEM credential — but we already established the credential is
+    # NOT SYSTEM (above), so a HUMAN lookup is safe.
+    cred = _resolve_active_credential(db, raw_key)
+    if cred.principal_type == V1PrincipalType.SYSTEM.value:
+        # Defensive: an active SYSTEM credential that was rejected
+        # above (unknown purpose / NULL binding / missing org) must
+        # still not surface as HUMAN — fail closed.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, "invalid credentials",
+        )
+    membership = (
+        db.query(Membership)
+        .filter(
+            Membership.user_id == cred.user_id,
+            Membership.state == MembershipState.ACTIVE.value,
+        )
+        .order_by(Membership.id.asc())
+        .first()
+    )
+    if membership is None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "user has no active membership",
+        )
+    try:
+        role = Role.parse(membership.role)
+    except UnknownRoleError as exc:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, str(exc),
+        ) from exc
+    return Principal(
+        user_id=cred.user_id,
+        org_id=membership.org_id,
+        role=role,
+        membership_state=membership.state,
+    )
+
+
 def require_role(*allowed: Role):
     """Dependency factory: enforce principal.role ∈ allowed set.
 
@@ -287,6 +372,7 @@ def parse_idempotency_key_header(
 __all__ = [
     "get_current_principal",
     "get_system_principal",
+    "get_human_or_system_principal",
     "get_db_dep",
     "parse_idempotency_key_header",
     "Principal",

@@ -388,6 +388,26 @@ class PropertyService:
             .all()
         )
 
+    def list_units_org(
+        self,
+        principal: Principal,
+        *,
+        org_id: int,
+    ) -> list[Unit]:
+        """Org-wide unit list. Issue #119 P0 (Telegram six-menu V1
+        contract repair): the bot's ``show_home`` calls
+        ``GET /units`` (no property filter) to populate the occupancy
+        counts. Without this V1 surface the legacy ``/units`` 404s and
+        Home fails closed with the ``⚠️⚠️ 获取数据失败`` card.
+        """
+        require_org_scope(principal, org_id)
+        return (
+            self.db.query(Unit)
+            .filter(Unit.org_id == org_id)
+            .order_by(Unit.property_id, Unit.label)
+            .all()
+        )
+
     def get_property_detail(
         self, principal: Principal, *, org_id: int, property_id: int,
     ) -> tuple[Property, list[Unit]]:
