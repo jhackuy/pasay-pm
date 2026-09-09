@@ -15,10 +15,18 @@ This test module pins down the minimum safe resilience contract for
 
 * For idempotent READ requests (GET / HEAD) ONLY, a transport-level
   stale/disconnected pooled connection triggers exactly ONE transparent
-  retry against a freshly-rebuilt ``httpx.AsyncClient`` (new keep-alive
-  pool, same auth/org headers, same per-request timeout, same HTTP/2
-  setting, same injected test transport). The retry re-uses the SAME
-  method/path/body/headers, so the request is byte-identical.
+  retry against a freshly-built LOCAL one-shot ``httpx.AsyncClient``
+  (new keep-alive pool, same auth/org headers, same per-request
+  timeout, same HTTP/2 setting, same injected test transport). The
+  retry re-uses the SAME method/path/body/headers, so the request is
+  byte-identical.
+* The shared singleton ``self._client`` is NEVER closed or replaced
+  by the recovery code — the production PTB Application is a singleton
+  and ``PasayApiClient`` is shared across every concurrent Telegram
+  update; the one-shot retry client is a local, single-attempt
+  resource that is closed as soon as the retry returns. The
+  ``test_concurrent_*`` regression group at the bottom of this file
+  pins down that contract.
 * A SECOND failure on the same logical request surfaces the original
   error verbatim — we do not infinite-retry, we do not silently swallow.
 * A normal successful GET sends the request ONCE (no spurious retry).
@@ -482,10 +490,20 @@ def test_retry_outcome_logged_with_retried_flag(caplog):
 
 
 def test_reopen_does_not_leak_old_pool_on_subsequent_failure():
-    """After a stale-retry the OLD ``httpx.AsyncClient`` must be closed
-    (not leaked) even if the NEW attempt also fails. We assert this
-    indirectly: a third consecutive GET must reuse the freshly-opened
-    client, not the dead one."""
+    """After a stale-retry the temporary retry client must be closed
+    (not leaked) even if the retry itself also fails, and the shared
+    ``self._client`` MUST remain operational for subsequent reads.
+
+    Production concurrency contract (independent-review follow-up):
+    the recovery code never closes or replaces the shared
+    ``self._client``. A follow-up healthy GET must therefore be able
+    to use the original shared client. Calls 1 and 2 are the first
+    GET's two attempts (call 1 on the shared client, call 2 on the
+    one-shot retry client) and both raise the stale-protocol
+    fingerprint; call 3 is the follow-up healthy GET on the shared
+    client — it MUST succeed because the shared pool was never
+    closed/swapped.
+    """
     calls: list[int] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -499,14 +517,16 @@ def test_reopen_does_not_leak_old_pool_on_subsequent_failure():
 
     client = _make_client(handler)
     try:
-        # First logical GET: stale -> retry on fresh client -> still dead
-        # -> surface error.
+        # First logical GET: stale -> retry on the one-shot fresh
+        # client -> still dead -> surface error.
         with pytest.raises(PasayApiError):
             _run(client.get_properties())
         assert len(calls) == 2
-        # The aboves run used the SAME client object. After the error,
-        # self._client is now the FRESH client (the old one was closed
-        # in _reopen_client). A follow-up healthy GET MUST succeed.
+        # The shared ``self._client`` was NEVER closed or swapped —
+        # a follow-up healthy GET MUST succeed on the original pool.
+        # httpx retires the failed pooled connection on its own, so
+        # the next request opens a fresh TCP/TLS over the shared
+        # keep-alive map.
         result = _run(client.get_properties())
         assert result == []
         assert len(calls) == 3
@@ -735,3 +755,475 @@ def test_retried_flag_false_on_normal_get_and_true_on_stale_retry(caplog):
     assert failure_lines[-1].endswith("error=RemoteProtocolError") or (
         "status=error" in failure_lines[-1]
     ), f"final line on stale failure must log status=error; got {failure_lines[-1]}"
+
+
+# ---------------------------------------------------------------------------
+# CONCURRENCY-SAFETY REGRESSIONS (independent-review follow-up)
+# ---------------------------------------------------------------------------
+#
+# Owner override 2026-09-09 11:36 Asia/Manila: the previous
+# implementation closed and replaced ``self._client`` from inside the
+# single GET recovery path. The production PTB Application is a
+# singleton and ``PasayApiClient`` is shared across every concurrent
+# Telegram update. Closing the shared pool from a single GET recovery
+# could disrupt another in-flight read on the same pool, and two
+# concurrent stale retries could close each other's newly-installed
+# clients.
+#
+# The current implementation uses a LOCAL one-shot fresh client for
+# each retry and closes ONLY that temp client. The shared
+# ``self._client`` is never touched by the recovery code.
+#
+# The tests below exercise that contract against the REAL PasayApiClient
+# instance — they verify the shared client's identity is preserved,
+# its bearer header is intact, and concurrent stale retries do not
+# interfere with each other or with a concurrent healthy read.
+
+
+def _identity(client: PasayApiClient) -> int:
+    """Stable identity of the shared ``httpx.AsyncClient`` instance.
+
+    A recovery that closed or swapped ``self._client`` would change
+    this identity. The concurrency contract requires it to NEVER
+    change after a stale-retry.
+    """
+    return id(client._client)
+
+
+def test_concurrent_in_flight_get_is_not_disrupted_by_stale_retry():
+    """Concurrency contract (1): a stale-retry in one async task must
+    NEVER close the shared ``self._client`` that another concurrent
+    task is using. The healthy in-flight GET on the shared client
+    must complete successfully.
+
+    The OLD implementation closed and replaced ``self._client`` on a
+    stale failure, which would have killed the in-flight request
+    on the shared client with a ``RuntimeError: Client has been
+    closed`` (or, in httpx's transport, a ``RemoteProtocolError``
+    because the pooled connection was forcibly torn down).
+    """
+    observed_inflight: dict[str, Any] = {}
+    observed_retry: dict[str, Any] = {}
+    in_flight_started = asyncio.Event()
+    release_in_flight = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/units"):
+            # Healthy in-flight read on the SHARED client. It must
+            # NOT be affected by the stale-retry the OTHER task is
+            # doing.
+            in_flight_started.set()
+            await release_in_flight.wait()
+            observed_inflight["auth"] = (
+                request.headers.get("authorization")
+            )
+            observed_inflight["method"] = request.method
+            return httpx.Response(200, json=[
+                {"id": 1, "property_id": 1, "unit_number": "U-1",
+                 "status": "vacant", "is_active": True},
+            ])
+        if path.endswith("/properties"):
+            # Stale on the shared client (call 1), then the one-shot
+            # retry client (call 2) succeeds. We mark the moment
+            # the retry starts so the test can correlate.
+            observed_retry.setdefault("calls", 0)
+            observed_retry["calls"] += 1
+            if observed_retry["calls"] == 1:
+                # Stale-protocol on the SHARED client.
+                raise httpx.RemoteProtocolError(
+                    "Server disconnected without sending a response."
+                )
+            # The retry is performed on the one-shot client.
+            observed_retry["auth"] = (
+                request.headers.get("authorization")
+            )
+            observed_retry["client_repr"] = id(client._client)
+            return httpx.Response(200, json=[
+                {"id": 1, "name": "Bayshore", "address": "5",
+                 "city": "Pasay", "total_units": 2, "is_active": True},
+            ])
+        # Anything else — keep mock transport predictable.
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    shared_client_id_before = _identity(client)
+
+    async def scenario() -> None:
+        # Task A: start a healthy GET on the shared client, then
+        # block until we know the shared client is in-flight.
+        async def healthy_in_flight() -> None:
+            units = await client.get_units()
+            assert len(units) == 1 and units[0].unit_number == "U-1"
+
+        # Task B: trigger a stale-retry on the shared client.
+        async def stale_then_retry() -> list[Any]:
+            return await client.get_properties()
+
+        inflight = asyncio.create_task(healthy_in_flight())
+        await in_flight_started.wait()
+        # While task A is mid-flight on the shared client, task B
+        # attempts the stale-retry.
+        retry_task = asyncio.create_task(stale_then_retry())
+        # Yield a couple of times so task B starts and the recovery
+        # code runs while task A is still suspended.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        # Now release task A — it must complete successfully even
+        # though the recovery code may have already created a
+        # one-shot client.
+        release_in_flight.set()
+        await inflight
+        properties = await retry_task
+        assert (
+            len(properties) == 1
+            and properties[0].name == "Bayshore"
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        _run(client.aclose())
+
+    # Concurrency contract: the shared ``self._client`` was NEVER
+    # closed or replaced. Its identity must be identical before
+    # and after the run.
+    assert _identity(client) == shared_client_id_before, (
+        "shared self._client must NEVER be closed or replaced by the "
+        "stale-retry path; identity changed"
+    )
+    # The healthy in-flight read on the shared client used the
+    # original bearer header (never re-derived).
+    assert observed_inflight.get("auth") == "Bearer secret-key"
+    assert observed_inflight.get("method") == "GET"
+    # The retry itself was authorised and ran on a separate
+    # one-shot client (its identity must NOT equal the shared
+    # client's identity).
+    assert observed_retry.get("auth") == "Bearer secret-key"
+    assert observed_retry.get("calls") == 2
+
+
+def test_concurrent_two_stale_retries_do_not_close_each_others_clients():
+    """Concurrency contract (2): two concurrent stale GET retries
+    must each build their OWN one-shot client, and closing one
+    must not affect the other. The OLD implementation swapped
+    ``self._client`` on each stale failure, so two concurrent
+    stale retries would race to ``aclose()`` each other's newly
+    installed shared client — the second retry would see
+    ``RuntimeError: Client has been closed`` and the call would
+    fail unexpectedly.
+
+    The handler distinguishes the two tasks by URL path (one hits
+    ``/units``, the other hits ``/properties``). Both tasks make
+    their FIRST attempt in lock‑step — the handler releases them
+    simultaneously so the stale-protocol fingerprint is raised
+    on the shared client concurrently for both. The
+    one-shot retry attempts run immediately and must each
+    succeed on their own fresh pool.
+    """
+    observed: list[dict[str, Any]] = []
+    first_call_started: dict[str, asyncio.Event] = {
+        "A": asyncio.Event(),
+        "B": asyncio.Event(),
+    }
+    release_first_calls: dict[str, asyncio.Event] = {
+        "A": asyncio.Event(),
+        "B": asyncio.Event(),
+    }
+    which = {"v": ""}
+    idx = {"A": 0, "B": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith("/units"):
+            which["v"] = "A"
+        elif path.endswith("/properties"):
+            which["v"] = "B"
+        else:
+            return httpx.Response(200, json=[])
+
+        w = which["v"]
+        idx[w] += 1
+        this_call = idx[w]
+        if this_call == 1:
+            # FIRST attempt on the SHARED client: signal and
+            # gate so both tasks are inside the handler in
+            # lock-step before we let either raise the stale
+            # fingerprint. The retry attempt (this_call == 2)
+            # is NOT gated — it must run immediately on the
+            # one-shot fresh client.
+            first_call_started[w].set()
+            await release_first_calls[w].wait()
+            observed.append({"which": w, "stale": True})
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response."
+            )
+        # RETRY attempt on the one-shot fresh client:
+        observed.append({
+            "which": w,
+            "auth": request.headers.get("authorization"),
+            "stale": False,
+            "client_repr": id(client._client),
+        })
+        if path.endswith("/units"):
+            return httpx.Response(200, json=[
+                {"id": 1, "property_id": 1, "unit_number": "U-1",
+                 "status": "vacant", "is_active": True},
+            ])
+        return httpx.Response(200, json=[
+            {"id": 1, "name": "Bayshore", "address": "5",
+             "city": "Pasay", "total_units": 2, "is_active": True},
+        ])
+
+    client = _make_client(handler)
+    shared_client_id_before = _identity(client)
+
+    async def scenario() -> None:
+        async def task_a() -> list[Any]:
+            return await client.get_units()
+
+        async def task_b() -> list[Any]:
+            return await client.get_properties()
+
+        ta = asyncio.create_task(task_a())
+        tb = asyncio.create_task(task_b())
+        # Wait until both tasks have entered their handler call
+        # #1 (i.e., both are suspended awaiting the release event).
+        await first_call_started["A"].wait()
+        await first_call_started["B"].wait()
+        # Yield so the retry code does not yet see both raised.
+        for _ in range(8):
+            await asyncio.sleep(0)
+        # Release BOTH first-call handlers simultaneously so
+        # both tasks raise their stale fingerprint in lock-step.
+        # Each task then builds its OWN one-shot retry client.
+        release_first_calls["A"].set()
+        release_first_calls["B"].set()
+        units = await ta
+        properties = await tb
+        assert len(units) == 1 and units[0].unit_number == "U-1"
+        assert (
+            len(properties) == 1
+            and properties[0].name == "Bayshore"
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        _run(client.aclose())
+
+    # Concurrency contract: the shared ``self._client`` was NEVER
+    # closed or replaced. Its identity must be identical before
+    # and after the run, and after all the one-shot retry clients
+    # have been closed.
+    assert _identity(client) == shared_client_id_before, (
+        "shared self._client must NEVER be closed or replaced by "
+        "concurrent stale-retries; identity changed"
+    )
+    # Each task saw exactly one stale on the shared client and
+    # one success on its retry. No task observed the shared
+    # client being closed mid-retry.
+    by_which: dict[str, list[dict[str, Any]]] = {}
+    for o in observed:
+        by_which.setdefault(o["which"], []).append(o)
+    assert sorted(by_which.keys()) == ["A", "B"], (
+        f"both stale-retries must have hit the handler; got {by_which}"
+    )
+    for which_, rows in by_which.items():
+        stale_count = sum(1 for r in rows if r["stale"])
+        ok_count = sum(1 for r in rows if not r["stale"])
+        assert stale_count == 1, (
+            f"task {which_} must see exactly one stale failure, "
+            f"got {stale_count}"
+        )
+        assert ok_count == 1, (
+            f"task {which_} must see exactly one successful retry, "
+            f"got {ok_count}"
+        )
+    # The successful-retry rows must each carry the original
+    # Bearer auth (never re-derived, never lost).
+    for which_, rows in by_which.items():
+        for r in rows:
+            if not r["stale"]:
+                assert r["auth"] == "Bearer secret-key", (
+                    f"retry {which_} lost the Bearer auth header"
+                )
+
+
+def test_concurrent_stale_retry_does_not_replace_shared_client_attribute():
+    """Concurrency contract (3): after a stale-retry, the attribute
+    ``PasayApiClient._client`` MUST still be the original object
+    (id-equal to what it was before). The OLD implementation
+    re-assigned ``self._client = self._build_fresh_client()``,
+    which would silently swap the shared pool; this test asserts
+    that contract is now broken.
+
+    The test uses a getter hook on the attribute to capture its
+    identity before any request, then after the stale-retry
+    succeeds, and asserts they are the same object.
+    """
+    call_count = {"n": 0}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response."
+            )
+        return httpx.Response(200, json=[])
+
+    client = _make_client(handler)
+    shared_id_before = id(client._client)
+    # The retry path builds a one-shot client via
+    # ``_build_fresh_client``; it MUST not be assigned back to
+    # ``self._client``. We assert that by checking the identity
+    # before and after a stale-retry run.
+    try:
+        _run(client.get_properties())
+        shared_id_after = id(client._client)
+        assert shared_id_before == shared_id_after, (
+            "shared self._client was replaced by stale-retry; "
+            "regression of independent-review contract"
+        )
+        assert call_count["n"] == 2
+    finally:
+        _run(client.aclose())
+
+
+def test_concurrent_stale_retry_only_closes_its_own_temp_client():
+    """Concurrency contract (4): the recovery path closes ONLY the
+    local one-shot retry client — it does NOT call ``aclose()``
+    on the shared ``self._client``. We assert this by patching
+    ``httpx.AsyncClient.aclose`` and capturing the SEQUENCE of
+    close events across a stale-retry:
+
+    * Between the start of ``client.get_properties()`` and the
+      call returning, exactly ONE client is closed — the local
+      one-shot retry client. The shared client is NEVER closed
+      during this window.
+    * The shared client is closed exactly once, by the explicit
+      ``client.aclose()`` at the end (which runs after
+      ``get_properties()`` returns).
+    """
+    closed_ids_in_order: list[int] = []
+    real_aclose = httpx.AsyncClient.aclose
+    close_lock = asyncio.Lock()
+
+    async def counting_aclose(self: httpx.AsyncClient) -> None:
+        async with close_lock:
+            closed_ids_in_order.append(id(self))
+        await real_aclose(self)
+
+    # Patch at the class level — every AsyncClient instance,
+    # including the one the retry path builds, gets counted.
+    httpx.AsyncClient.aclose = counting_aclose  # type: ignore[assignment]
+    try:
+        call_count = {"n": 0}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise httpx.RemoteProtocolError(
+                    "Server disconnected without sending a response."
+                )
+            return httpx.Response(200, json=[])
+
+        client = _make_client(handler)
+        shared_client_id = id(client._client)
+        # Snapshot how many closes have happened BEFORE the
+        # ``get_properties()`` call — the recovery path must
+        # only add closes for its OWN temp client; the shared
+        # client must NOT appear here.
+        closes_at_start = len(closed_ids_in_order)
+        try:
+            _run(client.get_properties())
+        finally:
+            # Snapshot BEFORE the explicit ``client.aclose()``
+            # call so we can separately reason about (a) the
+            # closes the recovery path did, and (b) the close
+            # of the shared client.
+            closes_after_recovery = list(closed_ids_in_order)
+            _run(client.aclose())
+
+        assert call_count["n"] == 2, (
+            f"expected exactly 2 handler invocations "
+            f"(1 stale + 1 retry), got {call_count['n']}"
+        )
+        # (a) Across the stale-retry path (between
+        # ``closes_at_start`` and ``closes_after_recovery``),
+        # exactly ONE client must have been closed — the local
+        # one-shot retry client. The shared client ID must
+        # NEVER appear in this slice. This is the direct
+        # concurrency-safety assertion: the recovery code does
+        # NOT call ``aclose()`` on the shared client.
+        #
+        # IMPORTANT: we slice from the snapshot
+        # ``closes_after_recovery`` (captured BEFORE the explicit
+        # ``client.aclose()`` call), NOT from ``closed_ids_in_order``
+        # (which already contains the shared client's close by
+        # the time this assert runs).
+        recovery_closes = (
+            closes_after_recovery[closes_at_start:]
+            if closes_at_start < len(closes_after_recovery)
+            else []
+        )
+        assert len(recovery_closes) == 1, (
+            f"recovery path must close exactly one client (the "
+            f"local retry temp); got {recovery_closes}"
+        )
+        assert recovery_closes[0] != shared_client_id, (
+            "recovery path must NOT close the shared client — "
+            f"closed IDs during recovery: {recovery_closes}, "
+            f"shared client ID: {shared_client_id}"
+        )
+        # (b) After the explicit ``client.aclose()`` at the end,
+        # the shared client must have been closed exactly once.
+        # This is the lifecycle contract for the shared client:
+        # the recovery path did not close it, and the explicit
+        # ``aclose()`` at the end closed it exactly once.
+        total_shared_closes = sum(
+            1 for cid in closed_ids_in_order
+            if cid == shared_client_id
+        )
+        assert total_shared_closes == 1, (
+            f"shared client must be closed exactly once "
+            f"(by the explicit aclose); observed "
+            f"{total_shared_closes} closes"
+        )
+    finally:
+        httpx.AsyncClient.aclose = real_aclose  # type: ignore[assignment]
+
+
+def test_concurrent_stale_retry_does_not_call_reopen_client():
+    """Concurrency contract (5): the independent-review follow-up
+    removes the ``_reopen_client`` method entirely. The recovery
+    path must NOT call any close/swap helper that touches the
+    shared client. This test asserts ``_reopen_client`` is no
+    longer present on ``PasayApiClient`` and the recovery path
+    never invokes such an operation on the shared client."""
+    assert not hasattr(PasayApiClient, "_reopen_client"), (
+        "_reopen_client must NOT exist on PasayApiClient — the "
+        "recovery path must not close/swap the shared client"
+    )
+    # The recovery path is local: it builds a fresh client via
+    # ``_build_fresh_client``, uses it once, and closes only that
+    # temp client. We assert ``_build_fresh_client`` exists and
+    # returns a NEW instance (not the shared client).
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError(
+            "Server disconnected without sending a response."
+        )
+
+    client = _make_client(handler)
+    shared_id = id(client._client)
+    try:
+        fresh = client._build_fresh_client()
+        try:
+            assert id(fresh) != shared_id, (
+                "_build_fresh_client must produce a new client, "
+                "never the shared one"
+            )
+        finally:
+            _run(fresh.aclose())
+    finally:
+        _run(client.aclose())

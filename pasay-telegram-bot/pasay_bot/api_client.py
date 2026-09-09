@@ -10,11 +10,20 @@ pool (see ``httpx.Limits`` below). A peer that drops its TLS connection
 without a response (``Server disconnected without sending a response`` =
 ``httpx.RemoteProtocolError``) is silent on the next pooled read. For
 idempotent READ requests (GET / HEAD only) we now classify the
-transport-level stale/disconnect failure, recreate the client once with a
-fresh connection pool, and retry the SAME request exactly once. WRITES
-(POST / PATCH / PUT / DELETE) are NEVER auto-retried because the prior
-write may already have committed server-side — the bot must follow the
-existing "uncertain write" reconciliation path instead.
+transport-level stale/disconnect failure, build a ONE-SHOT fresh
+``httpx.AsyncClient`` (a separate, locally-scoped client whose lifecycle
+is bound to the retry attempt), and retry the SAME request exactly once.
+The shared singleton ``self._client`` is NEVER closed or replaced by the
+recovery code — the PTB Application is a singleton in production and the
+``PasayApiClient`` is shared across every concurrent Telegram update;
+closing/swapping ``self._client`` from inside a single GET recovery path
+could disrupt another in-flight read, and two concurrent stale retries
+could close each other's newly-installed clients. The temporary retry
+client is the only thing the recovery path touches; it is closed as soon
+as the single retry attempt is done. WRITES (POST / PATCH / PUT / DELETE)
+are NEVER auto-retried because the prior write may already have committed
+server-side — the bot must follow the existing "uncertain write"
+reconciliation path instead.
 """
 from __future__ import annotations
 
@@ -1074,11 +1083,14 @@ class PasayApiClient:
         Issue #119 P0 STALE-CONNECTION RESILIENCE: the configured
         ``timeout``, ``enable_http2``, and the user-supplied
         ``transport`` are remembered so a transport-level stale
-        connection can be re-opened (fresh keep-alive pool, same
-        auth/org headers, same per-request timeout, same HTTP/2
-        mode, same transport if injected for tests). The bot owns
-        exactly one logical HTTP session; the pool can be re-opened
-        transparently for idempotent READ retries.
+        connection can be retried on a ONE-SHOT fresh ``httpx.AsyncClient``
+        (fresh keep-alive pool, same auth/org headers, same
+        per-request timeout, same HTTP/2 mode, same transport if
+        injected for tests). The bot owns exactly one logical HTTP
+        session — the shared ``self._client`` — and the recovery
+        code NEVER closes or replaces it. The temporary retry client
+        is a local, single-attempt resource that is closed as soon
+        as the retry returns.
         """
         self._telegram_user_id: ContextVar[int | None] = ContextVar(
             f"telegram_user_id_{id(self)}", default=None)
@@ -1129,18 +1141,27 @@ class PasayApiClient:
         await self._client.aclose()
 
     def _build_fresh_client(self) -> httpx.AsyncClient:
-        """Reopen a fresh ``httpx.AsyncClient`` with identical auth/limits/etc.
+        """Build a brand-new ``httpx.AsyncClient`` with identical auth/limits/etc.
 
         Issue #119 P0 STALE-CONNECTION RESILIENCE (Owner override
-        2026-09-09): when a pooled keep-alive connection silently dies
-        (peer sends FIN/RST without bytes), httpx raises
-        ``RemoteProtocolError`` (the Owner's
-        ``Server disconnected without sending a response``). Reusing
-        the same pool would keep retrying the dead socket. Reopening
-        the client drops the stale keep-alive map; the next request
-        goes over a fresh TCP/TLS connection that the peer has not
-        yet seen. Auth/org headers, timeout, http2 flag, limits, and
-        the optional injected test transport are preserved exactly.
+        2026-09-09, independent-review correction): when a pooled
+        keep-alive connection silently dies (peer sends FIN/RST
+        without bytes), httpx raises ``RemoteProtocolError`` (the
+        Owner's ``Server disconnected without sending a response``).
+        Reusing the same pool would keep retrying the dead socket,
+        and CLOSING the shared ``self._client`` to swap in a fresh
+        one would disrupt any other concurrent Telegram update that
+        is using the same shared pool — two concurrent stale retries
+        could also end up closing each other's newly-installed
+        clients.
+
+        Instead the recovery code builds a LOCAL one-shot client via
+        this helper, uses it for exactly one retry, and closes it as
+        soon as that retry returns. The shared ``self._client`` is
+        NEVER touched by the recovery path.
+
+        Auth/org headers, timeout, http2 flag, limits, and the
+        optional injected test transport are preserved exactly.
         """
         return httpx.AsyncClient(
             base_url=self.base_url,
@@ -1152,21 +1173,6 @@ class PasayApiClient:
             limits=self._limits,
             http2=self._enable_http2,
         )
-
-    async def _reopen_client(self) -> None:
-        """Best-effort close the old pool + install a fresh client.
-
-        The old ``aclose()`` may itself raise (e.g. when the failing
-        socket is mid-read). Swallow that — we are explicitly
-        abandoning the old pool. The fresh client is the only path
-        the next request will use.
-        """
-        old = self._client
-        try:
-            await old.aclose()
-        except Exception:  # noqa: BLE001 - abandonment is intentional
-            pass
-        self._client = self._build_fresh_client()
 
     @staticmethod
     def _is_stale_connection_error(exc: BaseException) -> bool:
@@ -1212,80 +1218,118 @@ class PasayApiClient:
         except Exception:  # noqa: BLE001 - path logging is best-effort
             pass
         # Issue #119 P0 STALE-CONNECTION RESILIENCE (Owner override
-        # 2026-09-09): for IDEMPOTENT reads only, allow exactly one
-        # transparent retry after a transport-level stale/disconnected
-        # pooled connection. The retry happens on a FRESH
-        # ``httpx.AsyncClient`` (new keep-alive pool, same auth/org
-        # headers, same per-request timeout, same HTTP/2 setting).
+        # 2026-09-09, independent-review correction): for IDEMPOTENT
+        # reads only, allow exactly one transparent retry after a
+        # transport-level stale/disconnected pooled connection. The
+        # retry happens on a LOCAL one-shot ``httpx.AsyncClient``
+        # (new keep-alive pool, same auth/org headers, same
+        # per-request timeout, same HTTP/2 setting, same injected
+        # test transport). The shared singleton ``self._client`` is
+        # NEVER closed or replaced — the PTB Application is a
+        # singleton in production and the ``PasayApiClient`` is
+        # shared across every concurrent Telegram update; closing
+        # the shared pool from inside a single GET recovery path
+        # could disrupt another in-flight read on the same pool, and
+        # two concurrent stale retries could close each other's
+        # newly-installed clients.
+        #
         # WRITES (POST / PATCH / PUT / DELETE / anything else) MUST
         # NEVER be auto-retried — the prior write may already have
         # committed and the existing ``PasayApiTimeoutError`` / 409
         # reconciliation path is the only safe way to handle that.
         method_upper = str(method).upper()
         _can_retry_once = method_upper in _READ_METHODS
-        _attempt = 0
-        _reopened = False
-        while True:
-            _attempt += 1
+        _retried = False
+        # The first attempt always goes through the shared
+        # ``self._client``; only the retry path builds a one-shot
+        # fresh client whose lifetime is bound to this single call.
+        try:
+            resp = await self._client.request(method, path, **kwargs)
+        except httpx.TimeoutException as exc:
+            # A timeout is NEVER auto-retried — the server-side
+            # outcome of a write is unknown and the caller owns
+            # reconciliation via ``PasayApiTimeoutError`` / 409.
             try:
-                resp = await self._client.request(method, path, **kwargs)
-            except httpx.TimeoutException as exc:
-                # Issue #119 P0 WARM-PATH TRACE: log the per-call latency
-                # with the trace_id so a timeout on the V1 leg is visible
-                # next to the PTB handler that triggered it. A timeout
-                # is NEVER auto-retried — the server-side outcome of a
-                # write is unknown and the caller owns reconciliation.
+                _elapsed = _time_ms() - _pstart
+                _logger.info(
+                    "pasay_v1_request trace_id=%s method=%s path=%s "
+                    "status=timeout elapsed_ms=%.2f error=%s",
+                    _trace_id, method_upper, _log_path, _elapsed,
+                    type(exc).__name__,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise PasayApiTimeoutError() from exc
+        except httpx.HTTPError as exc:
+            # Issue #119 P0 STALE-CONNECTION RESILIENCE: a
+            # transport-level "server disconnected" on a pooled
+            # keep-alive socket is recoverable for IDEMPOTENT
+            # reads. Build a LOCAL one-shot fresh client and retry
+            # exactly once with the SAME method/path/body/headers.
+            # The shared ``self._client`` is NOT touched.
+            if (
+                _can_retry_once
+                and self._is_stale_connection_error(exc)
+            ):
+                # Emit the retrying_once log line BEFORE building the
+                # one-shot client so the timeline reads top-down.
                 try:
                     _elapsed = _time_ms() - _pstart
                     _logger.info(
                         "pasay_v1_request trace_id=%s method=%s path=%s "
-                        "status=timeout elapsed_ms=%.2f error=%s",
+                        "status=retrying_once elapsed_ms=%.2f error=%s",
                         _trace_id, method_upper, _log_path, _elapsed,
                         type(exc).__name__,
                     )
                 except Exception:  # noqa: BLE001
                     pass
-                raise PasayApiTimeoutError() from exc
-            except httpx.HTTPError as exc:
-                # Issue #119 P0 STALE-CONNECTION RESILIENCE: a
-                # transport-level "server disconnected" on a pooled
-                # keep-alive socket is recoverable for IDEMPOTENT
-                # reads. Reopen the client (fresh pool) and retry
-                # exactly once with the SAME method/path/body/headers.
-                if (
-                    _can_retry_once
-                    and not _reopened
-                    and self._is_stale_connection_error(exc)
-                ):
-                    try:
-                        await self._reopen_client()
-                    except Exception as reopen_exc:  # noqa: BLE001
-                        try:
-                            _elapsed = _time_ms() - _pstart
-                            _logger.info(
-                                "pasay_v1_request trace_id=%s method=%s "
-                                "path=%s status=retry_aborted "
-                                "elapsed_ms=%.2f error=%s reopen_error=%s",
-                                _trace_id, method_upper, _log_path, _elapsed,
-                                type(exc).__name__, type(reopen_exc).__name__,
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                        raise PasayApiError(
-                            None, f"network error: {exc}"
-                        ) from exc
-                    _reopened = True
+                # Build the one-shot fresh client. Its lifecycle is
+                # local: it is closed in the ``finally`` below,
+                # regardless of whether the retry succeeded or
+                # raised. The shared ``self._client`` is never
+                # closed, replaced, or even referenced in the
+                # retry path — this is the concurrency-safety
+                # contract enforced by the independent-review
+                # follow-up.
+                retry_client = self._build_fresh_client()
+                try:
+                    resp = await retry_client.request(
+                        method, path, **kwargs
+                    )
+                    _retried = True
+                except httpx.HTTPError as retry_exc:
+                    # The retry itself failed too. Surface the
+                    # ORIGINAL error verbatim so the caller /
+                    # operator can correlate the fingerprint with
+                    # the upstream incident; the retry exception is
+                    # kept as the ``__cause__`` chain for
+                    # diagnostics.
                     try:
                         _elapsed = _time_ms() - _pstart
                         _logger.info(
-                            "pasay_v1_request trace_id=%s method=%s path=%s "
-                            "status=retrying_once elapsed_ms=%.2f error=%s",
-                            _trace_id, method_upper, _log_path, _elapsed,
-                            type(exc).__name__,
+                            "pasay_v1_request trace_id=%s method=%s "
+                            "path=%s status=error elapsed_ms=%.2f "
+                            "error=%s retry_error=%s",
+                            _trace_id, method_upper, _log_path,
+                            _elapsed, type(exc).__name__,
+                            type(retry_exc).__name__,
                         )
                     except Exception:  # noqa: BLE001
                         pass
-                    continue
+                    raise PasayApiError(
+                        None, f"network error: {exc}"
+                    ) from retry_exc
+                finally:
+                    # Close ONLY the temporary one-shot client.
+                    # ``aclose()`` may itself raise on a freshly-
+                    # minted client that hit the same dead peer —
+                    # swallow that because the temp client is
+                    # about to be discarded anyway.
+                    try:
+                        await retry_client.aclose()
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
                 try:
                     _elapsed = _time_ms() - _pstart
                     _logger.info(
@@ -1297,15 +1341,10 @@ class PasayApiClient:
                 except Exception:  # noqa: BLE001
                     pass
                 raise PasayApiError(None, f"network error: {exc}") from exc
-            # We have a real Response object — break out of the retry
-            # loop and process the body below.
-            break
-        # If the loop exits via ``continue`` it always re-enters ``while``;
-        # the only way to reach here is via ``break`` after a successful
-        # httpx.Response. The PhaseProbe add_backend accounting is done
-        # once per HTTP round-trip below — but because the loop may have
-        # run TWICE for a stale-retry, we record the cumulative cost
-        # of every attempt on the probe.
+        # ``resp`` is the httpx.Response from either the first
+        # attempt or the one-shot retry; the only path that did
+        # not assign ``resp`` is the timeout / write / non-stale
+        # error branches above, which already raised.
         try:
             from pasay_bot.state.latency import current_phase
 
@@ -1324,7 +1363,7 @@ class PasayApiClient:
                 "elapsed_ms=%.2f retried=%s",
                 _trace_id, method_upper, _log_path,
                 int(resp.status_code), _elapsed,
-                "true" if _reopened else "false",
+                "true" if _retried else "false",
             )
         except Exception:  # noqa: BLE001 - observability never breaks the request
             pass
