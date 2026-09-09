@@ -91,11 +91,13 @@ jobs:
           python - <<'PY'
           import json,os
           me=json.load(open('/tmp/getme.json')); wh=json.load(open('/tmp/webhook.json')); assert me.get('ok') and wh.get('ok')
-          username=(me.get('result') or {}).get('username') or ''; info=wh.get('result') or {}; url=info.get('url') or ''; pending=int(info.get('pending_update_count') or 0); err=info.get('last_error_message') or ''
+          username=(me.get('result') or {}).get('username') or ''; info=wh.get('result') or {}; url=info.get('url') or ''; pending=int(info.get('pending_update_count') or 0); err=info.get('last_error_message') or ''; err_date=int(info.get('last_error_date') or 0)
           assert username.lower()=='sellandrentbot',f'bot identity mismatch: @{username}'; assert url.endswith('/telegram/webhook'),f'unexpected webhook path: {url}'
+          safe_err=err[:180].replace('\n',' ').replace('\r',' ')
+          print(f'telegram_webhook_probe username=@{username} pending_update_count={pending} last_error_date={err_date} last_error_message={safe_err or "<none>"}')
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
               f.write(f'- Telegram identity: **PASS** `@{username}`\n'); f.write(f'- Telegram webhook configured: **PASS**; pending updates: `{pending}`\n')
-              if err: f.write(f'- Telegram last error: `{err[:180]}`\n')
+              if err: f.write(f'- Telegram last error: `{safe_err}`; date: `{err_date}`\n')
           if err: raise SystemExit('Telegram reports last_error_message')
           PY
 
