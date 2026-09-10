@@ -12,6 +12,20 @@
  *     the queue consumer can pick it up; idempotency is preserved because
  *     the Container's update_id claim is the single source of truth.
  *
+ * Webhook ACK contract (Issue #119):
+ *   * Direct-forward ack (Container 2xx)                => 2xx to Telegram
+ *   * Direct-forward transient + PASAY_QUEUE.send OK    => 2xx to Telegram
+ *   * Direct-forward transient + PASAY_QUEUE.send FAIL  => non-2xx to Telegram
+ *
+ * Returning 2xx on the queue-fallback path is REQUIRED by the Telegram
+ * webhook ACK contract: once the envelope has been durably accepted by
+ * the Queue, the Container's update_id claim guarantees idempotent
+ * processing — Telegram must NOT retry a delivery the Queue already owns.
+ * A prior regression returned 503 here, which surfaced as
+ * ``getWebhookInfo.last_error_message = "Wrong response from the webhook:
+ * 503 Service Unavailable"`` even though every update had been
+ * successfully enqueued.
+ *
  * Business logic belongs in the FastAPI application, never in this Worker.
  */
 import {
@@ -269,16 +283,33 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
   // owner of Telegram update_id dedup (claim_update_or_short_circuit in
   // app/services/telegram_webhook.py). Both paths reach the same
   // handler, so direct + fallback enqueue are idempotent under the same
-  // update_id — Telegram's webhook redelivery contract is preserved
-  // because we return 503 on transient Container failures (Telegram
-  // retries), and the Queue retry/ack contract is unchanged.
+  // update_id. Telegram's webhook redelivery contract is preserved
+  // because we return 2xx only when the envelope has been either
+  // synchronously accepted by the Container OR durably enqueued to the
+  // Queue (which guarantees eventual delivery to the same dedup layer).
+  //
+  // Webhook ACK contract (Issue #119 — CURRENT fix):
+  //   * Direct-forward ack (Container 2xx)        => 2xx to Telegram
+  //   * Direct-forward transient + queue send OK => 2xx to Telegram
+  //   * Direct-forward transient + queue send FAIL => non-2xx to Telegram
+  //
+  // Returning 2xx on the fallback path is CORRECT: the envelope has
+  // already been accepted for processing (Queue is the durable
+  // delivery contract), so Telegram must NOT be told to redeliver a
+  // duplicate. Previously this branch returned 503, which made
+  // Telegram record a webhook failure and retry an update that was
+  // already queued for processing — observable as
+  // ``Wrong response from the webhook: 503 Service Unavailable`` in
+  // ``getWebhookInfo.last_error_message`` even though the Queue had
+  // already taken ownership.
   //
   // Fallback: a transient direct-forward failure (5xx, container fetch
   // throws, container not bound) routes to PASAY_QUEUE.send so the
-  // existing queue consumer can pick it up. If the enqueue also fails
-  // we return a hard 503 so Telegram retries via its own redelivery
-  // contract (no PTB state mutated because the Container never received
-  // the envelope).
+  // existing queue consumer can pick it up. If the enqueue ALSO fails
+  // (rare: Queue availability breach) we return a hard non-2xx so
+  // Telegram retries via its own redelivery contract (no PTB state
+  // mutated because the Container never received the envelope).
+  const TELEGRAM_ACK_QUEUE_FALLBACK = 200;  // ACK once durable Queue accepts the envelope
   const direct_result = await direct_forward_envelope_to_container(env, envelope, {
     trace_id: envelope.event_id,
     trace_t0: occurred_at,
@@ -324,23 +355,33 @@ async function handle_telegram_ingress(request: Request, env: Env): Promise<Resp
       event_id: envelope.event_id,
       path: TRACE_PATH_ENQUEUED_FALLBACK,
       outcome: "enqueued_fallback",
-      status: 503,
+      status: TELEGRAM_ACK_QUEUE_FALLBACK,
       worker_arrival_iso,
       worker_arrival_ms,
       worker_total_ms: Date.now() - worker_arrival_ms,
       container_fetch_ms: direct_result.worker_ingress_ms,
       env,
     });
+    // ACK contract (Issue #119): the envelope has been durably accepted
+    // by the queue fallback send, so return a 2xx acknowledgement to
+    // Telegram to prevent it from treating this delivery as failed
+    // and retrying an update that the queue consumer will pick up.
+    // Preserving ``path: enqueued_fallback`` + ``state: enqueued_fallback``
+    // keeps operator-side grep on the structured log line + JSON body
+    // stable so watchdog / SRE dashboards continue to identify the
+    // fallback path. The Container's update_id claim layer guarantees
+    // idempotency: even if Telegram DOES redeliver (network-level
+    // race), the second arrival will be deduplicated by
+    // ``claim_update_or_short_circuit`` before any handler runs.
     return json(
-      503,
+      TELEGRAM_ACK_QUEUE_FALLBACK,
       {
-        ok: false,
+        ok: true,
         state: "enqueued_fallback",
         event_id: envelope.event_id,
         req_id,
         path: TRACE_PATH_ENQUEUED_FALLBACK,
-        error: direct_result.error || "container_unavailable_fallback_enqueued",
-        retryable: true,
+        delivery: "queue",
         worker_ingress_ms: direct_result.worker_ingress_ms,
       },
       { Allow: "POST" },
